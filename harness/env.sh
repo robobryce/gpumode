@@ -6,9 +6,15 @@
 # `eval.py` / `utils.py` (at the set root) plus `reference.py` / `task.yml`
 # (in the problem dir) are read where they already live — nothing is copied.
 #
-# Select the target problem with GPUMODE_PROBLEM=<set>/<problem> (e.g.
-# `pmpp_v2/histogram_py`), an env var the autocuda layout tells the manager to
-# export. The repo root holds ONE autocuda data dir (`autocuda/`).
+# Select the target problem by passing <set>/<problem> (e.g.
+# `pmpp_v2/histogram_py`) as the FIRST positional argument to the calling
+# script — build.sh / validate.sh / benchmark.sh / profile_ncu.sh each forward
+# their args here via `source env.sh "$@"`. This is the same <set>/<problem>
+# string you scope an optimize-tree run with (`benchmark=<set>/<problem>`), so
+# the one token flows from the skill argument straight to the harness with no
+# environment variable to export (a bare `export` would not survive between an
+# agent harness's separate shell invocations anyway). The repo root holds ONE
+# autocuda data dir (`autocuda/`).
 set -uo pipefail
 HARNESS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$HARNESS_DIR/.." && pwd)"
@@ -22,11 +28,13 @@ for cfg in "${GPUMODE_ENV:-}" "$HOME/.config/gpumode/gpumode.env"; do
 done
 
 # --- 2. target problem -------------------------------------------------------
-: "${GPUMODE_PROBLEM:?set GPUMODE_PROBLEM=<set>/<problem> (e.g. pmpp_v2/histogram_py)}"
-PROBLEM_DIR="$REPO_DIR/problems/$GPUMODE_PROBLEM"
+# First positional arg of the calling script, forwarded via `source env.sh "$@"`.
+# `${1:?...}` prints this usage and exits if it is missing (works under `set -u`).
+PROBLEM="${1:?usage: <script>.sh <set>/<problem> (e.g. pmpp_v2/histogram_py)}"
+PROBLEM_DIR="$REPO_DIR/problems/$PROBLEM"
 SET_DIR="$(dirname "$PROBLEM_DIR")"   # holds eval.py / utils.py
 [ -f "$PROBLEM_DIR/submission.py" ] || {
-    echo "no submission.py at $PROBLEM_DIR — is GPUMODE_PROBLEM=$GPUMODE_PROBLEM correct?" >&2; exit 1; }
+    echo "no submission.py at $PROBLEM_DIR — is '$PROBLEM' the right <set>/<problem>?" >&2; exit 1; }
 
 # --- derived / defaults ------------------------------------------------------
 # PYTHON is consumed by the scripts that source this file (not exported on
