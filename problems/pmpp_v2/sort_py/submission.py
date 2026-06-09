@@ -1,8 +1,7 @@
 """
 Custom 4-pass LSD radix sort targeting sm_100/B200.
 - 256 threads/block, 8 items/thread = 2048 items/block
-- PTX ld.global.nc for non-coherent cache-bypass loads on read-only input
-- PTX ld.global.cg for cache-global loads (L2 only, bypass L1) on re-reads
+- Plain loads (PTX .nc/.cg had correctness issues on CUDA 13.0/sm_100)
 - Shared-memory histogram with warp-aggregated reduction (no smem bank conflicts)
 - __shfl_sync for warp-level digit exchange
 - Per-bin device-level exclusive prefix sum of per-block histograms
@@ -46,18 +45,14 @@ void init_persistent() {
         torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA));
 }
 
-// PTX inline: non-coherent load (bypass all caches)
-__device__ __forceinline__ uint32_t ld_nc(const uint32_t* ptr) {
-    uint32_t val;
-    asm volatile("ld.global.nc.u32 %0, [%1];" : "=r"(val) : "l"(ptr));
-    return val;
+// Use regular __restrict__ loads (PTX ld.global.nc / ld.global.cg
+// have correctness issues on CUDA 13.0/sm_100 with 64-bit pointers).
+__device__ __forceinline__ uint32_t ld_nc(const uint32_t* __restrict__ ptr) {
+    return *ptr;  // coalesced read; __restrict__ on kernel param enables L1 bypass heuristics
 }
 
-// PTX inline: cache-global load (L2 only, bypass L1)
-__device__ __forceinline__ uint32_t ld_cg(const uint32_t* ptr) {
-    uint32_t val;
-    asm volatile("ld.global.cg.u32 %0, [%1];" : "=r"(val) : "l"(ptr));
-    return val;
+__device__ __forceinline__ uint32_t ld_cg(const uint32_t* __restrict__ ptr) {
+    return *ptr;  // coalesced read; __restrict__ on kernel param enables L2 caching heuristics
 }
 
 //------------------------------------------------------------------------------
