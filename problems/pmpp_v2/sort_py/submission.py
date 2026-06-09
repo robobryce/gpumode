@@ -1,8 +1,8 @@
 """
-Per-row DeviceSegmentedRadixSort + integer-bucket global sort.
+Per-row BlockRadixSort + global merge via DeviceRadixSort.
 Input is a flattened sqrt(N)xsqrt(N) matrix where each row is randn centered
-at (seed+i). DeviceSegmentedRadixSort sorts each row independently in one call,
-then a global DeviceRadixSort merges all rows.
+at (seed+i). Each row is sorted via BlockRadixSort in shared memory.
+Then a global DeviceRadixSort merges all row-sorted results.
 """
 import math
 import torch
@@ -18,21 +18,23 @@ torch::Tensor sort_rows(torch::Tensor input, torch::Tensor output, torch::Tensor
 sort_cuda_source = """
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <cub/block/block_radix_sort.cuh>
 #include <cub/device/device_radix_sort.cuh>
-#include <cub/device/device_segmented_radix_sort.cuh>
 #include <cstdint>
 #include <cuda_runtime_api.h>
+#include <cfloat>
+
+// BlockRadixSort: 256 threads x 32 items = 8192 items/block (power of 2)
+constexpr int BLOCK_THREADS = 256;
+constexpr int ITEMS_PER_THREAD = 32;
+constexpr int BLOCK_ITEMS = BLOCK_THREADS * ITEMS_PER_THREAD;  // 8192
+using BlockSortT = cub::BlockRadixSort<int32_t, BLOCK_THREADS, ITEMS_PER_THREAD>;
 
 static torch::Tensor persistent_temp = {};
 static size_t persistent_temp_bytes = 0;
-static torch::Tensor persistent_offsets = {};
-static int64_t cached_num_rows = 0;
-static int64_t cached_row_stride = 0;
-static int64_t cached_N = 0;
 
 void sort_rows_init(int64_t max_items) {
     if (persistent_temp.defined()) return;
-    // Temp storage for the global DeviceRadixSort (worst case size)
     cub::DeviceRadixSort::SortKeys(
         nullptr, persistent_temp_bytes,
         static_cast<const int32_t*>(nullptr),
@@ -45,21 +47,48 @@ void sort_rows_init(int64_t max_items) {
         torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCUDA));
 }
 
-__global__ void fill_segment_offsets_kernel(
-    int64_t* __restrict__ begin_offsets,
-    int64_t* __restrict__ end_offsets,
+// BlockRadixSort kernel: each block sorts one chunk of a row.
+// Input: blocked arrangement - thread t owns [t*ITEMS_PER_THREAD, (t+1)*ITEMS_PER_THREAD-1].
+// Output: blocked ascending - thread 0 holds smallest ITEMS_PER_THREAD keys.
+__global__ void sort_rows_kernel(
+    const int32_t* __restrict__ input,
+    int32_t* __restrict__ output,
     int64_t num_rows,
     int64_t row_stride,
-    int64_t N) {
+    int64_t* row_counts,
+    int64_t blocks_per_row)
+{
+    int global_block_id = blockIdx.x;
+    int row = global_block_id / blocks_per_row;
+    int block_in_row = global_block_id % blocks_per_row;
 
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= num_rows) return;
+    if (row >= num_rows) return;
 
-    int64_t start = idx * row_stride;
-    int64_t end = (idx + 1) * row_stride;
-    if (end > N) end = N;
-    begin_offsets[idx] = start;
-    end_offsets[idx] = end;
+    int64_t row_count = row_counts[row];
+    int64_t row_offset = int64_t(row) * row_stride;
+    int64_t block_start = int64_t(block_in_row) * BLOCK_ITEMS;
+    const int32_t* row_in = input + row_offset;
+    int32_t* row_out = output + row_offset;
+
+    int32_t keys[ITEMS_PER_THREAD];
+    int tid = threadIdx.x;
+
+    #pragma unroll
+    for (int j = 0; j < ITEMS_PER_THREAD; j++) {
+        int64_t idx = block_start + int64_t(tid) * ITEMS_PER_THREAD + j;
+        keys[j] = (idx < row_count) ? row_in[idx] : INT_MAX;
+    }
+
+    __shared__ typename BlockSortT::TempStorage temp;
+    BlockSortT(temp).Sort(keys);
+
+    #pragma unroll
+    for (int j = 0; j < ITEMS_PER_THREAD; j++) {
+        int64_t idx = block_start + int64_t(tid) * ITEMS_PER_THREAD + j;
+        if (idx < row_count) {
+            row_out[idx] = keys[j];
+        }
+    }
 }
 
 torch::Tensor sort_rows(torch::Tensor input, torch::Tensor output, torch::Tensor temp) {
@@ -67,6 +96,7 @@ torch::Tensor sort_rows(torch::Tensor input, torch::Tensor output, torch::Tensor
     int64_t num_rows = static_cast<int64_t>(std::sqrt(static_cast<double>(N)));
     if (num_rows < 1) num_rows = 1;
     int64_t row_stride = (N + num_rows - 1) / num_rows;
+    int64_t blocks_per_row = (row_stride + BLOCK_ITEMS - 1) / BLOCK_ITEMS;
 
     auto input_c = input.contiguous();
     const int32_t* in_ptr = reinterpret_cast<const int32_t*>(
@@ -76,63 +106,29 @@ torch::Tensor sort_rows(torch::Tensor input, torch::Tensor output, torch::Tensor
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
-    // Allocate or reuse segment offsets on GPU
-    if (persistent_offsets.defined() && cached_num_rows < num_rows) {
-        // Need larger offsets array
-        persistent_offsets = torch::empty(
-            {num_rows * 2},  // begin + end offsets
-            torch::TensorOptions().dtype(torch::kInt64).device(torch::kCUDA));
-        cached_num_rows = num_rows;
-    } else if (!persistent_offsets.defined()) {
-        persistent_offsets = torch::empty(
-            {num_rows * 2},
-            torch::TensorOptions().dtype(torch::kInt64).device(torch::kCUDA));
-        cached_num_rows = num_rows;
+    // Compute per-row element counts on host, copy to device
+    std::vector<int64_t> row_counts_h(num_rows);
+    for (int64_t r = 0; r < num_rows - 1; r++) {
+        row_counts_h[r] = row_stride;
     }
+    row_counts_h[num_rows - 1] = N - (num_rows - 1) * row_stride;
 
-    int64_t* offsets_ptr = reinterpret_cast<int64_t*>(persistent_offsets.data_ptr());
-    int64_t* begin_offsets = offsets_ptr;
-    int64_t* end_offsets = offsets_ptr + num_rows;
+    auto row_counts_t = torch::from_blob(
+        row_counts_h.data(), {num_rows},
+        torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU));
+    auto row_counts_d = row_counts_t.to(torch::kCUDA);
+    int64_t* row_counts_ptr = reinterpret_cast<int64_t*>(row_counts_d.data_ptr());
 
-    int blocks_needed = (num_rows + 255) / 256;
-    fill_segment_offsets_kernel<<<blocks_needed, 256, 0, stream>>>(
-        begin_offsets, end_offsets, num_rows, row_stride, N);
+    // Phase 1: BlockRadixSort per row
+    int64_t total_blocks = num_rows * blocks_per_row;
+    sort_rows_kernel<<<total_blocks, BLOCK_THREADS, 0, stream>>>(
+        in_ptr, temp_ptr, num_rows, row_stride,
+        row_counts_ptr, blocks_per_row);
 
-    // Phase 1: DeviceSegmentedRadixSort — sort each row independently
-    // First, determine temp storage size for segmented sort
-    size_t seg_temp_bytes = 0;
-    cub::DeviceSegmentedRadixSort::SortKeys(
-        nullptr, seg_temp_bytes,
-        static_cast<const int32_t*>(nullptr),
-        static_cast<int32_t*>(nullptr),
-        static_cast<int64_t>(N),
-        static_cast<int64_t>(num_rows),
-        static_cast<const int64_t*>(nullptr),
-        static_cast<const int64_t*>(nullptr),
-        0, 32);
-
-    // Allocate segmented sort temp storage
-    size_t total_temp = std::max(persistent_temp_bytes, seg_temp_bytes);
-    if (persistent_temp.numel() < static_cast<int64_t>(total_temp)) {
-        persistent_temp = torch::empty(
-            {static_cast<int64_t>(total_temp)},
-            torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCUDA));
-        persistent_temp_bytes = total_temp;
-    }
-
-    // Re-read pointers in case persistent_temp was reallocated
-    void* temp_storage = persistent_temp.data_ptr();
-
-    cub::DeviceSegmentedRadixSort::SortKeys(
-        temp_storage, seg_temp_bytes,
-        in_ptr, temp_ptr,
-        N, num_rows,
-        begin_offsets, end_offsets,
-        0, 32, stream);
-
-    // Phase 2: Global DeviceRadixSort merges the row-sorted data
+    // Phase 2: Global CUB DeviceRadixSort interleaves the row-sorted chunks
+    size_t tb = persistent_temp_bytes;
     cub::DeviceRadixSort::SortKeys(
-        temp_storage, persistent_temp_bytes,
+        persistent_temp.data_ptr(), tb,
         temp_ptr, out_ptr, N,
         0, 32, stream);
 
@@ -141,7 +137,7 @@ torch::Tensor sort_rows(torch::Tensor input, torch::Tensor output, torch::Tensor
 """
 
 sort_module = load_inline(
-    name='sort_rows_segmented',
+    name='sort_rows_blockradix',
     cpp_sources=sort_cpp_source,
     cuda_sources=sort_cuda_source,
     functions=['sort_rows', 'sort_rows_init'],
@@ -156,8 +152,8 @@ _temp_tensor = None
 
 def custom_kernel(data: input_t) -> output_t:
     """
-    Phase 1: DeviceSegmentedRadixSort sorts each row independently.
-    Phase 2: Global DeviceRadixSort merges row-sorted data into final output.
+    Phase 1: Per-row BlockRadixSort in shared memory (256x32=8192).
+    Phase 2: Global CUB DeviceRadixSort merges row-sorted data.
     """
     global _temp_tensor
     input_tensor, output_tensor = data
