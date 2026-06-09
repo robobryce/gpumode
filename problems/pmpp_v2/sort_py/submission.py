@@ -1,10 +1,8 @@
 """
-CUB DeviceRadixSort::SortKeys with int32_t bitcast + end_bit=31.
-All positive IEEE 754 float32 values have bit 31 = 0 in int32 bitcast.
-end_bit=31 skips the always-zero sign bit — still 4 radix passes
-(same as end_bit=32 for 8-bit Onesweep radix groups), but CUB
-may dispatch differently for the non-32 exact bit range.
-Uses int32_t offsets and sm_100a arch.
+CUB DeviceRadixSort::SortKeys with int32 bitcast (no float conversion).
+Since all data is positive IEEE 754, raw bits are in correct sort order.
+Interpret float* as int*, sort keys-only, re-interpret back as float.
+Persistent temp storage allocated once at module init to eliminate per-call overhead.
 """
 import torch
 from torch.utils.cpp_extension import load_inline
@@ -21,13 +19,13 @@ static size_t persistent_temp_bytes = 0;
 
 void init_persistent_temp() {
     if (persistent_temp.defined()) return;
-    int32_t max_n = 100'000'000;
+    int64_t max_n = 100'000'000;
     cub::DeviceRadixSort::SortKeys(
         nullptr, persistent_temp_bytes,
         static_cast<const int32_t*>(nullptr),
         static_cast<int32_t*>(nullptr),
-        static_cast<int32_t>(max_n),
-        0, 31);
+        static_cast<int64_t>(max_n),
+        0, 32);
     persistent_temp_bytes = (persistent_temp_bytes * 11 + 9) / 10;
     persistent_temp = torch::empty(
         {static_cast<int64_t>(persistent_temp_bytes)},
@@ -35,7 +33,7 @@ void init_persistent_temp() {
 }
 
 torch::Tensor sort_cuda(torch::Tensor input, torch::Tensor output) {
-    int32_t num_items = static_cast<int32_t>(input.numel());
+    auto num_items = static_cast<int64_t>(input.numel());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
     const int32_t* key_in = reinterpret_cast<const int32_t*>(input.const_data_ptr<float>());
@@ -45,7 +43,7 @@ torch::Tensor sort_cuda(torch::Tensor input, torch::Tensor output) {
     cub::DeviceRadixSort::SortKeys(
         persistent_temp.data_ptr(), temp_bytes,
         key_in, key_out, num_items,
-        0, 31,
+        0, 32,
         stream);
 
     return output;
@@ -60,11 +58,11 @@ torch::Tensor sort_cuda(torch::Tensor input, torch::Tensor output);
 """
 
 sort_module = load_inline(
-    name='sort_cuda_int32_endbit31_sm100a',
+    name='sort_cuda_int32_bitcast_persistent',
     cpp_sources=sort_cpp_source,
     cuda_sources=sort_cuda_source,
     functions=['sort_cuda', 'init_persistent_temp'],
-    extra_cuda_cflags=['-gencode=arch=compute_100a,code=sm_100a'],
+    extra_include_paths=['/usr/local/cuda-12.8/targets/x86_64-linux/include'],
     verbose=False,
 )
 
@@ -73,7 +71,9 @@ sort_module.init_persistent_temp()
 
 def custom_kernel(data: input_t) -> output_t:
     """
-    Sort via CUB DeviceRadixSort::SortKeys, end_bit=31.
+    Sort via CUB DeviceRadixSort::SortKeys on raw int32 bitcast of float32.
+    No conversion needed — all data is positive IEEE 754 floats.
+    Persistent temp storage avoids per-call allocation.
     """
     input_tensor, output_tensor = data
     sort_module.sort_cuda(input_tensor.contiguous(), output_tensor)
