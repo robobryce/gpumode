@@ -40,13 +40,10 @@ torch::Tensor sort_cuda(torch::Tensor input, torch::Tensor output) {
     int32_t* key_out = reinterpret_cast<int32_t*>(output.data_ptr<float>());
 
     size_t temp_bytes = persistent_temp_bytes;
-    // end_bit=31: skip the sign bit (always 0 for positive IEEE 754 floats).
-    // With 8-bit radix groups, this reduces from 4 passes to 3 — a 25% reduction
-    // in internal kernel launches vs the full 32-bit radix.
     cub::DeviceRadixSort::SortKeys(
         persistent_temp.data_ptr(), temp_bytes,
         key_in, key_out, num_items,
-        0, 31,
+        0, 32,
         stream);
 
     return output;
