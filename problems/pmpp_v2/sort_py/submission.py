@@ -12,7 +12,6 @@ from task import input_t, output_t
 
 sort_cuda_source = """
 #include <torch/extension.h>
-#include <ATen/cuda/CUDAContext.h>
 #include <cub/device/device_radix_sort.cuh>
 #include <cstdint>
 
@@ -36,7 +35,6 @@ void init_persistent_temp() {
 
 torch::Tensor sort_cuda(torch::Tensor input, torch::Tensor output) {
     auto num_items = static_cast<int32_t>(input.numel());
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
     const int32_t* key_in = reinterpret_cast<const int32_t*>(input.const_data_ptr<float>());
     int32_t* key_out = reinterpret_cast<int32_t*>(output.data_ptr<float>());
@@ -46,7 +44,7 @@ torch::Tensor sort_cuda(torch::Tensor input, torch::Tensor output) {
         persistent_temp.data_ptr(), temp_bytes,
         key_in, key_out, num_items,
         0, 32,
-        stream);
+        0);
 
     return output;
 }
