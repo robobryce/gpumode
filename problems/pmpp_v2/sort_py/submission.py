@@ -11,7 +11,7 @@ sort_cuda_source = """
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <cub/block/block_radix_sort.cuh>
-#include <cub/device/device_merge_sort.cuh>
+#include <cub/device/device_radix_sort.cuh>
 #include <cstdint>
 #include <algorithm>
 
@@ -39,7 +39,6 @@ __global__ void block_sort_kernel(float* data, int64_t n) {
         for (int i = 0; i < ITEMS_PER_THREAD; i++) {
             int64_t idx = chunk_start + threadIdx.x + static_cast<int64_t>(i) * BLOCK_THREADS;
             if (idx < chunk_start + chunk_items) {
-                // Positive floats: raw IEEE 754 bits preserve sort order
                 thread_keys[i] = __float_as_int(data[idx]);
             } else {
                 thread_keys[i] = 2147483647;  // INT_MAX sentinel
@@ -64,53 +63,60 @@ __global__ void block_sort_kernel(float* data, int64_t n) {
 // Persistent temp storage, allocated once at module init
 static torch::Tensor persistent_temp = {};
 static size_t persistent_temp_bytes = 0;
+static torch::Tensor scratch_buf = {};  // Intermediate buffer for block sort output
 
 void init_temp_storage() {
     if (persistent_temp.defined()) return;
-
     int64_t max_n = 100'000'000;
 
-    // Query temp storage for DeviceMergeSort on float keys
-    float* dummy = nullptr;
-    cub::DeviceMergeSort::SortKeys(
+    // Temp storage for DeviceRadixSort
+    cub::DeviceRadixSort::SortKeys(
         nullptr, persistent_temp_bytes,
-        dummy, static_cast<int64_t>(max_n),
-        cub::Less{});
-
-    // Add 15% padding
-    persistent_temp_bytes = (persistent_temp_bytes * 23 + 19) / 20;
-
+        static_cast<const int32_t*>(nullptr),
+        static_cast<int32_t*>(nullptr),
+        static_cast<int64_t>(max_n),
+        0, 32);
+    persistent_temp_bytes = (persistent_temp_bytes * 11 + 9) / 10;
     persistent_temp = torch::empty(
         {static_cast<int64_t>(persistent_temp_bytes)},
         torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCUDA));
+
+    // Scratch buffer for block sort output (float32, same size as max input)
+    scratch_buf = torch::empty(
+        {max_n},
+        torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA));
 }
 
 torch::Tensor sort_cuda(torch::Tensor input, torch::Tensor output) {
     auto num_items = static_cast<int64_t>(input.numel());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
-    // Step 1: Copy input to output (we'll sort in-place in output)
-    cudaMemcpyAsync(
-        output.data_ptr<float>(),
-        input.const_data_ptr<float>(),
-        num_items * sizeof(float),
-        cudaMemcpyDeviceToDevice,
-        stream);
-
     if (num_items > 0) {
-        // Step 2: Block-level sort chunks
+        // Step 1: Copy input to scratch buffer
+        cudaMemcpyAsync(
+            scratch_buf.data_ptr<float>(),
+            input.const_data_ptr<float>(),
+            num_items * sizeof(float),
+            cudaMemcpyDeviceToDevice,
+            stream);
+
+        // Step 2: Block-level sort chunks in scratch buffer (in-place)
         int num_chunks = (num_items + CHUNK_SIZE - 1) / CHUNK_SIZE;
-        int grid_blocks = min(num_chunks, 228);  // B200 has 228 SMs, use all of them
+        int grid_blocks = min(num_chunks, 228);
 
         block_sort_kernel<<<grid_blocks, BLOCK_THREADS, 0, stream>>>(
-            output.data_ptr<float>(), num_items);
+            scratch_buf.data_ptr<float>(), num_items);
 
-        // Step 3: Merge-sort the partially-sorted output to produce globally sorted result
+        // Step 3: DeviceRadixSort from scratch (sorted chunks) → output
+        // DeviceRadixSort is NOT in-place; uses separate input/output.
         size_t temp_bytes = persistent_temp_bytes;
-        cub::DeviceMergeSort::SortKeys(
+        cub::DeviceRadixSort::SortKeys(
             persistent_temp.data_ptr(), temp_bytes,
-            output.data_ptr<float>(), num_items,
-            cub::Less{}, stream);
+            reinterpret_cast<const int32_t*>(scratch_buf.const_data_ptr<float>()),
+            reinterpret_cast<int32_t*>(output.data_ptr<float>()),
+            num_items,
+            0, 32,
+            stream);
     }
 
     return output;
