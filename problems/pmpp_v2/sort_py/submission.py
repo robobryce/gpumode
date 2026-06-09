@@ -19,12 +19,12 @@ static size_t persistent_temp_bytes = 0;
 
 void init_persistent_temp() {
     if (persistent_temp.defined()) return;
-    int64_t max_n = 100'000'000;
+    int32_t max_n = 100'000'000;
     cub::DeviceRadixSort::SortKeys(
         nullptr, persistent_temp_bytes,
         static_cast<const int32_t*>(nullptr),
         static_cast<int32_t*>(nullptr),
-        static_cast<int64_t>(max_n),
+        static_cast<int32_t>(max_n),
         0, 32);
     persistent_temp_bytes = (persistent_temp_bytes * 11 + 9) / 10;
     persistent_temp = torch::empty(
@@ -33,7 +33,7 @@ void init_persistent_temp() {
 }
 
 torch::Tensor sort_cuda(torch::Tensor input, torch::Tensor output) {
-    auto num_items = static_cast<int64_t>(input.numel());
+    auto num_items = static_cast<int32_t>(input.numel());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
     const int32_t* key_in = reinterpret_cast<const int32_t*>(input.const_data_ptr<float>());
@@ -58,7 +58,7 @@ torch::Tensor sort_cuda(torch::Tensor input, torch::Tensor output);
 """
 
 sort_module = load_inline(
-    name='sort_cuda_int32_bitcast_persistent',
+    name='sort_cuda_int32_offsets',
     cpp_sources=sort_cpp_source,
     cuda_sources=sort_cuda_source,
     functions=['sort_cuda', 'init_persistent_temp'],
