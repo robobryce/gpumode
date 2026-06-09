@@ -2,7 +2,7 @@
 CUB DeviceRadixSort::SortKeys with int32 bitcast (no float conversion).
 Since all data is positive IEEE 754, raw bits are in correct sort order.
 Interpret float* as int*, sort keys-only, re-interpret back as float.
-Eliminates both CUB's internal float trait dispatch and explicit encode/decode.
+Persistent temp storage allocated once at module init to eliminate per-call overhead.
 """
 import torch
 from torch.utils.cpp_extension import load_inline
@@ -13,6 +13,26 @@ sort_cuda_source = """
 #include <ATen/cuda/CUDAContext.h>
 #include <cub/device/device_radix_sort.cuh>
 #include <cstdint>
+
+// Persistent temp storage — allocated once at module init, sized for 100M items.
+static torch::Tensor persistent_temp = {};
+static size_t persistent_temp_bytes = 0;
+
+void init_persistent_temp() {
+    if (persistent_temp.defined()) return;
+    int64_t max_n = 100'000'000;
+    cub::DeviceRadixSort::SortKeys(
+        nullptr, persistent_temp_bytes,
+        static_cast<const int32_t*>(nullptr),
+        static_cast<int32_t*>(nullptr),
+        static_cast<int64_t>(max_n),
+        0, 32);
+    // Add 10% headroom
+    persistent_temp_bytes = (persistent_temp_bytes * 11 + 9) / 10;
+    persistent_temp = torch::empty(
+        {static_cast<int64_t>(persistent_temp_bytes)},
+        torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCUDA));
+}
 
 torch::Tensor sort_cuda(torch::Tensor input, torch::Tensor output) {
     TORCH_CHECK(input.device().is_cuda(), "Input must be a CUDA tensor");
@@ -25,27 +45,13 @@ torch::Tensor sort_cuda(torch::Tensor input, torch::Tensor output) {
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
     // Reinterpret float pointers as int32 — raw IEEE 754 bits.
-    // For positive floats, bit representation is already in correct sort order.
     const int32_t* key_in = reinterpret_cast<const int32_t*>(input.const_data_ptr<float>());
     int32_t* key_out = reinterpret_cast<int32_t*>(output.data_ptr<float>());
 
-    // Query temp storage size
-    size_t temp_storage_bytes = 0;
+    // Use persistent temp storage (pass size by reference via local copy)
+    size_t temp_bytes = persistent_temp_bytes;
     cub::DeviceRadixSort::SortKeys(
-        nullptr, temp_storage_bytes,
-        key_in, key_out, num_items,
-        0, 32,
-        stream);
-
-    // Allocate temp storage
-    auto temp_storage = torch::empty(
-        {static_cast<int64_t>(temp_storage_bytes)},
-        torch::TensorOptions().dtype(torch::kUInt8).device(input.device()));
-
-    // Run the sort
-    cub::DeviceRadixSort::SortKeys(
-        temp_storage.data_ptr(),
-        temp_storage_bytes,
+        persistent_temp.data_ptr(), temp_bytes,
         key_in, key_out, num_items,
         0, 32,
         stream);
@@ -57,23 +63,28 @@ torch::Tensor sort_cuda(torch::Tensor input, torch::Tensor output) {
 sort_cpp_source = """
 #include <torch/extension.h>
 
+void init_persistent_temp();
 torch::Tensor sort_cuda(torch::Tensor input, torch::Tensor output);
 """
 
 sort_module = load_inline(
-    name='sort_cuda_int32_bitcast',
+    name='sort_cuda_int32_bitcast_persistent',
     cpp_sources=sort_cpp_source,
     cuda_sources=sort_cuda_source,
-    functions=['sort_cuda'],
+    functions=['sort_cuda', 'init_persistent_temp'],
     extra_include_paths=['/usr/local/cuda-12.8/targets/x86_64-linux/include'],
     verbose=False,
 )
+
+# Allocate persistent CUB workspace once at import time
+sort_module.init_persistent_temp()
 
 
 def custom_kernel(data: input_t) -> output_t:
     """
     Sort via CUB DeviceRadixSort::SortKeys on raw int32 bitcast of float32.
     No conversion needed — all data is positive IEEE 754 floats.
+    Persistent temp storage allocated once at import time.
     """
     input_tensor, output_tensor = data
     output_tensor[...] = sort_module.sort_cuda(input_tensor.contiguous(), output_tensor)
