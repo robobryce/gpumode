@@ -3,6 +3,7 @@ CUB DeviceRadixSort::SortKeys with DoubleBuffer, uint32_t keys, is_overwrite_oka
 Using DoubleBuffer overload avoids CUB's internal const_cast copy — CUB uses the
 input buffer directly as swap space. uint32_t instead of int32_t to bypass signed
 integer trait's sign-bit flip path in CUB's radix sort dispatch.
+Handle DoubleBuffer selector: after sort, copy result to output if needed.
 """
 import torch
 from torch.utils.cpp_extension import load_inline
@@ -48,6 +49,15 @@ torch::Tensor sort_cuda(torch::Tensor input, torch::Tensor output) {
         0, 32,
         stream);
 
+    // With is_overwrite_okay=true, CUB writes sorted data to either
+    // Current() or Alternate() depending on pass count parity.
+    // If the sorted result landed in the input buffer, copy it to output.
+    if (d_keys.Current() != key_out) {
+        cudaMemcpyAsync(key_out, d_keys.Current(),
+                        num_items * sizeof(uint32_t),
+                        cudaMemcpyDeviceToDevice, stream);
+    }
+
     return output;
 }
 """
@@ -60,7 +70,7 @@ torch::Tensor sort_cuda(torch::Tensor input, torch::Tensor output);
 """
 
 sort_module = load_inline(
-    name='sort_cuda_doublebuffer_uint32',
+    name='sort_cuda_doublebuffer_v2',
     cpp_sources=sort_cpp_source,
     cuda_sources=sort_cuda_source,
     functions=['sort_cuda', 'init_persistent_temp'],
@@ -74,8 +84,8 @@ sort_module.init_persistent_temp()
 def custom_kernel(data: input_t) -> output_t:
     """
     Sort via CUB DeviceRadixSort::SortKeys with DoubleBuffer + uint32_t keys.
-    is_overwrite_okay=true means CUB reuses input buffer as swap — no internal copy.
-    uint32_t avoids signed integer trait (no sign-bit flip for positive values).
+    Checks DoubleBuffer selector and copies result to output if sorted data
+    ended up in the input buffer (dependent on pass count parity).
     """
     input_tensor, output_tensor = data
     sort_module.sort_cuda(input_tensor.contiguous(), output_tensor)
