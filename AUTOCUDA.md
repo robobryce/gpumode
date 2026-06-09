@@ -1,0 +1,36 @@
+# Optimizing these kernels with autocuda
+
+This fork of [gpu-mode/reference-kernels](https://github.com/gpu-mode/reference-kernels) adds a thin layer for optimizing the leaderboard kernels with the [autocuda](https://github.com/brycelelbach/autocuda) plugin's `optimize-tree` / `optimize-simple` / `optimize-hill` skills. The problems themselves are upstream's, unchanged; optimization happens **in place** on each problem's own `submission.py` — nothing is copied or scaffolded.
+
+```
+bin/install.sh              one-time machine setup (popcorn-cli, torch venv, gpumode.env)
+bin/gen_specs.py            task.yml -> eval.py spec files + leaderboard/gpu/meta lookup
+harness/                    build/validate/benchmark/profile bridge (reads GPUMODE_PROBLEM)
+autocuda/layout.md          committed, machine-agnostic project description (the ground truth)
+                            (autocuda/environment.md, the per-machine half, is written by /autocuda:discover)
+.claude/skills/             repo-level agent skills (also exposed as .agents/skills):
+                            popcorn-login, leaderboard-rankings
+```
+
+## Quick start
+
+```bash
+./bin/install.sh                                    # once per machine
+bash .claude/skills/popcorn-login/scripts/login.sh  # authenticate popcorn-cli (once)
+/autocuda:discover                                  # once per machine -> autocuda/environment.md
+
+# optimize a problem IN PLACE:
+export GPUMODE_PROBLEM=pmpp_v2/histogram_py
+cd problems/pmpp_v2/histogram_py
+/autocuda:optimize-tree workers=4 benchmark=histogram_v2 tag-suffix=histogram_v2
+```
+
+`GPUMODE_PROBLEM=<set>/<problem>` is the one knob that selects the target: `harness/env.sh` reads it to find the editable `submission.py` and to put the problem dir + set root on `PYTHONPATH` (so the frozen `eval.py`/`utils.py` resolve where they already live). There is a single autocuda data dir at the repo root (`autocuda/`), so one `.gpu.lock` serializes the whole fleet; `tag-suffix=<leaderboard>` keeps each problem's tag, logs, and `autocuda/optimize/<tag>/...` branches legible. See `autocuda/layout.md` for the full contract.
+
+### Pick problems with real headroom
+
+The best targets are problems whose reference is *not* already one optimal library call. `histogram` (reference `torch.bincount` — collapses under atomic contention) and `grayscale` (materializes a temporary then reduces) have large structural headroom. `matmul` (cuBLAS), `sort` (CUB radix), `conv2d` (cuDNN) are near-optimal already — weak demos.
+
+## Skills
+
+Reusable helpers ship as agent skills under `.claude/skills/<name>/`: a `SKILL.md` plus, for the script-backed ones (`popcorn-login`, `leaderboard-rankings`), a `scripts/` and an offline `tests/`. `.agents/skills` is a symlink to `.claude/skills`, so harnesses that look under either path find the same skills. Each skill's test runs offline: `bash .claude/skills/<name>/tests/*.sh`.

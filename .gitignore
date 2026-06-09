@@ -173,3 +173,13 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+# --- autocuda ---------------------------------------------------------------
+# The single repo-root data dir (logs, schema, worktrees, profiles, dashboard,
+# and the discover-generated environment.md). The committed autocuda/layout.md
+# is force-added past this. `/autocuda/` is anchored to the root: there is only
+# one data dir, and worktrees live INSIDE it at autocuda/worktrees/, so no
+# nested per-problem data dirs exist to match.
+/autocuda/
+# torch load_inline build caches (one per problem worktree)
+.torch_ext/
