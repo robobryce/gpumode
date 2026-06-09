@@ -2,9 +2,13 @@ import torch
 from torch.utils.cpp_extension import load_inline
 from task import input_t, output_t
 
+# Incremental approach: Phase 1 (DeviceSegmentedRadixSort per row) +
+# Phase 2 (full merge tree, correctness-verified).
+# Then add overlap optimization on top.
+
 cpp_source = """
 #include <torch/extension.h>
-torch::Tensor segment_sort(torch::Tensor input, torch::Tensor output);
+torch::Tensor seg_sort_full(torch::Tensor input, torch::Tensor output);
 """
 
 cuda_source = r"""
@@ -15,282 +19,199 @@ cuda_source = r"""
 #include <algorithm>
 #include <cmath>
 
-// ---------------------------------------------------------------------------
-// copy kernel
-// ---------------------------------------------------------------------------
-__global__ void copy_kernel(const float* src, float* dst, int n) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < n) dst[idx] = src[idx];
-}
-
-// ---------------------------------------------------------------------------
-// Phase 2 merge kernel:
-// Uses cub::DeviceMerge::MergeKeys under the hood per pair, but we batch
-// pairs by launching at a coarse level.
-//
-// Instead of many tiny MergeKeys calls, we do a multi-way merge:
-// at each level L, merge pairs (2i, 2i+1) using a single grid that
-// partitions the work across all blocks.
-// ---------------------------------------------------------------------------
-#define MRG_THREADS 256
-
-__global__ void merge_batched_kernel(
+// Full merge kernel — always merges entire segments (no overlap optimization).
+// 2D grid: (chunks_per_pair, num_pairs). Each block handles 2048 output items.
+__global__ void merge_kernel(
     const float* __restrict__ src,
-    const int*    __restrict__ pair_data,  // [num_pairs * 4]: a_start, lenA, b_start, lenB
+    const int*    __restrict__ pair_data,  // [num_pairs*4]: a_start, a_len, b_start, b_len
     float*        __restrict__ dst,
-    const int*    __restrict__ dst_offsets, // [num_pairs]
-    int           num_pairs)
+    const int*    __restrict__ dst_offs,   // [num_pairs]: dst buffer start position
+    int num_pairs)
 {
     int p = blockIdx.y;
     if (p >= num_pairs) return;
+    int a0 = pair_data[4*p], aL = pair_data[4*p+1];
+    int b0 = pair_data[4*p+2], bL = pair_data[4*p+3];
+    int tot = aL + bL, d0 = dst_offs[p];
 
-    int a_off   = pair_data[4 * p];
-    int a_len   = pair_data[4 * p + 1];
-    int b_off   = pair_data[4 * p + 2];
-    int b_len   = pair_data[4 * p + 3];
-    int total   = a_len + b_len;
-    int d_off   = dst_offsets[p];
+    int bs = (int)blockIdx.x * 2048;
+    if (bs >= tot) return;
+    int bl = min(2048, tot - bs);
 
-    int block_start = (int)blockIdx.x * 2048;
-    if (block_start >= total) return;
-    int block_len   = std::min(2048, total - block_start);
+    int tid = (int)threadIdx.x;
+    int ts = bs + tid * 8;
+    int te = min(ts + 8, bs + bl);
+    if (ts >= te) return;
+    int tl = te - ts;
 
-    int tid       = (int)threadIdx.x;
-    int t_start   = block_start + tid * 8;
-    int t_end     = std::min(t_start + 8,
-                              block_start + block_len);
-    if (t_start >= t_end) return;
-    int t_len     = t_end - t_start;
-
-    // Merge-path binary search: find partition of A,B for this thread
-    int diag = t_start;
-    int lo   = std::max(0, diag - b_len);
-    int hi   = std::min(diag, a_len);
+    // Merge-path binary search for thread's start
+    int diag = ts;
+    int lo = max(0, diag - bL), hi = min(diag, aL);
     while (lo < hi) {
-        int m   = (lo + hi) >> 1;
-        int mB  = diag - 1 - m;
-        if (mB < 0) {
-            hi = m;
-        } else if (mB >= b_len) {
-            lo = m + 1;
-        } else if (src[a_off + m] <= src[b_off + mB]) {
-            lo = m + 1;
-        } else {
-            hi = m;
-        }
+        int m = (lo + hi) >> 1;
+        int mB = diag - 1 - m;
+        if (mB < 0) { hi = m; }
+        else if (mB >= bL) { lo = m + 1; }
+        else if (src[a0 + m] <= src[b0 + mB]) { lo = m + 1; }
+        else { hi = m; }
     }
-
-    // lo == position in A after the first 'diag' merged elements.
-    // Next element comes from A[lo] or B[diag-lo].
-    int pA = a_off + lo;
-    int pB = b_off + diag - lo;
-    int pA_end = a_off + a_len;
-    int pB_end = b_off + b_len;
-
-    float* out = dst + d_off + t_start;
-    for (int i = 0; i < t_len; i++) {
-        if ((pA < pA_end) && (pB >= pB_end || src[pA] <= src[pB])) {
+    int pA = a0 + lo, pB = b0 + diag - lo;
+    int aE = a0 + aL, bE = b0 + bL;
+    float* out = dst + d0 + ts;
+    for (int i = 0; i < tl; i++) {
+        if (pA < aE && (pB >= bE || src[pA] <= src[pB]))
             out[i] = src[pA++];
-        } else {
+        else
             out[i] = src[pB++];
-        }
     }
 }
 
-// ---------------------------------------------------------------------------
-// Host: build segment layout
-// ---------------------------------------------------------------------------
-struct SegLayout { std::vector<int> starts, lengths; };
-
-static SegLayout build_layout(const int* row_offsets, int rows) {
-    SegLayout L;
-    L.starts.reserve(rows + 1);
-    for (int i = 0; i <= rows; i++) L.starts.push_back(row_offsets[i]);
-    for (int i = 0; i < rows; i++)
-        L.lengths.push_back(row_offsets[i+1] - row_offsets[i]);
-    return L;
-}
-
-// next_level: produce pair metadata for the next merge level.
-// Returns false when 0 or 1 segment remains.
-static bool next_level(
-    const SegLayout& cur, SegLayout& nxt,
-    std::vector<int>& pairs, std::vector<int>& dst_offs,
-    int& max_chunks)
-{
-    int ns = (int)cur.lengths.size();
-    if (ns <= 1) return false;
-    int np = ns / 2;
-
-    nxt.starts.clear(); nxt.lengths.clear();
-    pairs.clear(); dst_offs.clear();
-    max_chunks = 0;
-    int pos = 0;
-
-    for (int i = 0; i < np; i++) {
-        int a0 = cur.starts[2*i];
-        int aL = cur.lengths[2*i];
-        int b0 = cur.starts[2*i+1];
-        int bL = cur.lengths[2*i+1];
-        pairs.insert(pairs.end(), {a0, aL, b0, bL});
-        dst_offs.push_back(pos);
-        int tot = aL + bL;
-        nxt.starts.push_back(pos);
-        nxt.lengths.push_back(tot);
-        pos += tot;
-        int ck = (tot + 2048 - 1) / 2048;
-        if (ck > max_chunks) max_chunks = ck;
-    }
-    if (ns % 2) {
-        int s0 = cur.starts[ns-1];
-        int sL = cur.lengths[ns-1];
-        nxt.starts.push_back(pos);
-        nxt.lengths.push_back(sL);
-        pos += sL;
-    }
-    nxt.starts.push_back(pos);
-    return true;
-}
-
-// ---------------------------------------------------------------------------
-// Host: upload int vector -> GPU, return pointer (device tensor backed)
-// ---------------------------------------------------------------------------
-static int* upload(const std::vector<int>& v, std::vector<torch::Tensor>& allocs) {
-    auto t = torch::empty({(int64_t)v.size()},
-                          torch::dtype(torch::kInt32).device(torch::kCUDA));
-    cudaMemcpy(t.data_ptr<int>(), v.data(), v.size() * sizeof(int),
-               cudaMemcpyHostToDevice);
-    allocs.push_back(t);
-    return t.data_ptr<int>();
+__global__ void copy_kernel(const float* src, float* dst, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = src[i];
 }
 
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
-torch::Tensor segment_sort(torch::Tensor input, torch::Tensor output) {
+torch::Tensor seg_sort_full(torch::Tensor input, torch::Tensor output) {
     int N = (int)input.numel();
-    if (N <= 1) {
-        if (N == 1) output[0] = input[0];
-        return output;
-    }
+    if (N <= 1) { if (N==1) output[0]=input[0]; return output; }
 
     int rows = (int)std::sqrt((double)N);
     int cols = (N + rows - 1) / rows;
 
-    // Row offsets (CPU)
     std::vector<int> ro(rows + 1);
     for (int i = 0; i < rows; i++) ro[i] = std::min(i * cols, N);
     ro[rows] = N;
 
-    // Trim trailing empty rows
     int eff = rows;
     while (eff > 0 && ro[eff-1] == ro[eff]) eff--;
     if (eff == 0) return output;
 
-    // --- Phase 1: DeviceSegmentedRadixSort (input -> output, no overlap) ---
+    // Phase 1: per-row sort
     {
-        std::vector<torch::Tensor> hold;
-
-        int* d_ro = upload(ro, hold);
-
+        auto d_ro = torch::empty({eff + 1}, torch::dtype(torch::kInt32).device(torch::kCUDA));
+        cudaMemcpy(d_ro.data_ptr<int>(), ro.data(), (eff+1)*sizeof(int), cudaMemcpyHostToDevice);
         size_t tb = 0;
-        cub::DeviceSegmentedRadixSort::SortKeys(
-            nullptr, tb,
-            input.data_ptr<float>(), output.data_ptr<float>(),
-            N, eff,
-            d_ro, d_ro + 1,
-            0, sizeof(float) * 8);
-
-        auto d_temp = torch::empty({(int64_t)tb},
-                                   torch::dtype(torch::kUInt8).device(torch::kCUDA));
-
-        auto err = cub::DeviceSegmentedRadixSort::SortKeys(
-            d_temp.data_ptr(), tb,
-            input.data_ptr<float>(), output.data_ptr<float>(),
-            N, eff,
-            d_ro, d_ro + 1,
-            0, sizeof(float) * 8);
-        TORCH_CHECK(err == cudaSuccess, "SegRadixSort failed: ",
-                    cudaGetErrorName(err));
-
+        cub::DeviceSegmentedRadixSort::SortKeys(nullptr, tb,
+            input.data_ptr<float>(), output.data_ptr<float>(), N, eff,
+            d_ro.data_ptr<int>(), d_ro.data_ptr<int>()+1, 0,sizeof(float)*8);
+        auto dtmp = torch::empty({(int64_t)tb}, torch::dtype(torch::kUInt8).device(torch::kCUDA));
+        cub::DeviceSegmentedRadixSort::SortKeys(dtmp.data_ptr(), tb,
+            input.data_ptr<float>(), output.data_ptr<float>(), N, eff,
+            d_ro.data_ptr<int>(), d_ro.data_ptr<int>()+1, 0,sizeof(float)*8);
         cudaDeviceSynchronize();
     }
+    // Copy output -> input for Phase 2 ping-pong
+    { int blk=(N+255)/256; copy_kernel<<<blk,256>>>(output.data_ptr<float>(),input.data_ptr<float>(),N); cudaDeviceSynchronize(); }
 
-    // --- Phase 2: multi-level merge tree ---
-    // Copy per-row-sorted data from output -> input so Phase 2 starts from input
+    // Phase 2: full merge tree
+    // Build all level metadata on CPU once, upload once
+    struct Lvl { std::vector<int> pair_data, dst_offs; int num_pairs, max_chunks; int odd_len, odd_src, odd_dst; };
+    std::vector<Lvl> levels;
+
     {
-        int blocks = (N + 255) / 256;
-        copy_kernel<<<blocks, 256>>>(
-            output.data_ptr<float>(), input.data_ptr<float>(), N);
-        cudaDeviceSynchronize();
+        std::vector<int> s(ro.begin(), ro.begin()+eff+1);
+        std::vector<int> l(eff);
+        for (int i=0; i<eff; i++) l[i]=s[i+1]-s[i];
+        int ns = eff;
+        while (ns > 1) {
+            int np = ns/2;
+            Lvl lv;
+            lv.num_pairs = np;
+            lv.max_chunks = 0;
+            int pos = 0;
+            for (int i=0; i<np; i++) {
+                lv.pair_data.insert(lv.pair_data.end(), {s[2*i], l[2*i], s[2*i+1], l[2*i+1]});
+                lv.dst_offs.push_back(pos);
+                int tot = l[2*i]+l[2*i+1];
+                pos += tot;
+                int ck = (tot+2047)/2048;
+                if (ck>lv.max_chunks) lv.max_chunks=ck;
+            }
+            lv.odd_len=0; lv.odd_src=0; lv.odd_dst=0;
+            if (ns%2 && ns>1) {
+                lv.odd_len=l[ns-1]; lv.odd_src=s[ns-1]; lv.odd_dst=pos;
+                pos += l[ns-1];
+            }
+            levels.push_back(lv);
+
+            std::vector<int> ns_s, ns_l;
+            pos = 0;
+            for (int i=0; i<np; i++) {
+                ns_s.push_back(pos); ns_l.push_back(l[2*i]+l[2*i+1]);
+                pos += l[2*i]+l[2*i+1];
+            }
+            if (ns%2) {
+                ns_s.push_back(pos); ns_l.push_back(l[ns-1]);
+                pos += l[ns-1];
+            }
+            ns_s.push_back(pos);
+            s=ns_s; l=ns_l;
+            ns=(int)ns_l.size();
+        }
     }
 
-    SegLayout cur = build_layout(ro.data(), eff);
+    // Upload all metadata
+    int total_pair_elems=0, total_dst_elems=0;
+    for (auto& lv : levels) { total_pair_elems += (int)lv.pair_data.size(); total_dst_elems += (int)lv.dst_offs.size(); }
+    auto g_pairs = torch::empty({total_pair_elems}, torch::dtype(torch::kInt32).device(torch::kCUDA));
+    auto g_dsts = torch::empty({total_dst_elems}, torch::dtype(torch::kInt32).device(torch::kCUDA));
+    int pd_off=0, do_off=0;
+    std::vector<int> pd_start, do_start, num_pairs, max_chunks, odd_len, odd_src, odd_dst;
+    for (auto& lv : levels) {
+        if (!lv.pair_data.empty()) {
+            cudaMemcpy(g_pairs.data_ptr<int>()+pd_off, lv.pair_data.data(),
+                       lv.pair_data.size()*sizeof(int), cudaMemcpyHostToDevice);
+        }
+        if (!lv.dst_offs.empty()) {
+            cudaMemcpy(g_dsts.data_ptr<int>()+do_off, lv.dst_offs.data(),
+                       lv.dst_offs.size()*sizeof(int), cudaMemcpyHostToDevice);
+        }
+        pd_start.push_back(pd_off); do_start.push_back(do_off);
+        num_pairs.push_back(lv.num_pairs); max_chunks.push_back(lv.max_chunks);
+        odd_len.push_back(lv.odd_len); odd_src.push_back(lv.odd_src); odd_dst.push_back(lv.odd_dst);
+        pd_off += (int)lv.pair_data.size(); do_off += (int)lv.dst_offs.size();
+    }
+
     float* bufs[2] = { input.data_ptr<float>(), output.data_ptr<float>() };
-    int src_idx = 0;
+    int src_i = 0, nlev = (int)levels.size();
 
-    while (true) {
-        SegLayout nxt;
-        std::vector<int> pairs_v, dst_v;
-        int max_chunks = 0;
-
-        if (!next_level(cur, nxt, pairs_v, dst_v, max_chunks))
-            break;
-
-        int np = (int)dst_v.size();
-        if (np == 0) {
-            // single segment — copy to dst
-            int L = cur.lengths[0], S = cur.starts[0];
-            int blk = (L + 255) / 256;
-            copy_kernel<<<blk, 256>>>(bufs[src_idx] + S, bufs[1-src_idx], L);
-            cudaDeviceSynchronize();
-            src_idx = 1 - src_idx;
-            cur = nxt;
-            continue;
+    for (int lev=0; lev<nlev; lev++) {
+        int np = num_pairs[lev];
+        if (np > 0) {
+            dim3 grid(max_chunks[lev], np);
+            merge_kernel<<<grid,256>>>(
+                bufs[src_i],
+                g_pairs.data_ptr<int>() + pd_start[lev],
+                bufs[1-src_i],
+                g_dsts.data_ptr<int>() + do_start[lev],
+                np);
         }
-
-        std::vector<torch::Tensor> hold;
-        int* d_pairs = upload(pairs_v, hold);
-        int* d_dst    = upload(dst_v, hold);
-
-        dim3 grid(max_chunks, np);
-        merge_batched_kernel<<<grid, MRG_THREADS>>>(
-            bufs[src_idx], d_pairs, bufs[1-src_idx], d_dst, np);
+        if (odd_len[lev] > 0) {
+            int blk = (odd_len[lev]+255)/256;
+            copy_kernel<<<blk,256>>>(bufs[src_i]+odd_src[lev], bufs[1-src_i]+odd_dst[lev], odd_len[lev]);
+        }
         cudaDeviceSynchronize();
-
-        // Copy odd leftover segment
-        int ns = (int)cur.lengths.size();
-        if (ns % 2 && ns > 1) {
-            int L = cur.lengths[ns-1], S = cur.starts[ns-1];
-            int D = nxt.starts[nxt.lengths.size()-1];
-            int blk = (L + 255) / 256;
-            copy_kernel<<<blk, 256>>>(bufs[src_idx] + S, bufs[1-src_idx] + D, L);
-            cudaDeviceSynchronize();
-        }
-
-        src_idx = 1 - src_idx;
-        cur = nxt;
+        src_i = 1 - src_i;
     }
 
     cudaDeviceSynchronize();
-
-    // If final result is in input (src_idx=0 after loop), copy to output
-    if (src_idx == 0) {
-        int blocks = (N + 255) / 256;
-        copy_kernel<<<blocks, 256>>>(
-            input.data_ptr<float>(), output.data_ptr<float>(), N);
+    if (src_i == 0) {
+        int blk=(N+255)/256;
+        copy_kernel<<<blk,256>>>(input.data_ptr<float>(), output.data_ptr<float>(), N);
         cudaDeviceSynchronize();
     }
-
     return output;
 }
 """
 
-segment_module = load_inline(
-    name='segment_sort_module',
+seg_full = load_inline(
+    name='seg_sort_full',
     cpp_sources=[cpp_source],
     cuda_sources=[cuda_source],
-    functions=['segment_sort'],
+    functions=['seg_sort_full'],
     extra_cuda_cflags=['--expt-relaxed-constexpr', '-std=c++17'],
     verbose=False,
 )
@@ -298,11 +219,9 @@ segment_module = load_inline(
 
 def custom_kernel(data: input_t) -> output_t:
     """
-    Segmented sort: Phase 1 = cub::DeviceSegmentedRadixSort (per-row,
-    batched), Phase 2 = multi-level batched merge tree.
-    Exploits the per-row-normal input: each row clusters around an
-    increasing mean, so merges at higher levels have less cross-row overlap.
+    Phase 1: DeviceSegmentedRadixSort per row.
+    Phase 2: Full merge tree (all levels, full merge).
     """
     input_tensor, output_tensor = data
-    segment_module.segment_sort(input_tensor, output_tensor)
+    seg_full.seg_sort_full(input_tensor, output_tensor)
     return output_tensor
