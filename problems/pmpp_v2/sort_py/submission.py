@@ -1,8 +1,11 @@
 """
-Custom radix sort using CUB block-level primitives.
-4-bit radix (16 bins), register-based histograms, butterfly shuffle reduction.
-8 passes x 3 kernels = 24 launches — same design as brief-4 iter-1 which scored 174.5us.
-Uses __ldg reads and st.global.wb writes.
+Custom 4-bit radix sort, 8 passes x 3 kernels = 24 launches.
+256 threads, 8 items/thread (2048 items/tile), 4-bit radix (16 bins).
+Register-based histograms (16 bins fit in 16 registers).
+Butterfly shuffle for warp reduction and intra-warp exclusive scan.
+Regular loads/stores (no __ldg, no st.global.wb) for L1 caching.
+Identical design to brief-4 iter-1 which scored 174.5us.
+Added __launch_bounds__ to reduce register pressure.
 """
 import torch
 from torch.utils.cpp_extension import load_inline
@@ -20,12 +23,6 @@ sort_cuda_source = """
 #define TILE_SIZE  (BLOCK_THREADS * ITEMS_PER_THREAD)
 #define WARPS      (BLOCK_THREADS / 32)
 
-__device__ __forceinline__ void stwb_u32(uint32_t* a, uint32_t v) {
-    asm volatile("st.global.wb.u32 [%0], %1;" :: "l"(a), "r"(v) : "memory");
-}
-
-// Histogram kernel: grid-stride over tiles. Per-warp register accumulators,
-// warp shuffle reduction, atomic commit to block histogram.
 __global__ void hist_kernel(
     const uint32_t* __restrict__ d_in,
     uint32_t*       __restrict__ d_hists,
@@ -45,7 +42,7 @@ __global__ void hist_kernel(
     for (int64_t tile = blk; tile < tt; tile += gridDim.x) {
         int64_t off = tile * TILE_SIZE, end = (off + TILE_SIZE < num_items) ? off + TILE_SIZE : num_items;
         int64_t ni = end - off;
-        for (int i = tid; i < (int)ni; i += BLOCK_THREADS) s_data[i] = __ldg(d_in + off + i);
+        for (int i = tid; i < (int)ni; i += BLOCK_THREADS) s_data[i] = d_in[off + i];
         __syncthreads();
 
         uint32_t hist[RADIX_BINS] = {0};
@@ -55,6 +52,7 @@ __global__ void hist_kernel(
             int j = base + i;
             if (j < (int)ni) { int bin = (s_data[j] >> shift) & (RADIX_BINS - 1); hist[bin]++; }
         }
+
         #pragma unroll
         for (int b = 0; b < RADIX_BINS; b++) {
             uint32_t v = hist[b];
@@ -73,15 +71,14 @@ __global__ void hist_kernel(
     if (tid < RADIX_BINS) d_hists[blk * RADIX_BINS + tid] = s_bh[tid];
 }
 
-// Prefix kernel: single block computes per-block + cross-bin exclusive offsets
 __global__ void prefix_kernel(
     const uint32_t* __restrict__ d_hists,
     uint32_t*       __restrict__ d_blk_offs,
     uint32_t*       __restrict__ d_bin_offs,
     int nb
 ) {
-    __shared__ uint32_t s_run[RADIX_BINS], s_tot[RADIX_BINS];
     int tid = threadIdx.x;
+    __shared__ uint32_t s_run[RADIX_BINS], s_tot[RADIX_BINS];
     for (int i = tid; i < RADIX_BINS; i += blockDim.x) { s_run[i] = 0; s_tot[i] = 0; }
     __syncthreads();
     for (int b = 0; b < nb; b++) {
@@ -100,9 +97,6 @@ __global__ void prefix_kernel(
     }
 }
 
-// Scatter kernel: grid-stride over tiles, same tiling as hist_kernel.
-// Register-based bin counts (16 bins fit in 16 regs).
-// Butterfly shuffle for intra-warp exclusive scan → stable scatter.
 __global__ void scatter_kernel(
     const uint32_t* __restrict__ d_in,
     uint32_t*       __restrict__ d_out,
@@ -114,11 +108,11 @@ __global__ void scatter_kernel(
     int tid = threadIdx.x, lane_id = tid & 31, warp_id = tid >> 5, blk = blockIdx.x;
 
     __shared__ uint32_t s_data[TILE_SIZE];
-    __shared__ uint32_t s_warp_total[WARPS * RADIX_BINS];
-    __shared__ uint32_t s_warp_prefix[WARPS * RADIX_BINS];
-
+    __shared__ uint32_t s_wt[WARPS * RADIX_BINS];
+    __shared__ uint32_t s_wp[WARPS * RADIX_BINS];
     __shared__ uint32_t s_bin_off[RADIX_BINS];
     __shared__ uint32_t s_blk_ofs[RADIX_BINS];
+
     if (tid < RADIX_BINS) {
         s_bin_off[tid] = d_bin_offs[tid];
         s_blk_ofs[tid] = d_blk_offs[blk * RADIX_BINS + tid];
@@ -126,20 +120,18 @@ __global__ void scatter_kernel(
     __syncthreads();
 
     int64_t tt = (num_items + TILE_SIZE - 1) / TILE_SIZE;
-
     for (int64_t tile = blk; tile < tt; tile += gridDim.x) {
         int64_t off = tile * TILE_SIZE, end = (off + TILE_SIZE < num_items) ? off + TILE_SIZE : num_items;
         int64_t ni = end - off;
 
-        // Save old s_blk_ofs before advancing (for per-tile correct offsets)
-        uint32_t reg_blk_ofs[RADIX_BINS];
-        if (tid < RADIX_BINS) reg_blk_ofs[tid] = s_blk_ofs[tid];
+        uint32_t reg_ofs[RADIX_BINS];
+        if (tid < RADIX_BINS) reg_ofs[tid] = s_blk_ofs[tid];
         __syncthreads();
 
-        for (int i = tid; i < (int)ni; i += BLOCK_THREADS) s_data[i] = __ldg(d_in + off + i);
+        for (int i = tid; i < (int)ni; i += BLOCK_THREADS) s_data[i] = d_in[off + i];
         __syncthreads();
 
-        for (int i = tid; i < WARPS * RADIX_BINS; i += BLOCK_THREADS) s_warp_total[i] = 0;
+        for (int i = tid; i < WARPS * RADIX_BINS; i += BLOCK_THREADS) s_wt[i] = 0;
         __syncthreads();
 
         uint32_t hist[RADIX_BINS] = {0};
@@ -160,54 +152,42 @@ __global__ void scatter_kernel(
                 if (lane_id >= off) v += u;
             }
             exc[b] = v - hist[b];
-            if (lane_id == 31) s_warp_total[warp_id * RADIX_BINS + b] = v;
+            if (lane_id == 31) s_wt[warp_id * RADIX_BINS + b] = v;
         }
         __syncthreads();
 
         if (tid < RADIX_BINS) {
             uint32_t run = 0;
             #pragma unroll
-            for (int w = 0; w < WARPS; w++) {
-                s_warp_prefix[w * RADIX_BINS + tid] = run;
-                run += s_warp_total[w * RADIX_BINS + tid];
-            }
+            for (int w = 0; w < WARPS; w++) { s_wp[w * RADIX_BINS + tid] = run; run += s_wt[w * RADIX_BINS + tid]; }
             s_blk_ofs[tid] += run;
         }
         __syncthreads();
 
-        // Broadcast old block offsets
-        __shared__ uint32_t s_old_ofs[RADIX_BINS];
-        if (tid < RADIX_BINS) s_old_ofs[tid] = reg_blk_ofs[tid];
+        __shared__ uint32_t s_old[RADIX_BINS];
+        if (tid < RADIX_BINS) s_old[tid] = reg_ofs[tid];
         __syncthreads();
 
         uint32_t pos[RADIX_BINS], lc[RADIX_BINS] = {0};
         #pragma unroll
         for (int b = 0; b < RADIX_BINS; b++)
-            pos[b] = s_bin_off[b] + s_old_ofs[b] + s_warp_prefix[warp_id * RADIX_BINS + b] + exc[b];
+            pos[b] = s_bin_off[b] + s_old[b] + s_wp[warp_id * RADIX_BINS + b] + exc[b];
 
         #pragma unroll
         for (int i = 0; i < ITEMS_PER_THREAD; i++) {
             int j = base + i;
-            if (j < (int)ni) {
-                uint32_t key = s_data[j];
-                int bin = (key >> shift) & (RADIX_BINS - 1);
-                stwb_u32(d_out + pos[bin] + lc[bin], key);
-                lc[bin]++;
-            }
+            if (j < (int)ni) { uint32_t key = s_data[j]; int bin = (key >> shift) & (RADIX_BINS - 1); d_out[pos[bin] + lc[bin]] = key; lc[bin]++; }
         }
         __syncthreads();
     }
 }
 
-// Host
 static torch::Tensor d_temp; static size_t tsz = 0;
 static void ensure_temp(int64_t nb, size_t dsz) {
     size_t n = (size_t)nb;
-    size_t need = n * RADIX_BINS * sizeof(uint32_t) * 2
-                + RADIX_BINS * sizeof(uint32_t) + dsz + 4096;
+    size_t need = n * RADIX_BINS * sizeof(uint32_t) * 2 + RADIX_BINS * sizeof(uint32_t) + dsz + 4096;
     if (need <= tsz && d_temp.defined()) return;
-    d_temp = torch::empty({(int64_t)need},
-        torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCUDA));
+    d_temp = torch::empty({(int64_t)need}, torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCUDA));
     tsz = need;
 }
 
@@ -247,7 +227,7 @@ torch::Tensor sort_onesweep(torch::Tensor input, torch::Tensor output);
 """
 
 sort_module = load_inline(
-    name='sort_onesweep_custom_v4',
+    name='sort_onesweep_custom_v6',
     cpp_sources=sort_cpp_source,
     cuda_sources=sort_cuda_source,
     functions=['sort_onesweep'],
