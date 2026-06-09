@@ -1,8 +1,7 @@
 """
-CUB DeviceRadixSort::SortKeys with int32_t keys AND int32_t num_items.
-Using int32_t (not int64_t) for num_items changes CUB's internal OFFSET_64BIT
-policy parameter from 1 to 0, increasing items_per_thread from 19 to 20
-(384*20=7680 items/block vs 384*19=7296). 100M fits in int32_t.
+CUB DeviceRadixSort::SortKeys with int32_t keys AND int64_t num_items.
+Exact parent dispatch type but with new compilation to verify no regressions
+from recompilation. int64_t OffsetT triggers OFFSET_64BIT=1 in Policy900.
 """
 import torch
 from torch.utils.cpp_extension import load_inline
@@ -19,7 +18,7 @@ static size_t persistent_temp_bytes = 0;
 
 void init_persistent_temp() {
     if (persistent_temp.defined()) return;
-    int max_n = 100'000'000;
+    int64_t max_n = 100'000'000;
     cub::DeviceRadixSort::SortKeys(
         nullptr, persistent_temp_bytes,
         static_cast<const int32_t*>(nullptr),
@@ -33,7 +32,7 @@ void init_persistent_temp() {
 }
 
 torch::Tensor sort_cuda(torch::Tensor input, torch::Tensor output) {
-    int num_items = static_cast<int>(input.numel());
+    auto num_items = static_cast<int64_t>(input.numel());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
     const int32_t* key_in = reinterpret_cast<const int32_t*>(input.const_data_ptr<float>());
@@ -58,7 +57,7 @@ torch::Tensor sort_cuda(torch::Tensor input, torch::Tensor output);
 """
 
 sort_module = load_inline(
-    name='sort_cuda_int32_offset32',
+    name='sort_cuda_int32_int64',
     cpp_sources=sort_cpp_source,
     cuda_sources=sort_cuda_source,
     functions=['sort_cuda', 'init_persistent_temp'],
@@ -71,8 +70,9 @@ sort_module.init_persistent_temp()
 
 def custom_kernel(data: input_t) -> output_t:
     """
-    Sort via CUB DeviceRadixSort::SortKeys with int32_t keys AND int32_t num_items.
-    int32_t offset enables OFFSET_64BIT=0 → items_per_thread=20 vs 19 for int64_t.
+    Sort via CUB DeviceRadixSort::SortKeys with int32_t keys, int64_t num_items.
+    Exact same dispatch types as parent c9b9338b. Verifies whether regressions
+    are from compilation artifact or genuine dispatch differences.
     """
     input_tensor, output_tensor = data
     sort_module.sort_cuda(input_tensor.contiguous(), output_tensor)
