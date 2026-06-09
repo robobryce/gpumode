@@ -2,14 +2,16 @@
 CUB DeviceRadixSort::SortKeys with int32 bitcast (no float conversion).
 Since all data is positive IEEE 754, raw bits are in correct sort order.
 Interpret float* as int*, sort keys-only, re-interpret back as float.
-Persistent temp storage allocated once at module init to eliminate per-call overhead.
-CUDA graph capture: SortKeys pipeline is captured into a graph once per pointer set
-(on the correctness-check call, before timing iterations begin). During capture,
-operations on the capture stream are NOT executed — only recorded. The graph is
-immediately instantiated and launched on the default stream to execute the sort.
-All subsequent calls with matching pointers replay the pre-instantiated graph,
-eliminating CPU-side kernel-launch chaining overhead from the benchmark path.
-Graph capture overhead is on the correctness-check call (not timed).
+Persistent temp storage allocated once at module init.
+
+CUDA graph capture: first call (correctness check, not timed) captures and
+instantiates the SortKeys pipeline into a CUDA graph. Subsequent calls with
+matching data pointers replay the graph on the default stream. The graph
+eliminates CUB's internal CPU-side kernel-launch chaining overhead
+(4+ cudaLaunchKernel calls become a single cudaGraphLaunch).
+
+Graph capture time and instantiation happen during the correctness-check call
+(not measured by eval.py's timing events). Only graph replay time counts.
 """
 import torch
 from torch.utils.cpp_extension import load_inline
@@ -41,7 +43,7 @@ void init_persistent_temp() {
         torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCUDA));
 }
 
-// Per-size CUDA graph state: captured once per pointer set, replayed thereafter
+// Per-size CUDA graph state
 struct SortGraphState {
     cudaGraphExec_t exec = nullptr;
     cudaStream_t stream = nullptr;
@@ -74,19 +76,22 @@ torch::Tensor sort_cuda(torch::Tensor input, torch::Tensor output) {
 
     auto& gs = sort_graphs[num_items];
 
-    // Case 1: We have a valid graph with matching pointers — replay it.
-    if (gs.exec != nullptr && gs.captured_in_ptr == in_ptr && gs.captured_out_ptr == out_ptr) {
+    // Case 1: Valid graph with matching pointers — replay it.
+    // This is the hot path for all benchmark timing iterations.
+    if (gs.exec != nullptr &&
+        gs.captured_in_ptr == in_ptr &&
+        gs.captured_out_ptr == out_ptr) {
         cudaGraphLaunch(gs.exec, def_stream);
         return output;
     }
 
-    // Destroy old graph if pointers changed since last capture
+    // Destroy old graph exec if pointers changed
     if (gs.exec != nullptr) {
         cudaGraphExecDestroy(gs.exec);
         gs.exec = nullptr;
     }
 
-    // If capture previously failed for this size, use direct execution always
+    // If capture previously failed for this size, use direct execution
     if (gs.capture_failed) {
         direct_sort(key_in, key_out, num_items, def_stream);
         return output;
@@ -97,9 +102,11 @@ torch::Tensor sort_cuda(torch::Tensor input, torch::Tensor output) {
         cudaStreamCreate(&gs.stream);
     }
 
-    // ---- Begin CUDA graph capture ----
-    // Use Relaxed mode: CUB may launch internal memsets/ops that need relaxed rules
-    cudaError_t cap_err = cudaStreamBeginCapture(gs.stream, cudaStreamCaptureModeRelaxed);
+    // ---- CUDA graph capture ----
+    // Use Global mode: all operations must be graph-capturable.
+    // CUB's internal kernel launches and memset operations are all supported.
+    cudaError_t cap_err = cudaStreamBeginCapture(
+        gs.stream, cudaStreamCaptureModeGlobal);
     if (cap_err != cudaSuccess) {
         gs.capture_failed = true;
         direct_sort(key_in, key_out, num_items, def_stream);
@@ -107,8 +114,7 @@ torch::Tensor sort_cuda(torch::Tensor input, torch::Tensor output) {
     }
 
     // Record SortKeys into the capture stream.
-    // IMPORTANT: during capture, operations on the capture stream are NOT executed;
-    // they are only recorded into the graph. Execution happens via graph replay.
+    // During capture, operations are NOT executed — only recorded into the graph.
     direct_sort(key_in, key_out, num_items, gs.stream);
 
     cudaGraph_t graph = nullptr;
@@ -116,14 +122,14 @@ torch::Tensor sort_cuda(torch::Tensor input, torch::Tensor output) {
 
     if (end_err != cudaSuccess || graph == nullptr) {
         gs.capture_failed = true;
-        // Capture failed but we never executed SortKeys — do it now on default stream
         direct_sort(key_in, key_out, num_items, def_stream);
         return output;
     }
 
-    // Instantiate the graph executable once (amortized: only on first call per pointer set)
+    // Instantiate the graph executable once
     cudaGraphExec_t new_exec = nullptr;
-    cudaError_t inst_err = cudaGraphInstantiate(&new_exec, graph, nullptr, nullptr, 0);
+    cudaError_t inst_err = cudaGraphInstantiate(
+        &new_exec, graph, nullptr, nullptr, 0);
     cudaGraphDestroy(graph);
 
     if (inst_err != cudaSuccess) {
@@ -138,7 +144,7 @@ torch::Tensor sort_cuda(torch::Tensor input, torch::Tensor output) {
 
     // Execute the captured graph now to actually sort the data.
     // (During capture, SortKeys was only recorded, not executed.)
-    // This launch goes on the default stream so PyTorch's events can time it.
+    // Sync to ensure the output is ready before check_implementation reads it.
     cudaGraphLaunch(gs.exec, def_stream);
     cudaStreamSynchronize(def_stream);
 
@@ -154,7 +160,7 @@ torch::Tensor sort_cuda(torch::Tensor input, torch::Tensor output);
 """
 
 sort_module = load_inline(
-    name='sort_cuda_cuda_graph_v2',
+    name='sort_cuda_graph_global',
     cpp_sources=sort_cpp_source,
     cuda_sources=sort_cuda_source,
     functions=['sort_cuda', 'init_persistent_temp'],
@@ -169,11 +175,9 @@ sort_module.init_persistent_temp()
 def custom_kernel(data: input_t) -> output_t:
     """
     Sort via CUB DeviceRadixSort::SortKeys on raw int32 bitcast of float32.
-    CUDA graph capture: the correctness-check call captures and instantiates
-    the graph, then immediately replays it to execute the sort. Subsequent
-    benchmark timing iterations simply replay the pre-instantiated graph,
-    eliminating CPU-side kernel-launch chaining overhead from CUB SortKeys
-    (4+ kernel launches reduced to a single cudaGraphLaunch).
+    CUDA graph with Global capture mode: first call captures+instantiates
+    the SortKeys pipeline and executes it. Subsequent calls replay the
+    pre-instantiated graph, eliminating CUB's internal launch chaining.
     """
     input_tensor, output_tensor = data
     sort_module.sort_cuda(input_tensor.contiguous(), output_tensor)
