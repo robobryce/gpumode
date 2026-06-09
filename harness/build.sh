@@ -7,8 +7,10 @@
 # as a non-zero exit NOW (an autocuda build_error) instead of at benchmark time.
 # A pure-PyTorch submission imports instantly. The compiled extension caches in
 # $TORCH_EXTENSIONS_DIR, so the validate / benchmark imports reuse this build.
+#
+# Usage:  bash harness/build.sh <set>/<problem>   # e.g. pmpp_v2/histogram_py
 set -uo pipefail
-source "$(dirname "${BASH_SOURCE[0]}")/env.sh"
+source "$(dirname "${BASH_SOURCE[0]}")/env.sh" "$@"
 cd "$PROBLEM_DIR" || exit 1
 
 "$PYTHON" - <<'PY'
