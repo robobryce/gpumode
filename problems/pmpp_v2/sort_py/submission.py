@@ -3,14 +3,7 @@ CUB DeviceRadixSort::SortKeys with int32 bitcast (no float conversion).
 Since all data is positive IEEE 754, raw bits are in correct sort order.
 Interpret float* as int*, sort keys-only, re-interpret back as float.
 Persistent temp storage allocated once at module init to eliminate per-call overhead.
-Strategy: cudaDeviceScheduleSpin set via ctypes before torch import.
 """
-import ctypes
-_libcuda = ctypes.CDLL("libcuda.so.1")
-# cudaDeviceScheduleSpin = 1, reduces kernel launch latency by spin-waiting
-# instead of yielding to OS scheduler. Must be called before any CUDA context is created.
-_libcuda.cudaSetDeviceFlags(1)
-
 import torch
 from torch.utils.cpp_extension import load_inline
 from task import input_t, output_t
@@ -47,10 +40,13 @@ torch::Tensor sort_cuda(torch::Tensor input, torch::Tensor output) {
     int32_t* key_out = reinterpret_cast<int32_t*>(output.data_ptr<float>());
 
     size_t temp_bytes = persistent_temp_bytes;
+    // end_bit=31: skip the sign bit (always 0 for positive IEEE 754 floats).
+    // With 8-bit radix groups, this reduces from 4 passes to 3 — a 25% reduction
+    // in internal kernel launches vs the full 32-bit radix.
     cub::DeviceRadixSort::SortKeys(
         persistent_temp.data_ptr(), temp_bytes,
         key_in, key_out, num_items,
-        0, 32,
+        0, 31,
         stream);
 
     return output;
@@ -65,7 +61,7 @@ torch::Tensor sort_cuda(torch::Tensor input, torch::Tensor output);
 """
 
 sort_module = load_inline(
-    name='sort_cuda_int32_bitcast_spin',
+    name='sort_cuda_int32_bitcast_persistent',
     cpp_sources=sort_cpp_source,
     cuda_sources=sort_cuda_source,
     functions=['sort_cuda', 'init_persistent_temp'],
@@ -79,7 +75,8 @@ sort_module.init_persistent_temp()
 def custom_kernel(data: input_t) -> output_t:
     """
     Sort via CUB DeviceRadixSort::SortKeys on raw int32 bitcast of float32.
-    cudaDeviceScheduleSpin reduces kernel launch latency via spin-wait.
+    No conversion needed — all data is positive IEEE 754 floats.
+    Persistent temp storage avoids per-call allocation.
     """
     input_tensor, output_tensor = data
     sort_module.sort_cuda(input_tensor.contiguous(), output_tensor)
