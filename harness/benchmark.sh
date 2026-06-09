@@ -16,13 +16,20 @@
 #
 # stdout: a single fenced result block, emitted LAST:
 #     ===GPUMODE_RESULT_BEGIN===
-#     <leaderboard>=<geomean us>
+#     <set>/<problem>=<geomean us>
 #     ===GPUMODE_RESULT_END===
+# The metric NAME is the <set>/<problem> token itself — the same string you pass
+# here and scope the optimize-tree run with (`benchmark=<set>/<problem>`) — so
+# the emitted key matches the autocuda schema column with no extra lookup. (The
+# GPU MODE *leaderboard* name, used only for `popcorn-cli submit`, is a separate
+# thing resolved on demand via `gen_specs.py --leaderboard`.)
 # stderr: the raw eval.py output + a per-shape microsecond breakdown.
+#
+# Usage:  bash harness/benchmark.sh <set>/<problem>   # e.g. pmpp_v2/histogram_py
 set -uo pipefail
-source "$(dirname "${BASH_SOURCE[0]}")/env.sh"
+source "$(dirname "${BASH_SOURCE[0]}")/env.sh" "$@"
 
-METRIC_NAME="$("$PYTHON" "$REPO_DIR/bin/gen_specs.py" "$PROBLEM_DIR/task.yml" --leaderboard)"
+METRIC_NAME="$PROBLEM"
 SPECS="$("$PYTHON" "$REPO_DIR/bin/gen_specs.py" "$PROBLEM_DIR/task.yml" --emit benchmarks)"
 SPECFILE="$(mktemp)"; trap 'rm -f "$SPECFILE" "$OUT"' EXIT
 printf '%s' "$SPECS" > "$SPECFILE"

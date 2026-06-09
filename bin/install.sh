@@ -82,8 +82,7 @@ Next steps:
   1. Authenticate popcorn-cli (one-time) with the popcorn-login skill:
        bash .claude/skills/popcorn-login/scripts/login.sh
   2. Set up this machine:   /autocuda:discover   (writes autocuda/environment.md)
-  3. Pick a problem and optimize it in place, e.g.:
-       export GPUMODE_PROBLEM=pmpp_v2/histogram_py
-       cd problems/pmpp_v2/histogram_py
-       /autocuda:optimize-tree workers=4 benchmark=histogram_v2 tag-suffix=histogram_v2
+  3. Pick a problem and optimize it in place — its <set>/<problem> path is the
+     one token (passed as benchmark=), e.g.:
+       /autocuda:optimize-tree workers=4 benchmark=pmpp_v2/histogram_py tag-suffix=histogram_py
 EOF

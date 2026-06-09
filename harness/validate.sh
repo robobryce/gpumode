@@ -8,8 +8,10 @@
 # every test passes (`check: pass`); non-zero on any mismatch, crash, or
 # compile error. These are the SAME shapes the leaderboard's `--mode test`
 # uses, so a local pass faithfully predicts a remote test pass.
+#
+# Usage:  bash harness/validate.sh <set>/<problem>   # e.g. pmpp_v2/histogram_py
 set -uo pipefail
-source "$(dirname "${BASH_SOURCE[0]}")/env.sh"
+source "$(dirname "${BASH_SOURCE[0]}")/env.sh" "$@"
 
 SPECS="$("$PYTHON" "$REPO_DIR/bin/gen_specs.py" "$PROBLEM_DIR/task.yml" --emit tests)"
 SPECFILE="$(mktemp)"; trap 'rm -f "$SPECFILE" "$OUT"' EXIT
