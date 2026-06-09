@@ -11,7 +11,6 @@ sort_module = load(
     name='sort_cuda_ext',
     sources=['sort.cu'],
     extra_cuda_cflags=['-O3', '-DNDEBUG'],
-    extra_include_paths=['/usr/local/cuda-12.8/targets/x86_64-linux/include'],
     verbose=False,
 )
 
