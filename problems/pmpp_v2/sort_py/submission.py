@@ -2,7 +2,7 @@
 CUB DeviceRadixSort::SortKeys with int32 bitcast (no float conversion).
 Since all data is positive IEEE 754, raw bits are in correct sort order.
 Interpret float* as int*, sort keys-only, re-interpret back as float.
-Persistent temp storage allocated once at module init to eliminate per-call overhead.
+Uses cudaMallocAsync for stream-ordered persistent temp storage.
 """
 import torch
 from torch.utils.cpp_extension import load_inline
@@ -12,13 +12,14 @@ sort_cuda_source = """
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <cub/device/device_radix_sort.cuh>
+#include <cuda_runtime_api.h>
 #include <cstdint>
 
-static torch::Tensor persistent_temp = {};
+static void* persistent_temp_ptr = nullptr;
 static size_t persistent_temp_bytes = 0;
 
 void init_persistent_temp() {
-    if (persistent_temp.defined()) return;
+    if (persistent_temp_ptr != nullptr) return;
     int64_t max_n = 100'000'000;
     cub::DeviceRadixSort::SortKeys(
         nullptr, persistent_temp_bytes,
@@ -27,9 +28,7 @@ void init_persistent_temp() {
         static_cast<int64_t>(max_n),
         0, 32);
     persistent_temp_bytes = (persistent_temp_bytes * 11 + 9) / 10;
-    persistent_temp = torch::empty(
-        {static_cast<int64_t>(persistent_temp_bytes)},
-        torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCUDA));
+    cudaMallocAsync(&persistent_temp_ptr, persistent_temp_bytes, 0);
 }
 
 torch::Tensor sort_cuda(torch::Tensor input, torch::Tensor output) {
@@ -41,7 +40,7 @@ torch::Tensor sort_cuda(torch::Tensor input, torch::Tensor output) {
 
     size_t temp_bytes = persistent_temp_bytes;
     cub::DeviceRadixSort::SortKeys(
-        persistent_temp.data_ptr(), temp_bytes,
+        persistent_temp_ptr, temp_bytes,
         key_in, key_out, num_items,
         0, 32,
         stream);
@@ -58,7 +57,7 @@ torch::Tensor sort_cuda(torch::Tensor input, torch::Tensor output);
 """
 
 sort_module = load_inline(
-    name='sort_cuda_int32_bitcast_persistent',
+    name='sort_cuda_int32_cudaMallocAsync',
     cpp_sources=sort_cpp_source,
     cuda_sources=sort_cuda_source,
     functions=['sort_cuda', 'init_persistent_temp'],
@@ -72,8 +71,7 @@ sort_module.init_persistent_temp()
 def custom_kernel(data: input_t) -> output_t:
     """
     Sort via CUB DeviceRadixSort::SortKeys on raw int32 bitcast of float32.
-    No conversion needed — all data is positive IEEE 754 floats.
-    Persistent temp storage avoids per-call allocation.
+    Persistent temp storage via cudaMallocAsync (stream-ordered, no PyTorch allocator).
     """
     input_tensor, output_tensor = data
     sort_module.sort_cuda(input_tensor.contiguous(), output_tensor)
