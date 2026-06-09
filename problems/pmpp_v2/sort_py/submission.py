@@ -1,8 +1,9 @@
 """
-Half-width sort via FP16: cast float32 input to half inside CUDA kernel,
-bitcast to uint16 for CUB SortKeys (4 radix passes instead of 8),
-cast back to float32. Single CUDA kernel avoids torch.to() dispatch overhead.
-Two pre-allocated half-precision scratch buffers.
+bfloat16 sort: cast float32 -> bfloat16, bitcast to uint16,
+CUB SortKeys (4 radix passes), cast back to float32.
+bfloat16 preserves full 8-bit exponent -- sort order is exact for
+same-sign values since higher exponent always wins, and same-exponent
+values share the same upper mantissa bits for comparison.
 """
 import torch
 from torch.utils.cpp_extension import load_inline
@@ -12,29 +13,31 @@ sort_cuda_source = """
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <cub/device/device_radix_sort.cuh>
-#include <cuda_fp16.h>
 #include <cstdint>
 
 static torch::Tensor persistent_temp = {};
 static size_t persistent_temp_bytes = 0;
-static torch::Tensor half_in = {};   // scratch for float32->half conversion
-static torch::Tensor half_out = {};  // scratch for sorted half output
+static torch::Tensor bf16_scratch = {};
 
 static constexpr int64_t MAX_N = 100'000'000;
 
-__global__ void float32_to_half_kernel(const float* __restrict__ src,
-                                        half* __restrict__ dst, int64_t n) {
+__global__ void f32_to_bf16(const float* __restrict__ src,
+                             uint16_t* __restrict__ dst, int64_t n) {
     int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < n) dst[idx] = __float2half(src[idx]);
+    if (idx < n) {
+        dst[idx] = static_cast<uint16_t>(__float_as_uint(src[idx]) >> 16);
+    }
 }
 
-__global__ void half_to_float32_kernel(const half* __restrict__ src,
-                                        float* __restrict__ dst, int64_t n) {
+__global__ void bf16_to_f32(const uint16_t* __restrict__ src,
+                             float* __restrict__ dst, int64_t n) {
     int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < n) dst[idx] = __half2float(src[idx]);
+    if (idx < n) {
+        dst[idx] = __uint_as_float(static_cast<uint32_t>(src[idx]) << 16);
+    }
 }
 
-void init_sort_half() {
+void init_bf16() {
     if (persistent_temp.defined()) return;
 
     cub::DeviceRadixSort::SortKeys(
@@ -47,39 +50,29 @@ void init_sort_half() {
         {static_cast<int64_t>(persistent_temp_bytes)},
         torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCUDA));
 
-    half_in = torch::empty({MAX_N},
-        torch::TensorOptions().dtype(torch::kHalf).device(torch::kCUDA));
-    half_out = torch::empty({MAX_N},
-        torch::TensorOptions().dtype(torch::kHalf).device(torch::kCUDA));
+    bf16_scratch = torch::empty({MAX_N},
+        torch::TensorOptions().dtype(torch::kUInt16).device(torch::kCUDA));
 }
 
-torch::Tensor sort_half(torch::Tensor input, torch::Tensor output) {
+torch::Tensor sort_bf16(torch::Tensor input, torch::Tensor output) {
     auto num_items = static_cast<int64_t>(input.numel());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
     const int64_t threads = 256;
     const int64_t blocks = (num_items + threads - 1) / threads;
 
-    // Step 1: f32 -> half
-    float32_to_half_kernel<<<blocks, threads, 0, stream>>>(
-        input.const_data_ptr<float>(),
-        reinterpret_cast<half*>(half_in.data_ptr()),
-        num_items);
+    uint16_t* keys = reinterpret_cast<uint16_t*>(bf16_scratch.data_ptr());
 
-    // Step 2: Sort uint16 keys
-    const uint16_t* key_in = reinterpret_cast<const uint16_t*>(half_in.data_ptr());
-    uint16_t* key_out = reinterpret_cast<uint16_t*>(half_out.data_ptr());
+    f32_to_bf16<<<blocks, threads, 0, stream>>>(
+        input.const_data_ptr<float>(), keys, num_items);
+
     size_t temp_bytes = persistent_temp_bytes;
     cub::DeviceRadixSort::SortKeys(
         persistent_temp.data_ptr(), temp_bytes,
-        key_in, key_out, num_items,
-        0, 16, stream);
+        keys, keys, num_items, 0, 16, stream);
 
-    // Step 3: half -> f32
-    half_to_float32_kernel<<<blocks, threads, 0, stream>>>(
-        reinterpret_cast<const half*>(half_out.data_ptr()),
-        output.data_ptr<float>(),
-        num_items);
+    bf16_to_f32<<<blocks, threads, 0, stream>>>(
+        keys, output.data_ptr<float>(), num_items);
 
     return output;
 }
@@ -87,31 +80,23 @@ torch::Tensor sort_half(torch::Tensor input, torch::Tensor output) {
 
 sort_cpp_source = """
 #include <torch/extension.h>
-
-void init_sort_half();
-torch::Tensor sort_half(torch::Tensor input, torch::Tensor output);
+void init_bf16();
+torch::Tensor sort_bf16(torch::Tensor input, torch::Tensor output);
 """
 
 sort_module = load_inline(
-    name='sort_half_fused_v2',
+    name='sort_bf16_final',
     cpp_sources=sort_cpp_source,
     cuda_sources=sort_cuda_source,
-    functions=['sort_half', 'init_sort_half'],
+    functions=['sort_bf16', 'init_bf16'],
     extra_include_paths=['/usr/local/cuda-12.8/targets/x86_64-linux/include'],
     verbose=False,
 )
 
-sort_module.init_sort_half()
+sort_module.init_bf16()
 
 
 def custom_kernel(data: input_t) -> output_t:
-    """
-    Sort via FP16 half-precision keys:
-    1. f32->half conversion kernel (elementwise)
-    2. CUB SortKeys on uint16 (4 radix passes vs 8)
-    3. half->f32 conversion kernel (elementwise)
-    All in single CUDA function with pre-allocated scratch buffers.
-    """
     input_tensor, output_tensor = data
-    sort_module.sort_half(input_tensor.contiguous(), output_tensor)
+    sort_module.sort_bf16(input_tensor.contiguous(), output_tensor)
     return output_tensor
