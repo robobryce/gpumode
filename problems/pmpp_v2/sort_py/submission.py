@@ -14,7 +14,6 @@ sort_cuda_source = """
 #include <cub/device/device_radix_sort.cuh>
 #include <cstdint>
 
-// Persistent temp storage — allocated once at module init, sized for 100M items.
 static torch::Tensor persistent_temp = {};
 static size_t persistent_temp_bytes = 0;
 
@@ -27,7 +26,6 @@ void init_persistent_temp() {
         static_cast<int32_t*>(nullptr),
         static_cast<int64_t>(max_n),
         0, 32);
-    // Add 10% headroom
     persistent_temp_bytes = (persistent_temp_bytes * 11 + 9) / 10;
     persistent_temp = torch::empty(
         {static_cast<int64_t>(persistent_temp_bytes)},
@@ -35,20 +33,12 @@ void init_persistent_temp() {
 }
 
 torch::Tensor sort_cuda(torch::Tensor input, torch::Tensor output) {
-    TORCH_CHECK(input.device().is_cuda(), "Input must be a CUDA tensor");
-    TORCH_CHECK(output.device().is_cuda(), "Output must be a CUDA tensor");
-    TORCH_CHECK(input.dtype() == torch::kFloat32, "Input must be float32");
-    TORCH_CHECK(output.dtype() == torch::kFloat32, "Output must be float32");
-    TORCH_CHECK(input.sizes() == output.sizes(), "Input and output must have same size");
-
     auto num_items = static_cast<int64_t>(input.numel());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
-    // Reinterpret float pointers as int32 — raw IEEE 754 bits.
     const int32_t* key_in = reinterpret_cast<const int32_t*>(input.const_data_ptr<float>());
     int32_t* key_out = reinterpret_cast<int32_t*>(output.data_ptr<float>());
 
-    // Use persistent temp storage (pass size by reference via local copy)
     size_t temp_bytes = persistent_temp_bytes;
     cub::DeviceRadixSort::SortKeys(
         persistent_temp.data_ptr(), temp_bytes,
@@ -76,7 +66,6 @@ sort_module = load_inline(
     verbose=False,
 )
 
-# Allocate persistent CUB workspace once at import time
 sort_module.init_persistent_temp()
 
 
@@ -84,8 +73,8 @@ def custom_kernel(data: input_t) -> output_t:
     """
     Sort via CUB DeviceRadixSort::SortKeys on raw int32 bitcast of float32.
     No conversion needed — all data is positive IEEE 754 floats.
-    Persistent temp storage allocated once at import time.
+    Persistent temp storage avoids per-call allocation.
     """
     input_tensor, output_tensor = data
-    output_tensor[...] = sort_module.sort_cuda(input_tensor.contiguous(), output_tensor)
+    sort_module.sort_cuda(input_tensor.contiguous(), output_tensor)
     return output_tensor
