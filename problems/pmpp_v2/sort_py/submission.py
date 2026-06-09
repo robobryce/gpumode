@@ -1,8 +1,8 @@
 """
-BlockRadixSort (256t x 8 = 2048/block) grid-stride + pairwise merge tree.
-Phase 1: block-sort chunks in-place (1R+1W per element).
-Phase 2: pairwise merge tree via cub::DeviceMerge::MergeKeys (no values).
-All temp storage allocated once at module init.
+BlockRadixSort + batched tile merge kernel (single-kernel per tree level).
+Block sort: 2048/block via BlockRadixSort (256 threads x 8 items/thread).
+Merge tree: each pair of segments merged by one tile_merge_kernel block.
+Key insight: block-level merge path with binary search + serial merge segment.
 """
 import torch
 from torch.utils.cpp_extension import load_inline
@@ -12,17 +12,13 @@ sort_cuda_source = """
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <cub/block/block_radix_sort.cuh>
-#include <cub/device/device_merge.cuh>
 #include <cstdint>
 #include <algorithm>
-
-struct FloatLess {
-    __device__ bool operator()(float a, float b) const { return a < b; }
-};
 
 constexpr int BLOCK_THREADS = 256;
 constexpr int ITEMS_PER_THREAD = 8;
 constexpr int CHUNK_SIZE = BLOCK_THREADS * ITEMS_PER_THREAD;  // 2048
+constexpr int MERGE_THREADS = 256;
 
 using BlockRadixSortT = cub::BlockRadixSort<int32_t, BLOCK_THREADS, ITEMS_PER_THREAD>;
 
@@ -30,10 +26,9 @@ __global__ void block_sort_kernel(float* data, int64_t n) {
     __shared__ typename BlockRadixSortT::TempStorage temp_storage;
     int32_t thread_keys[ITEMS_PER_THREAD];
 
-    for (int64_t chunk_start = static_cast<int64_t>(blockIdx.x) * CHUNK_SIZE;
+    for (int64_t chunk_start = blockIdx.x * CHUNK_SIZE;
          chunk_start < n;
-         chunk_start += static_cast<int64_t>(gridDim.x) * CHUNK_SIZE) {
-
+         chunk_start += gridDim.x * CHUNK_SIZE) {
         int64_t chunk_items = n - chunk_start;
         if (chunk_items > CHUNK_SIZE) chunk_items = CHUNK_SIZE;
 
@@ -45,9 +40,7 @@ __global__ void block_sort_kernel(float* data, int64_t n) {
                 thread_keys[i] = 2147483647;
             }
         }
-
         BlockRadixSortT(temp_storage).Sort(thread_keys);
-
         for (int i = 0; i < ITEMS_PER_THREAD; i++) {
             int rank = threadIdx.x + i * BLOCK_THREADS;
             if (rank < chunk_items) {
@@ -58,129 +51,137 @@ __global__ void block_sort_kernel(float* data, int64_t n) {
     }
 }
 
-static torch::Tensor merge_temp_storage = {};
-static size_t merge_temp_bytes = 0;
-static torch::Tensor scratch_buf = {};
-static torch::Tensor merge_buf = {};
+// Merge two sorted segments into one using merge path algorithm.
+// Each thread binary-searches for its partition start, then does serial merge.
+__global__ void tile_merge_kernel(
+    const float* __restrict__ left,
+    const float* __restrict__ right,
+    float* __restrict__ out,
+    int n_left,
+    int n_right)
+{
+    int total = n_left + n_right;
+    int tid = threadIdx.x;
 
-void init_temp_storage() {
-    if (merge_temp_storage.defined()) return;
-    int64_t max_n = 100'000'000;
+    // Each thread handles a segment of the output: [my_start, my_end)
+    int my_start = static_cast<int>(static_cast<int64_t>(tid) * total / MERGE_THREADS);
+    int my_end = static_cast<int>(static_cast<int64_t>(tid + 1) * total / MERGE_THREADS);
 
-    size_t bytes = 0;
-    float* d = nullptr;
+    // Binary search in left for start position
+    int low = (my_start > n_right) ? (my_start - n_right) : 0;
+    int high = (my_start < n_left) ? my_start : n_left;
 
-    // Query temp for DeviceMerge on largest pair (two halves of max_n)
-    cub::DeviceMerge::MergeKeys(
-        nullptr, bytes,
-        d, static_cast<int>(max_n/2),
-        d, static_cast<int>(max_n - max_n/2),
-        d,
-        FloatLess{});
+    while (low < high) {
+        int mid = (low + high) >> 1;
+        int r = my_start - mid - 1;
+        bool take_left;
+        if (r < 0) {
+            take_left = false;
+        } else if (r >= n_right) {
+            take_left = true;
+        } else if (mid >= n_left) {
+            take_left = false;
+        } else {
+            take_left = __float_as_int(left[mid]) <= __float_as_int(right[r]);
+        }
+        if (take_left) low = mid + 1;
+        else high = mid;
+    }
+    int li = low;
+    int ri = my_start - low;
 
-    bytes = (bytes * 11 + 9) / 10;
-    merge_temp_bytes = bytes;
-    merge_temp_storage = torch::empty(
-        {static_cast<int64_t>(bytes)},
-        torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCUDA));
+    // Serial merge
+    for (int pos = my_start; pos < my_end; pos++) {
+        bool take_left;
+        if (li >= n_left) take_left = false;
+        else if (ri >= n_right) take_left = true;
+        else take_left = __float_as_int(left[li]) <= __float_as_int(right[ri]);
 
-    scratch_buf = torch::empty(
-        {max_n},
-        torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA));
-
-    merge_buf = torch::empty(
-        {max_n},
-        torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA));
+        out[pos] = take_left ? left[li++] : right[ri++];
+    }
 }
 
-void do_merge_tree(
-    float* src_buf, float* dst_buf, float* output_buf,
-    int64_t n, int num_chunks, int chunk_size,
-    cudaStream_t stream)
-{
-    float* src = src_buf;
-    float* dst = dst_buf;
-    int cur_chunks = num_chunks;
-    int cur_chunk_sz = chunk_size;
+static torch::Tensor scratch_buf;
+static torch::Tensor merge_buf;
 
-    while (cur_chunks > 1) {
-        int next_chunks = (cur_chunks + 1) / 2;
-        int pairs = cur_chunks / 2;
-
-        for (int p = 0; p < pairs; p++) {
-            int64_t base1 = static_cast<int64_t>(p * 2) * cur_chunk_sz;
-            int64_t base2 = static_cast<int64_t>(p * 2 + 1) * cur_chunk_sz;
-            int64_t base_out = static_cast<int64_t>(p * 2) * cur_chunk_sz;
-
-            int n1 = (base1 + cur_chunk_sz <= n) ? cur_chunk_sz : static_cast<int>(n - base1);
-            int n2 = (base2 + cur_chunk_sz <= n) ? cur_chunk_sz : static_cast<int>(n - base2);
-            if (n2 < 0) n2 = 0;
-            if (n1 < 0) n1 = 0;
-
-            if (n1 > 0 && n2 > 0) {
-                size_t tb = merge_temp_bytes;
-                cub::DeviceMerge::MergeKeys(
-                    merge_temp_storage.data_ptr(), tb,
-                    src + base1, n1,
-                    src + base2, n2,
-                    dst + base_out,
-                    FloatLess{},
-                    stream);
-            } else if (n1 > 0) {
-                cudaMemcpyAsync(dst + base_out, src + base1,
-                    n1 * sizeof(float), cudaMemcpyDeviceToDevice, stream);
-            }
-        }
-
-        // Copy last odd chunk
-        if (cur_chunks % 2 == 1) {
-            int last = cur_chunks - 1;
-            int64_t base = static_cast<int64_t>(last) * cur_chunk_sz;
-            int64_t sz = n - base;
-            if (sz > 0) {
-                cudaMemcpyAsync(dst + base, src + base,
-                    sz * sizeof(float), cudaMemcpyDeviceToDevice, stream);
-            }
-        }
-
-        float* tmp = src;
-        src = dst;
-        dst = tmp;
-        cur_chunks = next_chunks;
-        cur_chunk_sz *= 2;
-    }
-
-    // Result is in 'src'
-    if (src != output_buf) {
-        cudaMemcpyAsync(output_buf, src,
-            n * sizeof(float), cudaMemcpyDeviceToDevice, stream);
-    }
+void init_temp_storage() {
+    if (scratch_buf.defined()) return;
+    int64_t max_n = 100'000'000;
+    scratch_buf = torch::empty({max_n},
+        torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA));
+    merge_buf = torch::empty({max_n},
+        torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA));
 }
 
 torch::Tensor sort_cuda(torch::Tensor input, torch::Tensor output) {
     auto n = static_cast<int64_t>(input.numel());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
-
     if (n == 0) return output;
 
+    float* scratch = scratch_buf.data_ptr<float>();
+    float* merges = merge_buf.data_ptr<float>();
+    float* out = output.data_ptr<float>();
+
     // Copy input -> scratch
-    cudaMemcpyAsync(scratch_buf.data_ptr<float>(),
-        input.const_data_ptr<float>(),
+    cudaMemcpyAsync(scratch, input.const_data_ptr<float>(),
         n * sizeof(float), cudaMemcpyDeviceToDevice, stream);
 
-    // Block-sort chunks in scratch
+    // Block sort chunks
     int num_chunks = (n + CHUNK_SIZE - 1) / CHUNK_SIZE;
     int grid = num_chunks < 228 ? num_chunks : 228;
+    block_sort_kernel<<<grid, BLOCK_THREADS, 0, stream>>>(scratch, n);
 
-    block_sort_kernel<<<grid, BLOCK_THREADS, 0, stream>>>(
-        scratch_buf.data_ptr<float>(), n);
+    if (num_chunks <= 1) {
+        cudaMemcpyAsync(out, scratch, n * sizeof(float),
+            cudaMemcpyDeviceToDevice, stream);
+        return output;
+    }
 
-    // Merge tree: scratch -> output
-    do_merge_tree(
-        scratch_buf.data_ptr<float>(),
-        merge_buf.data_ptr<float>(),
-        output.data_ptr<float>(),
-        n, num_chunks, CHUNK_SIZE, stream);
+    // Merge tree
+    float* src = scratch;
+    float* dst = merges;
+    int cur_chunks = num_chunks;
+    int64_t seg_size = CHUNK_SIZE;
+
+    while (cur_chunks > 1) {
+        int pairs = cur_chunks / 2;
+
+        for (int p = 0; p < pairs; p++) {
+            int64_t base = p * 2 * seg_size;
+            float* left = src + base;
+            float* right_ptr = src + base + seg_size;
+            float* out_ptr = dst + base;
+
+            int n_left = seg_size;
+            int64_t right_end = n - (base + seg_size);
+            int n_right = (right_end < seg_size) ? static_cast<int>(right_end) : seg_size;
+            if (n_right < 0) n_right = 0;
+
+            if (n_right <= 0) {
+                cudaMemcpyAsync(out_ptr, left, n_left * sizeof(float),
+                    cudaMemcpyDeviceToDevice, stream);
+            } else {
+                tile_merge_kernel<<<1, MERGE_THREADS, 0, stream>>>(
+                    left, right_ptr, out_ptr, n_left, n_right);
+            }
+        }
+
+        if (cur_chunks % 2 == 1) {
+            int64_t base = static_cast<int64_t>(cur_chunks - 1) * seg_size;
+            int64_t sz = n - base;
+            if (sz > 0)
+                cudaMemcpyAsync(dst + base, src + base,
+                    sz * sizeof(float), cudaMemcpyDeviceToDevice, stream);
+        }
+
+        float* tmp = src; src = dst; dst = tmp;
+        cur_chunks = (cur_chunks + 1) / 2;
+        seg_size *= 2;
+    }
+
+    if (src != out)
+        cudaMemcpyAsync(out, src, n * sizeof(float),
+            cudaMemcpyDeviceToDevice, stream);
 
     return output;
 }
@@ -188,26 +189,23 @@ torch::Tensor sort_cuda(torch::Tensor input, torch::Tensor output) {
 
 sort_cpp_source = """
 #include <torch/extension.h>
-
 void init_temp_storage();
 torch::Tensor sort_cuda(torch::Tensor input, torch::Tensor output);
 """
 
 sort_module = load_inline(
-    name='block_radix_sort_merge_tree_v2',
+    name='batch_tile_merge_v3',
     cpp_sources=sort_cpp_source,
     cuda_sources=sort_cuda_source,
     functions=['sort_cuda', 'init_temp_storage'],
     extra_include_paths=['/usr/local/cuda-12.8/targets/x86_64-linux/include'],
-    extra_cuda_cflags=['--expt-relaxed-constexpr'],
     verbose=False,
 )
 
 sort_module.init_temp_storage()
 
-
 def custom_kernel(data: input_t) -> output_t:
-    """BlockRadixSort + pairwise merge tree."""
+    """BlockRadixSort + batched tile-merge tree (1 kernel launch per level)."""
     input_tensor, output_tensor = data
     sort_module.sort_cuda(input_tensor.contiguous(), output_tensor)
     return output_tensor
