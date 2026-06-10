@@ -30,8 +30,10 @@ torch::Tensor sort_cuda(torch::Tensor input, torch::Tensor output) {
 
     size_t temp_bytes = persistent_temp_bytes;
 
-    // Use PyTorch's current stream so CUDAGraph capture works.
-    auto stream = c10::cuda::getCurrentCUDAStream(input.device().index()).stream();
+    // Route CUB through PyTorch's current stream so torch.cuda.CUDAGraph
+    // can capture the kernel launches during graph capture mode.
+    auto stream_obj = c10::cuda::getCurrentCUDAStream(input.device().index());
+    auto stream = stream_obj.stream();
 
     cub::DeviceRadixSort::SortKeys(
         persistent_temp.data_ptr(), temp_bytes,
