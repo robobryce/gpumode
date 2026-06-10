@@ -32,7 +32,7 @@ Frozen GPU MODE harness — DO NOT modify. These define correctness and timing e
 - **`problems/<set>/eval.py`** — the official KernelBot eval harness (at the set root, shared by the set's problems). Modes `test` / `benchmark` / `leaderboard` / `profile`; reads a spec file, runs `custom_kernel` in a spawned subprocess, writes `key: value` results to the fd named by `POPCORN_FD`. Times with CUDA events, clears L2 between repeats, runs an obligatory correctness check before timing.
 - **`problems/<set>/utils.py`** — checkers (`verbose_allclose` / `verbose_allequal`), seeding, `clear_l2_cache`.
 - **`problems/<set>/<problem>/reference.py`** — `generate_input(...)` and the `check_implementation` ground truth. **`task.py`** — input/output type schema. **`task.yml`** — the official problem spec (canonical `tests:` / `benchmarks:` shapes + leaderboard timeouts); the `harness/` scripts render its shapes into eval.py spec files on the fly via `bin/gen_specs.py`.
-- **`harness/env.sh`, `build.sh`, `validate.sh`, `benchmark.sh`, `profile_ncu.sh`** and **`bin/gen_specs.py`** — the autocuda↔GPU-MODE bridge. Treat as read-only infrastructure.
+- **`harness/env.sh`, `build.sh`, `validate.sh`, `benchmark.sh`, `profile_ncu.sh`, `submit.sh`** and **`bin/gen_specs.py`** — the autocuda↔GPU-MODE bridge. Treat as read-only infrastructure.
 
 ## Build
 
@@ -103,8 +103,24 @@ Every iteration row carries `--metric <set>/<problem>=<value>` (geomean µs). Th
 
 ## Leaderboard submission (manager)
 
-Submit to the public leaderboard regularly throughout a run, on your own, without pausing to ask the operator — automatic submission is authorized for this workspace:
+Leaderboard submissions are **mandatory evidence**, not optional reporting. A run without a baseline leaderboard submission is **invalid from the start**. A run that finds improvements but does not submit them regularly is also **invalid**: local geomean timings alone cannot tell whether a kernel is accepted by GPU MODE, whether it is considered cheating/reward-hacking by the remote harness, or what its real leaderboard performance is.
 
-- **At baseline setup:** when you measure the baseline (profile it and log the baseline row), also submit the baseline `submission.py` with `popcorn-cli submit --no-tui --leaderboard <name> --gpu <gpu> --mode leaderboard submission.py` (here `<name>` is the GPU MODE leaderboard name, e.g. `histogram_v2`, which `bin/gen_specs.py problems/<set>/<problem>/task.yml --leaderboard` prints — **not** the `<set>/<problem>` metric token), then read its score back (the `leaderboard-rankings` skill, or `popcorn-cli --no-tui submissions list --leaderboard <name>`). This puts the reference's public score on record up front and shows how the (noisier — see `environment.md`'s Noise) Modal ranking maps to the local geomean, so you can calibrate before trusting small deltas.
-- **As the run improves:** each time the global best kernel improves meaningfully over the last submitted one, submit the new best with `--mode leaderboard`. Submit the actual best-scoring committed `submission.py`, not work-in-progress.
-- These submissions post to the **public** leaderboard by design; do not gate them on operator confirmation. The `<gpu>` token must be one the problem supports (`bin/gen_specs.py … --gpus`), matched to the host.
+Automatic submission is authorized for this workspace. Do not ask the operator before submitting, and do not continue optimizing until the required submission for the current phase has either succeeded or failed with an explicit, logged infrastructure/authentication error.
+
+- **At baseline setup:** after the baseline passes local validation, is benchmarked, profiled, and logged with `autocuda log optimize-tree baseline`, immediately submit that exact baseline `submission.py` with `popcorn-cli submit --no-tui --leaderboard <name> --gpu <gpu> --mode leaderboard submission.py`. If this submission is missing, the entire optimize run is invalid and workers must not be launched.
+- **As the run improves:** each time the best safe committed kernel meaningfully improves over the last submitted kernel, submit that exact committed `submission.py` with `--mode leaderboard` before treating the improvement as real. Do not compare local candidates as final apples-to-apples results without corresponding leaderboard submissions.
+- **Before final selection:** the chosen final candidate must have a successful leaderboard submission. If the fastest local candidate was never submitted, or was rejected remotely, it is not the final candidate.
+- **Submission metadata:** resolve `<name>` with `bin/gen_specs.py problems/<set>/<problem>/task.yml --leaderboard` and `<gpu>` with `bin/gen_specs.py problems/<set>/<problem>/task.yml --gpus` (choose the token matching the host GPU). The leaderboard name is **not** the autocuda metric token.
+- **Submission records:** record the submission attempt, command, commit SHA, local metric, and returned leaderboard score/rank in the manager log or a run note. If `popcorn-cli` authentication or service availability prevents submission, log that failure explicitly and treat the run as blocked/invalid for leaderboard comparison until it is fixed.
+- **Public posting:** these submissions post to the **public** leaderboard by design; do not gate them on operator confirmation.
+
+Baseline submission checklist (run from the repo root, with the baseline commit checked out):
+
+```bash
+TASK=pmpp_v2/conv2d_py
+BASELINE=$(git rev-parse HEAD)
+bash harness/submit.sh "$TASK"
+echo "baseline leaderboard submission recorded for $BASELINE"
+```
+
+`harness/submit.sh` resolves the leaderboard name and supported GPU token from `task.yml`, honors `GPUMODE_GPU=<token>` when the automatic GPU-name match is ambiguous, runs `popcorn-cli submit --no-tui --mode leaderboard`, then lists recent submissions for that leaderboard. Use the same helper for every meaningful improvement and final candidate.
