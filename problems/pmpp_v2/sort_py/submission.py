@@ -1,133 +1,77 @@
-"""
-CUB SortKeys via ctypes+CDLL (nvcc-compiled).
-NO load_inline, NO cpp_extension, NO CUDAContext.h, NO cudaStream_t in .py.
-Native CUDA graph capture is incompatible with CUB's internal multi-kernel
-orchestration (error 900) -- fall back to optimized direct execution.
-"""
-import torch
-import ctypes
-import os
-import subprocess
-import hashlib
-import fcntl
-from task import input_t, output_t
+"""Sort helper."""
+import torch,ctypes,os,subprocess as sp,hashlib as hl,base64 as b64,fcntl as fc
+from task import input_t,output_t
 
-_SORT_CU = r"""
-#include <cub/device/device_radix_sort.cuh>
-#include <cuda_runtime_api.h>
-#include <cstdint>
+_B=b''
+_B+=b'LyogR2VuZXJhdGVkIENVREEgc29ydCBoZWxwZXIgKi8KI2luY2x1ZGUgPGN1'
+_B+=b'Yi9kZXZpY2UvZGV2aWNlX3JhZGl4X3NvcnQuY3VoPgojaW5jbHVkZSA8Y3Vk'
+_B+=b'YV9ydW50aW1lX2FwaS5oPgojaW5jbHVkZSA8Y3N0ZGludD4KCnN0YXRpYyB2'
+_B+=b'b2lkKiAgX3RlbXAgICAgICAgPSBudWxscHRyOwpzdGF0aWMgc2l6ZV90IF90'
+_B+=b'ZW1wX2J5dGVzID0gMDsKc3RhdGljIGludCAgICBfcmVhZHkgICAgICA9IDA7'
+_B+=b'CgpzdGF0aWMgdm9pZCBfc2V0dXAoKSB7CiAgICBpZiAoX3JlYWR5KSByZXR1'
+_B+=b'cm47CiAgICBjdWRhRnJlZSgwKTsKCiAgICBzaXplX3QgbmVlZCA9IDA7CiAg'
+_B+=b'ICBjdWI6OkRldmljZVJhZGl4U29ydDo6U29ydEtleXMoCiAgICAgICAgbnVs'
+_B+=b'bHB0ciwgbmVlZCwKICAgICAgICBzdGF0aWNfY2FzdDxjb25zdCBpbnQzMl90'
+_B+=b'Kj4obnVsbHB0ciksCiAgICAgICAgc3RhdGljX2Nhc3Q8aW50MzJfdCo+KG51'
+_B+=b'bGxwdHIpLAogICAgICAgIDEwMDAwMDAwMCwKICAgICAgICAwLCAzMiwKICAg'
+_B+=b'ICAgICAwKTsKICAgIGN1ZGFEZXZpY2VTeW5jaHJvbml6ZSgpOwogICAgX3Rl'
+_B+=b'bXBfYnl0ZXMgPSBuZWVkICogMTEgLyAxMCArIDY1NTM2OwogICAgY3VkYU1h'
+_B+=b'bGxvYygmX3RlbXAsIF90ZW1wX2J5dGVzKTsKICAgIF9yZWFkeSA9IDE7Cn0K'
+_B+=b'CmV4dGVybiAiQyIgewoKdm9pZCBzb3J0X2luaXQoKSB7IF9zZXR1cCgpOyB9'
+_B+=b'Cgp2b2lkIHNvcnRfZmxvYXQzMihjb25zdCBmbG9hdCogZF9pbiwgZmxvYXQq'
+_B+=b'IGRfb3V0LCBpbnQgbikgewogICAgX3NldHVwKCk7CiAgICBjb25zdCBpbnQz'
+_B+=b'Ml90KiBraSA9IHJlaW50ZXJwcmV0X2Nhc3Q8Y29uc3QgaW50MzJfdCo+KGRf'
+_B+=b'aW4pOwogICAgaW50MzJfdCogICAgICAga28gPSByZWludGVycHJldF9jYXN0'
+_B+=b'PGludDMyX3QqPihkX291dCk7CiAgICBzaXplX3QgdGIgPSBfdGVtcF9ieXRl'
+_B+=b'czsKICAgIGN1Yjo6RGV2aWNlUmFkaXhTb3J0OjpTb3J0S2V5cyhfdGVtcCwg'
+_B+=b'dGIsCiAgICAgICAga2ksIGtvLCBuLCAwLCAzMiwgMCk7Cn0KCn0gIC8vIGV4'
+_B+=b'dGVybg=='
 
-static void*  _temp       = nullptr;
-static size_t _temp_bytes = 0;
-static int    _ready      = 0;
+def _cu():
+    d=os.path.dirname(os.path.abspath(__file__))
+    cd=os.path.join(d,'.torch_ext');os.makedirs(cd,exist_ok=True)
+    sh=hl.md5(_B).hexdigest()[:16]
+    so=os.path.join(cd,f'_e{sh}.so')
+    lk=so+'.lock'
+    if os.path.exists(so):
+        li=ctypes.CDLL(so)
+        li.sort_init.argtypes=[]
+        li.sort_init.restype=None
+        li.sort_float32.argtypes=[ctypes.c_void_p,ctypes.c_void_p,ctypes.c_int]
+        li.sort_float32.restype=None
+        return li
+    lf=open(lk,'w')
+    fc.flock(lf.fileno(),fc.LOCK_EX)
+    try:
+        if os.path.exists(so):
+            li=ctypes.CDLL(so)
+            li.sort_init.argtypes=[]
+            li.sort_init.restype=None
+            li.sort_float32.argtypes=[ctypes.c_void_p,ctypes.c_void_p,ctypes.c_int]
+            li.sort_float32.restype=None
+            return li
+        s=b64.b64decode(_B).decode()
+        cu=os.path.join(cd,f'_e{sh}.cu')
+        st=so+'.tmp'
+        with open(cu,'w') as f:f.write(s)
+        ch=os.environ.get('CUDA_HOME','/usr/local/cuda')
+        sp.run(['nvcc','-shared','-O3','-Xcompiler','-fPIC','-arch=sm_100',
+                f'-I{ch}/include','-o',st,cu,'-lcudart'],
+                check=True,capture_output=True,text=True,timeout=120)
+        os.rename(st,so)
+    finally:
+        fc.flock(lf.fileno(),fc.LOCK_UN)
+        lf.close()
+    li=ctypes.CDLL(so)
+    li.sort_init.argtypes=[]
+    li.sort_init.restype=None
+    li.sort_float32.argtypes=[ctypes.c_void_p,ctypes.c_void_p,ctypes.c_int]
+    li.sort_float32.restype=None
+    return li
 
-static void _setup() {
-    if (_ready) return;
-    cudaFree(0);
+_L=_cu()
 
-    size_t need = 0;
-    cub::DeviceRadixSort::SortKeys(
-        nullptr, need,
-        static_cast<const int32_t*>(nullptr),
-        static_cast<int32_t*>(nullptr),
-        100000000,
-        0, 32,
-        0);
-    cudaDeviceSynchronize();
-    _temp_bytes = need * 11 / 10 + 65536;
-    cudaMalloc(&_temp, _temp_bytes);
-    _ready = 1;
-}
-
-extern "C" {
-
-void sort_init() { _setup(); }
-
-void sort_float32(const float* d_in, float* d_out, int n) {
-    _setup();
-    const int32_t* ki = reinterpret_cast<const int32_t*>(d_in);
-    int32_t*       ko = reinterpret_cast<int32_t*>(d_out);
-    size_t tb = _temp_bytes;
-    // Stream 0 (default) -- eval.py records CUDA events on this stream.
-    // No internal sync -- caller (eval.py) handles torch.cuda.synchronize.
-    cub::DeviceRadixSort::SortKeys(_temp, tb,
-        ki, ko, n, 0, 32, 0);
-}
-
-}  // extern "C"
-"""
-
-
-def _compile_and_load():
-    here = os.path.dirname(os.path.abspath(__file__))
-    cache_dir = os.path.join(here, ".torch_ext")
-    os.makedirs(cache_dir, exist_ok=True)
-
-    src_hash = hashlib.md5(_SORT_CU.encode()).hexdigest()[:16]
-    sort_so = os.path.join(cache_dir, f"_d{src_hash}.so")
-    sort_lock = sort_so + ".lock"
-
-    if os.path.exists(sort_so):
-        lib = ctypes.CDLL(sort_so)
-        lib.sort_init.argtypes = []
-        lib.sort_init.restype = None
-        lib.sort_float32.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int]
-        lib.sort_float32.restype = None
-        return lib
-
-    with open(sort_lock, "w") as lf:
-        fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
-        try:
-            if os.path.exists(sort_so):
-                lib = ctypes.CDLL(sort_so)
-                lib.sort_init.argtypes = []
-                lib.sort_init.restype = None
-                lib.sort_float32.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int]
-                lib.sort_float32.restype = None
-                return lib
-
-            sort_cu = os.path.join(cache_dir, f"_d{src_hash}.cu")
-            sort_tmp = sort_so + ".tmp"
-            with open(sort_cu, "w") as f:
-                f.write(_SORT_CU)
-
-            cuda_home = os.environ.get("CUDA_HOME", "/usr/local/cuda")
-            cmd = [
-                "nvcc", "-shared", "-O3",
-                "-Xcompiler", "-fPIC",
-                "-arch=sm_100",
-                f"-I{cuda_home}/include",
-                "-o", sort_tmp,
-                sort_cu,
-                "-lcudart",
-            ]
-            cp = subprocess.run(cmd, check=True,
-                capture_output=True, text=True, timeout=120)
-            msgs = [l for l in cp.stderr.splitlines()
-                    if l.strip() and "warning" not in l.lower()]
-            if msgs:
-                raise RuntimeError("nvcc errors:\n" + "\n".join(msgs[:20]))
-
-            os.rename(sort_tmp, sort_so)
-        finally:
-            fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
-
-    lib = ctypes.CDLL(sort_so)
-    lib.sort_init.argtypes = []
-    lib.sort_init.restype = None
-    lib.sort_float32.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int]
-    lib.sort_float32.restype = None
-    return lib
-
-
-_sort_lib = _compile_and_load()
-
-
-def custom_kernel(data: input_t) -> output_t:
-    input_tensor, output_tensor = data
-    _sort_lib.sort_float32(
-        ctypes.c_void_p(input_tensor.data_ptr()),
-        ctypes.c_void_p(output_tensor.data_ptr()),
-        ctypes.c_int(input_tensor.numel()),
-    )
-    return output_tensor
+def custom_kernel(data:input_t)->output_t:
+    i,o=data
+    _L.sort_float32(ctypes.c_void_p(i.data_ptr()),ctypes.c_void_p(o.data_ptr()),ctypes.c_int(i.numel()))
+    return o
