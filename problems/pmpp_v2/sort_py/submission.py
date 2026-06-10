@@ -58,10 +58,11 @@ torch::Tensor sort_cuda(torch::Tensor input, torch::Tensor output);
 """
 
 sort_module = load_inline(
-    name='sort_cuda_int32_bitcast_persistent',
+    name='sort_cuda_sm100a_test',
     cpp_sources=sort_cpp_source,
     cuda_sources=sort_cuda_source,
     functions=['sort_cuda', 'init_persistent_temp'],
+    extra_cuda_cflags=['-arch=sm_100a', '-O3'],
     extra_include_paths=['/usr/local/cuda-12.8/targets/x86_64-linux/include'],
     verbose=False,
 )
