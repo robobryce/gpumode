@@ -1,55 +1,31 @@
 """
-Pure-torch CUDAGraph sort: torch.sort on int32 bitcast, wrapped in torch.cuda.CUDAGraph.
-ZERO load_inline, ZERO cpp_extension, ZERO cudaStream -- pure Python + torch.ops.
-CUDAGraph operates on default stream internally. Leaderboard-safe.
-The torch.sort internally uses CUB Onesweep (same as load_inline CUB SortKeys),
-but graph replay eliminates kernel launch overhead (~34us per call).
+Pure-torch sort via torch.sort on int32 bitcast with out=.
+ZERO load_inline, ZERO cpp_extension -- pure Python + torch.ops.
+torch.sort internally uses CUB Onesweep (same sort kernel as load_inline CUB SortKeys).
+No CUDAGraph because torch.sort's internal cudaMalloc for scratch temp storage
+is fundamentally incompatible with CUDA graph capture (confirmed by testing:
+~50% data corruption on replay regardless of pool/capture_error_mode/stream configs).
+This is a known PyTorch limitation.
 """
 import torch
 from task import input_t, output_t
 
-# Module-level cache: maps numel -> (CUDAGraph, idx_scratch_tensor)
-# idx_scratch must be kept alive for graph replay to work (graph captures its data_ptr).
-_graph_cache = {}
-
-
-def _get_or_create_graph(input_tensor: torch.Tensor, output_tensor: torch.Tensor):
-    """Get or create a CUDA graph for sorting input_tensor into output_tensor."""
-    n = input_tensor.numel()
-    if n in _graph_cache:
-        return _graph_cache[n][0]
-
-    # Create scratch index tensor. Must stay alive for graph replay lifetime.
-    idx_scratch = torch.empty(n, dtype=torch.int64, device=input_tensor.device)
-
-    # Warmup: do a real torch.sort to prime CUDA context, kernel caches, etc.
-    output_int = output_tensor.view(torch.int32)
-    input_int = input_tensor.view(torch.int32)
-    torch.sort(input_int, out=(output_int, idx_scratch))
-    torch.cuda.synchronize()
-
-    # Capture the sort as a CUDA graph.
-    # eval.py reuses the same input/output tensors across repeated custom_kernel
-    # calls, so the captured data pointers remain valid for all replays.
-    g = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(g):
-        # Create fresh views inside capture; data_ptr matches original tensors.
-        ov = output_tensor.view(torch.int32)
-        iv = input_tensor.view(torch.int32)
-        torch.sort(iv, out=(ov, idx_scratch))
-
-    # Cache both graph and scratch tensor (scratch must not be GC'd).
-    _graph_cache[n] = (g, idx_scratch)
-    return g
+# Pre-allocate scratch index tensor for torch.sort's out=(values, indices).
+# Reuse across calls to avoid per-call allocation overhead.
+_max_n = 100_000_000
+_scratch_idx = torch.empty(_max_n, dtype=torch.int64, device='cuda')
 
 
 def custom_kernel(data: input_t) -> output_t:
     """
-    Sort via torch.sort on int32 bitcast, captured in CUDAGraph.
-    First call captures the graph; all subsequent calls replay it.
-    Graph replay eliminates kernel launch overhead (~34us per call).
+    Sort via torch.sort on int32 bitcast.
+    torch.sort uses CUB DeviceRadixSort internally - same sort kernel as
+    the CUB SortKeys load_inline approach, but with SortPairs for indices.
+    Pure Python, leaderboard-safe with zero file dependencies.
     """
     input_tensor, output_tensor = data
-    g = _get_or_create_graph(input_tensor, output_tensor)
-    g.replay()
+    n = input_tensor.numel()
+    # Sort int32 view directly into output's int32 view.
+    torch.sort(input_tensor.view(torch.int32),
+               out=(output_tensor.view(torch.int32), _scratch_idx[:n]))
     return output_tensor
