@@ -1,8 +1,8 @@
 """
 Pure PyTorch torch.sort on int32 bitcast with torch.cuda.CUDAGraph capture/replay.
 No load_inline, no cpp_extension, no ctypes, no CUDA streams -- leaderboard-safe.
-Strategy: pre-allocate indices_buf, use torch.sort with out=(output_int, indices_buf),
-capture into CUDAGraph on first untimed check call, replay all timed benchmark calls.
+Pre-allocate indices_buf, use out= for zero-copy, capture in CUDAGraph.
+Added torch.cuda.synchronize() before capture to flush pending ops.
 """
 import torch
 from task import input_t, output_t
@@ -43,13 +43,16 @@ def custom_kernel(data: input_t) -> output_t:
     indices_buf = torch.empty(n, dtype=torch.int64, device=in_contig.device)
 
     # Execute directly for the untimed check call
-    torch.sort(input_int, out=(output_int, indices_buf))
+    torch.sort(input_int, descending=False, out=(output_int, indices_buf))
+    torch.cuda.synchronize()
+
+    # Flush any pending CUDA ops before graph capture
     torch.cuda.synchronize()
 
     # Capture the sort into a CUDAGraph on these exact tensor pointers
     g = torch.cuda.CUDAGraph()
     with torch.cuda.graph(g):
-        torch.sort(input_int, out=(output_int, indices_buf))
+        torch.sort(input_int, descending=False, out=(output_int, indices_buf))
 
     _graph_cache[key] = (g, indices_buf)
     return output_tensor
