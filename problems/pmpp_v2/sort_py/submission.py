@@ -1,8 +1,6 @@
 """
 CUB DeviceRadixSort sorted via int32 bitcast with int32_t offset.
-Policy900 ITEMS_PER_THREAD = 20 - OFFSET_64BIT - FLOAT_KEYS.
-With int32_t offset, OFFSET_64BIT=0 => ITEMS_PER_THREAD=20 (up from 19).
-Tile items: 384*20=7680 vs default 384*19=7296 (5.3% larger tiles).
+extra_cuda_cflags with sm_100a target to attempt CUB dispatch change.
 """
 import torch
 from torch.utils.cpp_extension import load_inline
@@ -57,11 +55,12 @@ torch::Tensor sort_cuda(torch::Tensor input, torch::Tensor output);
 """
 
 sort_module = load_inline(
-    name='sort_cuda_int32_offset',
+    name='sort_cuda_int32_offset_sm100a',
     cpp_sources=sort_cpp_source,
     cuda_sources=sort_cuda_source,
     functions=['sort_cuda', 'init_persistent_temp'],
     extra_include_paths=['/usr/local/cuda-12.8/targets/x86_64-linux/include'],
+    extra_cuda_cflags=['-gencode=arch=compute_100a,code=sm_100a', '-DNDEBUG'],
     verbose=False,
 )
 
