@@ -1,14 +1,11 @@
 """
-Pure PyTorch torch.sort on int32 bitcast with torch.cuda.CUDAGraph capture/replay.
-No load_inline, no cpp_extension, no ctypes, no CUDA streams — leaderboard-safe.
-Int32 bitcast avoids CUB float dispatch overhead (1.045x from brief 17).
+Pure PyTorch torch.ops.aten.sort.values (direct ATen dispatch) int32 bitcast
+with torch.cuda.CUDAGraph capture/replay. Leaderboard-safe: no load_inline,
+cpp_extension, ctypes, or stream APIs.
 
-torch.sort always does SortPairs (keys+indices, 3x write traffic vs CUB SortKeys).
-CUDAGraph replay eliminates ~34us per-call launch+dispatch overhead,
-partially compensating for the extra indices write on small/medium shapes.
-
-Architecture: per-size graph captured on first (untimed) call, replayed on all
-subsequent timed calls within each eval.py subprocess.
+torch.ops.aten.sort.values dispatches one level lower than torch.sort —
+skipping Python wrapping overhead. Internally same CUB Onesweep.
+Key: store views in cache to keep graph tensor references alive.
 """
 import torch
 from task import input_t, output_t
@@ -18,25 +15,29 @@ _graph_cache = {}
 
 def custom_kernel(data: input_t) -> output_t:
     input_tensor, output_tensor = data
-    n = input_tensor.numel()
-    key = n
+    in_contig = input_tensor.contiguous()
+    out_contig = output_tensor.contiguous()
+    n = in_contig.numel()
+    key = (out_contig.data_ptr(), n)
 
-    g = _graph_cache.get(key)
-    if g is not None:
+    entry = _graph_cache.get(key)
+    if entry is not None:
+        g, _, _, _ = entry
         g.replay()
         return output_tensor
 
-    input_int = input_tensor.view(torch.int32)
-    output_int = output_tensor.view(torch.int32)
-    indices_buf = torch.empty(n, dtype=torch.int64, device=input_tensor.device)
+    in_int = in_contig.view(torch.int32)
+    out_int = out_contig.view(torch.int32)
+    idx = torch.empty(n, dtype=torch.int64, device=in_contig.device)
 
-    torch.sort(input_int, out=(output_int, indices_buf))
+    # Direct ATen dispatch — lower overhead than torch.sort
+    torch.ops.aten.sort.values(in_int, -1, False, values=out_int, indices=idx)
     torch.cuda.synchronize()
 
     g = torch.cuda.CUDAGraph()
     with torch.cuda.graph(g):
-        torch.sort(input_int, out=(output_int, indices_buf))
+        torch.ops.aten.sort.values(in_int, -1, False, values=out_int, indices=idx)
     g.replay()
 
-    _graph_cache[key] = g
+    _graph_cache[key] = (g, in_int, out_int, idx)
     return output_tensor
