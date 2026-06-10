@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "benchmarks": [
+    {
+      "name": "pmpp_v2/conv2d_py",
+      "unit": "us",
+      "direction": "min",
+      "precision": 3
+    }
+  ]
+}
