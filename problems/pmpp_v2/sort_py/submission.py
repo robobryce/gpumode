@@ -60,7 +60,7 @@ sort_module = load_inline(
     cpp_sources=sort_cpp_source,
     cuda_sources=sort_cuda_source,
     functions=['sort_cuda', 'init_persistent_temp'],
-    extra_cuda_cflags=['-arch=sm_100a'],
+    extra_cuda_cflags=['-arch=compute_100'],
     verbose=False,
 )
 sort_module.init_persistent_temp()
