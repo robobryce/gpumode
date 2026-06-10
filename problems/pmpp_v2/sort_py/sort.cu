@@ -1,4 +1,5 @@
 #include <torch/extension.h>
+#include <c10/cuda/CUDAStream.h>
 #include <cub/device/device_radix_sort.cuh>
 #include <cstdint>
 
@@ -28,16 +29,20 @@ torch::Tensor sort_cuda(torch::Tensor input, torch::Tensor output) {
     int32_t* key_out = reinterpret_cast<int32_t*>(output.data_ptr<float>());
 
     size_t temp_bytes = persistent_temp_bytes;
+
+    // Use PyTorch's current stream so CUDAGraph capture works.
+    auto stream = c10::cuda::getCurrentCUDAStream(input.device().index()).stream();
+
     cub::DeviceRadixSort::SortKeys(
         persistent_temp.data_ptr(), temp_bytes,
         key_in, key_out, num_items,
         0, 32,
-        0);
+        stream);
 
     return output;
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("sort_cuda", &sort_cuda, "CUB DeviceRadixSort::SortKeys with int32 bitcast, stream=0");
+    m.def("sort_cuda", &sort_cuda, "CUB DeviceRadixSort::SortKeys with int32 bitcast");
     m.def("init_persistent_temp", &init_persistent_temp, "Initialize persistent temp storage");
 }
