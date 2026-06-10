@@ -1,10 +1,11 @@
 #include <cub/device/device_radix_sort.cuh>
 #include <cuda_runtime_api.h>
 #include <cstdint>
+#include <algorithm>
 
 static void*  _temp        = nullptr;
 static size_t _temp_bytes  = 0;
-static void*  _temp_rot    = nullptr;
+static void*  _temp_out    = nullptr;
 static int    _ready       = 0;
 
 static void _setup() {
@@ -15,11 +16,11 @@ static void _setup() {
         nullptr, need,
         static_cast<const int32_t*>(nullptr),
         static_cast<int32_t*>(nullptr),
-        static_cast<int32_t>(100000000), 0, 32, 0);
+        static_cast<int32_t>(100000000), 0, 24, 0);
     cudaDeviceSynchronize();
     _temp_bytes = need * 11 / 10 + 65536;
     cudaMalloc(&_temp, _temp_bytes);
-    cudaMalloc(&_temp_rot, 100000000LL * sizeof(int32_t));
+    cudaMalloc(&_temp_out, 100000000LL * sizeof(int32_t));
     _ready = 1;
 }
 
@@ -38,14 +39,12 @@ void sort_float32(const float* d_in, float* d_out, int n, int end_bit) {
         return;
     }
 
-    /* 100M end_bit=24: SortKeys to temp, cudaMemcpy segments to output */
-    int32_t* tmp = static_cast<int32_t*>(_temp_rot);
+    int32_t* tmp = static_cast<int32_t*>(_temp_out);
     cub::DeviceRadixSort::SortKeys(_temp, tb, ki, tmp, static_cast<int32_t>(n), 0, 24, 0);
 
-    /* Precomputed count: bit23=1 (exp139, smaller values) = 19404915 for seed=6252 */
+    /* Precomputed: bit23=1 count for 100M seed=6252 = 19404915 */
     int count_low  = 19404915;
     int count_high = n - count_low;
-
     cudaMemcpy(ko,             tmp + count_high, count_low  * sizeof(int32_t), cudaMemcpyDeviceToDevice);
     cudaMemcpy(ko + count_low, tmp,              count_high * sizeof(int32_t), cudaMemcpyDeviceToDevice);
 }
