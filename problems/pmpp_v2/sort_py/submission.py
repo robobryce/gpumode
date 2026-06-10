@@ -1,4 +1,4 @@
-"""Sort helper with CUB SortKeys via ctypes CDLL (leaderboard-safe, no CUDAContext.h, stream=0)."""
+"""Sort helper with CUB SortKeys via ctypes CDLL (no CUDAContext.h)."""
 import torch,ctypes,os,subprocess as sp,hashlib as hl,base64 as b64,fcntl as fc
 from task import input_t,output_t
 
