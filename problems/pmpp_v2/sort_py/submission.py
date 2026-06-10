@@ -12,6 +12,7 @@ sort_cuda_source = """
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <cub/device/device_radix_sort.cuh>
+#include <cub/device/dispatch/dispatch_radix_sort.cuh>
 #include <cstdint>
 
 static torch::Tensor persistent_temp = {};
@@ -22,8 +23,8 @@ void init_persistent_temp() {
     int64_t max_n = 100'000'000;
     cub::DeviceRadixSort::SortKeys(
         nullptr, persistent_temp_bytes,
-        static_cast<const int32_t*>(nullptr),
-        static_cast<int32_t*>(nullptr),
+        static_cast<const uint32_t*>(nullptr),
+        static_cast<uint32_t*>(nullptr),
         static_cast<int64_t>(max_n),
         0, 32);
     persistent_temp_bytes = (persistent_temp_bytes * 11 + 9) / 10;
@@ -36,8 +37,8 @@ torch::Tensor sort_cuda(torch::Tensor input, torch::Tensor output) {
     auto num_items = static_cast<int64_t>(input.numel());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
-    const int32_t* key_in = reinterpret_cast<const int32_t*>(input.const_data_ptr<float>());
-    int32_t* key_out = reinterpret_cast<int32_t*>(output.data_ptr<float>());
+    const uint32_t* key_in = reinterpret_cast<const uint32_t*>(input.const_data_ptr<float>());
+    uint32_t* key_out = reinterpret_cast<uint32_t*>(output.data_ptr<float>());
 
     size_t temp_bytes = persistent_temp_bytes;
     cub::DeviceRadixSort::SortKeys(
