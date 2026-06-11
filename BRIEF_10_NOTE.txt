@@ -1,0 +1,6 @@
+Branch archived from autocuda run tag 2026-06-09-06-58-37 (worker-1-brief-10).
+
+Original commits (scrubbed due to profiler artifacts containing env secrets):
+- Partial CUDA graph capture for torch.sort + load_inline SortKeys
+- Geomean ~212us
+- Parent: 9b2eac6 (cpp_extension.load + stream=0)
