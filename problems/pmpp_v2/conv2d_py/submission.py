@@ -125,18 +125,24 @@ def _next_good_fft(n: int) -> int:
 # (so it WANTS small L / large tiles), and (c) the cuFFT transform is cheapest at
 # 2-smooth L. The optimum lands at the L that minimizes (FFT@L)x(GEMM-fill@M)x
 # (spectrum@Fb):
-#   (128,8): T32->L40   (128,16): T40->L56   (256,16): T64->L80   (256,32): T33->L64
-# NB (256,32): a recheck-timed good-L sweep (T in 9..64) found T33->L64 (M=49,
-# Fb=2112, 1632us) and T29->L60 (M=64, Fb=1860, 1646us) both BEAT the old
-# T32->L63 (M=64, Fb=2016, 1762us) by ~6%: L64=2^6 is pure radix-2 (the fastest
-# cuFFT size), and its smaller Fb makes the spectrum build cheaper, which more
-# than pays for M=49<64 worse GEMM fill. Larger T (40/48/56/64 -> L72/80/90/96)
-# is monotonically WORSE here: Fb grows faster than the per-tile count drops, so
-# the spectrum build dominates. T pinned to good-L only (off-radix L 3x slower).
+#   (128,8): T32->L40   (128,16): T40->L56   (256,16): T49->L64   (256,32): T33->L64
+# KEY FINDING: a pure-radix-2 L=64 (=2^6, cuFFT's fastest size) is the sweet spot
+# for BOTH the deep ch=128 shapes, beating the off-radix L the FLOP-only heuristic
+# picked. Recheck-timed good-L sweeps:
+#  (256,32): T in 9..64 -> T33->L64 (M=49, Fb=2112, 1632us) and T29->L60 (M=64,
+#    Fb=1860, 1646us) both BEAT old T32->L63 (M=64, Fb=2016, 1762us) by ~6-7%.
+#  (256,16): T in 33..64 -> T49->L64 (M=50, Fb=2112) gives 1490us, BEATING old
+#    T64->L80 (M=32, Fb=3280) 1760us by ~15% (this win lands on BOTH 256/16 seeds).
+# Why L64 wins: it halves the cuFFT cost vs off-radix L AND its Fb=L*Lf is smaller
+# than the larger-T off-radix L, so the dominant recheck-rebuilt weight-spectrum
+# build [Fb,ci,co] (which GROWS with Fb, not with tile count) gets cheaper -- which
+# more than pays for a smaller M (worse GEMM fill). Larger T is monotonically WORSE
+# on (256,32): Fb grows faster than the per-tile count drops. T pinned to good-L
+# only (off-radix L is ~3x slower in cuFFT).
 _TILE_TABLE = {
     (128, 8): 32,
     (128, 16): 40,
-    (256, 16): 64,
+    (256, 16): 49,
     (256, 32): 33,
 }
 
