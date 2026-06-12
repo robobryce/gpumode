@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "benchmarks": [
+    {
+      "name": "pmpp_v2/sort_py",
+      "unit": "us",
+      "direction": "min",
+      "precision": 3
+    },
+    {
+      "name": "pmpp_v2/histogram_py",
+      "unit": "us",
+      "direction": "min",
+      "precision": 3
+    },
+    {
+      "name": "pmpp_v2/conv2d_py",
+      "unit": "us",
+      "direction": "min",
+      "precision": 3
+    }
+  ]
+}
