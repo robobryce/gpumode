@@ -120,13 +120,18 @@ def _next_good_fft(n: int) -> int:
 # Per-shape valid-output tile size T (FFT tile L = next_good(T + k - 1)). The
 # optimum trades transform cost against the per-bin GEMM and weight-spectrum size;
 # it lands where L is a small {2,3,5,7}-smooth number. Measured per-(size,k)
-# optima from a tile sweep on the B200 benchmark shapes:
-#   (128,8): T32->L40   (128,16): T40->L56   (256,16): T64->L80   (256,32): T48->L80
+# optima from a recheck-timed tile sweep on the B200 benchmark shapes (the
+# channel-mix cgemm dominates, so smaller-T/larger-M tiles that fill the GEMM win
+# until the FFT/copy overhead from more tiles takes over):
+#   (128,8): T32->L40   (128,16): T40->L56   (256,16): T64->L80   (256,32): T32->L63
+# NB (256,32): T32->L63 (M=64) beat T48->L80 (M=25) by ~5% -- the larger M better
+# utilizes the tiny-M batched complex GEMM. L=63=7*9 is {3,7}-smooth (cuFFT-fast);
+# nearby L (60,70,75) are 3x SLOWER despite smaller, so T is pinned to good-L only.
 _TILE_TABLE = {
     (128, 8): 32,
     (128, 16): 40,
     (256, 16): 64,
-    (256, 32): 48,
+    (256, 32): 32,
 }
 
 
@@ -246,9 +251,14 @@ def _fft_conv_ols(input_tensor: torch.Tensor, kernel: torch.Tensor) -> torch.Ten
     blocks = x.unfold(2, L, T).unfold(3, L, T).reshape(batch, ci, nt * nt, L, L)
     In = torch.fft.rfft2(blocks, s=(L, L))                 # [b, ci, nt*nt, L, Lf]
 
-    Ig = In.permute(3, 4, 0, 2, 1).reshape(Fb, M, ci).contiguous()   # [Fb, M, ci]
-    Og = torch.bmm(Ig, Wg)                                 # [Fb, M, ci]@[Fb, ci, co]
-    Og = Og.reshape(L, Lf, batch, nt * nt, co).permute(2, 4, 3, 0, 1).contiguous()
+    # Channel mix in the FFT's NATURAL layout via einsum -- no transpose. The old
+    # bmm needed In permuted to [Fb,M,ci] (a 264MB transpose) and the result
+    # permuted back to [b,co,nt^2,L,Lf] for irfft2 (another transpose); the two
+    # transposes were ~30% of shape-4 (nsys). einsum contracts ci directly between
+    # In[b,ci,t,u,v] and the [L,Lf,ci,co] spectrum, emitting [b,co,t,u,v] ready for
+    # irfft2 -- both transposes fused into the contraction.
+    Wg5 = Wg.reshape(L, Lf, ci, co)                        # [L,Lf,ci,co] (view)
+    Og = torch.einsum('bituv,uvio->botuv', In, Wg5)        # [b,co,nt^2,L,Lf]
     full = torch.fft.irfft2(Og, s=(L, L)).contiguous()     # [b, co, nt*nt, L, L]
 
     reasm = _get_reasm()
