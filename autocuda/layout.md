@@ -101,7 +101,7 @@ autocuda schema define optimize --data-dir "$DATA_DIR" \
 
 Every iteration row carries `--metric <set>/<problem>=<value>` (geomean µs). The only allowed `N/A` is a failure-status row.
 
-## Leaderboard submission (manager)
+## Leaderboard submission & standings (manager)
 
 Leaderboard submissions are **mandatory evidence**, not optional reporting. A run without a baseline leaderboard submission is **invalid from the start**. A run that finds improvements but does not submit them regularly is also **invalid**: local geomean timings alone cannot tell whether a kernel is accepted by GPU MODE, whether it is considered cheating/reward-hacking by the remote harness, or what its real leaderboard performance is.
 
@@ -112,7 +112,11 @@ Automatic submission is authorized for this workspace. Do not ask the operator b
 - **Before final selection:** the chosen final candidate must have a successful leaderboard submission. If the fastest local candidate was never submitted, or was rejected remotely, it is not the final candidate.
 - **Submission metadata:** resolve `<name>` with `bin/gen_specs.py problems/<set>/<problem>/task.yml --leaderboard` and `<gpu>` with `bin/gen_specs.py problems/<set>/<problem>/task.yml --gpus` (choose the token matching the host GPU). The leaderboard name is **not** the autocuda metric token.
 - **Submission records:** record the submission attempt, command, commit SHA, local metric, and returned leaderboard score/rank in the manager log or a run note. If `popcorn-cli` authentication or service availability prevents submission, log that failure explicitly and treat the run as blocked/invalid for leaderboard comparison until it is fixed.
-- **Public posting:** these submissions post to the **public** leaderboard by design; do not gate them on operator confirmation.
+- **Check the standings — know your gap to #1:** `popcorn-cli` returns your own accepted score but **not a rank or a position** — so after every submission, read the public standings to get the rank the bullet above asks for and, more importantly, **how far you are from the #1 slot**. The leaderboard ranks by the same geomean-of-shapes the local benchmark uses, so this is directly comparable to your metric. Use the `leaderboard-rankings` skill (stdlib-only, no auth, no submission), keyed by the same leaderboard `<name>`:
+  - `.claude/skills/leaderboard-rankings/scripts/rankings.py --gpu <gpu> --user <you>` prints, per active problem on the GPU, the **#1 holder, their µs, your rank, and an explicit `gap→#1` percentage** — the rank/gap to record. `<you>` is the leaderboard `user_name` `popcorn-cli` submits as (set `$GPUMODE_USER`/`$GPUMODE_GPU` once and omit the flags).
+  - `.claude/skills/leaderboard-rankings/scripts/rankings.py --problem <name> --gpu <gpu> --user <you> --top 10` prints that one problem's full table — every top entry's µs **and `file_name`**, your row marked — so you can see how far above you #1 sits and what approach they took.
+  Let the gap **steer strategy:** a gap within run noise means you're at the frontier and the game is micro-optimization; a gap of multiples means #1 is reaching that score with a fundamentally different approach your current line cannot match — point some workers' next briefs at algorithmic departures (the leader's `file_name` often hints at the angle) instead of grinding the same kernel.
+- **Public posting:** these submissions post to the **public** leaderboard by design; do not gate them on operator confirmation. Reading standings needs no auth and no submission.
 
 Baseline submission checklist (run from the repo root, with the baseline commit checked out):
 
