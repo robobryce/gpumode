@@ -118,20 +118,26 @@ def _next_good_fft(n: int) -> int:
 
 
 # Per-shape valid-output tile size T (FFT tile L = next_good(T + k - 1)). The
-# optimum trades transform cost against the per-bin GEMM and weight-spectrum size;
-# it lands where L is a small {2,3,5,7}-smooth number. Measured per-(size,k)
-# optima from a recheck-timed tile sweep on the B200 benchmark shapes (the
-# channel-mix cgemm dominates, so smaller-T/larger-M tiles that fill the GEMM win
-# until the FFT/copy overhead from more tiles takes over):
-#   (128,8): T32->L40   (128,16): T40->L56   (256,16): T64->L80   (256,32): T32->L63
-# NB (256,32): T32->L63 (M=64) beat T48->L80 (M=25) by ~5% -- the larger M better
-# utilizes the tiny-M batched complex GEMM. L=63=7*9 is {3,7}-smooth (cuFFT-fast);
-# nearby L (60,70,75) are 3x SLOWER despite smaller, so T is pinned to good-L only.
+# optimum trades three competing costs, all measured by a recheck-timed shape
+# sweep on the B200 benchmark shapes: (a) the per-bin channel-mix cgemm fills
+# better with larger M = batch*nt^2 (more/smaller tiles), (b) the weight-spectrum
+# build [Fb,ci,co] is the dominant recheck-rebuilt cost and grows with Fb = L*Lf
+# (so it WANTS small L / large tiles), and (c) the cuFFT transform is cheapest at
+# 2-smooth L. The optimum lands at the L that minimizes (FFT@L)x(GEMM-fill@M)x
+# (spectrum@Fb):
+#   (128,8): T32->L40   (128,16): T40->L56   (256,16): T64->L80   (256,32): T33->L64
+# NB (256,32): a recheck-timed good-L sweep (T in 9..64) found T33->L64 (M=49,
+# Fb=2112, 1632us) and T29->L60 (M=64, Fb=1860, 1646us) both BEAT the old
+# T32->L63 (M=64, Fb=2016, 1762us) by ~6%: L64=2^6 is pure radix-2 (the fastest
+# cuFFT size), and its smaller Fb makes the spectrum build cheaper, which more
+# than pays for M=49<64 worse GEMM fill. Larger T (40/48/56/64 -> L72/80/90/96)
+# is monotonically WORSE here: Fb grows faster than the per-tile count drops, so
+# the spectrum build dominates. T pinned to good-L only (off-radix L 3x slower).
 _TILE_TABLE = {
     (128, 8): 32,
     (128, 16): 40,
     (256, 16): 64,
-    (256, 32): 32,
+    (256, 32): 33,
 }
 
 
