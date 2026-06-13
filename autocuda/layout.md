@@ -4,12 +4,12 @@
 
 This is a fork of [gpu-mode/reference-kernels](https://github.com/gpu-mode/reference-kernels) wired for optimizing [GPU MODE](https://www.gpumode.com/) leaderboard kernels with autocuda. The official problems already live under `problems/<set>/<problem>/` — each a single editable `submission.py` (`custom_kernel(data) -> output`) beside its frozen `reference.py` / `task.yml`, with the shared `eval.py` / `utils.py` at the set root. autocuda's `optimize-tree` (or `optimize-simple` / `optimize-hill`) edits `submission.py` **in place** — nothing is copied or scaffolded — then **builds → validates → benchmarks** it. The benchmark metric is the harness's per-shape timing reduced to the geomean the leaderboard ranks by, so every iteration is measured exactly the way the leaderboard measures it and a wrong kernel can never be scored.
 
-Pick the target problem by passing its `<set>/<problem>` path (e.g. `pmpp_v2/histogram_py`) — this is the single token that selects the target. It is both the `benchmark=` argument you scope the run with **and** the first positional argument to every `harness/` script (which use it to locate the editable file and put the right dirs on `PYTHONPATH`). There is no environment variable to export: the `harness/` scripts take the path as an argument, so it travels with each command instead of relying on shell state that an agent harness does not preserve between separate command invocations. There is **one** autocuda data dir for the whole repo (`autocuda/` at the root) holding the run's logs, schema, worktrees, and dashboard. The machine-agnostic project description is this `layout.md` (committed); the per-machine half — GPU, toolchain paths, measured timings/noise, profiler invocations — is `autocuda/environment.md`, which `/autocuda:discover` writes per host (run it once on a fresh machine; with this `layout.md` present it only sets up and records the environment).
+Pick the target problem by passing its `<set>/<problem>` path — this is the single token that selects the target. It is both the `benchmark=` argument you scope the run with **and** the first positional argument to every `harness/` script (which use it to locate the editable file and put the right dirs on `PYTHONPATH`). There is no environment variable to export: the `harness/` scripts take the path as an argument, so it travels with each command instead of relying on shell state that an agent harness does not preserve between separate command invocations. There is **one** autocuda data dir for the whole repo (`autocuda/` at the root) holding the run's logs, schema, worktrees, and dashboard. The machine-agnostic project description is this `layout.md` (committed); the per-machine half — GPU, toolchain paths, measured timings/noise, profiler invocations — is `autocuda/environment.md`, which `/autocuda:discover` writes per host (run it once on a fresh machine; with this `layout.md` present it only sets up and records the environment).
 
 Optimize a problem — pass its `<set>/<problem>` path as `benchmark=` (the one token that selects the target; nothing to export, nothing to `cd` into):
 
 ```bash
-/autocuda:optimize-tree workers=4 benchmark=pmpp_v2/histogram_py tag-suffix=histogram_py
+/autocuda:optimize-tree workers=4 benchmark=<set>/<problem> tag-suffix=<problem>
 ```
 
 ### ⚠️ MANDATORY: ALL COMMANDS MUST USE `autocuda run` WRAPPERS
@@ -68,7 +68,7 @@ autocuda run exclusive --data-dir "$DATA_DIR" -- \
 - **Command:** `autocuda run exclusive --data-dir "$DATA_DIR" -- bash harness/benchmark.sh <set>/<problem>`.
 - **Metric:** the **geometric mean of the per-shape mean runtimes**, in microseconds.
 - **Unit:** µs. **Direction:** **min** (lower is better — it's latency). **Precision:** 3.
-- **Metric name:** the `<set>/<problem>` token (e.g. `pmpp_v2/histogram_py`) — the same string you pass as `benchmark=` and to the script, so the emitted key matches the autocuda schema column with no lookup. (The GPU MODE *leaderboard* name from the set yaml, e.g. `histogram_v2`, is a separate identifier used only for `popcorn-cli submit --leaderboard`; `bin/gen_specs.py … --leaderboard` resolves it on demand.)
+- **Metric name:** the `<set>/<problem>` token — the same string you pass as `benchmark=` and to the script, so the emitted key matches the autocuda schema column with no lookup. (The GPU MODE *leaderboard* name from the set yaml is a separate identifier — distinct from the `<set>/<problem>` token — used only for `popcorn-cli submit --leaderboard`; `bin/gen_specs.py … --leaderboard` resolves it on demand.)
 - **Metric extraction:** the script prints, on **stdout**, a single fenced block as the LAST thing it emits:
   ```
   ===GPUMODE_RESULT_BEGIN===
@@ -121,7 +121,7 @@ Automatic submission is authorized for this workspace. Do not ask the operator b
 Baseline submission checklist (run from the repo root, with the baseline commit checked out):
 
 ```bash
-TASK=pmpp_v2/conv2d_py
+TASK=<set>/<problem>
 BASELINE=$(git rev-parse HEAD)
 bash harness/submit.sh "$TASK"
 echo "baseline leaderboard submission recorded for $BASELINE"
