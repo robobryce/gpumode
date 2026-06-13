@@ -32,7 +32,9 @@ done
 # `${1:?...}` prints this usage and exits if it is missing (works under `set -u`).
 PROBLEM="${1:?usage: <script>.sh <set>/<problem> (e.g. pmpp_v2/histogram_py)}"
 PROBLEM_DIR="$REPO_DIR/problems/$PROBLEM"
-SET_DIR="$(dirname "$PROBLEM_DIR")"   # holds eval.py / utils.py
+SET_DIR="$(dirname "$PROBLEM_DIR")"   # the set root (problems/<set>); the
+                                      # default — but NOT universal — home of
+                                      # eval.py / utils.py (see EVAL_PY below).
 [ -f "$PROBLEM_DIR/submission.py" ] || {
     echo "no submission.py at $PROBLEM_DIR — is '$PROBLEM' the right <set>/<problem>?" >&2; exit 1; }
 
@@ -45,13 +47,27 @@ export CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"
 export PATH="$CUDA_HOME/bin:$PATH"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 
+# Locate eval.py / utils.py from the problem's task.yml `files:` manifest —
+# the same flattening KernelBot does — instead of assuming the set root. Most
+# problems share `../eval.py` (so EVAL_PY == SET_DIR/eval.py), but several ship
+# a problem-local eval.py (linalg/qr_py, amd/mla-decode, bioml/trimul, …) and
+# qr_py even borrows utils.py from another set (../../pmpp_v2/utils.py). The
+# resolver returns an absolute path and falls back to the set-root sibling, so
+# this is strictly more general than the old hardcode. Callers run "$EVAL_PY".
+EVAL_PY="$("$PYTHON" "$REPO_DIR/bin/gen_specs.py" "$PROBLEM_DIR/task.yml" --file-source eval.py)"
+UTILS_PY="$("$PYTHON" "$REPO_DIR/bin/gen_specs.py" "$PROBLEM_DIR/task.yml" --file-source utils.py)"
+[ -f "$EVAL_PY" ] || { echo "eval.py not found for '$PROBLEM' (resolved: $EVAL_PY)" >&2; exit 1; }
+EVAL_DIR="$(dirname "$EVAL_PY")"
+UTILS_DIR="$(dirname "$UTILS_PY")"
+
 # eval.py uses bare imports (`from utils import …`, `from reference import …`,
 # `from submission import …`). reference.py + submission.py live in the problem
-# dir; eval.py + utils.py at the set root. Put the problem dir FIRST so its
-# submission.py/reference.py win, then the set dir for eval.py/utils.py. The
-# `spawn` Pool eval.py uses re-imports, so PYTHONPATH (inherited by children)
-# is what makes the in-place layout resolve.
-export PYTHONPATH="$PROBLEM_DIR:$SET_DIR${PYTHONPATH:+:$PYTHONPATH}"
+# dir; eval.py / utils.py live wherever the manifest points (resolved above).
+# Put the problem dir FIRST so its submission.py/reference.py win, then the
+# dirs holding eval.py and utils.py. The `spawn` Pool eval.py uses re-imports,
+# so PYTHONPATH (inherited by children) is what makes the in-place layout
+# resolve. Duplicate path entries are harmless when the dirs coincide.
+export PYTHONPATH="$PROBLEM_DIR:$EVAL_DIR:$UTILS_DIR${PYTHONPATH:+:$PYTHONPATH}"
 
 # Build cache for torch load_inline, keyed by source-content hash. Per-worktree
 # (under the problem dir) so concurrent optimize-tree workers never share or

@@ -36,7 +36,9 @@ printf '%s' "$SPECS" > "$SPECFILE"
 
 cd "$PROBLEM_DIR" || exit 1
 OUT="$(mktemp)"
-POPCORN_FD=3 "$PYTHON" "$SET_DIR/eval.py" benchmark "$SPECFILE" 3>"$OUT"
+# $EVAL_PY is the manifest-resolved eval.py (set-root or problem-local); env.sh
+# put its dir on PYTHONPATH so eval.py's bare imports resolve under the Pool.
+POPCORN_FD=3 "$PYTHON" "$EVAL_PY" benchmark "$SPECFILE" 3>"$OUT"
 rc=$?
 { echo "----- eval.py benchmark output -----"; cat "$OUT"; echo "------------------------------------"; } >&2
 [ $rc -eq 0 ] || { echo "benchmark: FAILED (eval.py exited $rc)" >&2; exit $rc; }

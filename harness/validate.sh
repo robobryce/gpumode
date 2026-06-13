@@ -19,9 +19,10 @@ printf '%s' "$SPECS" > "$SPECFILE"
 
 cd "$PROBLEM_DIR" || exit 1
 OUT="$(mktemp)"
-# POPCORN_FD=3 -> eval.py writes results to fd 3; capture it. eval.py is found
-# on PYTHONPATH (set dir); run it as a module so its dir isn't forced onto cwd.
-POPCORN_FD=3 "$PYTHON" "$SET_DIR/eval.py" test "$SPECFILE" 3>"$OUT"
+# POPCORN_FD=3 -> eval.py writes results to fd 3; capture it. $EVAL_PY is the
+# manifest-resolved eval.py (set-root or problem-local); env.sh put its dir on
+# PYTHONPATH so its sibling imports (utils/reference) resolve under the Pool.
+POPCORN_FD=3 "$PYTHON" "$EVAL_PY" test "$SPECFILE" 3>"$OUT"
 rc=$?
 echo "----- eval.py test output -----"; cat "$OUT"; echo "-------------------------------"
 if [ $rc -ne 0 ]; then echo "validation: FAILED (eval.py exited $rc)"; exit $rc; fi

@@ -49,7 +49,7 @@ run_ncu() {
     # we discard; ncu's textual report stays on stdout/stderr.
     "$@" "$NCU" --set full --launch-skip 5 --launch-count 1 \
         bash -c 'exec 3>/dev/null; export POPCORN_FD=3; exec "$@"' profile_ncu \
-        "$PYTHON" "$SET_DIR/eval.py" benchmark "$SPECFILE" 3>/dev/null
+        "$PYTHON" "$EVAL_PY" benchmark "$SPECFILE" 3>/dev/null
 }
 
 if [ "$(id -u)" -eq 0 ]; then
