@@ -12,6 +12,17 @@ Usage:
     gen_specs.py <task.yml> --leaderboard         # leaderboard/metric name
     gen_specs.py <task.yml> --gpus                # supported GPU tokens, CSV
     gen_specs.py <task.yml> --meta                # TEST_TIMEOUT=… etc. (KEY=VALUE)
+    gen_specs.py <task.yml> --file-source eval.py # resolved abs path of a manifest file
+
+`--file-source <name>` resolves where a file named in the problem's `files:`
+manifest actually lives. KernelBot flattens that manifest into one run dir, so
+its `source` paths (relative to the problem dir) are the authoritative locator
+for `eval.py` / `utils.py` — which is NOT always the set root: most problems
+share `../eval.py`, but several (qr_py, mla-decode, trimul, …) ship a
+problem-local `eval.py`, and qr_py borrows `utils.py` from another set
+(`../../pmpp_v2/utils.py`). harness/env.sh calls this so the same unwrapped
+build/validate/benchmark/profile scripts work for every layout. Falls back to
+the set-root sibling, then the problem-local file, when the manifest is silent.
 
 The leaderboard name and supported GPUs come from the set-level yaml
 (e.g. problems/pmpp_v2.yaml) that maps each problem `directory:` to its
@@ -68,6 +79,33 @@ def _resolve_meta(task_path):
     return hit if hit else (base, [])
 
 
+def _resolve_file_source(task_path, name):
+    """Resolve where a manifest file (e.g. eval.py / utils.py) lives.
+
+    The problem's task.yml `files:` list is what KernelBot flattens into one
+    run dir, so its `source` (relative to the problem dir) is the canonical
+    location. This is layout-agnostic: a set-root `../eval.py`, a problem-local
+    `eval.py`, and a cross-set `../../pmpp_v2/utils.py` all resolve correctly,
+    and a relative source resolves inside whatever (work)tree task.yml lives in.
+    Fall back to the set-root sibling, then the problem-local file, so a
+    manifest that omits the entry still works."""
+    problem_dir = os.path.dirname(os.path.abspath(task_path))
+    spec = yaml.safe_load(open(task_path)) or {}
+    for entry in (spec.get("files") or []):
+        if isinstance(entry, dict) and entry.get("name") == name:
+            source = entry.get("source") or ""
+            # @SUBMISSION@ and other sentinels aren't filesystem paths.
+            if source and not source.startswith("@"):
+                return os.path.normpath(os.path.join(problem_dir, source))
+    for cand in (os.path.join(os.path.dirname(problem_dir), name),  # set root
+                 os.path.join(problem_dir, name)):                  # problem-local
+        if os.path.exists(cand):
+            return os.path.normpath(cand)
+    # Last resort: the set-root path (the historical assumption), even if absent,
+    # so the caller surfaces a clear "no such file" against the expected location.
+    return os.path.normpath(os.path.join(os.path.dirname(problem_dir), name))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("task_yml")
@@ -76,12 +114,18 @@ def main():
     g.add_argument("--leaderboard", action="store_true")
     g.add_argument("--gpus", action="store_true")
     g.add_argument("--meta", action="store_true")
+    g.add_argument("--file-source", metavar="NAME",
+                   help="print the resolved abs path of a manifest file (e.g. eval.py)")
     args = ap.parse_args()
 
     spec = yaml.safe_load(open(args.task_yml)) or {}
 
     if args.emit:
         sys.stdout.write(_emit(spec.get(args.emit, []) or []))
+        return
+
+    if args.file_source:
+        print(_resolve_file_source(args.task_yml, args.file_source))
         return
 
     if args.leaderboard:
