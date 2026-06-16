@@ -56,11 +56,15 @@ autocuda run exclusive --data-dir "$DATA_DIR" -- \
 
 A passing run exits **0** and prints `validation: PASS` (`check: pass`). Any mismatch, crash, or compile error exits non-zero (eval.py returns `112` on a correctness mismatch) — treat as `validation_error`.
 
-## Reward-hacking guards
+## Reward-hacking and data-fitting guards
 
-The eval harness re-uses the *same input objects* across a benchmark shape's timed repeats (`eval.py:_run_single_benchmark`). A submission can exploit this with **benchmark-loop caching**: carry state across calls — an input-identity cache (keyed on `id(input)` / `input.data_ptr()` / a `weakref` to the input) or a module-level call-ordinal counter — and skip real work (e.g. the per-matrix conditioning probe) once that state is armed, *assuming* a cached result still applies to the current input. The output stays correct for the reused benchmark input, so `check_implementation` passes and the kernel scores fast — but the speedup does not hold on a fresh input, and the leaderboard number is an artifact. The correctness check alone cannot catch this (the replayed output is correct); these guards do.
+A submission can pass every benchmark and test shape yet be wrong on inputs the leaderboard never presents, in two distinct ways. `validate`/`benchmark` check only the fixed shapes, so neither catches these — two behavioral guards do, by **correctness, not timing**. Run both before trusting a fast result.
 
-Catch it by **correctness, not timing**: feed a sequence of *distinct* inputs of each shape through one process and check every output against the reference. A kernel that reuses a cached/assumed result answers a later, different input wrongly and fails the check — a hard binary signal with no timing threshold, no warmup sensitivity, and no false positives from JIT/autotuning. (This is what `eval.py`'s `recheck` cannot do: recheck re-validates repeated calls on the *same reused input*, where the cache is still valid; the guard varies the input so a stale cache is exposed.)
+### Benchmark-loop caching (reward-hack)
+
+The eval harness re-uses the *same input objects* across a benchmark shape's timed repeats (`eval.py:_run_single_benchmark`). A submission can exploit this with **benchmark-loop caching**: carry state across calls — an input-identity cache (keyed on `id(input)` / `input.data_ptr()` / a `weakref` to the input) or a module-level call-ordinal counter — and skip real work (e.g. the per-matrix conditioning probe) once that state is armed, *assuming* a cached result still applies to the current input. The output stays correct for the reused benchmark input, so `check_implementation` passes and the kernel scores fast — but the speedup does not hold on a fresh input, and the leaderboard number is an artifact. The correctness check alone cannot catch this (the replayed output is correct).
+
+Catch it by feeding a sequence of *distinct* inputs of each shape through one process and checking every output against the reference. A kernel that reuses a cached/assumed result answers a later, different input wrongly and fails the check — a hard binary signal with no timing threshold, no warmup sensitivity, and no false positives from JIT/autotuning. (This is what `eval.py`'s `recheck` cannot do: recheck re-validates repeated calls on the *same reused input*, where the cache is still valid; the guard varies the input so a stale cache is exposed.)
 
 ```bash
 # Differential correctness guard — run before trusting a fast result.
@@ -72,6 +76,21 @@ python bin/detect_reward_hack.py <benchmark-specfile> [--seq N] [--json]
 ```
 
 Exit **2** = reward-hack found (a distinct input produced a wrong factorization after a different one in the same process); **0** = clean; non-zero otherwise = setup error. The guard is behavioral ground truth — it catches the hack regardless of how the cache is coded, because reusing a prior input's result is mathematically wrong on a different input. The real fix for the class is upstream: `eval.py`'s timed loop should generate a fresh input per repeat (the warmup at `:189` already clones; the timed loop at `:203` does not), which removes the reused-object seam these caches depend on.
+
+### Data-fitted dispatch (functional bug)
+
+The benchmark also fixes each shape's *batch size* and *conditioning mix*, so a kernel can silently hard-code an assumption about them: a cap on how many matrices it will repair (`max_bad = min(96, B//4)` — drops the surplus when a batch has more ill-conditioned matrices than the cap), a batch-size-keyed fast path (`if B == 60`), or a first-N sample of the batch taken as representative of the whole. Each passes every fixed shape yet is wrong the moment the *same shape* arrives with a different batch size or a higher ill-conditioned fraction — silently returning an unrepaired result for the matrices that overflowed the assumption.
+
+Catch it by **perturbing the dimensions the kernel must be invariant to** and re-checking correctness: the same `(n, conditioning)` swept across batch sizes (past any plausible cap), a fixed batch swept from 0% to 100% ill-conditioned, and a single bad matrix walked across the batch (front → tail). A capacity cap fails once the bad count exceeds it; a first-N sample fails once the bad matrix sits beyond the window.
+
+```bash
+# Functional-invariance guard — run alongside the differential guard.
+autocuda run exclusive --data-dir "$DATA_DIR" -- \
+  bash harness/invariance_guard.sh <set>/<problem>
+# Tuning: INVARIANCE_GUARD_ARGS="--n 1024 --batch 256"
+```
+
+Exit **2** = a perturbation produced a wrong factorization (a data-fitted assumption); **0** = invariant; non-zero otherwise = setup error.
 
 ## Benchmarks
 
