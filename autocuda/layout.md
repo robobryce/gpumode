@@ -56,6 +56,23 @@ autocuda run exclusive --data-dir "$DATA_DIR" -- \
 
 A passing run exits **0** and prints `validation: PASS` (`check: pass`). Any mismatch, crash, or compile error exits non-zero (eval.py returns `112` on a correctness mismatch) — treat as `validation_error`.
 
+## Reward-hacking guards
+
+The eval harness re-uses the *same input objects* across a benchmark shape's timed repeats (`eval.py:_run_single_benchmark`). A submission can exploit this with **benchmark-loop caching**: carry state across calls — an input-identity cache (keyed on `id(input)` / `input.data_ptr()` / a `weakref` to the input) or a module-level call-ordinal counter — and skip real work (e.g. the per-matrix conditioning probe) once that state is armed, *assuming* a cached result still applies to the current input. The output stays correct for the reused benchmark input, so `check_implementation` passes and the kernel scores fast — but the speedup does not hold on a fresh input, and the leaderboard number is an artifact. The correctness check alone cannot catch this (the replayed output is correct); these guards do.
+
+Catch it by **correctness, not timing**: feed a sequence of *distinct* inputs of each shape through one process and check every output against the reference. A kernel that reuses a cached/assumed result answers a later, different input wrongly and fails the check — a hard binary signal with no timing threshold, no warmup sensitivity, and no false positives from JIT/autotuning. (This is what `eval.py`'s `recheck` cannot do: recheck re-validates repeated calls on the *same reused input*, where the cache is still valid; the guard varies the input so a stale cache is exposed.)
+
+```bash
+# Differential correctness guard — run before trusting a fast result.
+autocuda run exclusive --data-dir "$DATA_DIR" -- \
+  bash harness/diff_correctness_guard.sh <set>/<problem>
+
+# Or via the JSON-emitting front-end, for the report-reward-hacking skill / CI:
+python bin/detect_reward_hack.py <benchmark-specfile> [--seq N] [--json]
+```
+
+Exit **2** = reward-hack found (a distinct input produced a wrong factorization after a different one in the same process); **0** = clean; non-zero otherwise = setup error. The guard is behavioral ground truth — it catches the hack regardless of how the cache is coded, because reusing a prior input's result is mathematically wrong on a different input. The real fix for the class is upstream: `eval.py`'s timed loop should generate a fresh input per repeat (the warmup at `:189` already clones; the timed loop at `:203` does not), which removes the reused-object seam these caches depend on.
+
 ## Benchmarks
 
 The active benchmark is the problem named by the `<set>/<problem>` token; the autocuda metric name **is** that token. `harness/benchmark.sh` runs the problem's benchmark shapes from `task.yml`. Scope an `optimize-tree` run to it with `benchmark=<set>/<problem>` — the same token you pass to the script.
