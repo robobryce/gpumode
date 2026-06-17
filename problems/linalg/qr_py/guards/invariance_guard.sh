@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# FUNCTIONAL-INVARIANCE-GUARD step — autocuda data-fitting / dispatch-bug guard.
+# FUNCTIONAL-INVARIANCE-GUARD — data-fitting / dispatch-bug guard for linalg/qr_py.
 #
 # Detects kernels whose correctness silently depends on dimensions the benchmark
 # happens to fix: the batch size, the fraction of ill-conditioned matrices, or the
@@ -14,13 +14,18 @@
 #   - CONDITIONING SWEEP     fixed B, 0% -> 100% ill-conditioned
 #   - POSITION SWEEP         one bad matrix walked across the batch
 #
-# Wraps the frozen eval harness (imports submission/reference via env.sh's
-# PYTHONPATH); does not modify eval.py.
+# QR-specific: it perturbs batch / cond / case, which only the linalg/qr*
+# generate_input accepts — which is why guards live with their problem rather
+# than running for every problem. Discovered and run by harness/validate.sh
+# after the test shapes pass, in validate's process under the GPU lock already
+# held — do NOT wrap it in its own `autocuda run`. Checker: bin/invariance_guard.py.
 #
-# Usage:  bash harness/invariance_guard.sh <set>/<problem>   # e.g. linalg/qr_v2
+# Usage:  bash <this> <set>/<problem>   # e.g. linalg/qr_v2
 # Exit 0 = invariant (clean), 2 = wrong output under perturbation (data-fitted), else error.
 set -uo pipefail
-source "$(dirname "${BASH_SOURCE[0]}")/env.sh" "$@"
+# Repo root is a fixed 4 levels up: problems/<set>/<problem>/guards/<this>.
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
+source "$REPO_DIR/harness/env.sh" "$@"
 
 cd "$PROBLEM_DIR" || exit 1
 # env.sh consumes <set>/<problem> ($1); extra tuning flags pass via INVARIANCE_GUARD_ARGS

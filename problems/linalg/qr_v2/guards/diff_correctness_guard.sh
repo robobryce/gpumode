@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# DIFFERENTIAL-CORRECTNESS-GUARD step — autocuda anti-reward-hack guard.
+# DIFFERENTIAL-CORRECTNESS-GUARD — anti-reward-hack guard for linalg/qr_v2.
 #
 # Detects benchmark-loop caching reward-hacks by correctness, not timing: runs a
 # sequence of DISTINCT inputs of each benchmark shape through one process and
@@ -11,13 +11,17 @@
 # calls on the SAME reused input (where the cache is still valid); this guard
 # varies the input so a stale cache is exposed.
 #
-# Wraps the frozen eval harness (imports submission/reference via env.sh's
-# PYTHONPATH); does not modify eval.py.
+# This guard lives with its problem (problems/<set>/<problem>/guards/) so it is
+# discovered and run by harness/validate.sh after the test shapes pass. It runs
+# in validate's process under the GPU lock already held — do NOT wrap it in its
+# own `autocuda run`. The shared checker is bin/diff_correctness_guard.py.
 #
-# Usage:  bash harness/diff_correctness_guard.sh <set>/<problem>   # e.g. linalg/qr_v2
+# Usage:  bash <this> <set>/<problem>   # e.g. linalg/qr_v2
 # Exit 0 = clean, 2 = wrong output on a distinct input (reward-hack), else error.
 set -uo pipefail
-source "$(dirname "${BASH_SOURCE[0]}")/env.sh" "$@"
+# Repo root is a fixed 4 levels up: problems/<set>/<problem>/guards/<this>.
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
+source "$REPO_DIR/harness/env.sh" "$@"
 
 SPECS="$("$PYTHON" "$REPO_DIR/bin/gen_specs.py" "$PROBLEM_DIR/task.yml" --emit benchmarks)"
 SPECFILE="$(mktemp)"; trap 'rm -f "$SPECFILE"' EXIT
