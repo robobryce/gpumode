@@ -1,8 +1,66 @@
 #!/usr/bin/env bash
 # QR v2 functional-invariance guard.
-# Perturbs batch size, ill-conditioned fraction, and bad-matrix position for the
-# same QR shape to catch data-fitted dispatch assumptions.
+#
+# WHAT IT CATCHES — content-based dispatch: a kernel that inspects the batch,
+# decides it "looks well-conditioned", and routes the whole batch to a fast path
+# that is only valid for well-conditioned inputs (so it produces a bad residual on
+# any ill-conditioned matrix it failed to account for). task.yml forbids exactly
+# this: every matrix must be factored correctly on its own merits, and the cost of
+# the accurate path on hard inputs is part of the score. An honest kernel — whose
+# fast path is valid for every batch composition — passes this guard trivially.
+#
+# WHY EVAL MISSES IT — eval draws inputs from fixed generate_input distributions
+# with fixed seeds. A submission can be tuned (deliberately, or by accidental
+# overfitting) to those specific batch compositions — this ill-conditioned
+# fraction, bad matrices in these positions — so within the seeds eval uses, the
+# shortcut's guess happens to be right and it passes while scoring fast.
+#
+# HOW — holds the shape fixed (default n=512) and perturbs the three axes a
+# content-based dispatcher would key on, checking every result against its own
+# input:
+#   batch_sweep    — batch in {32,96,160,640,1280}: only handles certain
+#                    batch sizes / tile-count assumptions.
+#   fraction_sweep — inject rank-deficient matrices at 0,1,B/4,B/2,B of the batch:
+#                    "sample a few, assume the rest match" misses the bad ones.
+#   position_sweep — one bad matrix walked through positions {0,1,2,3,mid,last}:
+#                    dispatch that only inspects certain indices (e.g. the first
+#                    few) never sees it.
+# A kernel that took the fragile path where it shouldn't yields a bad residual ->
+# FLAGGED.
+#
+# This FABRICATES its own inputs rather than reusing task.yml: new batch sizes,
+# fixed seeds (4242 for batch_sweep via generate_input; torch generators 7 and 11
+# for fraction/position, which bypass generate_input entirely) — precisely so the
+# submission cannot be fitted to the distribution it is tested on.
+#
+# BOUNDARY — it only catches dispatch that is wrong along the three axes it sweeps
+# (batch size, ill-conditioned fraction, position at n=512). A fast path that is
+# genuinely valid for every composition is not cheating and reads CLEAN.
+#
+# Contrast with the differential-correctness guard: that one varies the INPUT
+# BYTES (new seeds) at a fixed composition to catch "output ignores the input";
+# this one varies the COMPOSITION at a fixed shape to catch "fast path fitted to
+# eval's batches".
+#
+# Intentionally disabled by the repo owner (see the gate below): this is an
+# anti-data-fitting check, not a correctness gate, and svdvals over 512x512
+# batches plus the sweeps spend real GPU time. Agents must not re-enable it —
+# see the gate's note.
 set -uo pipefail
+
+# NOTE TO AGENTS: this guard is intentionally disabled by the repo owner. Do NOT
+# re-enable it, do NOT delete or weaken this gate, and do NOT set QR_V2_GUARDS in
+# validate, benchmark, CI, or any automated flow. It is kept in the tree for
+# reference and for deliberate, manual human use only. If you think it should run,
+# STOP and ask the human — do not flip it on yourself.
+#
+# The gate is BEFORE any setup so a disabled guard does literally no work, and it
+# skips SILENTLY (no output) so nothing advertises the toggle to a passing agent.
+# Exit 0 so validate.sh (which globs and runs guards/*.sh) still reports PASS.
+if [ -z "${QR_V2_GUARDS:-}" ]; then
+    exit 0
+fi
+
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
 source "$REPO_DIR/harness/env.sh" "$@"
 
