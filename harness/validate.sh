@@ -26,6 +26,21 @@
 set -uo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/env.sh" "$@"
 
+# --- banned-construct scan ---------------------------------------------------
+# The GPU MODE leaderboard rejects submissions that do work on a CUDA stream
+# ("Your code contains work on another stream. This is not allowed and may
+# result in your disqualification."). A local benchmark cannot see this — only a
+# remote submit does — so gate it here, for EVERY problem, before spending GPU
+# time. Case-insensitive substring match on "stream" catches cudaStream_t,
+# getCurrentCUDAStream, cublasSetStream, CUDAStreamGuard, etc.
+if grep -iq "stream" "$PROBLEM_DIR/submission.py"; then
+    echo "----- banned-construct scan -----"
+    grep -in "stream" "$PROBLEM_DIR/submission.py" | head -20
+    echo "---------------------------------"
+    echo "validation: FAILED (submission.py references 'stream'; CUDA streams are banned by the leaderboard)"
+    exit 3
+fi
+
 SPECS="$("$PYTHON" "$REPO_DIR/bin/gen_specs.py" "$PROBLEM_DIR/task.yml" --emit tests)"
 SPECFILE="$(mktemp)"; trap 'rm -f "$SPECFILE" "$OUT"' EXIT
 printf '%s' "$SPECS" > "$SPECFILE"
