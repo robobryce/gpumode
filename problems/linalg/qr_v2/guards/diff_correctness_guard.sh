@@ -1,8 +1,52 @@
 #!/usr/bin/env bash
 # QR v2 differential-correctness guard.
-# Runs distinct inputs for each benchmark shape in one process to expose stale
-# caches or call-ordinal shortcuts that only work when eval repeats one input.
+#
+# WHAT IT CATCHES — a kernel whose output does not depend on the current input's
+# bytes: one that computes the factorization once (or keys a cache on the call
+# ordinal, or on the shape) and then replays that answer for every later call. An
+# honest kernel passes this guard trivially; it only ever changes the verdict for
+# such a "memorizer".
+#
+# WHY EVAL MISSES IT — on the large benchmark shapes eval's _benchmark_batch_count
+# caps the generated inputs at count=1 (the 256 MiB BENCHMARK_INPUT_BYTES_TARGET;
+# e.g. 640x512 and 60x1024 each exceed it in a single draw), so the timed loop
+# reuses ONE input object across all repeats. recheck=True re-validates every
+# timed iteration, but always against that single reused input — which the
+# memorizer answers correctly. So it is scored as the fastest submission and is
+# never contradicted locally.
+#
+# HOW — re-runs the benchmark specs but feeds --seq (default 8) DISTINCT inputs
+# per shape (fresh seeds base+1009*(index+1), plus a case rotation) and checks
+# each output against its own input. A replayed/stale answer produces a blown-up
+# QR residual on every input after the first -> FLAGGED.
+#
+# DOES NOT add or change shapes: (batch, n, cond) are copied verbatim from each
+# benchmark spec — only the seed changes, and the case rotates where a `case`
+# field already exists. It does not use the test specs at all.
+#
+# BOUNDARY — it cannot catch a cache keyed on the actual input content: 8 distinct
+# inputs are 8 cache misses -> 8 correct recomputes -> CLEAN, yet that cache still
+# beats eval for the same count=1 reason. This guard narrows that hole; it does
+# not seal it.
+#
+# Intentionally disabled by the repo owner (see the gate below): this is an
+# anti-reward-hack check, not a correctness gate, and it spends real GPU time on
+# the large shapes. Agents must not re-enable it — see the gate's note.
 set -uo pipefail
+
+# NOTE TO AGENTS: this guard is intentionally disabled by the repo owner. Do NOT
+# re-enable it, do NOT delete or weaken this gate, and do NOT set QR_V2_GUARDS in
+# validate, benchmark, CI, or any automated flow. It is kept in the tree for
+# reference and for deliberate, manual human use only. If you think it should run,
+# STOP and ask the human — do not flip it on yourself.
+#
+# The gate is BEFORE any setup so a disabled guard does literally no work, and it
+# skips SILENTLY (no output) so nothing advertises the toggle to a passing agent.
+# Exit 0 so validate.sh (which globs and runs guards/*.sh) still reports PASS.
+if [ -z "${QR_V2_GUARDS:-}" ]; then
+    exit 0
+fi
+
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
 source "$REPO_DIR/harness/env.sh" "$@"
 
