@@ -53,18 +53,32 @@ else
     log "creating venv at $VENV from $GPUMODE_PY ..."
     if command -v uv >/dev/null 2>&1; then
         uv venv --python "$GPUMODE_PY" "$VENV"
-        VIRTUAL_ENV="$VENV" uv pip install --python "$PYBIN" numpy pyyaml ninja
+        VIRTUAL_ENV="$VENV" uv pip install --python "$PYBIN" numpy pyyaml ninja kernelguard
         log "installing torch from $TORCH_INDEX_URL (large download) ..."
         VIRTUAL_ENV="$VENV" uv pip install --python "$PYBIN" torch --index-url "$TORCH_INDEX_URL"
     else
         "$GPUMODE_PY" -m venv "$VENV"
         "$PYBIN" -m pip install --upgrade pip
-        "$PYBIN" -m pip install numpy pyyaml ninja
+        "$PYBIN" -m pip install numpy pyyaml ninja kernelguard
         log "installing torch from $TORCH_INDEX_URL (large download) ..."
         "$PYBIN" -m pip install torch --index-url "$TORCH_INDEX_URL"
     fi
 fi
 log "torch CUDA check: $("$PYBIN" -c 'import torch;print("avail",torch.cuda.is_available(),"dev",torch.cuda.get_device_name(0) if torch.cuda.is_available() else "-")')"
+
+# kernelguard — rule-based reward-hack detector for harness/validate.sh. Ensured
+# idempotently here too, since the venv+torch block above is skipped on re-runs
+# over an existing venv (which predates this dependency).
+if "$PYBIN" -c "import kernelguard" 2>/dev/null; then
+    log "kernelguard already installed ($("$PYBIN" -c 'import importlib.metadata as m; print(m.version("kernelguard"))' 2>/dev/null || echo present))"
+else
+    log "installing kernelguard (reward-hack detector) ..."
+    if command -v uv >/dev/null 2>&1; then
+        VIRTUAL_ENV="$VENV" uv pip install --python "$PYBIN" kernelguard
+    else
+        "$PYBIN" -m pip install kernelguard
+    fi
+fi
 
 # --- 3. write machine config -------------------------------------------------
 cat > "$CFG" <<EOF
