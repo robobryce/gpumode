@@ -29,23 +29,11 @@
 # beats eval for the same count=1 reason. This guard narrows that hole; it does
 # not seal it.
 #
-# Intentionally disabled by the repo owner (see the gate below): this is an
-# anti-reward-hack check, not a correctness gate, and it spends real GPU time on
-# the large shapes. Agents must not re-enable it — see the gate's note.
+# ENABLED: this guard runs on every validate (harness/validate.sh globs and runs
+# guards/*.sh after the test shapes pass). It is an anti-reward-hack check, not a
+# correctness gate, and it spends real GPU time on the large shapes — that cost is
+# accepted as the price of catching memorizer/cache hacks the test shapes miss.
 set -uo pipefail
-
-# NOTE TO AGENTS: this guard is intentionally disabled by the repo owner. Do NOT
-# re-enable it, do NOT delete or weaken this gate, and do NOT set QR_V2_GUARDS in
-# validate, benchmark, CI, or any automated flow. It is kept in the tree for
-# reference and for deliberate, manual human use only. If you think it should run,
-# STOP and ask the human — do not flip it on yourself.
-#
-# The gate is BEFORE any setup so a disabled guard does literally no work, and it
-# skips SILENTLY (no output) so nothing advertises the toggle to a passing agent.
-# Exit 0 so validate.sh (which globs and runs guards/*.sh) still reports PASS.
-if [ -z "${QR_V2_GUARDS:-}" ]; then
-    exit 0
-fi
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
 source "$REPO_DIR/harness/env.sh" "$@"
