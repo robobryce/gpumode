@@ -41,6 +41,23 @@ if grep -iq "stream" "$PROBLEM_DIR/submission.py"; then
     exit 3
 fi
 
+# --- kernelguard static reward-hack scan -------------------------------------
+# Run the kernelguard rule-based detector (MIT, SinatrasC/kernelguard; installed
+# into the venv by bin/install.sh) over submission.py for EVERY problem, before
+# any GPU time. It statically flags leaderboard-disqualifying reward-hacks — e.g.
+# config-keyed result caching, hardcoded outputs — that a local benchmark cannot
+# see. bin/kernelguard_gate.py exits 2 only when kernelguard's own should_filter
+# fires (classification "hacked"); lower-severity signals print but do not fail.
+# This is a static scan, complementing (not replacing) the runtime guards below.
+echo "----- kernelguard scan -----"
+"$PYTHON" "$REPO_DIR/bin/kernelguard_gate.py" "$PROBLEM_DIR/submission.py"
+kgrc=$?
+echo "----------------------------"
+if [ $kgrc -ne 0 ]; then
+    echo "validation: FAILED (kernelguard flagged submission.py as a reward-hack; exit $kgrc)"
+    exit "$kgrc"
+fi
+
 SPECS="$("$PYTHON" "$REPO_DIR/bin/gen_specs.py" "$PROBLEM_DIR/task.yml" --emit tests)"
 SPECFILE="$(mktemp)"; trap 'rm -f "$SPECFILE" "$OUT"' EXIT
 printf '%s' "$SPECS" > "$SPECFILE"
