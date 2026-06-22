@@ -5,38 +5,46 @@ from task import input_t, output_t
 
 
 # =============================================================================
-# Batch-MAJOR right-looking blocked Householder QR (geqrf-compatible) with a
-# BLAS-3 (communication-avoiding) PANEL factorization.
+# Batch-MAJOR right-looking TWO-LEVEL (nested) blocked Householder QR
+# (geqrf-compatible).
 #
-# For a panel of width BLK starting at column j:
-#   1. _panel_factor_kernel : one program per matrix factors A[j:, j:j+BLK] in
-#      place. INSTEAD of BLK serial rank-1 Householder updates over the whole
-#      (MAXH, BLK) panel (BLAS-2, the occupancy wall), it factors the panel in
-#      narrow inner sub-blocks of width IB: the IB-step serial Householder chain
-#      runs over only the IB sub-block columns (cheap, narrow), then the rest of
-#      the panel columns [s+IB, BLK) are updated with ONE rank-IB compact-WY
-#      block reflector applied via TENSOR-CORE tl.dot GEMMs (BLAS-3). The bulk
-#      panel FLOPs thus move from serial BLAS-2 onto the tensor cores, in-kernel
-#      (no extra kernel launches). Builds the full BLK x BLK compact-WY T
-#      incrementally (the z[c]=w[c] trick) for the outer trailing update.
-#   2. trailing : A[j:, j+BLK:] := (I - V T^T V^T) A[j:, j+BLK:]  (BLAS-3),
-#      split into two race-free kernels (YT producer + apply).
+# Outer block width NB (64/128); inner sub-block width ib (8/16). For each outer
+# block [jo, jo+NB):
+#   1. inner factorization: ib columns at a time, _panel_factor_kernel runs the
+#      unblocked Householder chain on the narrow ib sub-panel (panel resident,
+#      incremental ib x ib dlarft T2 fused in) -> writes reflectors V[:, s:s+ib]
+#      and tau, AND an inner BLAS-3 trailing update bounded to the REST OF THE
+#      OUTER BLOCK [s+ib, NB) so the next sub-panel sees the right data.
+#   2. _build_wide_T_kernel: assemble the full NB x NB compact-WY T from the
+#      accumulated outer-block V + tau (dlarft forward over all NB columns).
+#   3. outer trailing update against [jo+NB, N): ONE wide-K (K=NB) BLAS-3 pass
+#      A_trail := (I - V T^T V^T) A_trail, split into TWO race-free kernels.
+#
+# Widening K from ib to NB on the OUTER trailing update means the big trailing
+# matrix is swept N/NB times instead of N/ib times -> far fewer passes / less
+# HBM traffic on the dominant n=512/1024 shapes. The inner serial Householder
+# chain stays narrow (ib registers) so panel occupancy does not regress.
 #
 # H upper-tri = R, below-diag = reflectors, tau separate. tf32x3 (error-
-# corrected TF32) tensor-core GEMMs throughout (passes all ill-conditioned
-# cases). Verified bit-equivalent to torch.geqrf in a PyTorch prototype.
+# corrected TF32) for the trailing GEMMs (passes all ill-conditioned cases).
+# Verified bit-equivalent to torch.geqrf in a PyTorch two-level prototype.
 # =============================================================================
 
 
 @triton.jit
 def _panel_factor_kernel(
     A_ptr, tau_ptr, Vbuf_ptr, Tbuf_ptr,
-    B, N, j, pheight, b,
+    B, N, j, pheight, b, koff, colstop, toff,
     stride_ab, stride_an,
     stride_vb, stride_vk, stride_vn,
     stride_tb, stride_tk, stride_tn,
-    BLK: tl.constexpr, IB: tl.constexpr, MAXH: tl.constexpr,
+    BLK: tl.constexpr, MAXH: tl.constexpr,
 ):
+    # Factor the narrow ib sub-panel A[j:, j:j+b] (b <= BLK).  Reflectors land in
+    # Vbuf at k-offset `koff` (so the same wide outer V buffer holds every inner
+    # block).  The within-panel rank-1 updates touch columns up to `colstop`
+    # (the OUTER block boundary), leaving the global trailing untouched -- that
+    # is the wide-K outer trailing kernel's job.
     bid = tl.program_id(0)
     if bid >= B:
         return
@@ -52,114 +60,151 @@ def _panel_factor_kernel(
     panel = tl.load(aptr, mask=mask, other=0.0)          # (MAXH, BLK)
 
     tau_panel = tl.zeros((BLK,), dtype=tl.float32)
-    # Full BLK x BLK compact-WY T (upper-tri), built incrementally below. Used by
-    # the outer trailing update; the per-sub-block block reflector uses its IB x
-    # IB diagonal slice.
+    # ib x ib WY T2 built incrementally (LAPACK dlarft forward).
     Tmat = tl.zeros((BLK, BLK), dtype=tl.float32)
-    # V columns accumulated for the current sub-block, used by the BLAS-3 update.
-    # Stored as the panel's reflector columns; we read them back from `panel`
-    # after each sub-block's serial chain.
 
-    nsub: tl.constexpr = BLK // IB
-    for sblk in range(0, nsub):
-        s = sblk * IB
-        # ---- serial Householder chain over the IB columns [s, s+IB) ----
-        for kk in range(0, IB):
-            k = s + kk
-            do_k = k < b
-            col_is_k = cols == k
-            xk = tl.sum(tl.where(col_is_k[None, :], panel, 0.0), axis=1)   # (MAXH,)
-            active = (rows >= k) & row_valid
-            xk = tl.where(active, xk, 0.0)
+    for k in range(0, BLK):
+        do_k = k < b
+        col_is_k = cols == k
+        xk = tl.sum(tl.where(col_is_k[None, :], panel, 0.0), axis=1)   # (MAXH,)
+        active = (rows >= k) & row_valid
+        xk = tl.where(active, xk, 0.0)
 
-            alpha = tl.sum(tl.where(rows == k, xk, 0.0))
-            tailv = tl.where(rows > k, xk, 0.0)
-            tail_n2 = tl.sum(tailv * tailv)
-            normx = tl.sqrt(alpha * alpha + tail_n2)
-            sgn = tl.where(alpha >= 0.0, 1.0, -1.0)
-            beta = -sgn * normx
-            has_refl = tail_n2 > 0.0
-            beta_safe = tl.where(beta == 0.0, 1.0, beta)
-            tau_k = tl.where(has_refl, (beta - alpha) / beta_safe, 0.0)
+        alpha = tl.sum(tl.where(rows == k, xk, 0.0))
+        tailv = tl.where(rows > k, xk, 0.0)
+        tail_n2 = tl.sum(tailv * tailv)
+        normx = tl.sqrt(alpha * alpha + tail_n2)
+        sgn = tl.where(alpha >= 0.0, 1.0, -1.0)
+        beta = -sgn * normx
+        has_refl = tail_n2 > 0.0
+        beta_safe = tl.where(beta == 0.0, 1.0, beta)
+        tau_k = tl.where(has_refl, (beta - alpha) / beta_safe, 0.0)
 
-            denom = alpha - beta
-            denom = tl.where(denom == 0.0, 1.0, denom)
-            v = tl.where(rows > k, xk / denom, 0.0)
-            v = tl.where(rows == k, 1.0, v)
-            v = tl.where(active, v, 0.0)
-            v = tl.where(has_refl, v, tl.where(rows == k, 1.0, 0.0))
+        denom = alpha - beta
+        denom = tl.where(denom == 0.0, 1.0, denom)
+        v = tl.where(rows > k, xk / denom, 0.0)
+        v = tl.where(rows == k, 1.0, v)
+        v = tl.where(active, v, 0.0)
+        v = tl.where(has_refl, v, tl.where(rows == k, 1.0, 0.0))
 
-            # w[c] = v_k . panel[:,c]. We only need it for the in-sub-block rank-1
-            # update (cols in (k, s+IB)) and the incremental T (cols < k, where
-            # z[c]=w[c] since v_k is supported on rows>=k). Compute over the full
-            # row but it is a (BLK,) reduction -- cheap.
-            w = tl.sum(v[:, None] * panel, axis=0)            # (BLK,)
+        # w[c] = v_k . panel[:,c]; reused for the within-panel update and the
+        # incremental T2 (z[c]=w[c] for c<k since v_k is supported on rows>=k).
+        w = tl.sum(v[:, None] * panel, axis=0)            # (BLK,)
 
-            # incremental T column k:  T[a<k,k] = -tau_k * (T @ w[c<k])
-            z = tl.where(cols < k, w, 0.0)
-            Tcol = -tau_k * tl.sum(Tmat * z[None, :], axis=1)  # (BLK,)
-            Tcol = tl.where(cols < k, Tcol, 0.0)
-            Tcol = tl.where(cols == k, tau_k, Tcol)
-            Tmat = tl.where(col_is_k[None, :], Tcol[:, None], Tmat)
+        z = tl.where(cols < k, w, 0.0)
+        Tcol = -tau_k * tl.sum(Tmat * z[None, :], axis=1)  # (BLK,)
+        Tcol = tl.where(cols < k, Tcol, 0.0)
+        Tcol = tl.where(cols == k, tau_k, Tcol)
+        Tmat = tl.where(col_is_k[None, :], Tcol[:, None], Tmat)
 
-            # rank-1 update of trailing columns WITHIN this sub-block: c in (k, s+IB)
-            upd = tau_k * v[:, None] * w[None, :]
-            col_in_sub_gt_k = (cols > k) & (cols < s + IB)
-            panel = tl.where(col_in_sub_gt_k[None, :], panel - upd, panel)
+        # apply H_k to trailing panel columns (c > k, within this ib sub-panel)
+        upd = tau_k * v[:, None] * w[None, :]
+        col_gt_k = cols > k
+        panel = tl.where(col_gt_k[None, :], panel - upd, panel)
 
-            # store column k: R[k,k] on diag, reflector below.
-            diagval = tl.where(has_refl, beta, alpha)
-            new_colk = tl.where(rows == k, diagval, v)
-            panel = tl.where(col_is_k[None, :] & (rows[:, None] >= k), new_colk[:, None], panel)
+        diagval = tl.where(has_refl, beta, alpha)
+        new_colk = tl.where(rows == k, diagval, v)
+        panel = tl.where(col_is_k[None, :] & (rows[:, None] >= k), new_colk[:, None], panel)
 
-            tau_panel = tl.where(col_is_k & do_k, tau_k, tau_panel)
-
-        # ---- BLAS-3 rank-IB block update of the REST of the panel ----
-        # Update columns [s+IB, BLK): A2 := (I - Vs Ts^T Vs^T) A2, where Vs are
-        # the IB reflector columns just computed (cols [s, s+IB)) and Ts is the
-        # IB x IB diagonal block of Tmat. Done with tensor-core tl.dot over the
-        # full (MAXH, BLK) panel, masked: only this sub-block's V columns
-        # contribute to W, and only the trailing columns are written.
-        if sblk < nsub - 1:
-            rr = rows[:, None]
-            cc2 = cols[None, :]
-            is_sub = (cc2 >= s) & (cc2 < s + IB)
-            # Vfull: this sub-block's unit-lower-trapezoidal reflectors, 0 elsewhere.
-            Vfull = tl.where(rr == cc2, 1.0, tl.where(rr > cc2, panel, 0.0))
-            Vfull = tl.where(is_sub & (rr < pheight), Vfull, 0.0)           # (MAXH, BLK)
-            # A2: trailing panel columns (>= s+IB), 0 elsewhere.
-            is_trail = cc2 >= (s + IB)
-            A2 = tl.where(is_trail & (rr < pheight), panel, 0.0)            # (MAXH, BLK)
-            # W = Vfull^T @ A2 ; YT = Tmat^T @ W ; delta = Vfull @ YT  (tensor cores)
-            Wm = tl.dot(tl.trans(Vfull), A2, input_precision="tf32x3")     # (BLK, BLK)
-            YTm = tl.dot(tl.trans(Tmat), Wm, input_precision="tf32x3")     # (BLK, BLK)
-            delta = tl.dot(Vfull, YTm, input_precision="tf32x3")           # (MAXH, BLK)
-            panel = tl.where(is_trail, panel - delta, panel)
+        tau_panel = tl.where(col_is_k & do_k, tau_k, tau_panel)
 
     tl.store(aptr, panel, mask=mask)
 
     tptr = tau_ptr + bid * N + j + cols
     tl.store(tptr, tau_panel, mask=col_valid)
 
-    # V transposed: Vt[c, r] = 1 if r==c, panel[r,c] if r>c, else 0
+    # store reflectors V (transposed) into the wide outer V buffer at k-offset
+    # koff.  The buffer row axis is the GLOBAL row index, so a reflector whose
+    # local panel row is `rr` (relative to panel top j) lands at global row j+rr.
+    # This single convention lets the inner (j=col) and outer/T-build (j=jo)
+    # readers all index V by global row with no per-block offset bookkeeping.
     panelT = tl.trans(panel)                               # (BLK, MAXH)
     cc = cols[:, None]
-    rr2 = rows[None, :]
-    Vt = tl.where(rr2 == cc, 1.0, tl.where(rr2 > cc, panelT, 0.0))
-    Vt = tl.where((rr2 < pheight) & (cc < b), Vt, 0.0)
-    vbase = Vbuf_ptr + bid * stride_vb
-    vptr = vbase + cc * stride_vk + rr2 * stride_vn
-    tl.store(vptr, Vt, mask=(rr2 < pheight) & (cc < b))
+    rr = rows[None, :]
+    Vt = tl.where(rr == cc, 1.0, tl.where(rr > cc, panelT, 0.0))
+    Vt = tl.where((rr < pheight) & (cc < b), Vt, 0.0)
+    vbase = Vbuf_ptr + bid * stride_vb + koff * stride_vk
+    vptr = vbase + cc * stride_vk + (j + rr) * stride_vn
+    tl.store(vptr, Vt, mask=(rr < pheight) & (cc < b))
 
-    tbase = Tbuf_ptr + bid * stride_tb
+    # store the inner ib x ib T2 at diagonal block offset `toff` of the T buffer.
+    # Pointed at Twide's [s:s+ib, s:s+ib] diagonal block, these per-sub-block
+    # diagonal T-blocks are reused by the inner trailing AND by the wide-T builder
+    # (which only fills the off-diagonal blocks, via a block recurrence -- so the
+    # wide T costs a few small GEMMs, not a full NB-step column recurrence).
+    tbase = Tbuf_ptr + bid * stride_tb + toff * stride_tk + toff * stride_tn
     tptr2 = tbase + cols[:, None] * stride_tk + cols[None, :] * stride_tn
-    tl.store(tptr2, Tmat)
+    mt = col_valid[:, None] & col_valid[None, :]
+    tl.store(tptr2, Tmat, mask=mt)
 
 
 @triton.jit
+def _build_wide_T_kernel(
+    Vbuf_ptr, tau_ptr, Twide_ptr,
+    B, N, jo, pheight, NBe,
+    stride_vb, stride_vk, stride_vn,
+    stride_tb, stride_tk, stride_tn,
+    NB: tl.constexpr, IB: tl.constexpr, MAXH: tl.constexpr, BMG: tl.constexpr,
+):
+    # Assemble the NB x NB compact-WY T over the full outer block.  The per-
+    # sub-block DIAGONAL blocks T_ss are already built by panel_factor (in
+    # Twide's diagonal); this kernel fills only the OFF-diagonal blocks via a
+    # BLOCK-forward dlarft recurrence (nb_sub steps of small tensor-core GEMMs on
+    # the Gram G = V^T V), NOT a full NB-step column recurrence.  G is computed
+    # once with tensor cores (chunked over rows).  One program per matrix.
+    bid = tl.program_id(0)
+    if bid >= B:
+        return
+
+    ks = tl.arange(0, NB)
+    k_valid = ks < NBe
+    vbase = Vbuf_ptr + bid * stride_vb
+    tbase = Twide_ptr + bid * stride_tb
+    tp0 = tbase + ks[:, None] * stride_tk + ks[None, :] * stride_tn
+
+    # G = V^T V  (NB, NB), accumulated over row-chunks of BMG via TENSOR CORES.
+    G = tl.zeros((NB, NB), dtype=tl.float32)
+    nchunks = tl.cdiv(pheight, BMG)
+    for ci in range(0, nchunks):
+        rr = ci * BMG + tl.arange(0, BMG)
+        rmask = rr < pheight
+        vp = vbase + ks[:, None] * stride_vk + (jo + rr[None, :]) * stride_vn
+        Vc = tl.load(vp, mask=k_valid[:, None] & rmask[None, :], other=0.0)     # (NB, BMG)
+        G += tl.dot(Vc, tl.trans(Vc), input_precision="tf32x3")                 # (NB, NB)
+
+    # Load the per-sub-block DIAGONAL T-blocks (built by panel_factor) as the
+    # block-diagonal of Tmat; force off-diagonal (uninitialized Twide) to 0.
+    Tmat = tl.load(tp0, mask=k_valid[:, None] & k_valid[None, :], other=0.0)    # (NB, NB)
+    blk_id = ks // IB
+    Tmat = tl.where(blk_id[:, None] == blk_id[None, :], Tmat, 0.0)
+
+    # BLOCK-forward dlarft recurrence: for sub-block column jb=1..nb_sub-1,
+    #   T[rows<jb, block jb] = -T[<jb,<jb] @ G[<jb, block jb] @ T_jbjb.
+    # Tmat @ G correctly sums only over filled blocks (unfilled off-diagonals are
+    # still 0 at step jb); masks restrict to rows<jb, cols in block jb.
+    nb_sub: tl.constexpr = NB // IB
+    for jb in range(1, nb_sub):
+        col_in_jb = blk_id == jb
+        rows_lt_jb = blk_id < jb
+        TG = tl.dot(Tmat, G, input_precision="tf32x3")                         # (NB,NB)
+        TG = tl.where(rows_lt_jb[:, None] & col_in_jb[None, :], TG, 0.0)
+        TGT = tl.dot(TG, Tmat, input_precision="tf32x3")                       # (NB,NB)
+        offblk = tl.where(rows_lt_jb[:, None] & col_in_jb[None, :], -TGT, 0.0)
+        Tmat = Tmat + offblk
+
+    tl.store(tp0, Tmat, mask=k_valid[:, None] & k_valid[None, :])
+
+
+# Trailing update is split into TWO kernels to be race-free: the first reads
+# A_trail and produces YT = T^T V^T A_trail (read-only consumer of A_trail); the
+# second reads YT (read-only) and applies A_trail -= V @ YT (each program owns a
+# disjoint output tile). Fusing them races. Parameterized by koff (k-offset into
+# the wide V buffer) so the SAME kernels serve both the inner (K=ib, koff=s) and
+# outer (K=NB, koff=0) trailing updates.
+@triton.jit
 def _trailing_YT_kernel(
     A_ptr, Vbuf_ptr, Tbuf_ptr, YT_ptr,
-    B, N, j, pheight, ncols, jb,
+    B, N, j, pheight, ncols, jb, koff, toff,
     stride_ab, stride_an,
     stride_vb, stride_vk, stride_vn,
     stride_tb, stride_tk, stride_tn,
@@ -176,8 +221,9 @@ def _trailing_YT_kernel(
     krange = tl.arange(0, BLK)
 
     a_trail_base = A_ptr + bid * stride_ab + j * stride_an + jb
-    v_base = Vbuf_ptr + bid * stride_vb
+    v_base = Vbuf_ptr + bid * stride_vb + koff * stride_vk
 
+    # W = V^T @ A_trail over all panel rows, in chunks of BM
     W = tl.zeros((BLK, BNc), dtype=tl.float32)
     nchunks = tl.cdiv(pheight, BM)
     for ci in range(0, nchunks):
@@ -185,11 +231,14 @@ def _trailing_YT_kernel(
         rrmask = rr < pheight
         ap = a_trail_base + rr[:, None] * stride_an + ccols[None, :]
         achunk = tl.load(ap, mask=rrmask[:, None] & cmask[None, :], other=0.0)   # (BM,BNc)
-        vp = v_base + krange[:, None] * stride_vk + rr[None, :] * stride_vn
+        vp = v_base + krange[:, None] * stride_vk + (j + rr[None, :]) * stride_vn
         vchunk = tl.load(vp, mask=rrmask[None, :], other=0.0)                    # (BLK,BM)
         W += tl.dot(vchunk, achunk, input_precision="tf32x3")
 
-    tp = Tbuf_ptr + bid * stride_tb + krange[:, None] * stride_tk + krange[None, :] * stride_tn
+    # YT = T^T @ W.  toff selects the ib x ib diagonal block of Twide (the inner
+    # sub-block's T2) so the inner trailing reuses Twide's diagonal T-blocks.
+    tp = (Tbuf_ptr + bid * stride_tb + toff * stride_tk + toff * stride_tn
+          + krange[:, None] * stride_tk + krange[None, :] * stride_tn)
     Tm = tl.load(tp)
     YT = tl.dot(tl.trans(Tm), W, input_precision="tf32x3")                        # (BLK,BNc)
 
@@ -200,7 +249,7 @@ def _trailing_YT_kernel(
 @triton.jit
 def _trailing_apply_kernel(
     A_ptr, Vbuf_ptr, YT_ptr,
-    B, N, j, pheight, ncols, jb,
+    B, N, j, pheight, ncols, jb, koff,
     stride_ab, stride_an,
     stride_vb, stride_vk, stride_vn,
     stride_yb, stride_yk, stride_yn,
@@ -220,10 +269,12 @@ def _trailing_apply_kernel(
     krange = tl.arange(0, BLK)
 
     a_trail_base = A_ptr + bid * stride_ab + j * stride_an + jb
-    v_base = Vbuf_ptr + bid * stride_vb
+    v_base = Vbuf_ptr + bid * stride_vb + koff * stride_vk
 
-    vp = v_base + krange[None, :] * stride_vk + rrows[:, None] * stride_vn
+    # V[rrows,:] : (BM, BLK).  V is stored by global row -> add panel top j.
+    vp = v_base + krange[None, :] * stride_vk + (j + rrows[:, None]) * stride_vn
     Vrow = tl.load(vp, mask=rmask[:, None], other=0.0)
+    # YT[:, ccols] : (BLK, BNc)
     yp = YT_ptr + bid * stride_yb + krange[:, None] * stride_yk + ccols[None, :] * stride_yn
     YT = tl.load(yp, mask=cmask[None, :], other=0.0)
     delta = tl.dot(Vrow, YT, input_precision="tf32x3")                            # (BM,BNc)
@@ -234,72 +285,136 @@ def _trailing_apply_kernel(
     tl.store(ap, aorig - delta, mask=amask)
 
 
+def _trailing_update(H, Vbuf, Tbuf, YTbuf, B, N, j, pheight, jb, ncols, koff,
+                     BLK, BM, BNc, sab, san, svb, svk, svn, stb, stk, stn,
+                     syb, syk, syn, nw, toff=0):
+    nct = triton.cdiv(ncols, BNc)
+    nrt = triton.cdiv(pheight, BM)
+    _trailing_YT_kernel[(nct, B)](
+        H, Vbuf, Tbuf, YTbuf,
+        B, N, j, pheight, ncols, jb, koff, toff,
+        sab, san, svb, svk, svn, stb, stk, stn, syb, syk, syn,
+        BLK=BLK, BM=BM, BNc=BNc, num_warps=nw,
+    )
+    _trailing_apply_kernel[(nrt * nct, B)](
+        H, Vbuf, YTbuf,
+        B, N, j, pheight, ncols, jb, koff,
+        sab, san, svb, svk, svn, syb, syk, syn,
+        BLK=BLK, BM=BM, BNc=BNc, num_warps=nw,
+    )
+
+
 def custom_kernel(data: input_t) -> output_t:
     A = data
     B, N, _ = A.shape
     H = A.clone()
     tau = torch.zeros((B, N), device=A.device, dtype=torch.float32)
 
+    # Inner sub-block ib (the serial Householder chain width -> register footprint)
+    # and outer block NB (the wide-K trailing-update width).
     if N <= 32:
-        BLK = min(16, N)
-        IB = BLK
+        IB = min(16, N)
+        NB = IB
     elif N >= 1536:
-        BLK = 16
+        # Tall panels (n>=2048): narrow ib for occupancy; modest NB.
         IB = 8
+        NB = 32
     else:
-        BLK = 32
+        # NARROW inner IB=8 -> the serial Householder chain holds only a
+        # (MAXH, 8) resident sub-panel (~2x higher occupancy than IB=16); a
+        # NARROW outer block NB=32 keeps the outer trailing at the efficient
+        # single-level width (the wide NB=64 of the prior two-level doubled
+        # trailing registers + YT HBM traffic and sank the geomean).
         IB = 8
+        NB = 32
 
-    IB = min(IB, BLK)
+    NB = min(NB, N)
+    IB = min(IB, NB)
 
-    Vbuf = torch.empty((B, BLK, N), device=A.device, dtype=torch.float32)
-    Tbuf = torch.empty((B, BLK, BLK), device=A.device, dtype=torch.float32)
-    YTbuf = torch.empty((B, BLK, N), device=A.device, dtype=torch.float32)
+    # V buffer must be zeroed: a reflector at k-index kk is supported only on
+    # global rows >= jo+kk, but the wide-K trailing reads ALL rows [jo, N) for
+    # every k in [0,NB) (and k in [NBe,NB) on the last short block) -- the unread
+    # upper-triangular dead zone must read as 0, not stale/garbage.  Zeroed once
+    # per outer block below (panel_factor only writes each reflector's support).
+    Vbuf = torch.zeros((B, NB, N), device=A.device, dtype=torch.float32)
+    # Twide holds the wide NB x NB T: panel_factor writes each sub-block's ib x ib
+    # T2 into its diagonal block, the inner trailing reads those diagonal blocks,
+    # and the wide-T builder fills the off-diagonal blocks (block recurrence).
+    Twide = torch.empty((B, NB, NB), device=A.device, dtype=torch.float32)
+    YTbuf = torch.empty((B, NB, N), device=A.device, dtype=torch.float32)
 
     sab, san = H.stride(0), H.stride(1)
     svb, svk, svn = Vbuf.stride(0), Vbuf.stride(1), Vbuf.stride(2)
-    stb, stk, stn = Tbuf.stride(0), Tbuf.stride(1), Tbuf.stride(2)
+    swb, swk, swn = Twide.stride(0), Twide.stride(1), Twide.stride(2)
     syb, syk, syn = YTbuf.stride(0), YTbuf.stride(1), YTbuf.stride(2)
 
     BM, BNc = 32, 64
-    j = 0
-    while j < N:
-        b = min(BLK, N - j)
-        pheight = N - j
-        MAXH = triton.next_power_of_2(pheight)
 
-        if MAXH <= 512:
-            nwp = 4
-        elif MAXH <= 1024:
-            nwp = 8
-        else:
-            nwp = 32
+    jo = 0
+    while jo < N:
+        NBe = min(NB, N - jo)
+        colstop = jo + NBe
+        pheight_o = N - jo
+        MAXH_o = triton.next_power_of_2(pheight_o)
 
-        # IB stays a fixed constexpr (nsub = BLK//IB static); columns >= b on a
-        # ragged final panel are masked out by do_k / col_valid inside the kernel.
-        _panel_factor_kernel[(B,)](
-            H, tau, Vbuf, Tbuf,
-            B, N, j, pheight, b,
-            sab, san, svb, svk, svn, stb, stk, stn,
-            BLK=BLK, IB=IB, MAXH=MAXH, num_warps=nwp,
-        )
+        # clear the V region this block will read (rows [jo, N), all NB cols) so
+        # the unwritten reflector dead-zone reads as 0 (correctness, see alloc).
+        Vbuf[:, :, jo:].zero_()
 
-        ncols = N - (j + b)
-        if ncols > 0:
-            nct = triton.cdiv(ncols, BNc)
-            nrt = triton.cdiv(pheight, BM)
-            _trailing_YT_kernel[(nct, B)](
-                H, Vbuf, Tbuf, YTbuf,
-                B, N, j, pheight, ncols, j + b,
-                sab, san, svb, svk, svn, stb, stk, stn, syb, syk, syn,
-                BLK=BLK, BM=BM, BNc=BNc, num_warps=2,
+        # ---- inner factorization of the outer panel [jo, jo+NBe) ----
+        s = 0
+        while s < NBe:
+            ib = min(IB, NBe - s)
+            col = jo + s
+            pheight = N - col
+            MAXH = triton.next_power_of_2(pheight)
+            if MAXH <= 512:
+                nwp = 4
+            elif MAXH <= 1024:
+                nwp = 8
+            else:
+                nwp = 32
+
+            # panel_factor writes T2 into Twide's [s:s+ib, s:s+ib] diagonal block.
+            _panel_factor_kernel[(B,)](
+                H, tau, Vbuf, Twide,
+                B, N, col, pheight, ib, s, colstop, s,
+                sab, san, svb, svk, svn, swb, swk, swn,
+                BLK=IB, MAXH=MAXH, num_warps=nwp,
             )
-            _trailing_apply_kernel[(nrt * nct, B)](
-                H, Vbuf, YTbuf,
-                B, N, j, pheight, ncols, j + b,
-                sab, san, svb, svk, svn, syb, syk, syn,
-                BLK=BLK, BM=BM, BNc=BNc, num_warps=2,
+
+            # inner trailing update: columns [col+ib, colstop) within outer block;
+            # reads the ib x ib diagonal T-block of Twide (toff=s).
+            inner_ncols = colstop - (col + ib)
+            if inner_ncols > 0:
+                _trailing_update(
+                    H, Vbuf, Twide, YTbuf, B, N, col, pheight, col + ib, inner_ncols,
+                    s, IB, BM, BNc, sab, san, svb, svk, svn, swb, swk, swn,
+                    syb, syk, syn, 2, toff=s,
+                )
+            s += ib
+
+        # ---- wide-T (block recurrence) + wide-K outer trailing, both only
+        # needed when there are trailing columns to update ----
+        outer_ncols = N - colstop
+        if outer_ncols > 0:
+            if MAXH_o <= 512:
+                nwt = 4
+            elif MAXH_o <= 1024:
+                nwt = 8
+            else:
+                nwt = 16
+            _build_wide_T_kernel[(B,)](
+                Vbuf, tau, Twide,
+                B, N, jo, pheight_o, NBe,
+                svb, svk, svn, swb, swk, swn,
+                NB=NB, IB=IB, MAXH=MAXH_o, BMG=64, num_warps=nwt,
             )
-        j += b
+            _trailing_update(
+                H, Vbuf, Twide, YTbuf, B, N, jo, pheight_o, colstop, outer_ncols,
+                0, NB, BM, BNc, sab, san, svb, svk, svn, swb, swk, swn,
+                syb, syk, syn, 2,
+            )
+        jo += NBe
 
     return H, tau
