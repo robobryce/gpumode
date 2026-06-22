@@ -73,20 +73,21 @@ def _panel_factor_kernel(
         v = tl.where(active, v, 0.0)
         v = tl.where(has_refl, v, tl.where(rows == k, 1.0, 0.0))
 
-        # --- incremental T column k ---
-        # z[c] = V[:,c]^T v_k  for c < k, where V[:,c] = (r==c?1 : r>c?panel[r,c] : 0)
-        Vmat = tl.where(rows[:, None] == cols[None, :], 1.0,
-                        tl.where(rows[:, None] > cols[None, :], panel, 0.0))
-        z = tl.sum(Vmat * v[:, None], axis=0)             # (BLK,) ; z[c]=V[:,c].v
-        z = tl.where(cols < k, z, 0.0)
-        # Tcol[a] = -tau_k * sum_c T[a,c] z[c]   (a < k)
+        # w[c] = v_k . panel[:,c] -- used both for the trailing-panel update AND
+        # the incremental T factor. Because v_k is supported only on rows >= k,
+        # for c < k we have z[c] = V[:,c].v_k == w[c] exactly (the diagonal/above
+        # terms vanish), so the WY recurrence needs no separate (MAXH,BLK) Vmat
+        # tensor or extra reduction -- a big register/occupancy win on the panel.
+        w = tl.sum(v[:, None] * panel, axis=0)            # (BLK,)
+
+        # --- incremental T column k:  T[a<k,k] = -tau_k * (T @ w[c<k]) ---
+        z = tl.where(cols < k, w, 0.0)
         Tcol = -tau_k * tl.sum(Tmat * z[None, :], axis=1)  # (BLK,)
         Tcol = tl.where(cols < k, Tcol, 0.0)
         Tcol = tl.where(cols == k, tau_k, Tcol)
         Tmat = tl.where(col_is_k[None, :], Tcol[:, None], Tmat)
 
         # apply H_k to trailing panel columns (c > k)
-        w = tl.sum(v[:, None] * panel, axis=0)            # (BLK,)
         upd = tau_k * v[:, None] * w[None, :]
         col_gt_k = cols > k
         panel = tl.where(col_gt_k[None, :], panel - upd, panel)
