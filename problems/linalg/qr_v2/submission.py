@@ -630,44 +630,292 @@ def _trailing_apply_kernel(
     tl.store(ap, aorig - delta, mask=amask)
 
 
+# =============================================================================
+# Two-level (nested) panel for the spilling tall few-matrix shapes (n>=4096).
+#
+# The single-level panel holds a (MAXH, BLK) register tensor per CTA. At
+# MAXH=4096 BLK=16 that is 64 f32/thread, which Triton caps at 64 regs/thread
+# and SPILLS to local memory (ncu: ~45MB local ld/st per launch, 313us vs the
+# un-spilled MAXH=2048 panel 74us). Narrowing the panel to ib=8 halves the
+# resident tensor (32 f32/thread) and ELIMINATES the spill (measured 313->59us).
+# But naive ib=8 with the trailing advancing by 8 doubles the (HBM-bound)
+# far-trailing passes, which swamps the panel win.
+#
+# This two-level path keeps the panel narrow (ib=8, un-spilled) AND the
+# far-trailing wide (nb=16, ONE pass): per nb=16 outer block it factors two
+# ib=8 sub-panels, applies sub-panel 0 to ONLY sub-panel 1's 8 columns (a tiny
+# inner trailing), then builds the combined 16-wide compact-WY T -- whose
+# off-diagonal block T01 = -T0 (V0^T V1) T1 couples the two sub-panels so a
+# SINGLE 16-wide WY trailing over the bulk [j+16, N) is exact. The cross-block
+# Gram G = V0^T V1 is computed by a row-tiled reduction kernel (K=BM tensor-core
+# dot, bounded (BM,8) resident -> no spill), dodging the (MAXH,16)-resident wall
+# that blocks an on-chip nested panel. The sub-panels write V/T into one 16-wide
+# buffer at the right (row,col) offsets so the existing wide trailing reads them
+# uniformly.
+# =============================================================================
+@triton.jit
+def _panel_factor2_kernel(
+    A_ptr, tau_ptr, Vbuf_ptr, Tbuf_ptr,
+    B, N, j, pheight, b, voff_r, voff_c,
+    stride_ab, stride_an,
+    stride_vb, stride_vk, stride_vn,
+    stride_tb, stride_tk, stride_tn,
+    BLK: tl.constexpr, MAXH: tl.constexpr,
+):
+    # Identical reflector build to _panel_factor_kernel, but the V/T stores are
+    # placed into a WIDER combined buffer at row offset voff_r (V rows) and col
+    # offset voff_c (V cols and T row/col), so two ib-wide sub-panels assemble a
+    # single nb-wide lower-trapezoidal V and block-diagonal T. The A read and the
+    # H/tau stores use the panel's own top j (unchanged).
+    bid = tl.program_id(0)
+    if bid >= B:
+        return
+
+    rows = tl.arange(0, MAXH)
+    cols = tl.arange(0, BLK)
+    row_valid = rows < pheight
+    col_valid = cols < b
+
+    a_base = A_ptr + bid * stride_ab + j * stride_an + j
+    aptr = a_base + rows[:, None] * stride_an + cols[None, :]
+    mask = row_valid[:, None] & col_valid[None, :]
+    panel = tl.load(aptr, mask=mask, other=0.0)
+
+    tau_panel = tl.zeros((BLK,), dtype=tl.float32)
+    Tmat = tl.zeros((BLK, BLK), dtype=tl.float32)
+
+    for k in range(0, BLK):
+        do_k = k < b
+        col_is_k = cols == k
+        xk = tl.sum(tl.where(col_is_k[None, :], panel, 0.0), axis=1)
+        active = (rows >= k) & row_valid
+        xk = tl.where(active, xk, 0.0)
+
+        alpha = tl.sum(tl.where(rows == k, xk, 0.0))
+        tailv = tl.where(rows > k, xk, 0.0)
+        tail_n2 = tl.sum(tailv * tailv)
+        normx = tl.sqrt(alpha * alpha + tail_n2)
+        sgn = tl.where(alpha >= 0.0, 1.0, -1.0)
+        beta = -sgn * normx
+        has_refl = tail_n2 > 0.0
+        beta_safe = tl.where(beta == 0.0, 1.0, beta)
+        tau_k = tl.where(has_refl, (beta - alpha) / beta_safe, 0.0)
+
+        denom = alpha - beta
+        denom = tl.where(denom == 0.0, 1.0, denom)
+        v = tl.where(rows > k, xk / denom, 0.0)
+        v = tl.where(rows == k, 1.0, v)
+        v = tl.where(active, v, 0.0)
+        v = tl.where(has_refl, v, tl.where(rows == k, 1.0, 0.0))
+
+        w = tl.sum(v[:, None] * panel, axis=0)
+
+        z = tl.where(cols < k, w, 0.0)
+        Tcol = -tau_k * tl.sum(Tmat * z[None, :], axis=1)
+        Tcol = tl.where(cols < k, Tcol, 0.0)
+        Tcol = tl.where(cols == k, tau_k, Tcol)
+        Tmat = tl.where(col_is_k[None, :], Tcol[:, None], Tmat)
+
+        upd = tau_k * v[:, None] * w[None, :]
+        col_gt_k = cols > k
+        panel = tl.where(col_gt_k[None, :], panel - upd, panel)
+
+        diagval = tl.where(has_refl, beta, alpha)
+        new_colk = tl.where(rows == k, diagval, v)
+        panel = tl.where(col_is_k[None, :] & (rows[:, None] >= k), new_colk[:, None], panel)
+
+        tau_panel = tl.where(col_is_k & do_k, tau_k, tau_panel)
+
+    tl.store(aptr, panel, mask=mask)
+
+    tptr = tau_ptr + bid * N + j + cols
+    tl.store(tptr, tau_panel, mask=col_valid)
+
+    # V transposed into the combined buffer at (col+voff_c, row+voff_r):
+    # Vt[c, r] = 1 if r==c, panel[r,c] if r>c, else 0  (relative to the sub-top).
+    panelT = tl.trans(panel)
+    cc = cols[:, None]
+    rr = rows[None, :]
+    Vt = tl.where(rr == cc, 1.0, tl.where(rr > cc, panelT, 0.0))
+    keep = (rr < pheight) & (cc < b)
+    Vt = tl.where(keep, Vt, 0.0)
+    vbase = Vbuf_ptr + bid * stride_vb
+    vptr = vbase + (cc + voff_c) * stride_vk + (rr + voff_r) * stride_vn
+    tl.store(vptr, Vt, mask=keep)
+
+    # T into the combined buffer diagonal block at (row+voff_c, col+voff_c).
+    tbase = Tbuf_ptr + bid * stride_tb
+    tptr2 = tbase + (cols[:, None] + voff_c) * stride_tk + (cols[None, :] + voff_c) * stride_tn
+    tl.store(tptr2, Tmat)
+
+
+@triton.jit
+def _cross_T_kernel(
+    Vbuf_ptr, Tbuf_ptr,
+    B, pheight, IB, voff_r1,
+    stride_vb, stride_vk, stride_vn,
+    stride_tb, stride_tk, stride_tn,
+    BM: tl.constexpr, IBP: tl.constexpr,
+):
+    # Build the off-diagonal compact-WY block T01 = -T0 (V0^T V1) T1 into the
+    # combined T's [0:IB, IB:2IB] block. V0 occupies cols 0:IB (rows from the
+    # panel top), V1 occupies cols IB:2IB (rows from voff_r1 == IB). The Gram
+    # G = V0^T V1 (IB x IB) is reduced over the panel rows in BM-row chunks with
+    # tensor cores (K = BM >= 16). T0,T1 are the already-built diagonal blocks.
+    bid = tl.program_id(0)
+    if bid >= B:
+        return
+    kk = tl.arange(0, IBP)            # padded reflector index (IB real)
+    real = kk < IB
+    v_base = Vbuf_ptr + bid * stride_vb
+
+    G = tl.zeros((IBP, IBP), dtype=tl.float32)
+    nchunks = tl.cdiv(pheight, BM)
+    for ci in range(0, nchunks):
+        rr = ci * BM + tl.arange(0, BM)
+        rmask = rr < pheight
+        # V0 chunk (cols 0:IB, rows rr)  -> (IBP, BM)
+        v0p = v_base + kk[:, None] * stride_vk + rr[None, :] * stride_vn
+        V0 = tl.load(v0p, mask=(rmask[None, :] & real[:, None]), other=0.0)
+        # V1 chunk (cols IB:2IB == kk+IB, rows rr)  -> (BM, IBP)
+        v1p = v_base + (kk[None, :] + IB) * stride_vk + rr[:, None] * stride_vn
+        V1 = tl.load(v1p, mask=(rmask[:, None] & real[None, :]), other=0.0)
+        G += tl.dot(V0, V1, input_precision="tf32x3")        # (IBP, IBP)
+
+    # Load T0 = T[0:IB,0:IB], T1 = T[IB:2IB, IB:2IB]  (IBP padded with 0).
+    t_base = Tbuf_ptr + bid * stride_tb
+    t0p = t_base + kk[:, None] * stride_tk + kk[None, :] * stride_tn
+    T0 = tl.load(t0p)
+    t1p = t_base + (kk[:, None] + IB) * stride_tk + (kk[None, :] + IB) * stride_tn
+    T1 = tl.load(t1p)
+    T0 = tl.where(real[:, None] & real[None, :], T0, 0.0)
+    T1 = tl.where(real[:, None] & real[None, :], T1, 0.0)
+
+    # T01 = -(T0 @ G) @ T1   (IB x IB).  IBP>=16 keeps the dots legal.
+    TG = tl.dot(T0, G, input_precision="tf32x3")
+    T01 = -tl.dot(TG, T1, input_precision="tf32x3")
+    T01 = tl.where(real[:, None] & real[None, :], T01, 0.0)
+
+    # store into [0:IB, IB:2IB]
+    toutp = t_base + kk[:, None] * stride_tk + (kk[None, :] + IB) * stride_tn
+    tl.store(toutp, T01, mask=real[:, None] & real[None, :])
+
+
+def _w2_qr_2level(data):
+    # Two-level path for n>=4096: ib=8 narrow (un-spilled) sub-panels + one
+    # nb=16 wide tf32x3 trailing per outer block. Same exact geqrf (H,tau).
+    A = data
+    B, N, _ = A.shape
+    H = A.clone()
+    tau = torch.zeros((B, N), device=A.device, dtype=torch.float32)
+
+    IB = 8
+    NB = 16
+    Vbuf = torch.zeros((B, NB, N), device=A.device, dtype=torch.float32)
+    Tbuf = torch.zeros((B, NB, NB), device=A.device, dtype=torch.float32)
+    YTbuf = torch.empty((B, NB, N), device=A.device, dtype=torch.float32)
+
+    sab, san = H.stride(0), H.stride(1)
+    svb, svk, svn = Vbuf.stride(0), Vbuf.stride(1), Vbuf.stride(2)
+    stb, stk, stn = Tbuf.stride(0), Tbuf.stride(1), Tbuf.stride(2)
+    syb, syk, syn = YTbuf.stride(0), YTbuf.stride(1), YTbuf.stride(2)
+
+    # trailing tiles for the n>=2048 (grid-starved) regime, BLK=16
+    BM_Y, BNc_Y, NW_Y = 128, 64, 4
+    BM_A, BNc_A, NW_A = 32, 32, 2
+
+    j = 0
+    while j < N:
+        b0 = min(IB, N - j)
+        pheight = N - j
+        MAXH = triton.next_power_of_2(pheight)
+        nwp0 = 4 if MAXH <= 512 else (8 if MAXH <= 1024 else 32)
+
+        # sub-panel 0: cols [j, j+IB), V/T at offset (0,0)
+        _panel_factor2_kernel[(B,)](
+            H, tau, Vbuf, Tbuf, B, N, j, pheight, b0, 0, 0,
+            sab, san, svb, svk, svn, stb, stk, stn,
+            BLK=IB, MAXH=MAXH, num_warps=nwp0,
+        )
+
+        b1 = min(IB, N - j - b0)
+        if b1 > 0:
+            # inner trailing: apply sub-panel 0's IB reflectors to ONLY sub-panel
+            # 1's b1 columns [j+b0, j+b0+b1). Uses the wide (16) padded buffer
+            # (cols IB:2IB still zero) so the K=16 dots are exact; ncols is tiny.
+            _trailing_YT_kernel[(1, B)](
+                H, Vbuf, Tbuf, YTbuf, B, N, j, pheight, b1, j + b0,
+                sab, san, svb, svk, svn, stb, stk, stn, syb, syk, syn,
+                BLK=NB, BM=128, BNc=NB, num_warps=4,
+            )
+            _trailing_apply_kernel[(triton.cdiv(pheight, 128), B)](
+                H, Vbuf, YTbuf, B, N, j, pheight, b1, j + b0,
+                sab, san, svb, svk, svn, syb, syk, syn,
+                BLK=NB, BM=128, BNc=NB, num_warps=4,
+            )
+
+            # sub-panel 1: cols [j+b0, j+b0+b1), V/T at offset (row IB, col IB)
+            ph1 = N - (j + b0)
+            MAXH1 = triton.next_power_of_2(ph1)
+            nwp1 = 4 if MAXH1 <= 512 else (8 if MAXH1 <= 1024 else 32)
+            _panel_factor2_kernel[(B,)](
+                H, tau, Vbuf, Tbuf, B, N, j + b0, ph1, b1, IB, IB,
+                sab, san, svb, svk, svn, stb, stk, stn,
+                BLK=IB, MAXH=MAXH1, num_warps=nwp1,
+            )
+
+            # cross-block T01 (needs both sub-panels' V and the two diagonal Ts)
+            _cross_T_kernel[(B,)](
+                Vbuf, Tbuf, B, pheight, IB, IB,
+                svb, svk, svn, stb, stk, stn,
+                BM=128, IBP=16,
+            )
+
+        bb = b0 + b1                      # reflectors in this outer block
+        ncols = N - (j + bb)
+        if ncols > 0:
+            # ONE wide (nb=16) trailing over the bulk, exact via the combined T.
+            nct_y = triton.cdiv(ncols, BNc_Y)
+            _trailing_YT_kernel[(nct_y, B)](
+                H, Vbuf, Tbuf, YTbuf, B, N, j, pheight, ncols, j + bb,
+                sab, san, svb, svk, svn, stb, stk, stn, syb, syk, syn,
+                BLK=NB, BM=BM_Y, BNc=BNc_Y, num_warps=NW_Y,
+            )
+            nct_a = triton.cdiv(ncols, BNc_A)
+            nrt_a = triton.cdiv(pheight, BM_A)
+            _trailing_apply_kernel[(nrt_a * nct_a, B)](
+                H, Vbuf, YTbuf, B, N, j, pheight, ncols, j + bb,
+                sab, san, svb, svk, svn, syb, syk, syn,
+                BLK=NB, BM=BM_A, BNc=BNc_A, num_warps=NW_A,
+            )
+
+        # reset the padding columns the next outer block relies on being zero:
+        # sub-panel 1 wrote V cols IB:2IB and T01/T1; zero them for reuse.
+        Vbuf[:, IB:NB, :].zero_()
+        Tbuf[:, :, IB:NB].zero_()
+        Tbuf[:, IB:NB, :].zero_()
+        j += bb
+
+    return H, tau
+
+
 def _w2_qr(data):
     A = data
     B, N, _ = A.shape
     H = A.clone()
     tau = torch.zeros((B, N), device=A.device, dtype=torch.float32)
 
-    # BLK_P is the panel block-width (how many reflectors a panel_factor launch
-    # builds, and the resident-panel register footprint = MAXH*BLK_P floats per
-    # CTA). BLK is the buffer/trailing-tile width (the K-dimension of the two
-    # tensor-core trailing dots, which need K>=16).
-    #
-    # For the tall few-matrix shapes (n>=2048) the panel runs grid=(B,)=2..8 ->
-    # only 2-8 SMs, so its register footprint must stay tiny or it SPILLS to
-    # local memory (HBM): ncu shows the MAXH=4096 BLK=16 panel spilling ~45MB of
-    # local ld/st per launch (regs capped at 64/thread), costing 313us where the
-    # un-spilled MAXH=2048 panel is 74us. Narrowing the PANEL to BLK_P=8 halves
-    # the resident (MAXH,BLK_P) tensor to 32 floats/thread, eliminating the spill
-    # (measured 313->59us, 5.3x, at MAXH=4096). The trailing keeps the wide
-    # BLK=16 tile (the panel writes 8 real reflectors into a 16-wide V/T buffer
-    # whose padding columns are pre-zeroed once, so the K=16 trailing dots are
-    # mathematically exact -- the 8 zero reflectors contribute nothing).
     if N <= 32:
         BLK = min(16, N)
-        BLK_P = BLK
     elif N >= 1536:
+        # Tall panels (n>=2048): a narrow block halves the panel register
+        # footprint -> much higher occupancy (~2x faster) than BLK=32.
         BLK = 16
-        BLK_P = 8
     else:
         BLK = 32
-        BLK_P = 32
 
-    if BLK_P != BLK:
-        # Padded buffers: panel writes BLK_P real cols/rows, the rest stay 0.
-        Vbuf = torch.zeros((B, BLK, N), device=A.device, dtype=torch.float32)
-        Tbuf = torch.zeros((B, BLK, BLK), device=A.device, dtype=torch.float32)
-    else:
-        Vbuf = torch.empty((B, BLK, N), device=A.device, dtype=torch.float32)
-        Tbuf = torch.empty((B, BLK, BLK), device=A.device, dtype=torch.float32)
+    Vbuf = torch.empty((B, BLK, N), device=A.device, dtype=torch.float32)
+    Tbuf = torch.empty((B, BLK, BLK), device=A.device, dtype=torch.float32)
     YTbuf = torch.empty((B, BLK, N), device=A.device, dtype=torch.float32)
 
     sab, san = H.stride(0), H.stride(1)
@@ -693,12 +941,12 @@ def _w2_qr(data):
         BM_A, BNc_A, NW_A = 32, 32, 2
     j = 0
     while j < N:
-        b = min(BLK_P, N - j)
+        b = min(BLK, N - j)
         pheight = N - j
         MAXH = triton.next_power_of_2(pheight)
 
         # num_warps must scale with the panel height: the panel kernel holds a
-        # (MAXH, BLK_P) register tensor; too few warps -> register spill -> huge
+        # (MAXH, BLK) register tensor; too few warps -> register spill -> huge
         # slowdown (measured 7-10x on n>=1024). Empirically-tuned per MAXH.
         if MAXH <= 512:
             nwp = 4
@@ -711,7 +959,7 @@ def _w2_qr(data):
             H, tau, Vbuf, Tbuf,
             B, N, j, pheight, b,
             sab, san, svb, svk, svn, stb, stk, stn,
-            BLK=BLK_P, MAXH=MAXH, num_warps=nwp,
+            BLK=BLK, MAXH=MAXH, num_warps=nwp,
         )
 
         ncols = N - (j + b)
@@ -748,6 +996,13 @@ def custom_kernel(data: input_t) -> output_t:
         return _tiny_qr(data)
     if n in _SMALL_N:
         return _small_qr(data)
+    # For the very tall few-matrix shapes (n>=2560) the single-level panel's
+    # (MAXH=4096, BLK=16) register tensor spills to local memory; the two-level
+    # ib=8 path keeps the panel un-spilled while doing one wide trailing. Routing
+    # by matrix size n is a SHAPE parameter (invariance-guard-safe). Same exact
+    # geqrf (H,tau).
+    if n >= 2560:
+        return _w2_qr_2level(data)
     return _w2_qr(data)
 
 
