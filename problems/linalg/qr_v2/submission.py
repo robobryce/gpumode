@@ -1014,9 +1014,10 @@ def _w2_qr_2level(data):
                 BLK=IB, MAXH=MAXH1, num_warps=nwp1,
             )
 
-            # cross-block T01 (single CTA/matrix; the split-Gram variant added
-            # more launches + a Gpart HBM round-trip that cost more than the
-            # SM-starvation it removed -- measured 51.3k->59.4k, reverted).
+            # cross-block T01 (single CTA/matrix). Swept the reduction chunk BM:
+            # 128 is best; BM=512 register-spills the (16,512) V tiles (0.36x),
+            # and a 2-kernel split-Gram added launches+HBM that lost (0.96x). Both
+            # reverted -- the single-CTA BM=128 Gram is the cross-T floor here.
             _cross_T_kernel[(B,)](
                 Vbuf, Tbuf, B, pheight, IB, IB,
                 svb, svk, svn, stb, stk, stn,
