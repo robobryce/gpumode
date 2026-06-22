@@ -1192,8 +1192,23 @@ def _w2_qr(data):
         # num_warps must scale with the panel height: the panel kernel holds a
         # (MAXH, BLK) register tensor; too few warps -> register spill -> huge
         # slowdown (measured 7-10x on n>=1024). Empirically-tuned per MAXH.
-        if MAXH <= 512:
+        #
+        # GRID-SATURATION-AWARE refinement (worker-1, grafted onto the fused-W
+        # trailing base: _panel_factor_kernel is byte-identical between the two,
+        # so its spill knee is unchanged and W1's threshold transfers directly):
+        # the optimal warp count also depends on whether grid=(B,) fills the GPU.
+        # The panel is register-limited to ~2 blocks/SM, so it saturates ~148*2
+        # =296 blocks. When B is SMALL (grid-STARVED), more warps/block adds work
+        # per SM and WINS; when B is LARGE (grid-SATURATED), more warps/block just
+        # steals block concurrency and LOSES. The MAXH=512 panel SPILLS at nwp4
+        # (255r/58s); bumping it to nwp8 (165r/0s) measured -6.8% on n=352 (B=40,
+        # grid-starved) but +2.6% on n=512 (B=640, saturated). So bump the tall
+        # spilling panel ONLY when the grid is starved (B below the knee).
+        grid_starved = B < 256
+        if MAXH <= 256:
             nwp = 4
+        elif MAXH <= 512:
+            nwp = 8 if grid_starved else 4
         elif MAXH <= 1024:
             nwp = 8
         else:
