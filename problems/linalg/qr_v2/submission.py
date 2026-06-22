@@ -27,7 +27,6 @@ def _panel_factor_kernel(
     stride_vb, stride_vk, stride_vn,
     stride_tb, stride_tk, stride_tn,
     BLK: tl.constexpr, MAXH: tl.constexpr,
-    IB: tl.constexpr, USE_B3: tl.constexpr,
 ):
     bid = tl.program_id(0)
     if bid >= B:
@@ -50,74 +49,56 @@ def _panel_factor_kernel(
     # kernel launch + a re-read of V from HBM.
     Tmat = tl.zeros((BLK, BLK), dtype=tl.float32)
 
-    nsub: tl.constexpr = (BLK // IB) if USE_B3 else 1
-    sub_w: tl.constexpr = IB if USE_B3 else BLK
-    for sblk in range(0, nsub):
-        s = sblk * sub_w
-        for kk in range(0, sub_w):
-            k = s + kk
-            do_k = k < b
-            col_is_k = cols == k
-            xk = tl.sum(tl.where(col_is_k[None, :], panel, 0.0), axis=1)   # (MAXH,)
-            active = (rows >= k) & row_valid
-            xk = tl.where(active, xk, 0.0)
+    for k in range(0, BLK):
+        do_k = k < b
+        col_is_k = cols == k
+        xk = tl.sum(tl.where(col_is_k[None, :], panel, 0.0), axis=1)   # (MAXH,)
+        active = (rows >= k) & row_valid
+        xk = tl.where(active, xk, 0.0)
 
-            alpha = tl.sum(tl.where(rows == k, xk, 0.0))
-            tailv = tl.where(rows > k, xk, 0.0)
-            tail_n2 = tl.sum(tailv * tailv)
-            normx = tl.sqrt(alpha * alpha + tail_n2)
-            sgn = tl.where(alpha >= 0.0, 1.0, -1.0)
-            beta = -sgn * normx
-            has_refl = tail_n2 > 0.0
-            beta_safe = tl.where(beta == 0.0, 1.0, beta)
-            tau_k = tl.where(has_refl, (beta - alpha) / beta_safe, 0.0)
+        alpha = tl.sum(tl.where(rows == k, xk, 0.0))
+        tailv = tl.where(rows > k, xk, 0.0)
+        tail_n2 = tl.sum(tailv * tailv)
+        normx = tl.sqrt(alpha * alpha + tail_n2)
+        sgn = tl.where(alpha >= 0.0, 1.0, -1.0)
+        beta = -sgn * normx
+        has_refl = tail_n2 > 0.0
+        beta_safe = tl.where(beta == 0.0, 1.0, beta)
+        tau_k = tl.where(has_refl, (beta - alpha) / beta_safe, 0.0)
 
-            denom = alpha - beta
-            denom = tl.where(denom == 0.0, 1.0, denom)
-            v = tl.where(rows > k, xk / denom, 0.0)
-            v = tl.where(rows == k, 1.0, v)
-            v = tl.where(active, v, 0.0)
-            v = tl.where(has_refl, v, tl.where(rows == k, 1.0, 0.0))
+        denom = alpha - beta
+        denom = tl.where(denom == 0.0, 1.0, denom)
+        v = tl.where(rows > k, xk / denom, 0.0)
+        v = tl.where(rows == k, 1.0, v)
+        v = tl.where(active, v, 0.0)
+        v = tl.where(has_refl, v, tl.where(rows == k, 1.0, 0.0))
 
-            # w[c] = v_k . panel[:,c]; used for the within-(sub)block update and
-            # the incremental T (for c<k, z[c]=w[c] since v_k supported on rows>=k).
-            w = tl.sum(v[:, None] * panel, axis=0)            # (BLK,)
+        # w[c] = v_k . panel[:,c] -- used both for the trailing-panel update AND
+        # the incremental T factor. Because v_k is supported only on rows >= k,
+        # for c < k we have z[c] = V[:,c].v_k == w[c] exactly (the diagonal/above
+        # terms vanish), so the WY recurrence needs no separate (MAXH,BLK) Vmat
+        # tensor or extra reduction -- a big register/occupancy win on the panel.
+        w = tl.sum(v[:, None] * panel, axis=0)            # (BLK,)
 
-            z = tl.where(cols < k, w, 0.0)
-            Tcol = -tau_k * tl.sum(Tmat * z[None, :], axis=1)  # (BLK,)
-            Tcol = tl.where(cols < k, Tcol, 0.0)
-            Tcol = tl.where(cols == k, tau_k, Tcol)
-            Tmat = tl.where(col_is_k[None, :], Tcol[:, None], Tmat)
+        # --- incremental T column k:  T[a<k,k] = -tau_k * (T @ w[c<k]) ---
+        z = tl.where(cols < k, w, 0.0)
+        Tcol = -tau_k * tl.sum(Tmat * z[None, :], axis=1)  # (BLK,)
+        Tcol = tl.where(cols < k, Tcol, 0.0)
+        Tcol = tl.where(cols == k, tau_k, Tcol)
+        Tmat = tl.where(col_is_k[None, :], Tcol[:, None], Tmat)
 
-            # rank-1 update of trailing columns within the current sub-block only
-            # (USE_B3): the cross-sub-block columns are updated by the BLAS-3 GEMM
-            # below. In the non-B3 path sub_w==BLK so this is the full trailing.
-            upd = tau_k * v[:, None] * w[None, :]
-            col_gt_k = (cols > k) & (cols < s + sub_w)
-            panel = tl.where(col_gt_k[None, :], panel - upd, panel)
+        # apply H_k to trailing panel columns (c > k)
+        upd = tau_k * v[:, None] * w[None, :]
+        col_gt_k = cols > k
+        panel = tl.where(col_gt_k[None, :], panel - upd, panel)
 
-            diagval = tl.where(has_refl, beta, alpha)
-            new_colk = tl.where(rows == k, diagval, v)
-            panel = tl.where(col_is_k[None, :] & (rows[:, None] >= k), new_colk[:, None], panel)
+        # store this column: R[k,k] on diag, reflector below; leave rows<k
+        # (already-finalized R entries from earlier steps) untouched.
+        diagval = tl.where(has_refl, beta, alpha)
+        new_colk = tl.where(rows == k, diagval, v)        # row==k -> beta, row>k -> v
+        panel = tl.where(col_is_k[None, :] & (rows[:, None] >= k), new_colk[:, None], panel)
 
-            tau_panel = tl.where(col_is_k & do_k, tau_k, tau_panel)
-
-        # ---- BLAS-3 rank-IB block update of the rest of the panel (USE_B3) ----
-        # Columns [s+IB, BLK) := (I - Vs Ts^T Vs^T) A2 via tensor-core tl.dot.
-        # Minimum live tiles: Vfull + delta (A2 masked inline) on top of panel.
-        if USE_B3 and (sblk < nsub - 1):
-            rr = rows[:, None]
-            cc2 = cols[None, :]
-            is_sub = (cc2 >= s) & (cc2 < s + IB)
-            Vfull = tl.where(rr == cc2, 1.0, tl.where(rr > cc2, panel, 0.0))
-            Vfull = tl.where(is_sub & (rr < pheight), Vfull, 0.0)           # (MAXH,BLK)
-            is_trail = cc2 >= (s + IB)
-            Wm = tl.dot(tl.trans(Vfull),
-                        tl.where(is_trail & (rr < pheight), panel, 0.0),
-                        input_precision="tf32x3")                          # (BLK,BLK)
-            YTm = tl.dot(tl.trans(Tmat), Wm, input_precision="tf32x3")     # (BLK,BLK)
-            delta = tl.dot(Vfull, YTm, input_precision="tf32x3")           # (MAXH,BLK)
-            panel = tl.where(is_trail, panel - delta, panel)
+        tau_panel = tl.where(col_is_k & do_k, tau_k, tau_panel)
 
     tl.store(aptr, panel, mask=mask)
 
@@ -269,19 +250,11 @@ def custom_kernel(data: input_t) -> output_t:
         else:
             nwp = 32
 
-        # In-kernel BLAS-3 panel: replace the within-panel rank-1 trailing updates
-        # of cross-sub-block columns with rank-IB compact-WY tensor-core GEMMs.
-        # Only enabled where the extra live (MAXH,BLK) GEMM tiles fit the 227KB
-        # smem budget: panel+Vfull+delta = 3*MAXH*BLK*4 <= ~192KB at MAXH<=512.
-        # IB=16 (tensor-core min K). For MAXH>=1024 fall back to the serial chain.
-        use_b3 = (BLK == 32) and (MAXH <= 256) and (b == BLK)
-        ib = 16
-
         _panel_factor_kernel[(B,)](
             H, tau, Vbuf, Tbuf,
             B, N, j, pheight, b,
             sab, san, svb, svk, svn, stb, stk, stn,
-            BLK=BLK, MAXH=MAXH, IB=ib, USE_B3=use_b3, num_warps=nwp,
+            BLK=BLK, MAXH=MAXH, num_warps=nwp,
         )
 
         ncols = N - (j + b)
