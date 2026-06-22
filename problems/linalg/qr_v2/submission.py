@@ -21,10 +21,11 @@ from task import input_t, output_t
 
 @triton.jit
 def _panel_factor_kernel(
-    A_ptr, tau_ptr, Vbuf_ptr,
+    A_ptr, tau_ptr, Vbuf_ptr, Tbuf_ptr,
     B, N, j, pheight, b,
     stride_ab, stride_an,
     stride_vb, stride_vk, stride_vn,
+    stride_tb, stride_tk, stride_tn,
     BLK: tl.constexpr, MAXH: tl.constexpr,
 ):
     bid = tl.program_id(0)
@@ -42,6 +43,11 @@ def _panel_factor_kernel(
     panel = tl.load(aptr, mask=mask, other=0.0)          # (MAXH, BLK)
 
     tau_panel = tl.zeros((BLK,), dtype=tl.float32)
+    # Build the WY T factor (BLK x BLK upper-tri) incrementally here (LAPACK
+    # dlarft forward): at step k, T[0:k,k] = -tau_k * T[0:k,0:k] * (V[:,0:k]^T v_k).
+    # This fuses build_T into panel_factor, eliminating a whole low-occupancy
+    # kernel launch + a re-read of V from HBM.
+    Tmat = tl.zeros((BLK, BLK), dtype=tl.float32)
 
     for k in range(0, BLK):
         do_k = k < b
@@ -66,6 +72,18 @@ def _panel_factor_kernel(
         v = tl.where(rows == k, 1.0, v)
         v = tl.where(active, v, 0.0)
         v = tl.where(has_refl, v, tl.where(rows == k, 1.0, 0.0))
+
+        # --- incremental T column k ---
+        # z[c] = V[:,c]^T v_k  for c < k, where V[:,c] = (r==c?1 : r>c?panel[r,c] : 0)
+        Vmat = tl.where(rows[:, None] == cols[None, :], 1.0,
+                        tl.where(rows[:, None] > cols[None, :], panel, 0.0))
+        z = tl.sum(Vmat * v[:, None], axis=0)             # (BLK,) ; z[c]=V[:,c].v
+        z = tl.where(cols < k, z, 0.0)
+        # Tcol[a] = -tau_k * sum_c T[a,c] z[c]   (a < k)
+        Tcol = -tau_k * tl.sum(Tmat * z[None, :], axis=1)  # (BLK,)
+        Tcol = tl.where(cols < k, Tcol, 0.0)
+        Tcol = tl.where(cols == k, tau_k, Tcol)
+        Tmat = tl.where(col_is_k[None, :], Tcol[:, None], Tmat)
 
         # apply H_k to trailing panel columns (c > k)
         w = tl.sum(v[:, None] * panel, axis=0)            # (BLK,)
@@ -96,49 +114,10 @@ def _panel_factor_kernel(
     vptr = vbase + cc * stride_vk + rr * stride_vn
     tl.store(vptr, Vt, mask=(rr < pheight) & (cc < b))
 
-
-@triton.jit
-def _build_T_kernel(
-    tau_ptr, Vbuf_ptr, Tbuf_ptr,
-    B, N, j, pheight, b,
-    stride_vb, stride_vk, stride_vn,
-    stride_tb, stride_tk, stride_tn,
-    BLK: tl.constexpr, RTILE: tl.constexpr,
-):
-    bid = tl.program_id(0)
-    if bid >= B:
-        return
-    cols = tl.arange(0, BLK)
-
-    # Z = V^T V : (BLK, BLK), contract over pheight rows in tiles.
-    vbase = Vbuf_ptr + bid * stride_vb
-    Z = tl.zeros((BLK, BLK), dtype=tl.float32)
-    nchunks = tl.cdiv(pheight, RTILE)
-    for ci in range(0, nchunks):
-        rr = ci * RTILE + tl.arange(0, RTILE)
-        rmask = rr < pheight
-        # load Vt chunk (BLK, RTILE): Vbuf[k, rr]
-        vp = vbase + cols[:, None] * stride_vk + rr[None, :] * stride_vn
-        vc = tl.load(vp, mask=rmask[None, :], other=0.0)       # (BLK, RTILE)
-        Z += tl.dot(vc, tl.trans(vc), input_precision="ieee")                          # (BLK, BLK)
-
-    tau_p = tl.load(tau_ptr + bid * N + j + cols, mask=cols < b, other=0.0)  # (BLK,)
-
-    # Sequential T build (columns). T[:, bb]: a<bb = -T[:,:] @ (tau_bb*Z[:,bb]); diag=tau_bb
-    Tmat = tl.zeros((BLK, BLK), dtype=tl.float32)
-    for bb in range(0, BLK):
-        is_b = cols == bb
-        zb = tl.sum(tl.where(is_b[None, :], Z, 0.0), axis=1)    # Z[:, bb]
-        taub = tl.sum(tl.where(is_b, tau_p, 0.0))
-        y = tl.where(cols < bb, taub * zb, 0.0)                 # (BLK,) over a
-        col = -tl.sum(Tmat * y[None, :], axis=1)                # (BLK,) over a'
-        col = tl.where(cols < bb, col, 0.0)
-        col = tl.where(cols == bb, taub, col)
-        Tmat = tl.where(is_b[None, :], col[:, None], Tmat)
-
+    # store T
     tbase = Tbuf_ptr + bid * stride_tb
-    tptr = tbase + cols[:, None] * stride_tk + cols[None, :] * stride_tn
-    tl.store(tptr, Tmat)
+    tptr2 = tbase + cols[:, None] * stride_tk + cols[None, :] * stride_tn
+    tl.store(tptr2, Tmat)
 
 
 # Trailing update is split into TWO kernels to be race-free: the first reads
@@ -179,12 +158,12 @@ def _trailing_YT_kernel(
         achunk = tl.load(ap, mask=rrmask[:, None] & cmask[None, :], other=0.0)   # (BM,BNc)
         vp = v_base + krange[:, None] * stride_vk + rr[None, :] * stride_vn
         vchunk = tl.load(vp, mask=rrmask[None, :], other=0.0)                    # (BLK,BM)
-        W += tl.dot(vchunk, achunk, input_precision="ieee")
+        W += tl.dot(vchunk, achunk, input_precision="tf32x3")
 
     # YT = T^T @ W
     tp = Tbuf_ptr + bid * stride_tb + krange[:, None] * stride_tk + krange[None, :] * stride_tn
     Tm = tl.load(tp)
-    YT = tl.dot(tl.trans(Tm), W, input_precision="ieee")                        # (BLK,BNc)
+    YT = tl.dot(tl.trans(Tm), W, input_precision="tf32x3")                        # (BLK,BNc)
 
     yp = YT_ptr + bid * stride_yb + krange[:, None] * stride_yk + ccols[None, :] * stride_yn
     tl.store(yp, YT, mask=cmask[None, :])
@@ -221,7 +200,7 @@ def _trailing_apply_kernel(
     # YT[:, ccols] : (BLK, BNc)
     yp = YT_ptr + bid * stride_yb + krange[:, None] * stride_yk + ccols[None, :] * stride_yn
     YT = tl.load(yp, mask=cmask[None, :], other=0.0)
-    delta = tl.dot(Vrow, YT, input_precision="ieee")                            # (BM,BNc)
+    delta = tl.dot(Vrow, YT, input_precision="tf32x3")                            # (BM,BNc)
 
     ap = a_trail_base + rrows[:, None] * stride_an + ccols[None, :]
     amask = rmask[:, None] & cmask[None, :]
@@ -249,7 +228,7 @@ def custom_kernel(data: input_t) -> output_t:
     stb, stk, stn = Tbuf.stride(0), Tbuf.stride(1), Tbuf.stride(2)
     syb, syk, syn = YTbuf.stride(0), YTbuf.stride(1), YTbuf.stride(2)
 
-    BM, BNc = 64, 64
+    BM, BNc = 32, 64
     j = 0
     while j < N:
         b = min(BLK, N - j)
@@ -267,33 +246,27 @@ def custom_kernel(data: input_t) -> output_t:
             nwp = 32
 
         _panel_factor_kernel[(B,)](
-            H, tau, Vbuf,
+            H, tau, Vbuf, Tbuf,
             B, N, j, pheight, b,
-            sab, san, svb, svk, svn,
+            sab, san, svb, svk, svn, stb, stk, stn,
             BLK=BLK, MAXH=MAXH, num_warps=nwp,
         )
 
         ncols = N - (j + b)
         if ncols > 0:
-            _build_T_kernel[(B,)](
-                tau, Vbuf, Tbuf,
-                B, N, j, pheight, b,
-                svb, svk, svn, stb, stk, stn,
-                BLK=BLK, RTILE=64, num_warps=4,
-            )
             nct = triton.cdiv(ncols, BNc)
             nrt = triton.cdiv(pheight, BM)
             _trailing_YT_kernel[(nct, B)](
                 H, Vbuf, Tbuf, YTbuf,
                 B, N, j, pheight, ncols, j + b,
                 sab, san, svb, svk, svn, stb, stk, stn, syb, syk, syn,
-                BLK=BLK, BM=BM, BNc=BNc,
+                BLK=BLK, BM=BM, BNc=BNc, num_warps=2,
             )
             _trailing_apply_kernel[(nrt * nct, B)](
                 H, Vbuf, YTbuf,
                 B, N, j, pheight, ncols, j + b,
                 sab, san, svb, svk, svn, syb, syk, syn,
-                BLK=BLK, BM=BM, BNc=BNc,
+                BLK=BLK, BM=BM, BNc=BNc, num_warps=2,
             )
         j += b
 
