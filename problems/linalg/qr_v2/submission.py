@@ -159,12 +159,12 @@ def _trailing_YT_kernel(
         achunk = tl.load(ap, mask=rrmask[:, None] & cmask[None, :], other=0.0)   # (BM,BNc)
         vp = v_base + krange[:, None] * stride_vk + rr[None, :] * stride_vn
         vchunk = tl.load(vp, mask=rrmask[None, :], other=0.0)                    # (BLK,BM)
-        W += tl.dot(vchunk, achunk, input_precision="tf32x3")
+        W += tl.dot(vchunk, achunk, input_precision="tf32")
 
     # YT = T^T @ W
     tp = Tbuf_ptr + bid * stride_tb + krange[:, None] * stride_tk + krange[None, :] * stride_tn
     Tm = tl.load(tp)
-    YT = tl.dot(tl.trans(Tm), W, input_precision="tf32x3")                        # (BLK,BNc)
+    YT = tl.dot(tl.trans(Tm), W, input_precision="tf32")                        # (BLK,BNc)
 
     yp = YT_ptr + bid * stride_yb + krange[:, None] * stride_yk + ccols[None, :] * stride_yn
     tl.store(yp, YT, mask=cmask[None, :])
@@ -201,7 +201,7 @@ def _trailing_apply_kernel(
     # YT[:, ccols] : (BLK, BNc)
     yp = YT_ptr + bid * stride_yb + krange[:, None] * stride_yk + ccols[None, :] * stride_yn
     YT = tl.load(yp, mask=cmask[None, :], other=0.0)
-    delta = tl.dot(Vrow, YT, input_precision="tf32x3")                            # (BM,BNc)
+    delta = tl.dot(Vrow, YT, input_precision="tf32")                            # (BM,BNc)
 
     ap = a_trail_base + rrows[:, None] * stride_an + ccols[None, :]
     amask = rmask[:, None] & cmask[None, :]
@@ -233,13 +233,7 @@ def custom_kernel(data: input_t) -> output_t:
     stb, stk, stn = Tbuf.stride(0), Tbuf.stride(1), Tbuf.stride(2)
     syb, syk, syn = YTbuf.stride(0), YTbuf.stride(1), YTbuf.stride(2)
 
-    # Trailing-update tiles. YT reduces V^T@A_trail over the tall panel-height
-    # (wants a tall reduction chunk BM_Y); apply does a rank-BLK subtract with
-    # disjoint (BM_A, BNc_A) output tiles (wants big output tiles for tensor-core
-    # MMA reuse and few waves). Separate tiles + more warps lift the apply from
-    # the measured 38% SM throughput / 39 waves (tiny 32x64 tiles, 2 warps).
-    BM_Y, BNc_Y, NW_Y = 64, 64, 4
-    BM_A, BNc_A, NW_A = 64, 128, 4
+    BM, BNc = 32, 64
     j = 0
     while j < N:
         b = min(BLK, N - j)
@@ -265,20 +259,19 @@ def custom_kernel(data: input_t) -> output_t:
 
         ncols = N - (j + b)
         if ncols > 0:
-            nct_y = triton.cdiv(ncols, BNc_Y)
-            _trailing_YT_kernel[(nct_y, B)](
+            nct = triton.cdiv(ncols, BNc)
+            nrt = triton.cdiv(pheight, BM)
+            _trailing_YT_kernel[(nct, B)](
                 H, Vbuf, Tbuf, YTbuf,
                 B, N, j, pheight, ncols, j + b,
                 sab, san, svb, svk, svn, stb, stk, stn, syb, syk, syn,
-                BLK=BLK, BM=BM_Y, BNc=BNc_Y, num_warps=NW_Y,
+                BLK=BLK, BM=BM, BNc=BNc, num_warps=2,
             )
-            nct_a = triton.cdiv(ncols, BNc_A)
-            nrt_a = triton.cdiv(pheight, BM_A)
-            _trailing_apply_kernel[(nrt_a * nct_a, B)](
+            _trailing_apply_kernel[(nrt * nct, B)](
                 H, Vbuf, YTbuf,
                 B, N, j, pheight, ncols, j + b,
                 sab, san, svb, svk, svn, syb, syk, syn,
-                BLK=BLK, BM=BM_A, BNc=BNc_A, num_warps=NW_A,
+                BLK=BLK, BM=BM, BNc=BNc, num_warps=2,
             )
         j += b
 
