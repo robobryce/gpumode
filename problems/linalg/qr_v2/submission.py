@@ -209,62 +209,6 @@ def _trailing_apply_kernel(
     tl.store(ap, aorig - delta, mask=amask)
 
 
-# Fused, race-free trailing update: one program owns ONE column-tile and does
-# both passes over the rows -- (1) reduce W = V^T A_trail[:, tile] over all rows,
-# form YT = T^T W; (2) loop row-chunks applying A_trail[:, tile] -= V[rows] @ YT.
-# Race-free because column-tiles are disjoint: a program only ever reads and
-# writes its own columns (all rows), so no other program touches them. Saves the
-# YT HBM round-trip and one kernel launch per panel vs the two-kernel split.
-@triton.jit
-def _trailing_fused_kernel(
-    A_ptr, Vbuf_ptr, Tbuf_ptr,
-    B, N, j, pheight, ncols, jb,
-    stride_ab, stride_an,
-    stride_vb, stride_vk, stride_vn,
-    stride_tb, stride_tk, stride_tn,
-    BLK: tl.constexpr, BM: tl.constexpr, BNc: tl.constexpr,
-):
-    col_tile = tl.program_id(0)
-    bid = tl.program_id(1)
-    if bid >= B:
-        return
-    ccols = col_tile * BNc + tl.arange(0, BNc)
-    cmask = ccols < ncols
-    krange = tl.arange(0, BLK)
-
-    a_trail_base = A_ptr + bid * stride_ab + j * stride_an + jb
-    v_base = Vbuf_ptr + bid * stride_vb
-
-    # --- pass 1: W = V^T @ A_trail[:, ccols] over all rows ---
-    W = tl.zeros((BLK, BNc), dtype=tl.float32)
-    nchunks = tl.cdiv(pheight, BM)
-    for ci in range(0, nchunks):
-        rr = ci * BM + tl.arange(0, BM)
-        rrmask = rr < pheight
-        ap = a_trail_base + rr[:, None] * stride_an + ccols[None, :]
-        achunk = tl.load(ap, mask=rrmask[:, None] & cmask[None, :], other=0.0)   # (BM,BNc)
-        vp = v_base + krange[:, None] * stride_vk + rr[None, :] * stride_vn
-        vchunk = tl.load(vp, mask=rrmask[None, :], other=0.0)                    # (BLK,BM)
-        W += tl.dot(vchunk, achunk, input_precision="tf32x3")
-
-    # YT = T^T @ W
-    tp = Tbuf_ptr + bid * stride_tb + krange[:, None] * stride_tk + krange[None, :] * stride_tn
-    Tm = tl.load(tp)
-    YT = tl.dot(tl.trans(Tm), W, input_precision="tf32x3")                       # (BLK,BNc)
-
-    # --- pass 2: A_trail[:, ccols] -= V[rows,:] @ YT, row-chunk at a time ---
-    for ci in range(0, nchunks):
-        rr = ci * BM + tl.arange(0, BM)
-        rrmask = rr < pheight
-        vp = v_base + krange[None, :] * stride_vk + rr[:, None] * stride_vn
-        Vrow = tl.load(vp, mask=rrmask[:, None], other=0.0)                       # (BM,BLK)
-        delta = tl.dot(Vrow, YT, input_precision="tf32x3")                       # (BM,BNc)
-        ap = a_trail_base + rr[:, None] * stride_an + ccols[None, :]
-        amask = rrmask[:, None] & cmask[None, :]
-        aorig = tl.load(ap, mask=amask, other=0.0)
-        tl.store(ap, aorig - delta, mask=amask)
-
-
 def custom_kernel(data: input_t) -> output_t:
     A = data
     B, N, _ = A.shape
@@ -316,31 +260,19 @@ def custom_kernel(data: input_t) -> output_t:
         ncols = N - (j + b)
         if ncols > 0:
             nct = triton.cdiv(ncols, BNc)
-            if N <= 1024:
-                # Small/medium N: launch-overhead dominates, so the fused
-                # single-launch race-free trailing (no YT HBM round-trip) wins.
-                _trailing_fused_kernel[(nct, B)](
-                    H, Vbuf, Tbuf,
-                    B, N, j, pheight, ncols, j + b,
-                    sab, san, svb, svk, svn, stb, stk, stn,
-                    BLK=BLK, BM=BM, BNc=BNc, num_warps=2,
-                )
-            else:
-                # Large N (tall trailing): memory traffic dominates; the split
-                # YT/apply streams V more efficiently than the fused 2-pass.
-                nrt = triton.cdiv(pheight, BM)
-                _trailing_YT_kernel[(nct, B)](
-                    H, Vbuf, Tbuf, YTbuf,
-                    B, N, j, pheight, ncols, j + b,
-                    sab, san, svb, svk, svn, stb, stk, stn, syb, syk, syn,
-                    BLK=BLK, BM=BM, BNc=BNc, num_warps=2,
-                )
-                _trailing_apply_kernel[(nrt * nct, B)](
-                    H, Vbuf, YTbuf,
-                    B, N, j, pheight, ncols, j + b,
-                    sab, san, svb, svk, svn, syb, syk, syn,
-                    BLK=BLK, BM=BM, BNc=BNc, num_warps=2,
-                )
+            nrt = triton.cdiv(pheight, BM)
+            _trailing_YT_kernel[(nct, B)](
+                H, Vbuf, Tbuf, YTbuf,
+                B, N, j, pheight, ncols, j + b,
+                sab, san, svb, svk, svn, stb, stk, stn, syb, syk, syn,
+                BLK=BLK, BM=BM, BNc=BNc, num_warps=2,
+            )
+            _trailing_apply_kernel[(nrt * nct, B)](
+                H, Vbuf, YTbuf,
+                B, N, j, pheight, ncols, j + b,
+                sab, san, svb, svk, svn, syb, syk, syn,
+                BLK=BLK, BM=BM, BNc=BNc, num_warps=2,
+            )
         j += b
 
     return H, tau
