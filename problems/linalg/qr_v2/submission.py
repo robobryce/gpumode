@@ -233,16 +233,22 @@ def custom_kernel(data: input_t) -> output_t:
     stb, stk, stn = Tbuf.stride(0), Tbuf.stride(1), Tbuf.stride(2)
     syb, syk, syn = YTbuf.stride(0), YTbuf.stride(1), YTbuf.stride(2)
 
-    # Trailing-update tiles, tuned per-kernel via micro-sweep on the dominant
-    # B=640 n=512 panel (tf32x3, BLK=32 rank):
-    #   YT (W=V^T@A reduces over tall pheight, BLK=32 output rows): small tile +
-    #       1 warp wins (205us vs parent 216us) -- tiny output, 1-warp latency.
-    #   apply (delta=Vrow@YT, disjoint output tiles): TALL-NARROW BM=128,BNc=32
-    #       + 4 warps wins (333us vs parent 395us, -16%). Keeping BNc==BLK==32
-    #       avoids K-starving the K=32 MMA; tall BM reuses the loaded YT across
-    #       many rows. (Bigger BNc regressed: K=32 << BNc starves the tensor core.)
-    BM_Y, BNc_Y, NW_Y = 32, 32, 1
-    BM_A, BNc_A, NW_A = 128, 32, 4
+    # Trailing-update tiles, tuned per-kernel via micro-sweep on representative
+    # panels. The optimal tile is strongly batch/BLK-dependent because batch fills
+    # the grid's program count:
+    #   BLK==32 (n=176..1024, large/mid batch -> grid already saturated): small
+    #       tiles win. YT BM=32/BNc=32/1w (205us vs 216us on B640); apply
+    #       TALL-NARROW BM=128/BNc=32/4w (333us vs 395us, -16%) -- BNc==BLK avoids
+    #       K-starving the K=32 MMA, tall BM reuses the loaded YT across rows.
+    #   BLK<=16 (n>=2048, small batch B=2/8 -> grid starved): the YT must use a
+    #       TALL reduction chunk + more warps to fill the SMs: BM=128/BNc=64/4w
+    #       (45us vs 80us on n=4096, -44%); apply BM=32/BNc=32/2w (60us vs 70us).
+    if BLK >= 32:
+        BM_Y, BNc_Y, NW_Y = 32, 32, 1
+        BM_A, BNc_A, NW_A = 128, 32, 4
+    else:
+        BM_Y, BNc_Y, NW_Y = 128, 64, 4
+        BM_A, BNc_A, NW_A = 32, 32, 2
     j = 0
     while j < N:
         b = min(BLK, N - j)
