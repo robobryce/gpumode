@@ -233,7 +233,13 @@ def custom_kernel(data: input_t) -> output_t:
     stb, stk, stn = Tbuf.stride(0), Tbuf.stride(1), Tbuf.stride(2)
     syb, syk, syn = YTbuf.stride(0), YTbuf.stride(1), YTbuf.stride(2)
 
-    BM, BNc = 32, 64
+    # Trailing-update tiles. YT reduces V^T@A_trail over the tall panel-height
+    # (wants a tall reduction chunk BM_Y); apply does a rank-BLK subtract with
+    # disjoint (BM_A, BNc_A) output tiles (wants big output tiles for tensor-core
+    # MMA reuse and few waves). Separate tiles + more warps lift the apply from
+    # the measured 38% SM throughput / 39 waves (tiny 32x64 tiles, 2 warps).
+    BM_Y, BNc_Y, NW_Y = 64, 64, 4
+    BM_A, BNc_A, NW_A = 64, 128, 4
     j = 0
     while j < N:
         b = min(BLK, N - j)
@@ -259,19 +265,20 @@ def custom_kernel(data: input_t) -> output_t:
 
         ncols = N - (j + b)
         if ncols > 0:
-            nct = triton.cdiv(ncols, BNc)
-            nrt = triton.cdiv(pheight, BM)
-            _trailing_YT_kernel[(nct, B)](
+            nct_y = triton.cdiv(ncols, BNc_Y)
+            _trailing_YT_kernel[(nct_y, B)](
                 H, Vbuf, Tbuf, YTbuf,
                 B, N, j, pheight, ncols, j + b,
                 sab, san, svb, svk, svn, stb, stk, stn, syb, syk, syn,
-                BLK=BLK, BM=BM, BNc=BNc, num_warps=2,
+                BLK=BLK, BM=BM_Y, BNc=BNc_Y, num_warps=NW_Y,
             )
-            _trailing_apply_kernel[(nrt * nct, B)](
+            nct_a = triton.cdiv(ncols, BNc_A)
+            nrt_a = triton.cdiv(pheight, BM_A)
+            _trailing_apply_kernel[(nrt_a * nct_a, B)](
                 H, Vbuf, YTbuf,
                 B, N, j, pheight, ncols, j + b,
                 sab, san, svb, svk, svn, syb, syk, syn,
-                BLK=BLK, BM=BM, BNc=BNc, num_warps=2,
+                BLK=BLK, BM=BM_A, BNc=BNc_A, num_warps=NW_A,
             )
         j += b
 
