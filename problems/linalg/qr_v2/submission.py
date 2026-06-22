@@ -781,11 +781,28 @@ _NW_F = int(_os.environ.get("QR_NW_F", "2"))
 # the barriers amortise (unlike n=1024 where they cost 3x). BLK=32 so the panel
 # never round-trips HBM and the wide trailing amortises. Knobs let the route's N
 # threshold, G cap, CTA threads, and BLK be swept without code edits.
-_MCTA_N = int(_os.environ.get("QR_MCTA_N", "4096"))     # min n to use mcta route
+# mcta route default OFF (set _MCTA_N above the largest shape): PROFILE-GATE KILLED
+# it. At n=4096 B=2 the mcta panel measured 50.8ms (78.9%) vs the two-level ib=8
+# single-CTA panel's 26ms -- the ~12000 cross-CTA barriers/matrix (3 per panel
+# column) cost more than the row-split across SMs saves, for every G in {2..64}
+# (best G=16 still 64ms total vs parent 48.6ms). Kept as a proven-correct
+# primitive; re-enable by lowering QR_MCTA_N.
+_MCTA_N = int(_os.environ.get("QR_MCTA_N", "999999"))   # min n to use mcta route (OFF)
 _MCTA_NT = int(_os.environ.get("QR_MCTA_NT", "256"))    # threads/CTA
-_MCTA_GMAX = int(_os.environ.get("QR_MCTA_GMAX", "64")) # max CTAs/matrix
+_MCTA_GMAX = int(_os.environ.get("QR_MCTA_GMAX", "16")) # max CTAs/matrix
 _MCTA_MINSLICE = int(_os.environ.get("QR_MCTA_MINSLICE", "64"))  # min rows/CTA
 _MCTA_BLK = int(_os.environ.get("QR_MCTA_BLK", "32"))   # panel width
+
+# Fused-W wide trailing for the two-level n>=2560 path: default OFF. Tested at
+# n=4096 B=2 the fused-W wide trailing measured 17.4ms vs the split YT(7.0)+
+# apply(6.5)=13.4ms -- the split pair's separately-tuned tiles (YT 128/64/4w,
+# apply 32/32/2w) beat the fused kernel's double A-read in this grid-starved
+# regime, so the YT HBM round-trip the fused kernel saves is cheaper than its
+# second A sweep here. Kept as a knob (QR_W2L_FUSED=1) but OFF by default.
+_W2L_FUSED = int(_os.environ.get("QR_W2L_FUSED", "0")) != 0
+_BM_2L = int(_os.environ.get("QR_BM_2L", "128"))
+_BNC_2L = int(_os.environ.get("QR_BNC_2L", "64"))
+_NW_2L = int(_os.environ.get("QR_NW_2L", "4"))
 
 
 def _mcta_choose_G(B, pheight, SMs=148):
@@ -1485,19 +1502,31 @@ def _w2_qr_2level(data):
         ncols = N - (j + bb)
         if ncols > 0:
             # ONE wide (nb=16) trailing over the bulk, exact via the combined T.
-            nct_y = triton.cdiv(ncols, BNc_Y)
-            _trailing_YT_kernel[(nct_y, B)](
-                H, Vbuf, Tbuf, YTbuf, B, N, j, pheight, ncols, j + bb,
-                sab, san, svb, svk, svn, stb, stk, stn, syb, syk, syn,
-                BLK=NB, BM=BM_Y, BNc=BNc_Y, num_warps=NW_Y,
-            )
-            nct_a = triton.cdiv(ncols, BNc_A)
-            nrt_a = triton.cdiv(pheight, BM_A)
-            _trailing_apply_kernel[(nrt_a * nct_a, B)](
-                H, Vbuf, YTbuf, B, N, j, pheight, ncols, j + bb,
-                sab, san, svb, svk, svn, syb, syk, syn,
-                BLK=NB, BM=BM_A, BNc=BNc_A, num_warps=NW_A,
-            )
+            # The fused-W trailing (W kept on-chip, no YT HBM round-trip) replaces
+            # the split YT/apply pair; ncu on the n=512 trailing showed the split
+            # is memory-pipe-bound (the YT round-trip is pure waste). It is
+            # race-free here too: each program owns a FULL-HEIGHT column strip.
+            if _W2L_FUSED:
+                nct_f = triton.cdiv(ncols, _BNC_2L)
+                _trailing_fused_kernel[(nct_f, B)](
+                    H, Vbuf, Tbuf, B, N, j, pheight, ncols, j + bb,
+                    sab, san, svb, svk, svn, stb, stk, stn,
+                    BLK=NB, BM=_BM_2L, BNc=_BNC_2L, num_warps=_NW_2L,
+                )
+            else:
+                nct_y = triton.cdiv(ncols, BNc_Y)
+                _trailing_YT_kernel[(nct_y, B)](
+                    H, Vbuf, Tbuf, YTbuf, B, N, j, pheight, ncols, j + bb,
+                    sab, san, svb, svk, svn, stb, stk, stn, syb, syk, syn,
+                    BLK=NB, BM=BM_Y, BNc=BNc_Y, num_warps=NW_Y,
+                )
+                nct_a = triton.cdiv(ncols, BNc_A)
+                nrt_a = triton.cdiv(pheight, BM_A)
+                _trailing_apply_kernel[(nrt_a * nct_a, B)](
+                    H, Vbuf, YTbuf, B, N, j, pheight, ncols, j + bb,
+                    sab, san, svb, svk, svn, syb, syk, syn,
+                    BLK=NB, BM=BM_A, BNc=BNc_A, num_warps=NW_A,
+                )
 
         # No per-block buffer reset: the inner trailing masks the reflector dim
         # to NREF=IB so it ignores cols IB:2IB; the wide far trailing reads all
