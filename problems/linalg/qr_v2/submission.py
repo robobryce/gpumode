@@ -140,40 +140,43 @@ def _build_wide_T_kernel(
     B, N, jo, pheight, NBe,
     stride_vb, stride_vk, stride_vn,
     stride_tb, stride_tk, stride_tn,
-    NB: tl.constexpr, MAXH: tl.constexpr,
+    NB: tl.constexpr, MAXH: tl.constexpr, BMG: tl.constexpr,
 ):
-    # Assemble the NB x NB compact-WY T over the full outer block from the
-    # accumulated reflectors V (k in [0,NBe)) and tau (LAPACK dlarft forward):
-    #   T[k,k]   = tau_k
-    #   T[:k,k]  = -tau_k * T[:k,:k] @ (V[:, :k]^T v_k)
-    # One program per matrix; loops k=0..NB.  V is stored transposed in Vbuf as
-    # V[k, row], so V[:, :k]^T v_k = sum_row V[i,row]*V[k,row] for i<k.
+    # Assemble the NB x NB compact-WY T over the full outer block (LAPACK dlarft
+    # forward):  T[k,k]=tau_k ;  T[:k,k] = -tau_k * T[:k,:k] @ (V[:, :k]^T v_k).
+    # The expensive term V[:, :k]^T v_k for all k is just column k of the Gram
+    # matrix G = V^T V.  Compute G ONCE with TENSOR CORES (chunked over rows to
+    # bound smem), then run the cheap NB-step recurrence on the small NB x NB G
+    # -- no re-reading V per k (that serial (NB,MAXH) reduction per k was the
+    # bottleneck: ~53% of total time).  One program per matrix.
     bid = tl.program_id(0)
     if bid >= B:
         return
 
-    rows = tl.arange(0, MAXH)
     ks = tl.arange(0, NB)
-    row_valid = rows < pheight
     k_valid = ks < NBe
-
-    # load full transposed V block: Vt[k, row]  (NB, MAXH).  V is stored by
-    # GLOBAL row, so the outer block's rows [0,pheight) live at global jo+rows.
     vbase = Vbuf_ptr + bid * stride_vb
-    vptr = vbase + ks[:, None] * stride_vk + (jo + rows[None, :]) * stride_vn
-    Vt = tl.load(vptr, mask=k_valid[:, None] & row_valid[None, :], other=0.0)  # (NB, MAXH)
 
-    # tau over the outer block
+    # G = V^T V  (NB, NB), accumulated over row-chunks of BMG via tl.dot.
+    G = tl.zeros((NB, NB), dtype=tl.float32)
+    nchunks = tl.cdiv(pheight, BMG)
+    for ci in range(0, nchunks):
+        rr = ci * BMG + tl.arange(0, BMG)
+        rmask = rr < pheight
+        # Vt_chunk[k, r] = V[k, global jo+rr]   (NB, BMG)
+        vp = vbase + ks[:, None] * stride_vk + (jo + rr[None, :]) * stride_vn
+        Vc = tl.load(vp, mask=k_valid[:, None] & rmask[None, :], other=0.0)     # (NB, BMG)
+        G += tl.dot(Vc, tl.trans(Vc), input_precision="tf32x3")                 # (NB, NB)
+
     tptr = tau_ptr + bid * N + jo + ks
     tau_blk = tl.load(tptr, mask=k_valid, other=0.0)                            # (NB,)
 
     Tmat = tl.zeros((NB, NB), dtype=tl.float32)
     for k in range(0, NB):
         col_is_k = ks == k
-        vk = tl.sum(tl.where(col_is_k[:, None], Vt, 0.0), axis=0)               # (MAXH,)
         tau_k = tl.sum(tl.where(col_is_k, tau_blk, 0.0))
-        # z[i] = V[i,:] . v_k for i<k   (i.e. row-reduce Vt*vk over rows)
-        z = tl.sum(Vt * vk[None, :], axis=1)                                    # (NB,)
+        # z = G[:, k] restricted to i<k  (== V[:, :k]^T v_k)
+        z = tl.sum(tl.where(col_is_k[None, :], G, 0.0), axis=1)                 # (NB,) = G[:,k]
         z = tl.where(ks < k, z, 0.0)
         Tcol = -tau_k * tl.sum(Tmat * z[None, :], axis=1)                       # (NB,)
         Tcol = tl.where(ks < k, Tcol, 0.0)
@@ -385,7 +388,7 @@ def custom_kernel(data: input_t) -> output_t:
             Vbuf, tau, Twide,
             B, N, jo, pheight_o, NBe,
             svb, svk, svn, swb, swk, swn,
-            NB=NB, MAXH=MAXH_o, num_warps=nwt,
+            NB=NB, MAXH=MAXH_o, BMG=64, num_warps=nwt,
         )
 
         # ---- outer trailing update against [jo+NBe, N): wide K=NB ----
