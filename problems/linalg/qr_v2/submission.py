@@ -222,10 +222,7 @@ def custom_kernel(data: input_t) -> output_t:
         # footprint -> much higher occupancy (~2x faster) than BLK=32.
         BLK = 16
     else:
-        # Wider block (BLK=64) for n=176..1024: the trailing GEMMs gain K=BLK=64
-        # (2x tensor-core MMA efficiency vs K=32) and there are half as many
-        # panels -> half the trailing launches + half YT's redundant A-reloads.
-        BLK = 64
+        BLK = 32
 
     Vbuf = torch.empty((B, BLK, N), device=A.device, dtype=torch.float32)
     Tbuf = torch.empty((B, BLK, BLK), device=A.device, dtype=torch.float32)
@@ -236,7 +233,16 @@ def custom_kernel(data: input_t) -> output_t:
     stb, stk, stn = Tbuf.stride(0), Tbuf.stride(1), Tbuf.stride(2)
     syb, syk, syn = YTbuf.stride(0), YTbuf.stride(1), YTbuf.stride(2)
 
-    BM, BNc = 32, 64
+    # Trailing-update tiles, tuned per-kernel via micro-sweep on the dominant
+    # B=640 n=512 panel (tf32x3, BLK=32 rank):
+    #   YT (W=V^T@A reduces over tall pheight, BLK=32 output rows): small tile +
+    #       1 warp wins (205us vs parent 216us) -- tiny output, 1-warp latency.
+    #   apply (delta=Vrow@YT, disjoint output tiles): TALL-NARROW BM=128,BNc=32
+    #       + 4 warps wins (333us vs parent 395us, -16%). Keeping BNc==BLK==32
+    #       avoids K-starving the K=32 MMA; tall BM reuses the loaded YT across
+    #       many rows. (Bigger BNc regressed: K=32 << BNc starves the tensor core.)
+    BM_Y, BNc_Y, NW_Y = 32, 32, 1
+    BM_A, BNc_A, NW_A = 128, 32, 4
     j = 0
     while j < N:
         b = min(BLK, N - j)
@@ -246,11 +252,10 @@ def custom_kernel(data: input_t) -> output_t:
         # num_warps must scale with the panel height: the panel kernel holds a
         # (MAXH, BLK) register tensor; too few warps -> register spill -> huge
         # slowdown (measured 7-10x on n>=1024). Empirically-tuned per MAXH.
-        # With BLK=64 the register tile doubles, so warps are bumped accordingly.
         if MAXH <= 512:
-            nwp = 4 if BLK <= 32 else 8
+            nwp = 4
         elif MAXH <= 1024:
-            nwp = 8 if BLK <= 32 else 16
+            nwp = 8
         else:
             nwp = 32
 
@@ -263,19 +268,20 @@ def custom_kernel(data: input_t) -> output_t:
 
         ncols = N - (j + b)
         if ncols > 0:
-            nct = triton.cdiv(ncols, BNc)
-            nrt = triton.cdiv(pheight, BM)
-            _trailing_YT_kernel[(nct, B)](
+            nct_y = triton.cdiv(ncols, BNc_Y)
+            _trailing_YT_kernel[(nct_y, B)](
                 H, Vbuf, Tbuf, YTbuf,
                 B, N, j, pheight, ncols, j + b,
                 sab, san, svb, svk, svn, stb, stk, stn, syb, syk, syn,
-                BLK=BLK, BM=BM, BNc=BNc, num_warps=2,
+                BLK=BLK, BM=BM_Y, BNc=BNc_Y, num_warps=NW_Y,
             )
-            _trailing_apply_kernel[(nrt * nct, B)](
+            nct_a = triton.cdiv(ncols, BNc_A)
+            nrt_a = triton.cdiv(pheight, BM_A)
+            _trailing_apply_kernel[(nrt_a * nct_a, B)](
                 H, Vbuf, YTbuf,
                 B, N, j, pheight, ncols, j + b,
                 sab, san, svb, svk, svn, syb, syk, syn,
-                BLK=BLK, BM=BM, BNc=BNc, num_warps=2,
+                BLK=BLK, BM=BM_A, BNc=BNc_A, num_warps=NW_A,
             )
         j += b
 
