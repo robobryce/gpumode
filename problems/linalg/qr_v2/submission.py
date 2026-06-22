@@ -423,6 +423,14 @@ def _small_qr(A):
 import os as _os
 _TINY_WPB = int(_os.environ.get("QR_TINY_WPB", "2"))
 
+# Fused single-kernel trailing for the BLK==32 (n=512/1024) regime: one kernel
+# per column strip, W kept on-chip (no YT HBM round-trip). Bounded (BM_F, BNc_F)
+# chunk resident across the two row sweeps so nothing spills.
+_FUSED_TRAIL = int(_os.environ.get("QR_FUSED_TRAIL", "1")) != 0
+_BM_F = int(_os.environ.get("QR_BM_F", "32"))
+_BNC_F = int(_os.environ.get("QR_BNC_F", "32"))
+_NW_F = int(_os.environ.get("QR_NW_F", "2"))
+
 
 def _tiny_qr(A):
     B, n, _ = A.shape
@@ -628,6 +636,75 @@ def _trailing_apply_kernel(
     amask = rmask[:, None] & cmask[None, :]
     aorig = tl.load(ap, mask=amask, other=0.0)
     tl.store(ap, aorig - delta, mask=amask)
+
+
+# ---------------------------------------------------------------------------
+# FUSED trailing update: ONE kernel per column strip, W kept on-chip.
+#
+# The split YT/apply pair writes the (BLK, ncols) YT intermediate to HBM in
+# _trailing_YT and reads it back in _trailing_apply. ncu on the n=512 trailing
+# showed it MEMORY-PIPE-bound (compute_memory_throughput ~75% vs sm ~42%, NOT
+# MMA-bound), so the YT HBM round-trip is pure waste. Each program here owns a
+# FULL-HEIGHT column strip of A_trail (all pheight rows, a BNc-wide col tile),
+# so the W = V^T A reduction needs only rows this program reads -> no
+# cross-program race (the reason the pair was split is partial-row ownership).
+# W and YT stay in registers between the two row sweeps; YT never touches HBM:
+#   sweep 1: W = sum_chunks V^T_chunk @ A_chunk     (A chunk transient)
+#   YT = T^T @ W                                     (registers)
+#   sweep 2: A_chunk -= V_chunk @ YT                 (re-read A chunk, store)
+# A_trail is still read twice (the two sweeps), but only the chunk is resident
+# (BM, BNc) so nothing spills; the saving over the split pair is the whole YT
+# HBM round-trip + one kernel launch per block.
+# ---------------------------------------------------------------------------
+@triton.jit
+def _trailing_fused_kernel(
+    A_ptr, Vbuf_ptr, Tbuf_ptr,
+    B, N, j, pheight, ncols, jb,
+    stride_ab, stride_an,
+    stride_vb, stride_vk, stride_vn,
+    stride_tb, stride_tk, stride_tn,
+    BLK: tl.constexpr, BM: tl.constexpr, BNc: tl.constexpr,
+):
+    col_tile = tl.program_id(0)
+    bid = tl.program_id(1)
+    if bid >= B:
+        return
+    c0 = col_tile * BNc
+    ccols = c0 + tl.arange(0, BNc)
+    cmask = ccols < ncols
+    krange = tl.arange(0, BLK)
+
+    a_trail_base = A_ptr + bid * stride_ab + j * stride_an + jb
+    v_base = Vbuf_ptr + bid * stride_vb
+
+    # sweep 1: W = V^T @ A_trail over all panel rows, in chunks of BM.
+    W = tl.zeros((BLK, BNc), dtype=tl.float32)
+    nchunks = tl.cdiv(pheight, BM)
+    for ci in range(0, nchunks):
+        rr = ci * BM + tl.arange(0, BM)
+        rrmask = rr < pheight
+        ap = a_trail_base + rr[:, None] * stride_an + ccols[None, :]
+        achunk = tl.load(ap, mask=rrmask[:, None] & cmask[None, :], other=0.0)   # (BM,BNc)
+        vp = v_base + krange[:, None] * stride_vk + rr[None, :] * stride_vn
+        vchunk = tl.load(vp, mask=rrmask[None, :], other=0.0)                    # (BLK,BM)
+        W += tl.dot(vchunk, achunk, input_precision="tf32x3")
+
+    # YT = T^T @ W  (stays in registers, never written to HBM)
+    tp = Tbuf_ptr + bid * stride_tb + krange[:, None] * stride_tk + krange[None, :] * stride_tn
+    Tm = tl.load(tp)
+    YT = tl.dot(tl.trans(Tm), W, input_precision="tf32x3")                        # (BLK,BNc)
+
+    # sweep 2: A_trail -= V @ YT, re-reading each A chunk and storing in place.
+    for ci in range(0, nchunks):
+        rr = ci * BM + tl.arange(0, BM)
+        rrmask = rr < pheight
+        vp2 = v_base + krange[None, :] * stride_vk + rr[:, None] * stride_vn
+        Vrow = tl.load(vp2, mask=rrmask[:, None], other=0.0)                     # (BM,BLK)
+        delta = tl.dot(Vrow, YT, input_precision="tf32x3")                      # (BM,BNc)
+        ap2 = a_trail_base + rr[:, None] * stride_an + ccols[None, :]
+        amask = rrmask[:, None] & cmask[None, :]
+        aorig = tl.load(ap2, mask=amask, other=0.0)
+        tl.store(ap2, aorig - delta, mask=amask)
 
 
 # Two-level-specific trailing kernels: identical to the single-level pair but
@@ -1090,6 +1167,10 @@ def _w2_qr(data):
     else:
         BM_Y, BNc_Y, NW_Y = 128, 64, 4
         BM_A, BNc_A, NW_A = 32, 32, 2
+    # Fused single-kernel trailing (W kept on-chip, no YT HBM round-trip) for the
+    # BLK==32 throughput-bound regime (n=512/1024). Bounded (BM_F, BNc_F) chunk
+    # resident -> no spill; full-height column strip per program -> race-free.
+    use_fused = (BLK == 32) and _FUSED_TRAIL
     j = 0
     while j < N:
         b = min(BLK, N - j)
@@ -1115,21 +1196,30 @@ def _w2_qr(data):
 
         ncols = N - (j + b)
         if ncols > 0:
-            nct_y = triton.cdiv(ncols, BNc_Y)
-            _trailing_YT_kernel[(nct_y, B)](
-                H, Vbuf, Tbuf, YTbuf,
-                B, N, j, pheight, ncols, j + b,
-                sab, san, svb, svk, svn, stb, stk, stn, syb, syk, syn,
-                BLK=BLK, BM=BM_Y, BNc=BNc_Y, num_warps=NW_Y,
-            )
-            nct_a = triton.cdiv(ncols, BNc_A)
-            nrt_a = triton.cdiv(pheight, BM_A)
-            _trailing_apply_kernel[(nrt_a * nct_a, B)](
-                H, Vbuf, YTbuf,
-                B, N, j, pheight, ncols, j + b,
-                sab, san, svb, svk, svn, syb, syk, syn,
-                BLK=BLK, BM=BM_A, BNc=BNc_A, num_warps=NW_A,
-            )
+            if use_fused:
+                nct_f = triton.cdiv(ncols, _BNC_F)
+                _trailing_fused_kernel[(nct_f, B)](
+                    H, Vbuf, Tbuf,
+                    B, N, j, pheight, ncols, j + b,
+                    sab, san, svb, svk, svn, stb, stk, stn,
+                    BLK=BLK, BM=_BM_F, BNc=_BNC_F, num_warps=_NW_F,
+                )
+            else:
+                nct_y = triton.cdiv(ncols, BNc_Y)
+                _trailing_YT_kernel[(nct_y, B)](
+                    H, Vbuf, Tbuf, YTbuf,
+                    B, N, j, pheight, ncols, j + b,
+                    sab, san, svb, svk, svn, stb, stk, stn, syb, syk, syn,
+                    BLK=BLK, BM=BM_Y, BNc=BNc_Y, num_warps=NW_Y,
+                )
+                nct_a = triton.cdiv(ncols, BNc_A)
+                nrt_a = triton.cdiv(pheight, BM_A)
+                _trailing_apply_kernel[(nrt_a * nct_a, B)](
+                    H, Vbuf, YTbuf,
+                    B, N, j, pheight, ncols, j + b,
+                    sab, san, svb, svk, svn, syb, syk, syn,
+                    BLK=BLK, BM=BM_A, BNc=BNc_A, num_warps=NW_A,
+                )
         j += b
 
     return H, tau
