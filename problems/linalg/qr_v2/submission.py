@@ -636,17 +636,38 @@ def _w2_qr(data):
     H = A.clone()
     tau = torch.zeros((B, N), device=A.device, dtype=torch.float32)
 
+    # BLK_P is the panel block-width (how many reflectors a panel_factor launch
+    # builds, and the resident-panel register footprint = MAXH*BLK_P floats per
+    # CTA). BLK is the buffer/trailing-tile width (the K-dimension of the two
+    # tensor-core trailing dots, which need K>=16).
+    #
+    # For the tall few-matrix shapes (n>=2048) the panel runs grid=(B,)=2..8 ->
+    # only 2-8 SMs, so its register footprint must stay tiny or it SPILLS to
+    # local memory (HBM): ncu shows the MAXH=4096 BLK=16 panel spilling ~45MB of
+    # local ld/st per launch (regs capped at 64/thread), costing 313us where the
+    # un-spilled MAXH=2048 panel is 74us. Narrowing the PANEL to BLK_P=8 halves
+    # the resident (MAXH,BLK_P) tensor to 32 floats/thread, eliminating the spill
+    # (measured 313->59us, 5.3x, at MAXH=4096). The trailing keeps the wide
+    # BLK=16 tile (the panel writes 8 real reflectors into a 16-wide V/T buffer
+    # whose padding columns are pre-zeroed once, so the K=16 trailing dots are
+    # mathematically exact -- the 8 zero reflectors contribute nothing).
     if N <= 32:
         BLK = min(16, N)
+        BLK_P = BLK
     elif N >= 1536:
-        # Tall panels (n>=2048): a narrow block halves the panel register
-        # footprint -> much higher occupancy (~2x faster) than BLK=32.
         BLK = 16
+        BLK_P = 8
     else:
         BLK = 32
+        BLK_P = 32
 
-    Vbuf = torch.empty((B, BLK, N), device=A.device, dtype=torch.float32)
-    Tbuf = torch.empty((B, BLK, BLK), device=A.device, dtype=torch.float32)
+    if BLK_P != BLK:
+        # Padded buffers: panel writes BLK_P real cols/rows, the rest stay 0.
+        Vbuf = torch.zeros((B, BLK, N), device=A.device, dtype=torch.float32)
+        Tbuf = torch.zeros((B, BLK, BLK), device=A.device, dtype=torch.float32)
+    else:
+        Vbuf = torch.empty((B, BLK, N), device=A.device, dtype=torch.float32)
+        Tbuf = torch.empty((B, BLK, BLK), device=A.device, dtype=torch.float32)
     YTbuf = torch.empty((B, BLK, N), device=A.device, dtype=torch.float32)
 
     sab, san = H.stride(0), H.stride(1)
@@ -672,12 +693,12 @@ def _w2_qr(data):
         BM_A, BNc_A, NW_A = 32, 32, 2
     j = 0
     while j < N:
-        b = min(BLK, N - j)
+        b = min(BLK_P, N - j)
         pheight = N - j
         MAXH = triton.next_power_of_2(pheight)
 
         # num_warps must scale with the panel height: the panel kernel holds a
-        # (MAXH, BLK) register tensor; too few warps -> register spill -> huge
+        # (MAXH, BLK_P) register tensor; too few warps -> register spill -> huge
         # slowdown (measured 7-10x on n>=1024). Empirically-tuned per MAXH.
         if MAXH <= 512:
             nwp = 4
@@ -690,7 +711,7 @@ def _w2_qr(data):
             H, tau, Vbuf, Tbuf,
             B, N, j, pheight, b,
             sab, san, svb, svk, svn, stb, stk, stn,
-            BLK=BLK, MAXH=MAXH, num_warps=nwp,
+            BLK=BLK_P, MAXH=MAXH, num_warps=nwp,
         )
 
         ncols = N - (j + b)
