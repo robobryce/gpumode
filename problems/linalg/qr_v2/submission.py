@@ -159,12 +159,12 @@ def _trailing_YT_kernel(
         achunk = tl.load(ap, mask=rrmask[:, None] & cmask[None, :], other=0.0)   # (BM,BNc)
         vp = v_base + krange[:, None] * stride_vk + rr[None, :] * stride_vn
         vchunk = tl.load(vp, mask=rrmask[None, :], other=0.0)                    # (BLK,BM)
-        W += tl.dot(vchunk, achunk, input_precision="tf32")
+        W += tl.dot(vchunk, achunk, input_precision="tf32x3")
 
     # YT = T^T @ W
     tp = Tbuf_ptr + bid * stride_tb + krange[:, None] * stride_tk + krange[None, :] * stride_tn
     Tm = tl.load(tp)
-    YT = tl.dot(tl.trans(Tm), W, input_precision="tf32")                        # (BLK,BNc)
+    YT = tl.dot(tl.trans(Tm), W, input_precision="tf32x3")                        # (BLK,BNc)
 
     yp = YT_ptr + bid * stride_yb + krange[:, None] * stride_yk + ccols[None, :] * stride_yn
     tl.store(yp, YT, mask=cmask[None, :])
@@ -201,7 +201,7 @@ def _trailing_apply_kernel(
     # YT[:, ccols] : (BLK, BNc)
     yp = YT_ptr + bid * stride_yb + krange[:, None] * stride_yk + ccols[None, :] * stride_yn
     YT = tl.load(yp, mask=cmask[None, :], other=0.0)
-    delta = tl.dot(Vrow, YT, input_precision="tf32")                            # (BM,BNc)
+    delta = tl.dot(Vrow, YT, input_precision="tf32x3")                            # (BM,BNc)
 
     ap = a_trail_base + rrows[:, None] * stride_an + ccols[None, :]
     amask = rmask[:, None] & cmask[None, :]
@@ -222,7 +222,10 @@ def custom_kernel(data: input_t) -> output_t:
         # footprint -> much higher occupancy (~2x faster) than BLK=32.
         BLK = 16
     else:
-        BLK = 32
+        # Wider block (BLK=64) for n=176..1024: the trailing GEMMs gain K=BLK=64
+        # (2x tensor-core MMA efficiency vs K=32) and there are half as many
+        # panels -> half the trailing launches + half YT's redundant A-reloads.
+        BLK = 64
 
     Vbuf = torch.empty((B, BLK, N), device=A.device, dtype=torch.float32)
     Tbuf = torch.empty((B, BLK, BLK), device=A.device, dtype=torch.float32)
@@ -243,10 +246,11 @@ def custom_kernel(data: input_t) -> output_t:
         # num_warps must scale with the panel height: the panel kernel holds a
         # (MAXH, BLK) register tensor; too few warps -> register spill -> huge
         # slowdown (measured 7-10x on n>=1024). Empirically-tuned per MAXH.
+        # With BLK=64 the register tile doubles, so warps are bumped accordingly.
         if MAXH <= 512:
-            nwp = 4
+            nwp = 4 if BLK <= 32 else 8
         elif MAXH <= 1024:
-            nwp = 8
+            nwp = 8 if BLK <= 32 else 16
         else:
             nwp = 32
 
