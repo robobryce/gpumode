@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "benchmarks": [
+    {
+      "name": "linalg/qr_v2",
+      "unit": "us",
+      "direction": "min",
+      "precision": 3
+    }
+  ]
+}
