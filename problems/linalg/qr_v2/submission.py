@@ -707,6 +707,18 @@ def _trailing_fused_kernel(
         tl.store(ap2, aorig - delta, mask=amask)
 
 
+# NOTE: an A-RESIDENT variant (keep the whole full-height column strip in one
+# register tensor across both dots -> read A once + write once) was tried and
+# REJECTED. Even with the transpose avoided (V loaded (BLK,BM) for W) and a
+# narrow BNc=16 strip, a (pheight=512, BNc) resident tensor does NOT map to the
+# MMA's natural smem staging in Triton and generates pathological code: n=512
+# 6002->94539us, n=1024 5448->331983us (validates PASS, so it is correct, just
+# unusably slow). Cutting the A double-read therefore needs a hand-written CUDA
+# kernel with explicit smem, not a Triton resident strip; the chunked fused-W
+# above (which still reads A twice but drops the YT HBM round-trip) is the right
+# Triton structure for this L1-pipe-bound trailing.
+
+
 # Two-level-specific trailing kernels: identical to the single-level pair but
 # mask the reflector (K) dimension to the first NREF columns of V/T. This lets
 # the inner trailing apply ONLY sub-panel 0's IB reflectors out of the shared
