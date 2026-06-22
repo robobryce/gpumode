@@ -804,6 +804,16 @@ _BM_2L = int(_os.environ.get("QR_BM_2L", "128"))
 _BNC_2L = int(_os.environ.get("QR_BNC_2L", "64"))
 _NW_2L = int(_os.environ.get("QR_NW_2L", "4"))
 
+# Hybrid two-level / single-level threshold. The two-level ib=8 path exists only
+# to dodge the single-level BLK=16 panel's register spill at MAXH=4096. But as j
+# advances the panel SHRINKS: once pheight <= 2048 the single-level BLK=16 panel
+# is un-spilled, so it is strictly cheaper there (one panel + one wide trailing,
+# NO inner-trailing + NO cross_T -- the two-level overhead, measured ~16ms / 28%
+# of n=4096). So below this height, switch to the cheaper single-level BLK=16
+# path. At n=4096 this is the bottom HALF of the factorization -> ~half the
+# two-level overhead removed. Exact geqrf (one panel builds the full 16-wide T).
+_2L_HYBRID_H = int(_os.environ.get("QR_2L_HYBRID_H", "2048"))
+
 
 def _mcta_choose_G(B, pheight, SMs=148):
     # Pick CTAs-per-matrix so B*G fills the SMs WITHOUT exceeding one wave (the
@@ -1449,9 +1459,40 @@ def _w2_qr_2level(data):
 
     j = 0
     while j < N:
-        b0 = min(IB, N - j)
         pheight = N - j
         MAXH = triton.next_power_of_2(pheight)
+
+        if pheight <= _2L_HYBRID_H:
+            # Single-level BLK=16 panel: un-spilled at MAXH<=2048, so it is
+            # strictly cheaper than the two-level machinery (no inner trailing,
+            # no cross_T). One panel builds the full 16-wide compact-WY T; the
+            # wide trailing applies all 16 reflectors. Exact geqrf.
+            b = min(NB, N - j)
+            nwp = 8 if MAXH <= 1024 else 32
+            _panel_factor_kernel[(B,)](
+                H, tau, Vbuf, Tbuf, B, N, j, pheight, b,
+                sab, san, svb, svk, svn, stb, stk, stn,
+                BLK=NB, MAXH=MAXH, num_warps=nwp,
+            )
+            ncols = N - (j + b)
+            if ncols > 0:
+                nct_y = triton.cdiv(ncols, BNc_Y)
+                _trailing_YT_kernel[(nct_y, B)](
+                    H, Vbuf, Tbuf, YTbuf, B, N, j, pheight, ncols, j + b,
+                    sab, san, svb, svk, svn, stb, stk, stn, syb, syk, syn,
+                    BLK=NB, BM=BM_Y, BNc=BNc_Y, num_warps=NW_Y,
+                )
+                nct_a = triton.cdiv(ncols, BNc_A)
+                nrt_a = triton.cdiv(pheight, BM_A)
+                _trailing_apply_kernel[(nrt_a * nct_a, B)](
+                    H, Vbuf, YTbuf, B, N, j, pheight, ncols, j + b,
+                    sab, san, svb, svk, svn, syb, syk, syn,
+                    BLK=NB, BM=BM_A, BNc=BNc_A, num_warps=NW_A,
+                )
+            j += b
+            continue
+
+        b0 = min(IB, N - j)
         nwp0 = 4 if MAXH <= 512 else (8 if MAXH <= 1024 else 32)
 
         # sub-panel 0: cols [j, j+IB), V/T at offset (0,0)
