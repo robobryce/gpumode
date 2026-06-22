@@ -256,11 +256,21 @@ def custom_kernel(data: input_t) -> output_t:
         pheight = N - j
         MAXH = triton.next_power_of_2(pheight)
 
+        # num_warps must scale with the panel height: the panel kernel holds a
+        # (MAXH, BLK) register tensor; too few warps -> register spill -> huge
+        # slowdown (measured 7-10x on n>=1024). Empirically-tuned per MAXH.
+        if MAXH <= 512:
+            nwp = 4
+        elif MAXH <= 1024:
+            nwp = 8
+        else:
+            nwp = 32
+
         _panel_factor_kernel[(B,)](
             H, tau, Vbuf,
             B, N, j, pheight, b,
             sab, san, svb, svk, svn,
-            BLK=BLK, MAXH=MAXH,
+            BLK=BLK, MAXH=MAXH, num_warps=nwp,
         )
 
         ncols = N - (j + b)
@@ -269,7 +279,7 @@ def custom_kernel(data: input_t) -> output_t:
                 tau, Vbuf, Tbuf,
                 B, N, j, pheight, b,
                 svb, svk, svn, stb, stk, stn,
-                BLK=BLK, RTILE=64,
+                BLK=BLK, RTILE=64, num_warps=4,
             )
             nct = triton.cdiv(ncols, BNc)
             nrt = triton.cdiv(pheight, BM)
