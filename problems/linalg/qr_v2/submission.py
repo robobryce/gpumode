@@ -320,8 +320,13 @@ def custom_kernel(data: input_t) -> output_t:
         IB = 16
         NB = 32
     else:
+        # NARROW outer block (matches the single-level best's efficient narrow-K
+        # trailing): the wide NB=64 outer trailing of the prior two-level version
+        # doubled trailing registers + YT HBM traffic and SANK the geomean. Keep
+        # the outer trailing at the single-level width (32) but factor that panel
+        # via nested IB=16 sub-blocks with BLAS-3 inner updates + Gram buildT.
         IB = 16
-        NB = 64
+        NB = 32
 
     NB = min(NB, N)
     IB = min(IB, NB)
