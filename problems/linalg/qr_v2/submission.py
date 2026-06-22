@@ -113,14 +113,18 @@ def _panel_factor_kernel(
     tptr = tau_ptr + bid * N + j + cols
     tl.store(tptr, tau_panel, mask=col_valid)
 
-    # store reflectors V (transposed) into the wide outer V buffer at k-offset koff
+    # store reflectors V (transposed) into the wide outer V buffer at k-offset
+    # koff.  The buffer row axis is the GLOBAL row index, so a reflector whose
+    # local panel row is `rr` (relative to panel top j) lands at global row j+rr.
+    # This single convention lets the inner (j=col) and outer/T-build (j=jo)
+    # readers all index V by global row with no per-block offset bookkeeping.
     panelT = tl.trans(panel)                               # (BLK, MAXH)
     cc = cols[:, None]
     rr = rows[None, :]
     Vt = tl.where(rr == cc, 1.0, tl.where(rr > cc, panelT, 0.0))
     Vt = tl.where((rr < pheight) & (cc < b), Vt, 0.0)
     vbase = Vbuf_ptr + bid * stride_vb + koff * stride_vk
-    vptr = vbase + cc * stride_vk + rr * stride_vn
+    vptr = vbase + cc * stride_vk + (j + rr) * stride_vn
     tl.store(vptr, Vt, mask=(rr < pheight) & (cc < b))
 
     # store the inner ib x ib T2 (Tbuf is sized ib x ib, used by the inner
@@ -153,9 +157,10 @@ def _build_wide_T_kernel(
     row_valid = rows < pheight
     k_valid = ks < NBe
 
-    # load full transposed V block: Vt[k, row]  (NB, MAXH)
+    # load full transposed V block: Vt[k, row]  (NB, MAXH).  V is stored by
+    # GLOBAL row, so the outer block's rows [0,pheight) live at global jo+rows.
     vbase = Vbuf_ptr + bid * stride_vb
-    vptr = vbase + ks[:, None] * stride_vk + rows[None, :] * stride_vn
+    vptr = vbase + ks[:, None] * stride_vk + (jo + rows[None, :]) * stride_vn
     Vt = tl.load(vptr, mask=k_valid[:, None] & row_valid[None, :], other=0.0)  # (NB, MAXH)
 
     # tau over the outer block
@@ -216,7 +221,7 @@ def _trailing_YT_kernel(
         rrmask = rr < pheight
         ap = a_trail_base + rr[:, None] * stride_an + ccols[None, :]
         achunk = tl.load(ap, mask=rrmask[:, None] & cmask[None, :], other=0.0)   # (BM,BNc)
-        vp = v_base + krange[:, None] * stride_vk + rr[None, :] * stride_vn
+        vp = v_base + krange[:, None] * stride_vk + (j + rr[None, :]) * stride_vn
         vchunk = tl.load(vp, mask=rrmask[None, :], other=0.0)                    # (BLK,BM)
         W += tl.dot(vchunk, achunk, input_precision="tf32x3")
 
@@ -254,8 +259,8 @@ def _trailing_apply_kernel(
     a_trail_base = A_ptr + bid * stride_ab + j * stride_an + jb
     v_base = Vbuf_ptr + bid * stride_vb + koff * stride_vk
 
-    # V[rrows,:] : (BM, BLK)
-    vp = v_base + krange[None, :] * stride_vk + rrows[:, None] * stride_vn
+    # V[rrows,:] : (BM, BLK).  V is stored by global row -> add panel top j.
+    vp = v_base + krange[None, :] * stride_vk + (j + rrows[:, None]) * stride_vn
     Vrow = tl.load(vp, mask=rmask[:, None], other=0.0)
     # YT[:, ccols] : (BLK, BNc)
     yp = YT_ptr + bid * stride_yb + krange[:, None] * stride_yk + ccols[None, :] * stride_yn
@@ -309,7 +314,12 @@ def custom_kernel(data: input_t) -> output_t:
     NB = min(NB, N)
     IB = min(IB, NB)
 
-    Vbuf = torch.empty((B, NB, N), device=A.device, dtype=torch.float32)
+    # V buffer must be zeroed: a reflector at k-index kk is supported only on
+    # global rows >= jo+kk, but the wide-K trailing reads ALL rows [jo, N) for
+    # every k in [0,NB) (and k in [NBe,NB) on the last short block) -- the unread
+    # upper-triangular dead zone must read as 0, not stale/garbage.  Zeroed once
+    # per outer block below (panel_factor only writes each reflector's support).
+    Vbuf = torch.zeros((B, NB, N), device=A.device, dtype=torch.float32)
     Tin = torch.empty((B, IB, IB), device=A.device, dtype=torch.float32)
     Twide = torch.empty((B, NB, NB), device=A.device, dtype=torch.float32)
     YTbuf = torch.empty((B, NB, N), device=A.device, dtype=torch.float32)
@@ -328,6 +338,10 @@ def custom_kernel(data: input_t) -> output_t:
         colstop = jo + NBe
         pheight_o = N - jo
         MAXH_o = triton.next_power_of_2(pheight_o)
+
+        # clear the V region this block will read (rows [jo, N), all NB cols) so
+        # the unwritten reflector dead-zone reads as 0 (correctness, see alloc).
+        Vbuf[:, :, jo:].zero_()
 
         # ---- inner factorization of the outer panel [jo, jo+NBe) ----
         s = 0
