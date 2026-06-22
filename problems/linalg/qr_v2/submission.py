@@ -255,6 +255,295 @@ extern "C" __global__ void qr_small(
         Hb[idx] = sA[(long)c * n + r];
     }
 }
+
+
+// qr_panel_mcta: MULTI-CTA panel factor. G CTAs cooperate on ONE matrix's
+// BLK-wide column panel (the n=1024 B=60 regime: 60 panels for 148 SMs leaves
+// ~88 SMs idle in the panel phase, so giving each matrix G CTAs fills them).
+//
+// Grid = (G, B). For matrix bid the G CTAs split the panel's `pheight` rows
+// into G contiguous slices; each CTA holds its slice (sliceH x BLK) in SMEM
+// (column-major) for the WHOLE 32-step sweep -- so the panel never round-trips
+// HBM between columns (the property that makes the single-CTA Triton panel
+// fast), while the row work is parallelised across G CTAs.
+//
+// Cross-CTA coupling each column step is a tiny per-matrix reduction:
+//   * tail2 (1 scalar) and w[c]=v_k . panel[:,c] for all c (BLK scalars).
+// Each CTA atomic-adds its slice partial into a per-matrix global scratch row,
+// then a per-matrix G-way barrier (sense-reversal) publishes the totals. The
+// barrier is scoped to ONE matrix's G CTAs (cheap G-way handshake, NOT a grid
+// barrier). At B=60,G<=2 -> <=120 CTAs <= 148 SMs so all are co-resident in one
+// wave (no barrier deadlock). w[c<k] doubles as the WY-T Gram column (V[:,c].v_k
+// == w[c] for c<k), so T is built incrementally with no extra reduction.
+//
+// Emits exactly the same outputs as _panel_factor_kernel: H panel updated in
+// place (R on/above diag, reflectors below), tau, V^T buffer, T (BLK x BLK).
+// Convention bit-identical to LAPACK dlarfg / torch.geqrf.
+//
+// Scratch layout (per matrix bid), float row of width SCR = BLK+1+? :
+//   scr[bid*SCRW + 0]            : tail2 partial accumulator
+//   scr[bid*SCRW + 1 .. 1+BLK]   : w[0..BLK-1] partial accumulators
+// Barrier (per matrix): bar_cnt[bid] (int), bar_sense[bid] (int); each CTA
+// keeps a private sense it flips each barrier.
+// ---------------------------------------------------------------------------
+extern "C" __global__ void qr_panel_mcta(
+    float* __restrict__ Hbuf,     // (B, N, N) row-major, panel updated in place
+    float* __restrict__ tauout,   // (B, N)
+    float* __restrict__ Vtbuf,    // (B, BLK, N)  V transposed: Vt[k, r]
+    float* __restrict__ Tbuf,     // (B, BLK, BLK)
+    float* __restrict__ scr,      // (B, SCRW) reduction scratch
+    int* __restrict__ bar_cnt,    // (B,)
+    int* __restrict__ bar_sense,  // (B,)
+    int B, int N, int j, int pheight, int b, int BLK, int G,
+    int strideHb, int strideHn,   // H strides (elements): batch, row
+    int strideVb, int strideVk, int strideVn,
+    int strideTb, int strideTk, int strideTn,
+    int SCRW, int scrSb)          // scrSb = scratch per-matrix stride (Gmax*SCRW)
+{
+    const int g     = blockIdx.x;            // which CTA of this matrix (0..G-1)
+    const int bid   = blockIdx.y;            // matrix index
+    if (bid >= B) return;
+    const int tid   = threadIdx.x;
+    const int NT    = blockDim.x;
+    const int lane  = tid & 31;
+    const int warp  = tid >> 5;
+    const int nwarps = (NT + 31) >> 5;
+
+    // This CTA's contiguous row slice [r0, r1) of the pheight-row panel.
+    // Rows are GLOBAL panel rows 0..pheight-1 (global matrix row = j + r).
+    int per = (pheight + G - 1) / G;
+    int r0 = g * per;
+    int r1 = r0 + per; if (r1 > pheight) r1 = pheight;
+    if (r0 > pheight) r0 = pheight;
+    int sliceH = r1 - r0;                     // rows this CTA owns
+
+    extern __shared__ float smem_mc[];
+    // sP: this CTA's panel slice, column-major: sP[c*sliceH + (r-r0)].
+    // Held across the whole 32-step sweep (panel never round-trips HBM). v is
+    // kept in sP column k (overwritten in place below the diagonal). Cross-CTA
+    // reduction uses PER-CTA scratch slots (no atomicAdd contention): CTA g
+    // writes its partial to its own slot scr[bid][g][...]; after the barrier
+    // every CTA reads all G slots and sums them DETERMINISTICALLY into sbc[]
+    // (SMEM broadcast). Disjoint slots => no write race; deterministic sum =>
+    // bit-reproducible result across runs.
+    float* sP    = smem_mc;                   // sliceH * BLK
+    float* sredw = sP + (long)sliceH * BLK;   // per-warp reduction scratch: nwarps*BLK
+    float* sbc   = sredw + (long)nwarps * BLK; // broadcast: sbc[0]=tail2, sbc[1]=alpha, sbc[2..]=w
+
+    float* Hb = Hbuf + (long)bid * strideHb + (long)j * strideHn + j;   // panel top-left
+    float* taub = tauout + (long)bid * N + j;
+    // SCRW floats per CTA slot; this matrix owns Gmax consecutive slots (the
+    // allocation is sized for the tallest panel's Gmax; scrSb = Gmax*SCRW).
+    float* scr_mat = scr + (long)bid * scrSb;      // base of this matrix's slots
+    float* myslot  = scr_mat + (long)g * SCRW;     // this CTA's slot
+    int* bcnt = bar_cnt + bid;
+    int* bsen = bar_sense + bid;
+
+    // Load this CTA's slice into smem (column-major). Global element (r,c) of the
+    // panel is at Hb[r*strideHn + c]; store into sP[c*sliceH + (r-r0)].
+    for (long idx = tid; idx < (long)sliceH * BLK; idx += NT) {
+        int rr = idx % sliceH;                // 0..sliceH-1
+        int c  = idx / sliceH;                // 0..BLK-1
+        int r  = r0 + rr;
+        sP[(long)c * sliceH + rr] = (c < b) ? Hb[(long)r * strideHn + c] : 0.0f;
+    }
+    __syncthreads();
+
+    // Per-matrix G-way SENSE-REVERSAL barrier. Sense-reversal (unlike a plain
+    // monotonic counter) BOUNDS the G CTAs to at most one barrier apart: barrier
+    // N+1 needs all G arrivals, and a CTA cannot pass N+1 until the slowest also
+    // arrives there, so no CTA can lap and pollute the next generation's count.
+    // The last arriver resets the counter (for reuse) and flips the shared sense
+    // AFTER a __threadfence(), so a released waiter observes all G partials in L2;
+    // partials are consumed from SMEM (tid0 broadcast) so no per-thread stale L1.
+    // bcnt and bsen are zeroed each launch; priv_sense starts 0 and flips per call.
+    int priv_sense = 0;
+    #define MCTA_BARRIER() do {                                            \
+        __syncthreads();                                                   \
+        if (tid == 0) {                                                    \
+            __threadfence();  /* publish THIS CTA's pre-barrier writes (e.g. the \
+                                 scratch zeroing / partials) to L2 regardless of  \
+                                 whether this CTA ends up arriver or waiter */ \
+            int my = priv_sense ^ 1;                                       \
+            priv_sense = my;                                               \
+            if (atomicAdd(bcnt, 1) == G - 1) {                             \
+                atomicExch(bcnt, 0);  /* reset BEFORE release */          \
+                /* st.release.gpu publishes ALL prior writes (the G partials  \
+                   in L2) before the flag becomes visible -- hardware ack/rel */ \
+                asm volatile("st.release.gpu.b32 [%0], %1;" :: "l"(bsen), "r"(my) : "memory"); \
+            } else {                                                       \
+                int seen;                                                  \
+                do {                                                       \
+                    asm volatile("ld.acquire.gpu.b32 %0, [%1];" : "=r"(seen) : "l"(bsen) : "memory"); \
+                } while (seen != my);  /* acquire: subsequent loads see the published L2 */ \
+            }                                                              \
+        }                                                                  \
+        __syncthreads();   /* broadcast release to the whole CTA */        \
+    } while (0)
+
+    // Tmat: only CTA g==0 maintains/writes T. Keep T columns in registers of
+    // thread 0 is impractical (BLK*BLK); instead CTA 0 accumulates T into smem
+    // tail of sscal? T is BLK*BLK=1024 floats -> store T in a dedicated smem
+    // region on CTA 0. To keep all CTAs uniform we just have CTA0 build T in
+    // global Tbuf incrementally using w[c<k] published each step.
+
+    for (int k = 0; k < b; ++k) {
+        // ---- reduce tail2 = sum_{r>k} col_k[r]^2 over THIS CTA's rows>k ----
+        // and w[c] = sum_{r>=k} v_k[r]*panel[r,c]; but v_k isn't known until the
+        // reflector is built. So step is two-phase:
+        //   phase A: reduce tail2 (and alpha = col_k[k], owned by whoever holds row k)
+        //   build reflector (replicated from totals), write v into sP col k rows>k
+        //   phase B: reduce w[c] = sum_{r>=k} v_k[r]*panel[r,c]
+        //   apply: panel[:,c>k] -= tau*v*w[c]; finalize col k.
+
+        // phase A partial: tail2 over rows in (k, ...) within THIS CTA's slice,
+        // written to this CTA's OWN scratch slot[0] (no cross-CTA write race).
+        float part = 0.0f;
+        for (int rr = tid; rr < sliceH; rr += NT) {
+            int r = r0 + rr;
+            if (r > k) { float x = sP[(long)k * sliceH + rr]; part += x * x; }
+        }
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            part += __shfl_down_sync(0xffffffffu, part, off);
+        if (lane == 0) sredw[warp] = part;
+        __syncthreads();
+        if (tid == 0) {
+            float s = 0.0f;
+            for (int w2 = 0; w2 < nwarps; ++w2) s += sredw[w2];
+            myslot[0] = s;                       // this CTA's tail2 partial
+        }
+        // alpha = col_k[k]: the CTA owning row k publishes it into ITS slot[1].
+        if (k >= r0 && k < r1 && tid == 0) {
+            int rr = k - r0;
+            myslot[1] = sP[(long)k * sliceH + rr];
+        }
+        MCTA_BARRIER();
+        // every CTA deterministically sums the G tail2 partials; alpha is the
+        // value published by whichever slot's owner holds row k.
+        if (tid == 0) {
+            float t2 = 0.0f;
+            for (int gg = 0; gg < G; ++gg) t2 += scr_mat[(long)gg * SCRW + 0];
+            sbc[0] = t2;
+            int owner = k / per; if (owner >= G) owner = G - 1;
+            sbc[1] = scr_mat[(long)owner * SCRW + 1];
+        }
+        __syncthreads();
+        float tail2 = sbc[0];
+        float alpha = sbc[1];
+
+        float beta, tau_k, scale;
+        if (tail2 == 0.0f) { beta = alpha; tau_k = 0.0f; scale = 1.0f; }
+        else {
+            float normx = sqrtf(alpha * alpha + tail2);
+            float sgn = (alpha >= 0.0f) ? 1.0f : -1.0f;
+            beta = -sgn * normx;
+            tau_k = (beta - alpha) / beta;
+            scale = 1.0f / (alpha - beta);
+        }
+
+        // Write v into sP col k: v[k]=1 (on the owner), v[r>k]=col_k[r]*scale.
+        for (int rr = tid; rr < sliceH; rr += NT) {
+            int r = r0 + rr;
+            if (r > k) sP[(long)k * sliceH + rr] *= scale;     // becomes v[r]
+            else if (r == k) sP[(long)k * sliceH + rr] = 1.0f; // v[k]=1 (temp; finalized to beta later)
+        }
+        __syncthreads();
+
+        if (tau_k != 0.0f) {
+            // ---- phase B: w[c] = sum_{r>=k} v_k[r]*panel[r,c], for all c ----
+            // Each warp handles a set of columns; reduce over THIS CTA's rows>=k
+            // into this CTA's OWN slot[2+c] (disjoint -> no cross-CTA write race).
+            for (int c = warp; c < b; c += nwarps) {
+                float acc = 0.0f;
+                for (int rr = lane; rr < sliceH; rr += 32) {
+                    int r = r0 + rr;
+                    if (r >= k) acc += sP[(long)k * sliceH + rr] * sP[(long)c * sliceH + rr];
+                }
+                #pragma unroll
+                for (int off = 16; off > 0; off >>= 1)
+                    acc += __shfl_down_sync(0xffffffffu, acc, off);
+                if (lane == 0) myslot[2 + c] = acc;       // this CTA's w[c] partial
+            }
+            MCTA_BARRIER();
+            // every CTA deterministically sums the G w[c] partials into SMEM.
+            for (int c = tid; c < b; c += NT) {
+                float wc = 0.0f;
+                for (int gg = 0; gg < G; ++gg) wc += scr_mat[(long)gg * SCRW + 2 + c];
+                sbc[2 + c] = wc;
+            }
+            __syncthreads();
+
+            // apply to trailing cols c>k: panel[r,c] -= tau*v[r]*w[c], this CTA's rows
+            for (int c = k + 1; c < b; ++c) {
+                float wc = tau_k * sbc[2 + c];
+                for (int rr = tid; rr < sliceH; rr += NT) {
+                    int r = r0 + rr;
+                    if (r >= k) sP[(long)c * sliceH + rr] -= sP[(long)k * sliceH + rr] * wc;
+                }
+            }
+            // CTA 0 builds T column k using w[c<k] (== V[:,c].v_k) just reduced.
+            // T[a<k,k] = -tau_k * sum_{c<k} T[a,c] * w[c]; T[k,k]=tau_k.
+            if (g == 0) {
+                float* Tb = Tbuf + (long)bid * strideTb;
+                for (int a = tid; a < BLK; a += NT) {
+                    if (a < k) {
+                        float s = 0.0f;
+                        for (int c = 0; c < k; ++c)
+                            s += Tb[(long)a * strideTk + c * strideTn] * sbc[2 + c];
+                        Tb[(long)a * strideTk + k * strideTn] = -tau_k * s;
+                    } else if (a == k) {
+                        Tb[(long)a * strideTk + k * strideTn] = tau_k;
+                    } else {
+                        Tb[(long)a * strideTk + k * strideTn] = 0.0f;
+                    }
+                }
+            }
+            __syncthreads();
+        } else {
+            // tau_k == 0: identity reflector, T column k = e_k*0 except diag 0.
+            if (g == 0) {
+                float* Tb = Tbuf + (long)bid * strideTb;
+                for (int a = tid; a < BLK; a += NT)
+                    Tb[(long)a * strideTk + k * strideTn] = 0.0f;
+            }
+        }
+
+        // finalize column k: diag -> beta (or alpha if no refl), already-v below.
+        if (k >= r0 && k < r1) {
+            int rr = k - r0;
+            if (tid == 0) sP[(long)k * sliceH + rr] = (tail2 == 0.0f) ? alpha : beta;
+        }
+        if (g == 0 && tid == 0) taub[k] = tau_k;
+        MCTA_BARRIER();
+    }
+
+    // Write back: this CTA's rows of the panel (H), and V^T for its rows.
+    // H panel element (r,c): Hb[r*strideHn + c] = sP[c*sliceH + (r-r0)].
+    for (long idx = tid; idx < (long)sliceH * BLK; idx += NT) {
+        int rr = idx % sliceH;
+        int c  = idx / sliceH;
+        int r  = r0 + rr;
+        if (c < b) Hb[(long)r * strideHn + c] = sP[(long)c * sliceH + rr];
+    }
+    // V^T: Vt[c, r] (global row r => global col offset j+r in Vt's N dim).
+    // Vt[c,r] = 1 if r==c, panel[r,c] if r>c, else 0. panel here already holds v
+    // below diag and beta on diag, so re-derive: r==c ->1, r>c -> sP value, else 0.
+    {
+        float* Vb = Vtbuf + (long)bid * strideVb;
+        for (long idx = tid; idx < (long)sliceH * BLK; idx += NT) {
+            int rr = idx % sliceH;
+            int c  = idx / sliceH;
+            int r  = r0 + rr;
+            float val;
+            if (r == c) val = 1.0f;
+            else if (r > c && c < b) val = sP[(long)c * sliceH + rr];
+            else val = 0.0f;
+            Vb[(long)c * strideVk + (long)r * strideVn] = val;
+        }
+    }
+    #undef MCTA_BARRIER
+}
 '''
 
 
@@ -308,6 +597,13 @@ class _SmallQRKernel:
             self.max_smem)
         self._ck(err)
         err, self.func_tiny = cd.cuModuleGetFunction(self.module, b"qr_tiny")
+        self._ck(err)
+        err, self.func_panel_mcta = cd.cuModuleGetFunction(self.module, b"qr_panel_mcta")
+        self._ck(err)
+        err, = cd.cuFuncSetAttribute(
+            self.func_panel_mcta,
+            cd.CUfunction_attribute.CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+            self.max_smem)
         self._ck(err)
 
         # torch.cuda.current_<q>() -> .cuda_<q>, driver CU<q>(handle)
@@ -389,6 +685,52 @@ class _SmallQRKernel:
             self._tiny_argp, 0)
         self._ck(err)
 
+    def launch_panel_mcta(self, H, tau, Vt, T, scr, bar_cnt, bar_sense,
+                          B, N, j, pheight, b, BLK, G, nthreads):
+        # Multi-CTA panel factor: grid=(G, B). Each matrix's G CTAs cooperate on
+        # its BLK-wide panel at column offset j (height pheight). Smem holds each
+        # CTA's row-slice (sliceH x BLK) + per-warp reduction scratch.
+        import numpy as np
+        cd = self.cd
+        per = (pheight + G - 1) // G
+        sliceH = min(per, pheight)            # max slice (CTA 0); smem sized to it
+        nwarps = (nthreads + 31) // 32
+        smem = (sliceH * BLK + nwarps * BLK + (BLK + 2)) * 4   # sP + sredw + sbc broadcast
+        SCRW = scr.shape[2]                    # scr is (B, Gmax, SCRW)
+        scrSb = scr.shape[1] * scr.shape[2]    # per-matrix stride = Gmax*SCRW
+        sHb, sHn = H.stride(0), H.stride(1)
+        sVb, sVk, sVn = Vt.stride(0), Vt.stride(1), Vt.stride(2)
+        sTb, sTk, sTn = T.stride(0), T.stride(1), T.stride(2)
+        a = [
+            np.array([H.data_ptr()], dtype=np.uint64),
+            np.array([tau.data_ptr()], dtype=np.uint64),
+            np.array([Vt.data_ptr()], dtype=np.uint64),
+            np.array([T.data_ptr()], dtype=np.uint64),
+            np.array([scr.data_ptr()], dtype=np.uint64),
+            np.array([bar_cnt.data_ptr()], dtype=np.uint64),
+            np.array([bar_sense.data_ptr()], dtype=np.uint64),
+            np.array([B], dtype=np.int32), np.array([N], dtype=np.int32),
+            np.array([j], dtype=np.int32), np.array([pheight], dtype=np.int32),
+            np.array([b], dtype=np.int32), np.array([BLK], dtype=np.int32),
+            np.array([G], dtype=np.int32),
+            np.array([sHb], dtype=np.int32), np.array([sHn], dtype=np.int32),
+            np.array([sVb], dtype=np.int32), np.array([sVk], dtype=np.int32),
+            np.array([sVn], dtype=np.int32),
+            np.array([sTb], dtype=np.int32), np.array([sTk], dtype=np.int32),
+            np.array([sTn], dtype=np.int32),
+            np.array([SCRW], dtype=np.int32), np.array([scrSb], dtype=np.int32),
+        ]
+        argv = np.array([x.ctypes.data for x in a], dtype=np.uint64)
+        cur = getattr(torch.cuda, self._cur_q)()
+        qh = getattr(cur, self._cuda_q)
+        err, = cd.cuLaunchKernel(
+            self.func_panel_mcta,
+            G, B, 1,
+            nthreads, 1, 1,
+            smem, self._QH(qh),
+            argv.ctypes.data, 0)
+        self._ck(err)
+
 
 _KERNEL = None
 
@@ -430,6 +772,32 @@ _FUSED_TRAIL = int(_os.environ.get("QR_FUSED_TRAIL", "1")) != 0
 _BM_F = int(_os.environ.get("QR_BM_F", "32"))
 _BNC_F = int(_os.environ.get("QR_BNC_F", "32"))
 _NW_F = int(_os.environ.get("QR_NW_F", "2"))
+
+# Multi-CTA panel for the tall few-matrix shapes (n>=4096 B=2, n>=2048 B=8). The
+# single-CTA panel launches grid=(B,) so 146/148 SMs idle through the panel that
+# is 81% of n=4096 runtime. The mcta panel (qr_panel_mcta) gives each matrix G
+# CTAs that split the pheight rows + cooperate via a per-matrix G-way barrier,
+# filling the idle SMs. At n=4096 the per-column row work is HUGE (4096 rows) so
+# the barriers amortise (unlike n=1024 where they cost 3x). BLK=32 so the panel
+# never round-trips HBM and the wide trailing amortises. Knobs let the route's N
+# threshold, G cap, CTA threads, and BLK be swept without code edits.
+_MCTA_N = int(_os.environ.get("QR_MCTA_N", "4096"))     # min n to use mcta route
+_MCTA_NT = int(_os.environ.get("QR_MCTA_NT", "256"))    # threads/CTA
+_MCTA_GMAX = int(_os.environ.get("QR_MCTA_GMAX", "64")) # max CTAs/matrix
+_MCTA_MINSLICE = int(_os.environ.get("QR_MCTA_MINSLICE", "64"))  # min rows/CTA
+_MCTA_BLK = int(_os.environ.get("QR_MCTA_BLK", "32"))   # panel width
+
+
+def _mcta_choose_G(B, pheight, SMs=148):
+    # Pick CTAs-per-matrix so B*G fills the SMs WITHOUT exceeding one wave (the
+    # per-matrix barrier requires all G CTAs co-resident, else deadlock), and
+    # only split panels tall enough that the row work amortises the barrier cost.
+    G = max(1, SMs // max(1, B))
+    G = min(G, _MCTA_GMAX)
+    # keep slice tall enough to be worth a CTA
+    while G > 1 and pheight // G < _MCTA_MINSLICE:
+        G -= 1
+    return G
 
 
 def _tiny_qr(A):
@@ -1252,6 +1620,109 @@ def _w2_qr(data):
     return H, tau
 
 
+def _w2_qr_mcta(data):
+    # Multi-CTA panel path for the tall few-matrix shapes (n>=_MCTA_N). The panel
+    # uses qr_panel_mcta: grid=(G,B) cooperative CTAs split the pheight rows to
+    # fill the SMs the single-CTA grid=(B,) panel leaves idle. Trailing uses the
+    # fused-W BLK=32 kernels (already multi-CTA via column tiling). Exact geqrf.
+    A = data
+    B, N, _ = A.shape
+    H = A.clone()
+    tau = torch.zeros((B, N), device=A.device, dtype=torch.float32)
+
+    BLK = _MCTA_BLK
+    kern = _get_kernel()
+
+    Vbuf = torch.empty((B, BLK, N), device=A.device, dtype=torch.float32)
+    Tbuf = torch.empty((B, BLK, BLK), device=A.device, dtype=torch.float32)
+    YTbuf = torch.empty((B, BLK, N), device=A.device, dtype=torch.float32)
+
+    sab, san = H.stride(0), H.stride(1)
+    svb, svk, svn = Vbuf.stride(0), Vbuf.stride(1), Vbuf.stride(2)
+    stb, stk, stn = Tbuf.stride(0), Tbuf.stride(1), Tbuf.stride(2)
+    syb, syk, syn = YTbuf.stride(0), YTbuf.stride(1), YTbuf.stride(2)
+
+    # Trailing tiles for the grid-starved small-batch regime (B=2/8): a tall
+    # reduction chunk + more warps fill the SMs (same tuning the BLK<=16 branch of
+    # _w2_qr uses for n>=2048). The fused-W trailing keeps W on-chip (no YT HBM
+    # round-trip); split YT/apply is the fallback when fused is disabled.
+    BM_Y, BNc_Y, NW_Y = 128, 64, 4
+    BM_A, BNc_A, NW_A = 32, 32, 2
+
+    # mcta scratch: each matrix owns Gmax slots of SCRW floats (tail2, alpha, w).
+    SCRW = BLK + 2
+    Gmax = _mcta_choose_G(B, N)
+    scr = torch.empty((B, max(1, Gmax), SCRW), device=A.device, dtype=torch.float32)
+    bar_cnt = torch.zeros((B,), device=A.device, dtype=torch.int32)
+    bar_sense = torch.zeros((B,), device=A.device, dtype=torch.int32)
+
+    j = 0
+    while j < N:
+        b = min(BLK, N - j)
+        pheight = N - j
+        MAXH = triton.next_power_of_2(pheight)
+
+        Gp = _mcta_choose_G(B, pheight)
+        if Gp > 1:
+            # cooperative multi-CTA panel: grid=(Gp,B); each matrix's Gp CTAs split
+            # the pheight rows and synchronise via a per-matrix barrier. Reset the
+            # barrier state each launch (the sense flag persists across launches; a
+            # stale sense would falsely release the first barrier of the next panel).
+            bar_cnt.zero_()
+            bar_sense.zero_()
+            kern.launch_panel_mcta(
+                H, tau, Vbuf, Tbuf, scr, bar_cnt, bar_sense,
+                B, N, j, pheight, b, BLK, Gp, _MCTA_NT,
+            )
+        else:
+            # fall back to the single-CTA Triton panel when the panel is too short
+            # to split (G==1): spill-aware num_warps per MAXH.
+            if MAXH <= 256:
+                nwp = 4
+            elif MAXH <= 512:
+                nwp = 8
+            elif MAXH <= 1024:
+                nwp = 8
+            else:
+                nwp = 32
+            _panel_factor_kernel[(B,)](
+                H, tau, Vbuf, Tbuf,
+                B, N, j, pheight, b,
+                sab, san, svb, svk, svn, stb, stk, stn,
+                BLK=BLK, MAXH=MAXH, num_warps=nwp,
+            )
+
+        ncols = N - (j + b)
+        if ncols > 0:
+            if _FUSED_TRAIL:
+                nct_f = triton.cdiv(ncols, _BNC_F)
+                _trailing_fused_kernel[(nct_f, B)](
+                    H, Vbuf, Tbuf,
+                    B, N, j, pheight, ncols, j + b,
+                    sab, san, svb, svk, svn, stb, stk, stn,
+                    BLK=BLK, BM=_BM_F, BNc=_BNC_F, num_warps=_NW_F,
+                )
+            else:
+                nct_y = triton.cdiv(ncols, BNc_Y)
+                _trailing_YT_kernel[(nct_y, B)](
+                    H, Vbuf, Tbuf, YTbuf,
+                    B, N, j, pheight, ncols, j + b,
+                    sab, san, svb, svk, svn, stb, stk, stn, syb, syk, syn,
+                    BLK=BLK, BM=BM_Y, BNc=BNc_Y, num_warps=NW_Y,
+                )
+                nct_a = triton.cdiv(ncols, BNc_A)
+                nrt_a = triton.cdiv(pheight, BM_A)
+                _trailing_apply_kernel[(nrt_a * nct_a, B)](
+                    H, Vbuf, YTbuf,
+                    B, N, j, pheight, ncols, j + b,
+                    sab, san, svb, svk, svn, syb, syk, syn,
+                    BLK=BLK, BM=BM_A, BNc=BNc_A, num_warps=NW_A,
+                )
+        j += b
+
+    return H, tau
+
+
 def custom_kernel(data: input_t) -> output_t:
     n = data.shape[-1]
     # The custom one-block-per-matrix small-n kernel (_small_qr) is currently
@@ -1264,11 +1735,17 @@ def custom_kernel(data: input_t) -> output_t:
         return _tiny_qr(data)
     if n in _SMALL_N:
         return _small_qr(data)
+    # For the tall FEW-matrix shapes (n>=_MCTA_N, default 4096 B=2) the single-CTA
+    # panel grid=(B,) leaves 146/148 SMs idle through the 81%-of-runtime panel. The
+    # multi-CTA panel route fills them: grid=(G,B) cooperative CTAs split the panel
+    # rows. The per-column row work is huge here so the cross-CTA barriers amortise.
+    # Routing by matrix size n is a SHAPE parameter (invariance-guard-safe).
+    if n >= _MCTA_N:
+        return _w2_qr_mcta(data)
     # For the very tall few-matrix shapes (n>=2560) the single-level panel's
     # (MAXH=4096, BLK=16) register tensor spills to local memory; the two-level
-    # ib=8 path keeps the panel un-spilled while doing one wide trailing. Routing
-    # by matrix size n is a SHAPE parameter (invariance-guard-safe). Same exact
-    # geqrf (H,tau).
+    # ib=8 path keeps the panel un-spilled while doing one wide trailing. Same
+    # exact geqrf (H,tau).
     if n >= 2560:
         return _w2_qr_2level(data)
     return _w2_qr(data)
