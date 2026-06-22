@@ -217,6 +217,10 @@ def custom_kernel(data: input_t) -> output_t:
 
     if N <= 32:
         BLK = min(16, N)
+    elif N >= 1536:
+        # Tall panels (n>=2048): a narrow block halves the panel register
+        # footprint -> much higher occupancy (~2x faster) than BLK=32.
+        BLK = 16
     else:
         BLK = 32
 
