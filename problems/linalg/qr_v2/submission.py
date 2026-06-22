@@ -630,6 +630,93 @@ def _trailing_apply_kernel(
     tl.store(ap, aorig - delta, mask=amask)
 
 
+# Two-level-specific trailing kernels: identical to the single-level pair but
+# mask the reflector (K) dimension to the first NREF columns of V/T. This lets
+# the inner trailing apply ONLY sub-panel 0's IB reflectors out of the shared
+# 16-wide V/T buffer regardless of what cols IB:2IB hold -- so the buffer's pad
+# columns need NOT be reset to zero between outer blocks (removes ~768 elementwise
+# zeroing launches). The single-level kernels are left untouched (their callers
+# pass all BLK reflectors valid).
+@triton.jit
+def _trailing_YT2_kernel(
+    A_ptr, Vbuf_ptr, Tbuf_ptr, YT_ptr,
+    B, N, j, pheight, ncols, jb,
+    stride_ab, stride_an,
+    stride_vb, stride_vk, stride_vn,
+    stride_tb, stride_tk, stride_tn,
+    stride_yb, stride_yk, stride_yn,
+    BLK: tl.constexpr, BM: tl.constexpr, BNc: tl.constexpr, NREF: tl.constexpr,
+):
+    col_tile = tl.program_id(0)
+    bid = tl.program_id(1)
+    if bid >= B:
+        return
+    ccols = col_tile * BNc + tl.arange(0, BNc)
+    cmask = ccols < ncols
+    krange = tl.arange(0, BLK)
+    kvalid = krange < NREF
+
+    a_trail_base = A_ptr + bid * stride_ab + j * stride_an + jb
+    v_base = Vbuf_ptr + bid * stride_vb
+
+    W = tl.zeros((BLK, BNc), dtype=tl.float32)
+    nchunks = tl.cdiv(pheight, BM)
+    for ci in range(0, nchunks):
+        rr = ci * BM + tl.arange(0, BM)
+        rrmask = rr < pheight
+        ap = a_trail_base + rr[:, None] * stride_an + ccols[None, :]
+        achunk = tl.load(ap, mask=rrmask[:, None] & cmask[None, :], other=0.0)
+        vp = v_base + krange[:, None] * stride_vk + rr[None, :] * stride_vn
+        vchunk = tl.load(vp, mask=rrmask[None, :] & kvalid[:, None], other=0.0)
+        W += tl.dot(vchunk, achunk, input_precision="tf32x3")
+
+    tp = Tbuf_ptr + bid * stride_tb + krange[:, None] * stride_tk + krange[None, :] * stride_tn
+    Tm = tl.load(tp)
+    Tm = tl.where(kvalid[:, None] & kvalid[None, :], Tm, 0.0)
+    YT = tl.dot(tl.trans(Tm), W, input_precision="tf32x3")
+
+    yp = YT_ptr + bid * stride_yb + krange[:, None] * stride_yk + ccols[None, :] * stride_yn
+    tl.store(yp, YT, mask=cmask[None, :] & kvalid[:, None])
+
+
+@triton.jit
+def _trailing_apply2_kernel(
+    A_ptr, Vbuf_ptr, YT_ptr,
+    B, N, j, pheight, ncols, jb,
+    stride_ab, stride_an,
+    stride_vb, stride_vk, stride_vn,
+    stride_yb, stride_yk, stride_yn,
+    BLK: tl.constexpr, BM: tl.constexpr, BNc: tl.constexpr, NREF: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    bid = tl.program_id(1)
+    if bid >= B:
+        return
+    num_col_tiles = tl.cdiv(ncols, BNc)
+    row_tile = pid // num_col_tiles
+    col_tile = pid % num_col_tiles
+    rrows = row_tile * BM + tl.arange(0, BM)
+    ccols = col_tile * BNc + tl.arange(0, BNc)
+    rmask = rrows < pheight
+    cmask = ccols < ncols
+    krange = tl.arange(0, BLK)
+    kvalid = krange < NREF
+
+    a_trail_base = A_ptr + bid * stride_ab + j * stride_an + jb
+    v_base = Vbuf_ptr + bid * stride_vb
+
+    vp = v_base + krange[None, :] * stride_vk + rrows[:, None] * stride_vn
+    Vrow = tl.load(vp, mask=rmask[:, None] & kvalid[None, :], other=0.0)
+    yp = YT_ptr + bid * stride_yb + krange[:, None] * stride_yk + ccols[None, :] * stride_yn
+    YT = tl.load(yp, mask=cmask[None, :] & kvalid[:, None], other=0.0)
+    delta = tl.dot(Vrow, YT, input_precision="tf32x3")
+
+    ap = a_trail_base + rrows[:, None] * stride_an + ccols[None, :]
+    amask = rmask[:, None] & cmask[None, :]
+    aorig = tl.load(ap, mask=amask, other=0.0)
+    tl.store(ap, aorig - delta, mask=amask)
+
+
 # =============================================================================
 # Two-level (nested) panel for the spilling tall few-matrix shapes (n>=4096).
 #
@@ -801,6 +888,68 @@ def _cross_T_kernel(
     tl.store(toutp, T01, mask=real[:, None] & real[None, :])
 
 
+# Split cross-T: the single-CTA _cross_T_kernel runs grid=(B,)=2 so its tall
+# Gram reduction (V0^T V1 over ~pheight rows) is SM-starved. Split it: each
+# (row-tile, matrix) program computes a partial Gram with tensor cores, then a
+# tiny finish reduces the partials and forms T01 = -T0 G T1. This fills the SMs
+# for the dominant reduction on the few-matrix tall shapes.
+@triton.jit
+def _cross_gram_kernel(
+    Vbuf_ptr, Gpart_ptr,
+    B, pheight, IB,
+    stride_vb, stride_vk, stride_vn,
+    stride_gb, stride_gt, stride_gi, stride_gj,
+    BM: tl.constexpr, IBP: tl.constexpr,
+):
+    rt = tl.program_id(0)
+    bid = tl.program_id(1)
+    if bid >= B:
+        return
+    kk = tl.arange(0, IBP)
+    real = kk < IB
+    v_base = Vbuf_ptr + bid * stride_vb
+    rr = rt * BM + tl.arange(0, BM)
+    rmask = rr < pheight
+    v0p = v_base + kk[:, None] * stride_vk + rr[None, :] * stride_vn
+    V0 = tl.load(v0p, mask=(rmask[None, :] & real[:, None]), other=0.0)   # (IBP,BM)
+    v1p = v_base + (kk[None, :] + IB) * stride_vk + rr[:, None] * stride_vn
+    V1 = tl.load(v1p, mask=(rmask[:, None] & real[None, :]), other=0.0)   # (BM,IBP)
+    G = tl.dot(V0, V1, input_precision="tf32x3")                          # (IBP,IBP)
+    gp = Gpart_ptr + bid * stride_gb + rt * stride_gt + kk[:, None] * stride_gi + kk[None, :] * stride_gj
+    tl.store(gp, G)
+
+
+@triton.jit
+def _cross_finish_kernel(
+    Gpart_ptr, Tbuf_ptr,
+    B, nrt, IB,
+    stride_gb, stride_gt, stride_gi, stride_gj,
+    stride_tb, stride_tk, stride_tn,
+    IBP: tl.constexpr,
+):
+    bid = tl.program_id(0)
+    if bid >= B:
+        return
+    kk = tl.arange(0, IBP)
+    real = kk < IB
+    G = tl.zeros((IBP, IBP), dtype=tl.float32)
+    for rt in range(0, nrt):
+        gp = Gpart_ptr + bid * stride_gb + rt * stride_gt + kk[:, None] * stride_gi + kk[None, :] * stride_gj
+        G += tl.load(gp)
+    t_base = Tbuf_ptr + bid * stride_tb
+    t0p = t_base + kk[:, None] * stride_tk + kk[None, :] * stride_tn
+    T0 = tl.load(t0p)
+    t1p = t_base + (kk[:, None] + IB) * stride_tk + (kk[None, :] + IB) * stride_tn
+    T1 = tl.load(t1p)
+    T0 = tl.where(real[:, None] & real[None, :], T0, 0.0)
+    T1 = tl.where(real[:, None] & real[None, :], T1, 0.0)
+    TG = tl.dot(T0, G, input_precision="tf32x3")
+    T01 = -tl.dot(TG, T1, input_precision="tf32x3")
+    T01 = tl.where(real[:, None] & real[None, :], T01, 0.0)
+    toutp = t_base + kk[:, None] * stride_tk + (kk[None, :] + IB) * stride_tn
+    tl.store(toutp, T01, mask=real[:, None] & real[None, :])
+
+
 def _w2_qr_2level(data):
     # Two-level path for n>=4096: ib=8 narrow (un-spilled) sub-panels + one
     # nb=16 wide tf32x3 trailing per outer block. Same exact geqrf (H,tau).
@@ -841,17 +990,18 @@ def _w2_qr_2level(data):
         b1 = min(IB, N - j - b0)
         if b1 > 0:
             # inner trailing: apply sub-panel 0's IB reflectors to ONLY sub-panel
-            # 1's b1 columns [j+b0, j+b0+b1). Uses the wide (16) padded buffer
-            # (cols IB:2IB still zero) so the K=16 dots are exact; ncols is tiny.
-            _trailing_YT_kernel[(1, B)](
+            # 1's b1 columns [j+b0, j+b0+b1). The masked (NREF=IB) trailing applies
+            # ONLY sub-panel 0's IB reflectors out of the shared 16-wide buffer, so
+            # cols IB:2IB may hold stale data (no per-block reset needed). K=16.
+            _trailing_YT2_kernel[(1, B)](
                 H, Vbuf, Tbuf, YTbuf, B, N, j, pheight, b1, j + b0,
                 sab, san, svb, svk, svn, stb, stk, stn, syb, syk, syn,
-                BLK=NB, BM=128, BNc=NB, num_warps=4,
+                BLK=NB, BM=128, BNc=NB, NREF=IB, num_warps=4,
             )
-            _trailing_apply_kernel[(triton.cdiv(pheight, 128), B)](
+            _trailing_apply2_kernel[(triton.cdiv(pheight, 128), B)](
                 H, Vbuf, YTbuf, B, N, j, pheight, b1, j + b0,
                 sab, san, svb, svk, svn, syb, syk, syn,
-                BLK=NB, BM=128, BNc=NB, num_warps=4,
+                BLK=NB, BM=128, BNc=NB, NREF=IB, num_warps=4,
             )
 
             # sub-panel 1: cols [j+b0, j+b0+b1), V/T at offset (row IB, col IB)
@@ -864,7 +1014,9 @@ def _w2_qr_2level(data):
                 BLK=IB, MAXH=MAXH1, num_warps=nwp1,
             )
 
-            # cross-block T01 (needs both sub-panels' V and the two diagonal Ts)
+            # cross-block T01 (single CTA/matrix; the split-Gram variant added
+            # more launches + a Gpart HBM round-trip that cost more than the
+            # SM-starvation it removed -- measured 51.3k->59.4k, reverted).
             _cross_T_kernel[(B,)](
                 Vbuf, Tbuf, B, pheight, IB, IB,
                 svb, svk, svn, stb, stk, stn,
@@ -889,11 +1041,9 @@ def _w2_qr_2level(data):
                 BLK=NB, BM=BM_A, BNc=BNc_A, num_warps=NW_A,
             )
 
-        # reset the padding columns the next outer block relies on being zero:
-        # sub-panel 1 wrote V cols IB:2IB and T01/T1; zero them for reuse.
-        Vbuf[:, IB:NB, :].zero_()
-        Tbuf[:, :, IB:NB].zero_()
-        Tbuf[:, IB:NB, :].zero_()
+        # No per-block buffer reset: the inner trailing masks the reflector dim
+        # to NREF=IB so it ignores cols IB:2IB; the wide far trailing reads all
+        # 16 cols, all of which this block's sub-panels + cross-T wrote fresh.
         j += bb
 
     return H, tau
