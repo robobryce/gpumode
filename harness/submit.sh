@@ -63,19 +63,23 @@ popcorn-cli submit --no-tui \
 CLI_RC="${PIPESTATUS[0]}"
 set -e
 
-# --- Verdict parsing: the remote returns explicit success/failure markers. ---
-# Success requires BOTH the leaderboard-run-success marker AND a full test pass.
-# Anything else (compile error, correctness mismatch, timeout, network drop,
-# "processing" with no terminal result) is a FAILED submit -> non-zero exit.
-# Primary signal: the remote "Leaderboard run successful" marker. Secondary:
-# a "Passed N/M tests" line where N==M (checked in awk to avoid non-portable
-# regex backreferences across grep/ugrep). A leaderboard-success marker WITHOUT
-# a full test pass is still treated as accepted-but-flagged, never as failure.
+# --- Verdict parsing: FAILURE-FIRST. ---
+# The remote transcript can contain BOTH a "Leaderboard run failed" line (the
+# real ranked run) AND a later "Leaderboard run successful" line (e.g. a
+# secondary/secret run), and the RANKED benchmark can fail a shape (e.g.
+# "... failed testing: R - Q.T @ A is too large") even after the 22 TEST shapes
+# pass — the test shapes use small batches, the ranked benchmark uses the large
+# B=640 batches where a kernel bug surfaces. So a failure marker ANYWHERE must
+# override any success marker. Only a clean run with NO failure marker AND the
+# leaderboard-success marker counts as ACCEPTED.
 verdict="UNKNOWN"
 full_pass="$(awk '
     match($0, /Passed ([0-9]+)\/([0-9]+) tests/, m) { if (m[1]==m[2] && m[1]>0) print "yes" }
 ' "$SUBMIT_LOG" | head -1)"
-if grep -qi "Leaderboard run successful" "$SUBMIT_LOG"; then
+# Hard failure markers — any one of these => REJECTED, no matter what else is present.
+if grep -qiE "Leaderboard run failed|failed testing|Benchmarking failed|Testing failed|compilation error|build error|too large|not orthogonal|Submission failed|exceeded" "$SUBMIT_LOG"; then
+    verdict="REJECTED"
+elif grep -qi "Leaderboard run successful" "$SUBMIT_LOG"; then
     if [ "$full_pass" = "yes" ]; then
         verdict="ACCEPTED"
     else
