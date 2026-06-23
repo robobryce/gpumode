@@ -915,6 +915,34 @@ _N2048_ROUTE = int(_os.environ.get("QR_N2048_ROUTE", "1"))
 # footprint -> may take even fewer warps. 0 = keep in-code default.
 _2L_PNW = int(_os.environ.get("QR_2L_PNW", "0"))
 
+# brief-15 N=512 TWO-LEVEL DECOUPLING (IB=16 / NB=32). The BLK=32 single-level
+# panel at n=512 is register-WALLED (ncu: 255 r/thr -> 2 blocks/SM, 12.5% occ).
+# Naive BLK=16 un-spills (167 r/thr -> 3 blocks/SM, +50% occ) but DOUBLES the
+# (HBM-bound) trailing-pass count (n=512 5285->5910us, +11.8%). This path keeps
+# the panel narrow (IB=16, un-spilled, 3 blocks/SM) AND the wide trailing at
+# NB=32 (ONE pass per PAIR of sub-panels == the BLK=32 trailing-pass count): per
+# NB=32 outer block it factors two IB=16 sub-panels, applies sub-panel 0 to ONLY
+# sub-panel 1's 16 cols (a small inner trailing), then builds the combined 32-wide
+# compact-WY T whose off-diagonal block T01 = -T0 (V0^T V1) T1 couples the two
+# sub-panels so ONE 32-wide wide trailing over [j+32, N) is exact. The wide
+# trailing is the SAME un-spilled _trailing_fused_kernel (154 r/thr, 6 blocks/SM
+# -- GATE: it does NOT spill at NB=32, so the panel occupancy win is NOT confined
+# to the factor phase). All GEMMs stay tf32x3 (W0 finding: n=512 sequential
+# trailing updates compound tf32x2 error -> n=512 irreducibly tf32x3). Default
+# route OFF (perf-neutral until measured).
+_N512_2L = int(_os.environ.get("QR_N512_2L", "1")) != 0
+_N512_2L_IB = int(_os.environ.get("QR_N512_2L_IB", "16"))   # sub-panel width
+_N512_2L_NB = int(_os.environ.get("QR_N512_2L_NB", "32"))   # outer block / wide-trailing width
+# Saturated-grid tiles for the n=512 (B=640, grid-saturated) two-level path. The
+# wide trailing is the on-chip fused kernel (no YT HBM round-trip), the inner
+# trailing + cross_T fill SMs via the split variants. Distinct from the n>=2560
+# (grid-STARVED) tiles in _w2_qr_2level.
+_N512_2L_FBM = int(_os.environ.get("QR_N512_2L_FBM", "32"))   # fused wide-trail BM
+_N512_2L_FBNC = int(_os.environ.get("QR_N512_2L_FBNC", "32")) # fused wide-trail BNc
+_N512_2L_FNW = int(_os.environ.get("QR_N512_2L_FNW", "2"))    # fused wide-trail warps
+_N512_2L_PNW = int(_os.environ.get("QR_N512_2L_PNW", "4"))    # IB=16 sub-panel warps
+_N512_2L_GRAM_BM = int(_os.environ.get("QR_N512_2L_GRAM_BM", "128"))  # cross-Gram/YT2 row tile
+
 
 def _mcta_choose_G(B, pheight, SMs=148):
     # Pick CTAs-per-matrix so B*G fills the SMs WITHOUT exceeding one wave (the
@@ -1889,6 +1917,125 @@ def _w2_qr_2level(data):
     return H, tau
 
 
+def _w2_qr_2level_n512(data):
+    # brief-15: TWO-LEVEL DECOUPLING for the n=512 (B=640, grid-SATURATED) regime.
+    # IB=16 narrow (un-spilled, 3 blocks/SM) sub-panels + ONE wide NB=32 trailing
+    # per PAIR of sub-panels (trailing-pass count UNCHANGED vs the single-level
+    # BLK=32 path) coupled by the cross_T T01 = -T0 (V0^T V1) T1 block. Same exact
+    # geqrf (H,tau). All GEMMs tf32x3 (n=512 irreducibly tf32x3).
+    #
+    # Distinct from _w2_qr_2level (n>=2560): NO hybrid single-level fallback (the
+    # whole point at n=512 is the IB=16 panel at every j), SATURATED-grid tiles
+    # (fused on-chip wide trailing, not the grid-starved split pair), and tf32x3
+    # throughout (not the 1-pass _N4096_PREC the tall-shape path uses).
+    A = data.contiguous()
+    B, N, _ = A.shape
+    # NOTE: clone retained (panel/inner-trailing/cross kernels read+write H in
+    # place from the start). Clone-fusion (block 0 reads A, writes H) is a later
+    # lever if this path wins -- _panel_factor2_kernel would need a separate src.
+    H = A.clone()
+    tau = torch.zeros((B, N), device=A.device, dtype=torch.float32)
+
+    IB = _N512_2L_IB                 # 16
+    NB = _N512_2L_NB                 # 32
+    IBP = 16 if IB <= 16 else 32     # padded reflector index for the cross kernels (>=IB, MMA-legal)
+    Vbuf = torch.zeros((B, NB, N), device=A.device, dtype=torch.float32)
+    Tbuf = torch.zeros((B, NB, NB), device=A.device, dtype=torch.float32)
+    YTbuf = torch.empty((B, NB, N), device=A.device, dtype=torch.float32)
+
+    sab, san = H.stride(0), H.stride(1)
+    svb, svk, svn = Vbuf.stride(0), Vbuf.stride(1), Vbuf.stride(2)
+    stb, stk, stn = Tbuf.stride(0), Tbuf.stride(1), Tbuf.stride(2)
+    syb, syk, syn = YTbuf.stride(0), YTbuf.stride(1), YTbuf.stride(2)
+
+    # split-Gram / split-YT2 partials (fill SMs on the per-matrix reductions).
+    GRAM_BM = _N512_2L_GRAM_BM
+    nrt_max = triton.cdiv(N, GRAM_BM)
+    Gpart = torch.empty((B, nrt_max, IBP, IBP), device=A.device, dtype=torch.float32)
+    sgb, sgt, sgi, sgj = Gpart.stride(0), Gpart.stride(1), Gpart.stride(2), Gpart.stride(3)
+    Wpart = torch.empty((B, nrt_max, NB, NB), device=A.device, dtype=torch.float32)
+    swb, swt, swk, swn = Wpart.stride(0), Wpart.stride(1), Wpart.stride(2), Wpart.stride(3)
+
+    FBM, FBNC, FNW = _N512_2L_FBM, _N512_2L_FBNC, _N512_2L_FNW
+
+    j = 0
+    while j < N:
+        pheight = N - j
+        MAXH = triton.next_power_of_2(pheight)
+
+        b0 = min(IB, N - j)
+        # IB=16 sub-panel: (MAXH,16) register tile. nwp chosen so it un-spills at
+        # 3 blocks/SM (gate: 167 r/thr). MAXH<=512 -> nwp=4 keeps it un-spilled.
+        nwp0 = _N512_2L_PNW
+        # sub-panel 0: cols [j, j+IB), V/T at offset (0,0)
+        _panel_factor2_kernel[(B,)](
+            H, tau, Vbuf, Tbuf, B, N, j, pheight, b0, 0, 0,
+            sab, san, svb, svk, svn, stb, stk, stn,
+            BLK=IB, MAXH=MAXH, num_warps=nwp0,
+        )
+
+        b1 = min(IB, N - j - b0)
+        if b1 > 0:
+            # inner trailing: apply sub-panel 0's IB reflectors to ONLY sub-panel
+            # 1's b1 cols. Masked NREF=IB out of the NB-wide buffer (cols IB:2IB
+            # may be stale -> no per-block reset). Split-W reduction fills SMs.
+            nrt_y2 = triton.cdiv(pheight, GRAM_BM)
+            _trailing_YT2_partW_kernel[(nrt_y2, B)](
+                H, Vbuf, Wpart, B, N, j, pheight, b1, j + b0,
+                sab, san, svb, svk, svn, swb, swt, swk, swn,
+                BLK=NB, BM=GRAM_BM, BNc=NB, NREF=IB, num_warps=4,
+            )
+            _trailing_YT2_finishW_kernel[(B,)](
+                Wpart, Tbuf, YTbuf, B, nrt_y2, b1,
+                swb, swt, swk, swn, stb, stk, stn, syb, syk, syn,
+                BLK=NB, BNc=NB, NREF=IB, num_warps=2,
+            )
+            _trailing_apply2_kernel[(triton.cdiv(pheight, FBM), B)](
+                H, Vbuf, YTbuf, B, N, j, pheight, b1, j + b0,
+                sab, san, svb, svk, svn, syb, syk, syn,
+                BLK=NB, BM=FBM, BNc=NB, NREF=IB, num_warps=FNW,
+            )
+
+            # sub-panel 1: cols [j+b0, j+b0+b1), V/T at offset (row IB, col IB)
+            ph1 = N - (j + b0)
+            MAXH1 = triton.next_power_of_2(ph1)
+            _panel_factor2_kernel[(B,)](
+                H, tau, Vbuf, Tbuf, B, N, j + b0, ph1, b1, IB, IB,
+                sab, san, svb, svk, svn, stb, stk, stn,
+                BLK=IB, MAXH=MAXH1, num_warps=nwp0,
+            )
+
+            # cross-block T01 (split-Gram across SMs then a finish forms T01).
+            nrt_g = triton.cdiv(pheight, GRAM_BM)
+            _cross_gram_kernel[(nrt_g, B)](
+                Vbuf, Gpart, B, pheight, IB,
+                svb, svk, svn, sgb, sgt, sgi, sgj,
+                BM=GRAM_BM, IBP=IBP,
+            )
+            _cross_finish_kernel[(B,)](
+                Gpart, Tbuf, B, nrt_g, IB,
+                sgb, sgt, sgi, sgj, stb, stk, stn,
+                IBP=IBP,
+            )
+
+        bb = b0 + b1                      # reflectors in this outer block (<=NB)
+        ncols = N - (j + bb)
+        if ncols > 0:
+            # ONE wide NB=32 trailing over the bulk, exact via the combined T.
+            # Fused on-chip (W kept in regs, no YT HBM round-trip); race-free
+            # (each program owns a full-height column strip). tf32x3 (n=512).
+            nct_f = triton.cdiv(ncols, FBNC)
+            _trailing_fused_kernel[(nct_f, B)](
+                H, Vbuf, Tbuf, B, N, j, pheight, ncols, j + bb,
+                sab, san, svb, svk, svn, stb, stk, stn,
+                H,
+                BLK=NB, BM=FBM, BNc=FBNC, num_warps=FNW, IPREC="tf32x3",
+            )
+        j += bb
+
+    return H, tau
+
+
 def _w2_qr(data, blk_override=None):
     # block 0 reads A directly (clone fusion), and the kernels assume unit stride in
     # the last dim, so A must be contiguous. .contiguous() is a no-op (no copy, no
@@ -2230,6 +2377,13 @@ def custom_kernel(data: input_t) -> output_t:
         if _N2048_ROUTE == 2:
             return _w2_qr_2level(data)
         return _w2_qr(data, blk_override=_N2048_BLK)
+    # n=512 (B=640, grid-saturated): the single-level BLK=32 panel is register-
+    # WALLED (ncu 255 r/thr -> 2 blocks/SM). The two-level IB=16/NB=32 path keeps
+    # the panel un-spilled (3 blocks/SM, +50% occ) while the wide NB=32 trailing
+    # stays at the BLK=32 pass count. Gated by _N512_2L (default OFF -> perf-
+    # neutral) and n==512 (a SHAPE param -> invariance-guard-safe). Exact geqrf.
+    if n == 512 and _N512_2L:
+        return _w2_qr_2level_n512(data)
     return _w2_qr(data)
 
 
