@@ -868,6 +868,18 @@ _N2048_PREC = _os.environ.get("QR_N2048_PREC", "tf32")
 # "tf32" for the n=4096 WIDE trailing GEMM. The inner-trailing + cross-T GEMMs keep
 # tf32x3 (smaller cost, and cross-T forms the sub-panel-coupling T01 -- more delicate).
 _N4096_PREC = _os.environ.get("QR_N4096_PREC", "tf32")
+# n=1024 trailing GEMM precision (the FUSED BLK==32 trailing _trailing_fused_kernel).
+# THE UNEXPLOITED MIDDLE CASE: n=1024 is 27% of the geomean (x3 ranked shapes) but
+# still runs the expensive 3-pass tf32x3 trailing. The SAME 1/n-shrinking error/tol
+# argument that justified 1-pass tf32 at n>=2048 applies: tf32 GEMM rel-error is
+# ~CONSTANT in n (~7.7e-4) while the QR factor tolerance grows ~20*n*eps, so a single
+# trailing GEMM in plain tf32 is ~0.32x tol at n=1024 (vs 0.16 @ n=2048, 0.63 @ n=512
+# where it fails). n=1024 is the BOUNDARY CASE -- ratio 0.32 is 2x the n=2048 value, so
+# rankdef (the tightest ill-cond case, 9.17/20 = 46% of budget at n=2048) could land
+# near the cliff. Default is SAFE (tf32x3); flip to "tf32" ONLY after MEASURING every
+# n=1024 ill-cond ranked shape clears with margin (<=15/20). Gated by N==1024 (a shape
+# param -> invariance-safe); n=512 keeps tf32x3 (shares the fused kernel but N!=1024).
+_N1024_PREC = _os.environ.get("QR_N1024_PREC", "tf32x3")
 # n=2048 panel num_warps override for the tall (MAXH>1024) panels. 0 = keep the
 # height-based default (32). The panel is L1/serial-latency bound, so fewer warps
 # (less cross-warp shared-mem sync per reflector reduction) MIGHT cut latency.
@@ -1145,6 +1157,7 @@ def _trailing_fused_kernel(
     stride_tb, stride_tk, stride_tn,
     Aout_ptr,                                 # separate store dest (block 0: read A, write H => fuses the clone)
     BLK: tl.constexpr, BM: tl.constexpr, BNc: tl.constexpr,
+    IPREC: tl.constexpr = "tf32x3",
 ):
     col_tile = tl.program_id(0)
     bid = tl.program_id(1)
@@ -1160,6 +1173,9 @@ def _trailing_fused_kernel(
     v_base = Vbuf_ptr + bid * stride_vb
 
     # sweep 1: W = V^T @ A_trail over all panel rows, in chunks of BM.
+    # IPREC controls this big W=V^T@A reduction (the bulk FLOPs). Default tf32x3
+    # keeps n=512 (which shares this kernel) at full accuracy; the n=1024 caller may
+    # pass 1-pass "tf32" (gated by N==1024) once the residual gate is measured-clear.
     W = tl.zeros((BLK, BNc), dtype=tl.float32)
     nchunks = tl.cdiv(pheight, BM)
     for ci in range(0, nchunks):
@@ -1169,20 +1185,22 @@ def _trailing_fused_kernel(
         achunk = tl.load(ap, mask=rrmask[:, None] & cmask[None, :], other=0.0)   # (BM,BNc)
         vp = v_base + krange[:, None] * stride_vk + rr[None, :] * stride_vn
         vchunk = tl.load(vp, mask=rrmask[None, :], other=0.0)                    # (BLK,BM)
-        W += tl.dot(vchunk, achunk, input_precision="tf32x3")
+        W += tl.dot(vchunk, achunk, input_precision=IPREC)
 
-    # YT = T^T @ W  (stays in registers, never written to HBM)
+    # YT = T^T @ W  (stays in registers, never written to HBM). Tiny BLKxBLK dot ->
+    # keep full tf32x3 (negligible cost, and it couples all reflectors -> delicate).
     tp = Tbuf_ptr + bid * stride_tb + krange[:, None] * stride_tk + krange[None, :] * stride_tn
     Tm = tl.load(tp)
     YT = tl.dot(tl.trans(Tm), W, input_precision="tf32x3")                        # (BLK,BNc)
 
     # sweep 2: A_trail -= V @ YT, re-reading each A chunk and storing in place.
+    # delta=V@YT is the second bulk GEMM -> also IPREC-controlled.
     for ci in range(0, nchunks):
         rr = ci * BM + tl.arange(0, BM)
         rrmask = rr < pheight
         vp2 = v_base + krange[None, :] * stride_vk + rr[:, None] * stride_vn
         Vrow = tl.load(vp2, mask=rrmask[:, None], other=0.0)                     # (BM,BLK)
-        delta = tl.dot(Vrow, YT, input_precision="tf32x3")                      # (BM,BNc)
+        delta = tl.dot(Vrow, YT, input_precision=IPREC)                         # (BM,BNc)
         ap2 = a_trail_base + rr[:, None] * stride_an + ccols[None, :]
         amask = rrmask[:, None] & cmask[None, :]
         aorig = tl.load(ap2, mask=amask, other=0.0)
@@ -1863,6 +1881,11 @@ def _w2_qr(data, blk_override=None):
     # precision than tf32x3 (gated by N, a shape param -> invariance-safe). All other
     # shapes keep tf32x3 via the kernels' IPREC default.
     iprec = _N2048_PREC if blk_override is not None else "tf32x3"
+    # FUSED (BLK==32) trailing precision: the n=1024 route (blk_override is None,
+    # N==1024) may use 1-pass tf32 -- the SAME 1/n-shrinking error/tol argument as
+    # n=2048, gated to N==1024 so n=512 (which shares this kernel) keeps tf32x3. All
+    # other N keep tf32x3. Shape-N gate -> invariance-safe.
+    fused_iprec = _N1024_PREC if (blk_override is None and N == 1024) else "tf32x3"
     j = 0
     while j < N:
         b = min(BLK, N - j)
@@ -1926,7 +1949,7 @@ def _w2_qr(data, blk_override=None):
                     B, N, j, pheight, ncols, j + b,
                     sab, san, svb, svk, svn, stb, stk, stn,
                     H,
-                    BLK=BLK, BM=BM_F, BNc=BNc_F, num_warps=NW_F,
+                    BLK=BLK, BM=BM_F, BNc=BNc_F, num_warps=NW_F, IPREC=fused_iprec,
                 )
             else:
                 nct_y = triton.cdiv(ncols, BNc_Y)
