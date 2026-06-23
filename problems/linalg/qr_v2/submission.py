@@ -773,17 +773,22 @@ _BM_F = int(_os.environ.get("QR_BM_F", "32"))
 _BNC_F = int(_os.environ.get("QR_BNC_F", "32"))
 _NW_F = int(_os.environ.get("QR_NW_F", "2"))
 # brief-22 COMBINE: n=1024 fused-trailing ILP knobs grafted from worker-0 brief-21.
-# The leader base routes n=1024 through _w2_qr -> _trailing_fused_kernel with the
-# accepted (BM=128,BNc=64,NW=4) tile (f8e3567, leaderboard id 829663). brief-21's
-# n=1024 optimum (NACC=1 + NS=3) was measured on the OLD small (32,32,2) tile.
-# MEASURED on THIS base (brief-22 iter1): NS=3 on the BIG (128,64,4) tile is a
-# DISASTER -- n=1024 4145->5757us (+39%): the big (BM=128,BNc=64) chunk already
-# uses far more registers/shared-mem, and num_stages=3 multi-buffers that large
-# A/V chunk -> register/smem pressure spills and occupancy collapses. The pipeline
-# lever does NOT transfer to the big tile. So n=1024 keeps NS=1 (== the accepted
-# leader path exactly); the ILP win lands only on n=512's small-chunk tile.
+# The leader base routed n=1024 through _w2_qr -> _trailing_fused_kernel with the
+# accepted BIG (BM=128,BNc=64,NW=4) tile (f8e3567, leaderboard id 829663). brief-21's
+# n=1024 optimum (NACC=1 + NS=3 software-pipeline) was measured on the SMALL (32,32,2)
+# tile. brief-22 RE-MEASURED both on this base (the brief's explicit BM=64-vs-32 ask):
+#   - NS=3 on the BIG tile is a DISASTER: n1024 4145->5757us (+39%) -- num_stages
+#     multi-buffers the large BM=128/BNc=64 chunk -> register/smem spill, occ collapse.
+#   - The SMALL (32,32,2) tile + NS=3 pipeline (NACC=1) BEATS the accepted big tile:
+#     shape4 4146->4068us (-1.9%), geomean 2586->2570us. The small tile's tiny chunk
+#     leaves register headroom for the 3-stage pipeline to hide L1-miss latency, and
+#     at B=60 (grid-starved) more programs (smaller BNc) still help fill the 148 SMs.
+#     Swept on THIS base: NS=2 4672us, NS=4 4104us, BM=64 4139us, BNc=64 4174us,
+#     NACC=2 4181us -- (BM=32,BNc=32,NW=2,NACC=1,NS=3) is the local optimum.
+# So n=1024 reverts to the SMALL tile + NS=3 (supersedes the accepted big-tile graft,
+# which it beats locally). Tile set in _fused_tile_for_N; NS here. NACC stays 1.
 _FUSE_NACC_1024 = int(_os.environ.get("QR_FUSE_NACC_1024", "1"))
-_FUSE_NS_1024 = int(_os.environ.get("QR_FUSE_NS_1024", "1"))
+_FUSE_NS_1024 = int(_os.environ.get("QR_FUSE_NS_1024", "3"))
 
 
 def _fused_tile_for_N(N):
@@ -792,15 +797,14 @@ def _fused_tile_for_N(N):
     #   n=512  (B=640): GRID-SATURATED -- the small (32,32,2) tile maximises the
     #     program count that fills the 148 SMs; every bigger tile cuts concurrency.
     #     (Fresh sweep on the prior fast lineage: BM=64 +3.0%, NW=4 +42%.)
-    #   n=1024 (B=60):  GRID-STARVED -- only 60 matrices for 148 SMs, so the fused
-    #     trailing wants a BIG tile that fills idle SMs with MORE work per program.
-    #     The accepted graft (f8e3567, leaderboard id 829663) measured (128,64,4)
-    #     -3.4% on n=1024 vs (32,32,2); a SHARP local optimum (BM=64 +6.7%, BNc=32
-    #     +12%, BM=256 +109%, NW=8 +13%). The n=1024 fused path here is byte-
-    #     identical to that lineage (_trailing_fused_kernel + _panel_factor_kernel
-    #     verified identical 6957b600 vs this base; W1's two-level only added n=512
-    #     code + perf-neutral knobs), so the (128,64,4) optimum transfers directly.
-    #     This is the SAME (128,64,4) tile the grid-starved n>=2048 split path uses.
+    #   n=1024 (B=60):  GRID-STARVED -- only 60 matrices for 148 SMs. The accepted
+    #     graft (f8e3567, leaderboard id 829663) measured a BIG (128,64,4) tile
+    #     -3.4% vs (32,32,2) -- but that was WITHOUT a software pipeline. brief-22
+    #     found that adding the NS=3 pipeline (_FUSE_NS_1024) flips the optimum back
+    #     to the SMALL (32,32,2) tile: the pipeline needs register headroom the big
+    #     chunk doesn't have, and at B=60 more programs (small BNc) fill the SMs
+    #     better than fewer-but-bigger ones. (32,32,2)+NS=3 beats (128,64,4)+NS=1 by
+    #     -1.9% on shape4. See the _FUSE_NS_1024 block above for the full sweep.
     # Pure shape-N gate -> invariance-guard-safe; n=512 keeps the shared default
     # (and never reaches _w2_qr here anyway -- it routes to _w2_qr_2level_n512).
     bm, bnc, nw = _BM_F, _BNC_F, _NW_F
@@ -809,9 +813,16 @@ def _fused_tile_for_N(N):
         bnc = int(_os.environ.get("QR_BNC_F_512", str(bnc)))
         nw  = int(_os.environ.get("QR_NW_F_512",  str(nw)))
     elif N == 1024:
-        bm  = int(_os.environ.get("QR_BM_F_1024",  "128"))
-        bnc = int(_os.environ.get("QR_BNC_F_1024", "64"))
-        nw  = int(_os.environ.get("QR_NW_F_1024",  "4"))
+        # brief-22: the small (32,32,2) tile + NS=3 software-pipeline (_FUSE_NS_1024)
+        # BEATS the accepted big (128,64,4) graft on THIS base (shape4 4146->4068us,
+        # -1.9%). The big tile was a sharp optimum only WITHOUT the pipeline; once the
+        # 3-stage pipeline hides the L1-miss latency, the small tile's register headroom
+        # (no spill) + higher program count (better SM fill at B=60) wins. Re-measured
+        # per the brief's BM=64-vs-32 ask: BM=64 4139us, BNc=64 4174us, NACC=2 4181us
+        # all lose to (32,32,2)+NS=3.
+        bm  = int(_os.environ.get("QR_BM_F_1024",  "32"))
+        bnc = int(_os.environ.get("QR_BNC_F_1024", "32"))
+        nw  = int(_os.environ.get("QR_NW_F_1024",  "2"))
     return bm, bnc, nw
 
 # Multi-CTA panel for the tall few-matrix shapes (n>=4096 B=2, n>=2048 B=8). The
