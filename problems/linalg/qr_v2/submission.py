@@ -861,6 +861,13 @@ _N2048_FUSED = int(_os.environ.get("QR_N2048_FUSED", "0")) != 0
 # headroom. Default is now "tf32" (1-pass) for the n=2048 trailing GEMM ONLY (gated
 # by N, a shape param). n=512/1024/4096 keep tf32x3 via the kernels' IPREC default.
 _N2048_PREC = _os.environ.get("QR_N2048_PREC", "tf32")
+# n=4096 (two-level path) wide-trailing GEMM precision. Same 1/n-shrinking error/tol
+# argument applies even more strongly (n=4096 tol is 2x n=2048's; single-GEMM 1-pass
+# ratio ~0.08). MEASURED: 1-pass tf32 wide trailing PASSES n=4096 cond=1 at scaled_factor
+# 1.38/20 (6.9% of budget -- very safe, looser than n=2048) and upper (trivial). Default
+# "tf32" for the n=4096 WIDE trailing GEMM. The inner-trailing + cross-T GEMMs keep
+# tf32x3 (smaller cost, and cross-T forms the sub-panel-coupling T01 -- more delicate).
+_N4096_PREC = _os.environ.get("QR_N4096_PREC", "tf32")
 # n=2048 panel num_warps override for the tall (MAXH>1024) panels. 0 = keep the
 # height-based default (32). The panel is L1/serial-latency bound, so fewer warps
 # (less cross-warp shared-mem sync per reflector reduction) MIGHT cut latency.
@@ -1633,7 +1640,7 @@ def _w2_qr_2level(data):
                 _trailing_YT_kernel[(nct_y, B)](
                     H, Vbuf, Tbuf, YTbuf, B, N, j, pheight, ncols, j + b,
                     sab, san, svb, svk, svn, stb, stk, stn, syb, syk, syn,
-                    BLK=NB, BM=BM_Y, BNc=BNc_Y, num_warps=NW_Y,
+                    BLK=NB, BM=BM_Y, BNc=BNc_Y, num_warps=NW_Y, IPREC=_N4096_PREC,
                 )
                 nct_a = triton.cdiv(ncols, BNc_A)
                 nrt_a = triton.cdiv(pheight, BM_A)
@@ -1641,7 +1648,7 @@ def _w2_qr_2level(data):
                     H, Vbuf, YTbuf, B, N, j, pheight, ncols, j + b,
                     sab, san, svb, svk, svn, syb, syk, syn,
                     H,
-                    BLK=NB, BM=BM_A, BNc=BNc_A, num_warps=NW_A,
+                    BLK=NB, BM=BM_A, BNc=BNc_A, num_warps=NW_A, IPREC=_N4096_PREC,
                 )
             j += b
             continue
@@ -1743,7 +1750,7 @@ def _w2_qr_2level(data):
                 _trailing_YT_kernel[(nct_y, B)](
                     H, Vbuf, Tbuf, YTbuf, B, N, j, pheight, ncols, j + bb,
                     sab, san, svb, svk, svn, stb, stk, stn, syb, syk, syn,
-                    BLK=NB, BM=BM_Y, BNc=BNc_Y, num_warps=NW_Y,
+                    BLK=NB, BM=BM_Y, BNc=BNc_Y, num_warps=NW_Y, IPREC=_N4096_PREC,
                 )
                 nct_a = triton.cdiv(ncols, BNc_A)
                 nrt_a = triton.cdiv(pheight, BM_A)
@@ -1751,7 +1758,7 @@ def _w2_qr_2level(data):
                     H, Vbuf, YTbuf, B, N, j, pheight, ncols, j + bb,
                     sab, san, svb, svk, svn, syb, syk, syn,
                     H,
-                    BLK=NB, BM=BM_A, BNc=BNc_A, num_warps=NW_A,
+                    BLK=NB, BM=BM_A, BNc=BNc_A, num_warps=NW_A, IPREC=_N4096_PREC,
                 )
 
         # No per-block buffer reset: the inner trailing masks the reflector dim
