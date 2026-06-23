@@ -949,9 +949,12 @@ _N512_2L_GRAM_BM = int(_os.environ.get("QR_N512_2L_GRAM_BM", "128"))  # cross-Gr
 # Default OFF for n=512 -> use the single-CTA YT2 + single-CTA cross_T (fewer
 # launches). _YT2_NW/_cross_T warps tunable.
 _N512_2L_SPLIT = int(_os.environ.get("QR_N512_2L_SPLIT", "0")) != 0
-_N512_2L_YT2_NW = int(_os.environ.get("QR_N512_2L_YT2_NW", "4"))   # single-CTA YT2 warps
-_N512_2L_YT2_BM = int(_os.environ.get("QR_N512_2L_YT2_BM", "128")) # single-CTA YT2 row chunk
-_N512_2L_CT_BM = int(_os.environ.get("QR_N512_2L_CT_BM", "128"))   # single-CTA cross_T Gram chunk
+_N512_2L_YT2_NW = int(_os.environ.get("QR_N512_2L_YT2_NW", "2"))   # single-CTA YT2 warps
+_N512_2L_YT2_BM = int(_os.environ.get("QR_N512_2L_YT2_BM", "32"))  # single-CTA YT2 row chunk
+_N512_2L_CT_BM = int(_os.environ.get("QR_N512_2L_CT_BM", "32"))    # single-CTA cross_T Gram chunk
+_N512_2L_CT_NW = int(_os.environ.get("QR_N512_2L_CT_NW", "2"))     # single-CTA cross_T warps
+_N512_2L_AP2_BM = int(_os.environ.get("QR_N512_2L_AP2_BM", "32"))  # inner-trailing apply2 row tile
+_N512_2L_AP2_NW = int(_os.environ.get("QR_N512_2L_AP2_NW", "2"))   # inner-trailing apply2 warps
 
 
 def _mcta_choose_G(B, pheight, SMs=148):
@@ -2008,10 +2011,10 @@ def _w2_qr_2level_n512(data):
                     sab, san, svb, svk, svn, stb, stk, stn, syb, syk, syn,
                     BLK=NB, BM=_N512_2L_YT2_BM, BNc=NB, NREF=IB, num_warps=_N512_2L_YT2_NW,
                 )
-            _trailing_apply2_kernel[(triton.cdiv(pheight, FBM), B)](
+            _trailing_apply2_kernel[(triton.cdiv(pheight, _N512_2L_AP2_BM), B)](
                 H, Vbuf, YTbuf, B, N, j, pheight, b1, j + b0,
                 sab, san, svb, svk, svn, syb, syk, syn,
-                BLK=NB, BM=FBM, BNc=NB, NREF=IB, num_warps=FNW,
+                BLK=NB, BM=_N512_2L_AP2_BM, BNc=NB, NREF=IB, num_warps=_N512_2L_AP2_NW,
             )
 
             # sub-panel 1: cols [j+b0, j+b0+b1), V/T at offset (row IB, col IB)
@@ -2041,7 +2044,7 @@ def _w2_qr_2level_n512(data):
                 _cross_T_kernel[(B,)](
                     Vbuf, Tbuf, B, pheight, IB, IB,
                     svb, svk, svn, stb, stk, stn,
-                    BM=_N512_2L_CT_BM, IBP=IBP,
+                    BM=_N512_2L_CT_BM, IBP=IBP, num_warps=_N512_2L_CT_NW,
                 )
 
         bb = b0 + b1                      # reflectors in this outer block (<=NB)
