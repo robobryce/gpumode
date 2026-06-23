@@ -1324,7 +1324,12 @@ def _trailing_YT2_kernel(
 
     tp = Tbuf_ptr + bid * stride_tb + krange[:, None] * stride_tk + krange[None, :] * stride_tn
     Tm = tl.load(tp)
-    Tm = tl.where(kvalid[:, None] & kvalid[None, :], Tm, 0.0)
+    # brief-12 ALU trim (FP-exact): `Tm = tl.where(kvalid&kvalid, Tm, 0)` is
+    # redundant. YT[i,c] = sum_k Tm[k,i]*W[k,c]; W rows k>=NREF are 0 (vchunk
+    # loaded with mask kvalid[:,None]) so stale Tm[k>=NREF,:] contribute g*0=0
+    # exactly (g finite) -- the ROW mask adds nothing. The COL mask would zero
+    # Tm[:,i>=NREF] i.e. YT[i>=NREF], but YT is stored masked kvalid[:,None] so
+    # those rows are never written. Drop the (BLK,BLK) select; use stale Tm.
     YT = tl.dot(tl.trans(Tm), W, input_precision="tf32x3")
 
     yp = YT_ptr + bid * stride_yb + krange[:, None] * stride_yk + ccols[None, :] * stride_yn
@@ -1427,7 +1432,10 @@ def _trailing_YT2_finishW_kernel(
         W += tl.load(wp)
     tp = Tbuf_ptr + bid * stride_tb + krange[:, None] * stride_tk + krange[None, :] * stride_tn
     Tm = tl.load(tp)
-    Tm = tl.where(kvalid[:, None] & kvalid[None, :], Tm, 0.0)
+    # brief-12 ALU trim (FP-exact, same proof as _trailing_YT2_kernel): W rows
+    # k>=NREF are 0 (Wpart from partW's dot has vchunk masked kvalid[:,None]) so
+    # stale Tm[k>=NREF,:] contribute g*0=0; YT stored masked kvalid -> col mask
+    # unobserved. Drop the (BLK,BLK) select.
     YT = tl.dot(tl.trans(Tm), W, input_precision="tf32x3")
     yp = YT_ptr + bid * stride_yb + krange[:, None] * stride_yk + ccols[None, :] * stride_yn
     tl.store(yp, YT, mask=cmask[None, :] & kvalid[:, None])
