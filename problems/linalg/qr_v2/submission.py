@@ -1015,9 +1015,18 @@ def _panel_factor_kernel(
         w = tl.sum(v[:, None] * panel, axis=0)            # (BLK,)
 
         # --- incremental T column k:  T[a<k,k] = -tau_k * (T @ w[c<k]) ---
-        z = tl.where(cols < k, w, 0.0)
-        Tcol = -tau_k * tl.sum(Tmat * z[None, :], axis=1)  # (BLK,)
-        Tcol = tl.where(cols < k, Tcol, 0.0)
+        # brief-12 ALU trims (FP-exact). Tmat's strict-lower triangle is exactly 0
+        # (each step writes col k as [rows<k: vals, row k: tau, rows>k: 0]), and
+        # cols>=k of Tmat are still their initial 0 at this step (col c is written
+        # only at step c). So:
+        #  - z = tl.where(cols<k, w, 0) is REDUNDANT: in Tmat*w the c>=k products
+        #    are Tmat[a,c]*w[c] with Tmat[:,c>=k]=0 -> 0*finite=0 exactly, same
+        #    addends as with z (c<k identical, c>=k both 0) -> identical reduction.
+        #  - Tcol = tl.where(cols<k, Tcol, 0) is REDUNDANT: Tcol[a>=k] =
+        #    -tau*sum_{c<k} Tmat[a,c]*w[c] and Tmat[a>=k, c<k] is strict-lower = 0,
+        #    so Tcol[a>=k] is ALREADY 0 from the dot.
+        # Use w directly and drop both (BLK,)-wide selects per column.
+        Tcol = -tau_k * tl.sum(Tmat * w[None, :], axis=1)  # (BLK,)
         Tcol = tl.where(cols == k, tau_k, Tcol)
         Tmat = tl.where(col_is_k[None, :], Tcol[:, None], Tmat)
 
