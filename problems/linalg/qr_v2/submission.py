@@ -836,6 +836,17 @@ _AP2_NW = int(_os.environ.get("QR_AP2_NW", "4"))
 _YT2_SPLIT = int(_os.environ.get("QR_YT2_SPLIT", "1")) != 0
 _YT2_GRAM_BM = int(_os.environ.get("QR_YT2_GRAM_BM", "128"))
 
+# n=2048-specific panel block width (B=8 regime). The single-level panel at
+# n=2048 is LATENCY-bound (ncu: 2.97% SM throughput, grid=8 -> 146 idle SMs),
+# 52.9% of the n=2048 runtime. BLK=16 was chosen for the TRAILING throughput
+# regime (halves panel register footprint). But at B=8 the panel is the wall and
+# it is latency-, not occupancy-, bound: a WIDER panel (BLK=32) halves the panel
+# count (128->64) and thus halves the inter-panel serial barriers + kernel
+# launches, trading register spill (acceptable -- 146 SMs idle) for a shorter
+# serial chain of launches. Knob so BLK can be swept for the n=2048 panel without
+# touching n=512/1024 (which keep BLK=32 / BLK=16 via _w2_qr's own selection).
+_N2048_BLK = int(_os.environ.get("QR_N2048_BLK", "16"))
+
 
 def _mcta_choose_G(B, pheight, SMs=148):
     # Pick CTAs-per-matrix so B*G fills the SMs WITHOUT exceeding one wave (the
@@ -1701,13 +1712,15 @@ def _w2_qr_2level(data):
     return H, tau
 
 
-def _w2_qr(data):
+def _w2_qr(data, blk_override=None):
     A = data
     B, N, _ = A.shape
     H = A.clone()
     tau = torch.zeros((B, N), device=A.device, dtype=torch.float32)
 
-    if N <= 32:
+    if blk_override is not None:
+        BLK = min(blk_override, N)
+    elif N <= 32:
         BLK = min(16, N)
     elif N >= 1536:
         # Tall panels (n>=2048): a narrow block halves the panel register
@@ -1942,6 +1955,13 @@ def custom_kernel(data: input_t) -> output_t:
     # exact geqrf (H,tau).
     if n >= 2560:
         return _w2_qr_2level(data)
+    # n=2048 (B=8): the single-level panel is the latency-bound wall (52.9%,
+    # ncu 2.97% SM throughput, grid=8). Route through _w2_qr with an n=2048-only
+    # BLK override so the panel block width can be widened (fewer panels -> fewer
+    # serial barriers) independently of n=512/1024. _N2048_BLK=16 == the prior
+    # default path, so this is perf-neutral until the knob is changed.
+    if n == 2048:
+        return _w2_qr(data, blk_override=_N2048_BLK)
     return _w2_qr(data)
 
 
