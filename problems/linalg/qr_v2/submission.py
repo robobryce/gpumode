@@ -775,13 +775,15 @@ _NW_F = int(_os.environ.get("QR_NW_F", "2"))
 # brief-22 COMBINE: n=1024 fused-trailing ILP knobs grafted from worker-0 brief-21.
 # The leader base routes n=1024 through _w2_qr -> _trailing_fused_kernel with the
 # accepted (BM=128,BNc=64,NW=4) tile (f8e3567, leaderboard id 829663). brief-21's
-# n=1024 optimum on the OLD (32,32,2) tile was NACC=1 (single chain) + NS=3 (the
-# longer K-loop already amortises the accumulate chain, so the win is purely the
-# software-pipeline that hides L1-miss latency). The pipeline lever is orthogonal
-# to tile size, so NS=3 transfers onto the big tile; NACC stays 1 (keep the bigger
-# tile's lower register pressure). Re-measured per-N on this base.
+# n=1024 optimum (NACC=1 + NS=3) was measured on the OLD small (32,32,2) tile.
+# MEASURED on THIS base (brief-22 iter1): NS=3 on the BIG (128,64,4) tile is a
+# DISASTER -- n=1024 4145->5757us (+39%): the big (BM=128,BNc=64) chunk already
+# uses far more registers/shared-mem, and num_stages=3 multi-buffers that large
+# A/V chunk -> register/smem pressure spills and occupancy collapses. The pipeline
+# lever does NOT transfer to the big tile. So n=1024 keeps NS=1 (== the accepted
+# leader path exactly); the ILP win lands only on n=512's small-chunk tile.
 _FUSE_NACC_1024 = int(_os.environ.get("QR_FUSE_NACC_1024", "1"))
-_FUSE_NS_1024 = int(_os.environ.get("QR_FUSE_NS_1024", "3"))
+_FUSE_NS_1024 = int(_os.environ.get("QR_FUSE_NS_1024", "1"))
 
 
 def _fused_tile_for_N(N):
@@ -1372,9 +1374,28 @@ def _trailing_fused_kernel(
             else:
                 W1 += d
         W = W0 + W1
-    else:
+    elif NS > 1:
+        # single-accumulator but software-pipelined (NACC==1, NS>1).
         W = tl.zeros((BLK, BNc), dtype=tl.float32)
         for ci in tl.range(0, nchunks, num_stages=NS):
+            rr = ci * BM + tl.arange(0, BM)
+            rrmask = rr < pheight
+            ap = a_trail_base + rr[:, None] * stride_an + ccols[None, :]
+            achunk = tl.load(ap, mask=rrmask[:, None] & cmask[None, :], other=0.0)   # (BM,BNc)
+            vp = v_base + krange[:, None] * stride_vk + rr[None, :] * stride_vn
+            vchunk = tl.load(vp, mask=rrmask[None, :], other=0.0)                    # (BLK,BM)
+            if IPREC == "tf32x2":
+                W += _dot_tf32x2(vchunk, achunk)        # achunk (A) kept full precision
+            else:
+                W += tl.dot(vchunk, achunk, input_precision=IPREC)
+    else:
+        # ORIGINAL path (NACC==1, NS==1): plain range, byte-identical to the leader
+        # _trailing_fused_kernel. tl.range(num_stages=1) compiles DIFFERENTLY from a
+        # plain range (measured: n=1024 regressed +9.5% when the NS=1 path used
+        # tl.range), so the trivial case MUST stay on plain range to preserve the
+        # accepted n=1024 (128,64,4) performance.
+        W = tl.zeros((BLK, BNc), dtype=tl.float32)
+        for ci in range(0, nchunks):
             rr = ci * BM + tl.arange(0, BM)
             rrmask = rr < pheight
             ap = a_trail_base + rr[:, None] * stride_an + ccols[None, :]
@@ -1393,22 +1414,41 @@ def _trailing_fused_kernel(
     YT = tl.dot(tl.trans(Tm), W, input_precision="tf32x3")                        # (BLK,BNc)
 
     # sweep 2: A_trail -= V @ YT, re-reading each A chunk and storing in place.
-    # delta=V@YT is the second bulk GEMM -> also IPREC-controlled. Pipelined the same
-    # way (num_stages=NS prefetches the next A/V chunk while the current dot runs).
-    for ci in tl.range(0, nchunks, num_stages=NS):
-        rr = ci * BM + tl.arange(0, BM)
-        rrmask = rr < pheight
-        vp2 = v_base + krange[None, :] * stride_vk + rr[:, None] * stride_vn
-        Vrow = tl.load(vp2, mask=rrmask[:, None], other=0.0)                     # (BM,BLK)
-        if IPREC == "tf32x2":
-            delta = _dot_tf32x2(Vrow, YT)            # YT (A-derived) kept full precision
-        else:
-            delta = tl.dot(Vrow, YT, input_precision=IPREC)                     # (BM,BNc)
-        ap2 = a_trail_base + rr[:, None] * stride_an + ccols[None, :]
-        amask = rrmask[:, None] & cmask[None, :]
-        aorig = tl.load(ap2, mask=amask, other=0.0)
-        aoutp2 = aout_trail_base + rr[:, None] * stride_an + ccols[None, :]
-        tl.store(aoutp2, aorig - delta, mask=amask)
+    # delta=V@YT is the second bulk GEMM -> also IPREC-controlled. When NS>1 it is
+    # software-pipelined the same way (num_stages=NS prefetches the next A/V chunk
+    # while the current dot runs); when NS==1 it uses a plain range, byte-identical
+    # to the leader (tl.range(num_stages=1) compiles differently and regresses the
+    # big-tile n=1024 path -- keep the trivial case on plain range).
+    if NS > 1:
+        for ci in tl.range(0, nchunks, num_stages=NS):
+            rr = ci * BM + tl.arange(0, BM)
+            rrmask = rr < pheight
+            vp2 = v_base + krange[None, :] * stride_vk + rr[:, None] * stride_vn
+            Vrow = tl.load(vp2, mask=rrmask[:, None], other=0.0)                     # (BM,BLK)
+            if IPREC == "tf32x2":
+                delta = _dot_tf32x2(Vrow, YT)            # YT (A-derived) kept full precision
+            else:
+                delta = tl.dot(Vrow, YT, input_precision=IPREC)                     # (BM,BNc)
+            ap2 = a_trail_base + rr[:, None] * stride_an + ccols[None, :]
+            amask = rrmask[:, None] & cmask[None, :]
+            aorig = tl.load(ap2, mask=amask, other=0.0)
+            aoutp2 = aout_trail_base + rr[:, None] * stride_an + ccols[None, :]
+            tl.store(aoutp2, aorig - delta, mask=amask)
+    else:
+        for ci in range(0, nchunks):
+            rr = ci * BM + tl.arange(0, BM)
+            rrmask = rr < pheight
+            vp2 = v_base + krange[None, :] * stride_vk + rr[:, None] * stride_vn
+            Vrow = tl.load(vp2, mask=rrmask[:, None], other=0.0)                     # (BM,BLK)
+            if IPREC == "tf32x2":
+                delta = _dot_tf32x2(Vrow, YT)            # YT (A-derived) kept full precision
+            else:
+                delta = tl.dot(Vrow, YT, input_precision=IPREC)                     # (BM,BNc)
+            ap2 = a_trail_base + rr[:, None] * stride_an + ccols[None, :]
+            amask = rrmask[:, None] & cmask[None, :]
+            aorig = tl.load(ap2, mask=amask, other=0.0)
+            aoutp2 = aout_trail_base + rr[:, None] * stride_an + ccols[None, :]
+            tl.store(aoutp2, aorig - delta, mask=amask)
 
 
 # NOTE: an A-RESIDENT variant (keep the whole full-height column strip in one
