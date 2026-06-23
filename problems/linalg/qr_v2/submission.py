@@ -998,10 +998,24 @@ _N2048_PNW_MID = int(_os.environ.get("QR_N2048_PNW_MID", "0"))  # 512<MAXH<=1024
 # whether the two-level structure (fewer wide trailing updates, smaller un-spilled
 # sub-panels) beats single-level at n=2048.
 _N2048_ROUTE = int(_os.environ.get("QR_N2048_ROUTE", "1"))
-# Override for the two-level _panel_factor2_kernel tall (MAXH>1024) sub-panel warps
-# (default in-code is 32). The ib=8 sub-panel tensor is (MAXH,8) -- half the BLK=16
-# footprint -> may take even fewer warps. 0 = keep in-code default.
-_2L_PNW = int(_os.environ.get("QR_2L_PNW", "0"))
+# Override for the two-level _panel_factor2_kernel tall (MAXH>1024) sub-panel
+# warps used by the n=4096 path (the in-code fall-through is 32). brief-30
+# (re-)measured the n=4096 IB=8 tall panel on the CURRENT fast base across
+# num_warps with the grid-starved B=2 occupancy (1 block/SM): nwp 4=520us
+# (under-parallel), 8=45.0us (OPTIMUM), 16=46.0us, 32=52.6us. The panel is
+# pipe-throttled, not warp-starved -- ncu (this base, MAXH=4096): 61% no-
+# eligible-warp but the dominant stalls are lg_throttle 21.5% + barrier 10.3%
+# + mio_throttle 8.5% (~40%), so MORE warps add LSU/MIO/barrier contention
+# (the nwp 16/32 regression band) rather than hiding the serial-reflector
+# latency. nwp=8 holds a 4x larger (MAXH,IB) per-thread tile at the 255-reg
+# ceiling but with ZERO spill (vs nwp=32: 64 reg + 16 spill bytes) AND issues
+# 4x fewer cross-warp reduction barriers -> -6.9% NET on n=4096 wall-clock
+# (33697->31364us, confirmed back-to-back under one GPU lock). Same exact geqrf
+# (H,tau): num_warps only repartitions the same reductions across threads, so
+# the result is bit-near-identical (max|dH|=7.6e-6, validated below). This is
+# the n=4096 mirror of the already-default _N2048_PNW=8 win for n=2048. 0 =
+# keep the in-code default.
+_2L_PNW = int(_os.environ.get("QR_2L_PNW", "8"))
 
 # brief-18 SMALL-SHAPE wins (grafted onto W0's best base, brief-19 COMBINE).
 # n=176 / n=352 (B=40 mid shapes) route through _w2_qr at BLK=32 with the SAME
