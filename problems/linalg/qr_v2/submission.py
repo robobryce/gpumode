@@ -1394,6 +1394,7 @@ def _trailing_apply2_kernel(
     stride_ab, stride_an,
     stride_vb, stride_vk, stride_vn,
     stride_yb, stride_yk, stride_yn,
+    Aout_ptr,                                 # separate store dest (clone fusion: block 0 reads A, writes H)
     BLK: tl.constexpr, BM: tl.constexpr, BNc: tl.constexpr, NREF: tl.constexpr,
 ):
     pid = tl.program_id(0)
@@ -1411,6 +1412,7 @@ def _trailing_apply2_kernel(
     kvalid = krange < NREF
 
     a_trail_base = A_ptr + bid * stride_ab + j * stride_an + jb
+    aout_trail_base = Aout_ptr + bid * stride_ab + j * stride_an + jb
     v_base = Vbuf_ptr + bid * stride_vb
 
     vp = v_base + krange[None, :] * stride_vk + rrows[:, None] * stride_vn
@@ -1422,7 +1424,8 @@ def _trailing_apply2_kernel(
     ap = a_trail_base + rrows[:, None] * stride_an + ccols[None, :]
     amask = rmask[:, None] & cmask[None, :]
     aorig = tl.load(ap, mask=amask, other=0.0)
-    tl.store(ap, aorig - delta, mask=amask)
+    aoutp = aout_trail_base + rrows[:, None] * stride_an + ccols[None, :]
+    tl.store(aoutp, aorig - delta, mask=amask)
 
 
 # Split inner-trailing YT2: the YT2 W=V0^T@A_sub1 reduction over pheight rows ran
@@ -1522,13 +1525,15 @@ def _panel_factor2_kernel(
     stride_ab, stride_an,
     stride_vb, stride_vk, stride_vn,
     stride_tb, stride_tk, stride_tn,
+    Aout_ptr,                                 # separate store dest (clone fusion: block 0 reads A, writes H)
     BLK: tl.constexpr, MAXH: tl.constexpr,
 ):
     # Identical reflector build to _panel_factor_kernel, but the V/T stores are
     # placed into a WIDER combined buffer at row offset voff_r (V rows) and col
     # offset voff_c (V cols and T row/col), so two ib-wide sub-panels assemble a
-    # single nb-wide lower-trapezoidal V and block-diagonal T. The A read and the
-    # H/tau stores use the panel's own top j (unchanged).
+    # single nb-wide lower-trapezoidal V and block-diagonal T. The A read uses
+    # A_ptr; the H/tau stores use Aout_ptr (== A_ptr for in-place callers; A_ptr=A,
+    # Aout_ptr=H for the n=512 clone-fusion block-0 sub-panel).
     bid = tl.program_id(0)
     if bid >= B:
         return
@@ -1540,6 +1545,8 @@ def _panel_factor2_kernel(
 
     a_base = A_ptr + bid * stride_ab + j * stride_an + j
     aptr = a_base + rows[:, None] * stride_an + cols[None, :]
+    aout_base = Aout_ptr + bid * stride_ab + j * stride_an + j
+    aoutptr = aout_base + rows[:, None] * stride_an + cols[None, :]
     mask = row_valid[:, None] & col_valid[None, :]
     panel = tl.load(aptr, mask=mask, other=0.0)
 
@@ -1597,7 +1604,7 @@ def _panel_factor2_kernel(
 
         tau_panel = tl.where(col_is_k & do_k, tau_k, tau_panel)
 
-    tl.store(aptr, panel, mask=mask)
+    tl.store(aoutptr, panel, mask=mask)
 
     tptr = tau_ptr + bid * N + j + cols
     tl.store(tptr, tau_panel, mask=col_valid)
@@ -1823,6 +1830,7 @@ def _w2_qr_2level(data):
         _panel_factor2_kernel[(B,)](
             H, tau, Vbuf, Tbuf, B, N, j, pheight, b0, 0, 0,
             sab, san, svb, svk, svn, stb, stk, stn,
+            H,
             BLK=IB, MAXH=MAXH, num_warps=nwp0,
         )
 
@@ -1853,6 +1861,7 @@ def _w2_qr_2level(data):
             _trailing_apply2_kernel[(triton.cdiv(pheight, _AP2_BM), B)](
                 H, Vbuf, YTbuf, B, N, j, pheight, b1, j + b0,
                 sab, san, svb, svk, svn, syb, syk, syn,
+                H,
                 BLK=NB, BM=_AP2_BM, BNc=NB, NREF=IB, num_warps=_AP2_NW,
             )
 
@@ -1865,6 +1874,7 @@ def _w2_qr_2level(data):
             _panel_factor2_kernel[(B,)](
                 H, tau, Vbuf, Tbuf, B, N, j + b0, ph1, b1, IB, IB,
                 sab, san, svb, svk, svn, stb, stk, stn,
+                H,
                 BLK=IB, MAXH=MAXH1, num_warps=nwp1,
             )
 
@@ -1943,10 +1953,17 @@ def _w2_qr_2level_n512(data):
     # throughout (not the 1-pass _N4096_PREC the tall-shape path uses).
     A = data.contiguous()
     B, N, _ = A.shape
-    # NOTE: clone retained (panel/inner-trailing/cross kernels read+write H in
-    # place from the start). Clone-fusion (block 0 reads A, writes H) is a later
-    # lever if this path wins -- _panel_factor2_kernel would need a separate src.
-    H = A.clone()
+    # CLONE FUSION (brief-15 iter3): the old `H = A.clone()` did a full HBM
+    # read(A)+write(H) of all of A (~209us measured at n=512 B=640 -- ~4% of the
+    # shape) just so the kernels could factor in place. But the FIRST outer block
+    # already touches EVERY column of H: sub-panel 0 writes cols [0,IB), apply2
+    # writes sub-panel 1's cols [IB,2IB), the wide trailing writes [2IB,N). So
+    # block 0 reads A (src) and writes H; every later block reads+writes H in
+    # place. _panel_factor2_kernel / _trailing_apply2_kernel / _trailing_fused_
+    # kernel take a separate Aout dest so block 0's A-reads come from A while the
+    # stores populate the uninitialized H. (Sub-panel 1 always reads H -- apply2
+    # wrote its columns just before.) Saves the whole clone pass.
+    H = torch.empty_like(A)
     tau = torch.zeros((B, N), device=A.device, dtype=torch.float32)
 
     IB = _N512_2L_IB                 # 16
@@ -1976,14 +1993,20 @@ def _w2_qr_2level_n512(data):
         pheight = N - j
         MAXH = triton.next_power_of_2(pheight)
 
+        # CLONE FUSION: block 0's A-reads come from A; later blocks read H. The
+        # store dest is always H. Sub-panel 1 is the exception -- it reads H (its
+        # columns were just written by apply2), so it uses H even in block 0.
+        src = A if j == 0 else H
+
         b0 = min(IB, N - j)
         # IB=16 sub-panel: (MAXH,16) register tile. nwp chosen so it un-spills at
         # 3 blocks/SM (gate: 167 r/thr). MAXH<=512 -> nwp=4 keeps it un-spilled.
         nwp0 = _N512_2L_PNW
-        # sub-panel 0: cols [j, j+IB), V/T at offset (0,0)
+        # sub-panel 0: cols [j, j+IB), V/T at offset (0,0). Reads src, writes H.
         _panel_factor2_kernel[(B,)](
-            H, tau, Vbuf, Tbuf, B, N, j, pheight, b0, 0, 0,
+            src, tau, Vbuf, Tbuf, B, N, j, pheight, b0, 0, 0,
             sab, san, svb, svk, svn, stb, stk, stn,
+            H,
             BLK=IB, MAXH=MAXH, num_warps=nwp0,
         )
 
@@ -1991,11 +2014,12 @@ def _w2_qr_2level_n512(data):
         if b1 > 0:
             # inner trailing: apply sub-panel 0's IB reflectors to ONLY sub-panel
             # 1's b1 cols. Masked NREF=IB out of the NB-wide buffer (cols IB:2IB
-            # may be stale -> no per-block reset). Split-W reduction fills SMs.
+            # may be stale -> no per-block reset). The A_sub1 columns are read from
+            # src (block 0: A); apply2 writes them to H.
             if _N512_2L_SPLIT:
                 nrt_y2 = triton.cdiv(pheight, GRAM_BM)
                 _trailing_YT2_partW_kernel[(nrt_y2, B)](
-                    H, Vbuf, Wpart, B, N, j, pheight, b1, j + b0,
+                    src, Vbuf, Wpart, B, N, j, pheight, b1, j + b0,
                     sab, san, svb, svk, svn, swb, swt, swk, swn,
                     BLK=NB, BM=GRAM_BM, BNc=NB, NREF=IB, num_warps=4,
                 )
@@ -2007,22 +2031,25 @@ def _w2_qr_2level_n512(data):
             else:
                 # saturated grid: single-CTA YT2 (grid=(1,B)=640 fills the GPU).
                 _trailing_YT2_kernel[(1, B)](
-                    H, Vbuf, Tbuf, YTbuf, B, N, j, pheight, b1, j + b0,
+                    src, Vbuf, Tbuf, YTbuf, B, N, j, pheight, b1, j + b0,
                     sab, san, svb, svk, svn, stb, stk, stn, syb, syk, syn,
                     BLK=NB, BM=_N512_2L_YT2_BM, BNc=NB, NREF=IB, num_warps=_N512_2L_YT2_NW,
                 )
             _trailing_apply2_kernel[(triton.cdiv(pheight, _N512_2L_AP2_BM), B)](
-                H, Vbuf, YTbuf, B, N, j, pheight, b1, j + b0,
+                src, Vbuf, YTbuf, B, N, j, pheight, b1, j + b0,
                 sab, san, svb, svk, svn, syb, syk, syn,
+                H,
                 BLK=NB, BM=_N512_2L_AP2_BM, BNc=NB, NREF=IB, num_warps=_N512_2L_AP2_NW,
             )
 
-            # sub-panel 1: cols [j+b0, j+b0+b1), V/T at offset (row IB, col IB)
+            # sub-panel 1: cols [j+b0, j+b0+b1), V/T at offset (row IB, col IB).
+            # Always reads H (apply2 just wrote these columns), writes H.
             ph1 = N - (j + b0)
             MAXH1 = triton.next_power_of_2(ph1)
             _panel_factor2_kernel[(B,)](
                 H, tau, Vbuf, Tbuf, B, N, j + b0, ph1, b1, IB, IB,
                 sab, san, svb, svk, svn, stb, stk, stn,
+                H,
                 BLK=IB, MAXH=MAXH1, num_warps=nwp0,
             )
 
@@ -2055,7 +2082,7 @@ def _w2_qr_2level_n512(data):
             # (each program owns a full-height column strip). tf32x3 (n=512).
             nct_f = triton.cdiv(ncols, FBNC)
             _trailing_fused_kernel[(nct_f, B)](
-                H, Vbuf, Tbuf, B, N, j, pheight, ncols, j + bb,
+                src, Vbuf, Tbuf, B, N, j, pheight, ncols, j + bb,
                 sab, san, svb, svk, svn, stb, stk, stn,
                 H,
                 BLK=NB, BM=FBM, BNc=FBNC, num_warps=FNW, IPREC="tf32x3",
