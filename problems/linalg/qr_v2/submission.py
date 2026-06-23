@@ -773,6 +773,35 @@ _BM_F = int(_os.environ.get("QR_BM_F", "32"))
 _BNC_F = int(_os.environ.get("QR_BNC_F", "32"))
 _NW_F = int(_os.environ.get("QR_NW_F", "2"))
 
+
+def _fused_tile_for_N(N):
+    # Per-N fused-trailing (BM,BNc,NW) tile for the BLK==32 (n=512/1024) regime.
+    # The two shapes have OPPOSITE grid pressure so they want different tiles:
+    #   n=512  (B=640): GRID-SATURATED -- the small (32,32,2) tile maximises the
+    #     program count that fills the 148 SMs; every bigger tile cuts concurrency.
+    #     (Fresh sweep on the prior fast lineage: BM=64 +3.0%, NW=4 +42%.)
+    #   n=1024 (B=60):  GRID-STARVED -- only 60 matrices for 148 SMs, so the fused
+    #     trailing wants a BIG tile that fills idle SMs with MORE work per program.
+    #     The accepted graft (f8e3567, leaderboard id 829663) measured (128,64,4)
+    #     -3.4% on n=1024 vs (32,32,2); a SHARP local optimum (BM=64 +6.7%, BNc=32
+    #     +12%, BM=256 +109%, NW=8 +13%). The n=1024 fused path here is byte-
+    #     identical to that lineage (_trailing_fused_kernel + _panel_factor_kernel
+    #     verified identical 6957b600 vs this base; W1's two-level only added n=512
+    #     code + perf-neutral knobs), so the (128,64,4) optimum transfers directly.
+    #     This is the SAME (128,64,4) tile the grid-starved n>=2048 split path uses.
+    # Pure shape-N gate -> invariance-guard-safe; n=512 keeps the shared default
+    # (and never reaches _w2_qr here anyway -- it routes to _w2_qr_2level_n512).
+    bm, bnc, nw = _BM_F, _BNC_F, _NW_F
+    if N == 512:
+        bm  = int(_os.environ.get("QR_BM_F_512",  str(bm)))
+        bnc = int(_os.environ.get("QR_BNC_F_512", str(bnc)))
+        nw  = int(_os.environ.get("QR_NW_F_512",  str(nw)))
+    elif N == 1024:
+        bm  = int(_os.environ.get("QR_BM_F_1024",  "128"))
+        bnc = int(_os.environ.get("QR_BNC_F_1024", "64"))
+        nw  = int(_os.environ.get("QR_NW_F_1024",  "4"))
+    return bm, bnc, nw
+
 # Multi-CTA panel for the tall few-matrix shapes (n>=4096 B=2, n>=2048 B=8). The
 # single-CTA panel launches grid=(B,) so 146/148 SMs idle through the panel that
 # is 81% of n=4096 runtime. The mcta panel (qr_panel_mcta) gives each matrix G
@@ -2265,7 +2294,12 @@ def _w2_qr(data, blk_override=None):
     # its own (tall-chunk, grid-starved) tile so the YT round-trip can be measured.
     if BLK >= 32 or (_mid_lt32 and _MID_FUSE_LT32):
         use_fused = _FUSED_TRAIL
-        BM_F, BNc_F, NW_F = _BM_F, _BNC_F, _NW_F
+        # Per-N fused-trailing tile: n=1024 (grid-starved) wants the big (128,64,4)
+        # tile (accepted graft f8e3567); n=512 keeps the shared (32,32,2). Gated by
+        # N -> invariance-safe. (n=512 routes to _w2_qr_2level_n512, so in practice
+        # only n=1024 reaches here at BLK>=32; the n=512 case is the BLK<32 mid path
+        # which still wants the small saturated tile -> _fused_tile_for_N returns it.)
+        BM_F, BNc_F, NW_F = _fused_tile_for_N(N)
     else:
         use_fused = _N2048_FUSED
         BM_F = int(_os.environ.get("QR_N2048_FBM", "128"))
