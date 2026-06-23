@@ -1070,6 +1070,13 @@ _N512_2L_YT2_NW = int(_os.environ.get("QR_N512_2L_YT2_NW", "2"))   # single-CTA 
 _N512_2L_YT2_BM = int(_os.environ.get("QR_N512_2L_YT2_BM", "32"))  # single-CTA YT2 row chunk
 _N512_2L_CT_BM = int(_os.environ.get("QR_N512_2L_CT_BM", "32"))    # single-CTA cross_T Gram chunk
 _N512_2L_CT_NW = int(_os.environ.get("QR_N512_2L_CT_NW", "1"))     # single-CTA cross_T warps
+# brief-26: precision for the cross-block Gram G = V0^T V1 in _cross_T_kernel.
+# This is the last loop-carried single-accumulator tf32x3 dot in the n512 path
+# (G += tl.dot over pheight-row chunks) -- the same breakable RAW chain the brief
+# flags. tf32x3i restructures it to 3 independent accumulators. The Gram feeds
+# T01 = -(T0 G) T1 which couples the two sub-panels' reflectors, so accuracy is
+# delicate -- gated and validated against the ill-cond gate before defaulting.
+_N512_2L_CT_PREC = _os.environ.get("QR_N512_2L_CT_PREC", "tf32x3")
 _N512_2L_AP2_BM = int(_os.environ.get("QR_N512_2L_AP2_BM", "32"))  # inner-trailing apply2 row tile
 _N512_2L_AP2_NW = int(_os.environ.get("QR_N512_2L_AP2_NW", "2"))   # inner-trailing apply2 warps
 # Fuse the inner trailing (YT2+apply2 -> one _trailing_fused2_kernel: W on-chip,
@@ -1083,6 +1090,13 @@ _N512_2L_FI_NW = int(_os.environ.get("QR_N512_2L_FI_NW", "2"))     # fused-inner
 # rankdef 4413->4368 probe us, -1.0%) -- the W-reduction is the same pheight-row
 # contraction so the RAW-chain break applies. DEFAULT tf32x3i.
 _N512_2L_FI_PREC = _os.environ.get("QR_N512_2L_FI_PREC", "tf32x3i")
+# brief-26: software-pipeline stages for the fused2 inner-trailing W/apply sweeps.
+# Mirrors the wide trailing's NS knob (prefetch A/V loads ahead of the dot). NS=1
+# keeps the accepted plain-range path; >1 uses tl.range(num_stages=NS). MEASURED
+# (interleaved A/B, 3 reps each): NS=3 wins every rep -- FI_NS=1 mean 2486.1us,
+# FI_NS=3 mean 2480.2us (-0.24%); NS=2 2481.6, NS=4 2482.9 (NS=3 is the optimum).
+# Validation PASS incl ill-cond gate. DEFAULT 3 so leaderboard runs get the win.
+_N512_2L_FI_NS = int(_os.environ.get("QR_N512_2L_FI_NS", "3"))
 
 
 def _mcta_choose_G(B, pheight, SMs=148):
@@ -1601,6 +1615,7 @@ def _trailing_fused2_kernel(
     Aout_ptr,
     BLK: tl.constexpr, BM: tl.constexpr, BNc: tl.constexpr, NREF: tl.constexpr,
     IPREC: tl.constexpr = "tf32x3",
+    NS: tl.constexpr = 1,
 ):
     col_tile = tl.program_id(0)
     bid = tl.program_id(1)
@@ -1619,19 +1634,35 @@ def _trailing_fused2_kernel(
     # sweep 1: W = V0^T @ A_sub1 over all panel rows, in chunks of BM. V masked to
     # NREF reflectors -> W rows k>=NREF are 0 (stale-buffer-safe, same proof as
     # _trailing_YT2_kernel).
+    # NS>1 software-pipelines the A/V loads ahead of the dot (hides L1-miss latency),
+    # mirroring the wide _trailing_fused_kernel. NS==1 MUST stay on plain range:
+    # tl.range(num_stages=1) compiles differently and would perturb the accepted path.
     W = tl.zeros((BLK, BNc), dtype=tl.float32)
     nchunks = tl.cdiv(pheight, BM)
-    for ci in range(0, nchunks):
-        rr = ci * BM + tl.arange(0, BM)
-        rrmask = rr < pheight
-        ap = a_trail_base + rr[:, None] * stride_an + ccols[None, :]
-        achunk = tl.load(ap, mask=rrmask[:, None] & cmask[None, :], other=0.0)
-        vp = v_base + krange[:, None] * stride_vk + rr[None, :] * stride_vn
-        vchunk = tl.load(vp, mask=rrmask[None, :] & kvalid[:, None], other=0.0)
-        if IPREC == "tf32x3i":
-            W += _dot_tf32x3i(vchunk, achunk)
-        else:
-            W += tl.dot(vchunk, achunk, input_precision="tf32x3")
+    if NS > 1:
+        for ci in tl.range(0, nchunks, num_stages=NS):
+            rr = ci * BM + tl.arange(0, BM)
+            rrmask = rr < pheight
+            ap = a_trail_base + rr[:, None] * stride_an + ccols[None, :]
+            achunk = tl.load(ap, mask=rrmask[:, None] & cmask[None, :], other=0.0)
+            vp = v_base + krange[:, None] * stride_vk + rr[None, :] * stride_vn
+            vchunk = tl.load(vp, mask=rrmask[None, :] & kvalid[:, None], other=0.0)
+            if IPREC == "tf32x3i":
+                W += _dot_tf32x3i(vchunk, achunk)
+            else:
+                W += tl.dot(vchunk, achunk, input_precision="tf32x3")
+    else:
+        for ci in range(0, nchunks):
+            rr = ci * BM + tl.arange(0, BM)
+            rrmask = rr < pheight
+            ap = a_trail_base + rr[:, None] * stride_an + ccols[None, :]
+            achunk = tl.load(ap, mask=rrmask[:, None] & cmask[None, :], other=0.0)
+            vp = v_base + krange[:, None] * stride_vk + rr[None, :] * stride_vn
+            vchunk = tl.load(vp, mask=rrmask[None, :] & kvalid[:, None], other=0.0)
+            if IPREC == "tf32x3i":
+                W += _dot_tf32x3i(vchunk, achunk)
+            else:
+                W += tl.dot(vchunk, achunk, input_precision="tf32x3")
 
     # YT = T^T @ W (registers). Stale Tm rows k>=NREF hit W rows k>=NREF=0 -> g*0=0.
     tp = Tbuf_ptr + bid * stride_tb + krange[:, None] * stride_tk + krange[None, :] * stride_tn
@@ -1640,20 +1671,36 @@ def _trailing_fused2_kernel(
 
     # sweep 2: A_sub1 -= V0 @ YT, re-reading each A chunk and storing to Aout. V
     # masked to NREF -> delta's k>=NREF contributions are 0 (stale YT rows ignored).
-    for ci in range(0, nchunks):
-        rr = ci * BM + tl.arange(0, BM)
-        rrmask = rr < pheight
-        vp2 = v_base + krange[None, :] * stride_vk + rr[:, None] * stride_vn
-        Vrow = tl.load(vp2, mask=rrmask[:, None] & kvalid[None, :], other=0.0)
-        if IPREC == "tf32x3i":
-            delta = _dot_tf32x3i(Vrow, YT)
-        else:
-            delta = tl.dot(Vrow, YT, input_precision="tf32x3")
-        ap2 = a_trail_base + rr[:, None] * stride_an + ccols[None, :]
-        amask = rrmask[:, None] & cmask[None, :]
-        aorig = tl.load(ap2, mask=amask, other=0.0)
-        aoutp2 = aout_trail_base + rr[:, None] * stride_an + ccols[None, :]
-        tl.store(aoutp2, aorig - delta, mask=amask)
+    if NS > 1:
+        for ci in tl.range(0, nchunks, num_stages=NS):
+            rr = ci * BM + tl.arange(0, BM)
+            rrmask = rr < pheight
+            vp2 = v_base + krange[None, :] * stride_vk + rr[:, None] * stride_vn
+            Vrow = tl.load(vp2, mask=rrmask[:, None] & kvalid[None, :], other=0.0)
+            if IPREC == "tf32x3i":
+                delta = _dot_tf32x3i(Vrow, YT)
+            else:
+                delta = tl.dot(Vrow, YT, input_precision="tf32x3")
+            ap2 = a_trail_base + rr[:, None] * stride_an + ccols[None, :]
+            amask = rrmask[:, None] & cmask[None, :]
+            aorig = tl.load(ap2, mask=amask, other=0.0)
+            aoutp2 = aout_trail_base + rr[:, None] * stride_an + ccols[None, :]
+            tl.store(aoutp2, aorig - delta, mask=amask)
+    else:
+        for ci in range(0, nchunks):
+            rr = ci * BM + tl.arange(0, BM)
+            rrmask = rr < pheight
+            vp2 = v_base + krange[None, :] * stride_vk + rr[:, None] * stride_vn
+            Vrow = tl.load(vp2, mask=rrmask[:, None] & kvalid[None, :], other=0.0)
+            if IPREC == "tf32x3i":
+                delta = _dot_tf32x3i(Vrow, YT)
+            else:
+                delta = tl.dot(Vrow, YT, input_precision="tf32x3")
+            ap2 = a_trail_base + rr[:, None] * stride_an + ccols[None, :]
+            amask = rrmask[:, None] & cmask[None, :]
+            aorig = tl.load(ap2, mask=amask, other=0.0)
+            aoutp2 = aout_trail_base + rr[:, None] * stride_an + ccols[None, :]
+            tl.store(aoutp2, aorig - delta, mask=amask)
 
 
 # Two-level-specific trailing kernels: identical to the single-level pair but
@@ -1957,6 +2004,7 @@ def _cross_T_kernel(
     stride_vb, stride_vk, stride_vn,
     stride_tb, stride_tk, stride_tn,
     BM: tl.constexpr, IBP: tl.constexpr,
+    GPREC: tl.constexpr = "tf32x3",
 ):
     # Build the off-diagonal compact-WY block T01 = -T0 (V0^T V1) T1 into the
     # combined T's [0:IB, IB:2IB] block. V0 occupies cols 0:IB (rows from the
@@ -1981,7 +2029,10 @@ def _cross_T_kernel(
         # V1 chunk (cols IB:2IB == kk+IB, rows rr)  -> (BM, IBP)
         v1p = v_base + (kk[None, :] + IB) * stride_vk + rr[:, None] * stride_vn
         V1 = tl.load(v1p, mask=(rmask[:, None] & real[None, :]), other=0.0)
-        G += tl.dot(V0, V1, input_precision="tf32x3")        # (IBP, IBP)
+        if GPREC == "tf32x3i":
+            G += _dot_tf32x3i(V0, V1)                        # (IBP, IBP)
+        else:
+            G += tl.dot(V0, V1, input_precision=GPREC)       # (IBP, IBP)
 
     # Load T0 = T[0:IB,0:IB], T1 = T[IB:2IB, IB:2IB]  (IBP padded with 0).
     t_base = Tbuf_ptr + bid * stride_tb
@@ -2347,7 +2398,7 @@ def _w2_qr_2level_n512(data):
                     sab, san, svb, svk, svn, stb, stk, stn,
                     H,
                     BLK=NB, BM=_N512_2L_FI_BM, BNc=NB, NREF=IB, num_warps=_N512_2L_FI_NW,
-                    IPREC=_N512_2L_FI_PREC,
+                    IPREC=_N512_2L_FI_PREC, NS=_N512_2L_FI_NS,
                 )
             else:
                 if _N512_2L_SPLIT:
@@ -2406,6 +2457,7 @@ def _w2_qr_2level_n512(data):
                     Vbuf, Tbuf, B, pheight, IB, IB,
                     svb, svk, svn, stb, stk, stn,
                     BM=_N512_2L_CT_BM, IBP=IBP, num_warps=_N512_2L_CT_NW,
+                    GPREC=_N512_2L_CT_PREC,
                 )
 
         bb = b0 + b1                      # reflectors in this outer block (<=NB)
