@@ -1138,7 +1138,19 @@ _N512_2L_CT_NW = int(_os.environ.get("QR_N512_2L_CT_NW", "1"))     # single-CTA 
 # to this one default flip. The n>=2560 _w2_qr_2level cross_T caller (line ~2271)
 # passes NO GPREC so it stays default tf32x3 (byte-unchanged); only the n512
 # _w2_qr_2level_n512 caller reads this knob. W0 sanity-benched de5550c4 at 2483us.
-_N512_2L_CT_PREC = _os.environ.get("QR_N512_2L_CT_PREC", "tf32x3i")
+# brief-47: DEFAULT flipped tf32x3i -> tf32x2 (3 MMA -> 2 MMA) AS PART OF THE JOINT
+# inner+cross_T flip (see _N512_2L_FI_PREC). The cross_T Gram alone in RTN-tf32x2
+# pushes the band-mixed case to sf 19.17 (1.04x margin -- UNSAFE on its own), but
+# flipping BOTH the inner trailing AND the cross_T Gram to the SAME RTN-tf32x2
+# DROPS the worst-case to sf 17.66 (1.13x margin, 0 matrices over the 20 gate
+# across 216 distinct diff-guard seed batches at seq=24). The error CANCELS when
+# the diagonal-block trailing and the off-diagonal T01 coupling use a CONSISTENT
+# precision; a MISMATCH (inner-only sf 21.06 FAIL, or cross-only sf 19.17 marginal)
+# is WORSE than either uniform choice. So cross_T tf32x2 is shippable ONLY paired
+# with inner tf32x2 -- the joint flip is the safe subset, not either single one.
+# Uses the asymmetric RTN _dot_tf32x2 (V0 rounded to nearest tf32, V1 kept hi+lo);
+# both Gram operands are O(1) reflectors so the asymmetry is harmless.
+_N512_2L_CT_PREC = _os.environ.get("QR_N512_2L_CT_PREC", "tf32x2")
 _N512_2L_AP2_BM = int(_os.environ.get("QR_N512_2L_AP2_BM", "32"))  # inner-trailing apply2 row tile
 _N512_2L_AP2_NW = int(_os.environ.get("QR_N512_2L_AP2_NW", "2"))   # inner-trailing apply2 warps
 # Fuse the inner trailing (YT2+apply2 -> one _trailing_fused2_kernel: W on-chip,
@@ -1151,7 +1163,20 @@ _N512_2L_FI_NW = int(_os.environ.get("QR_N512_2L_FI_NW", "2"))     # fused-inner
 # GEMM is thinner (ncols<=16). MEASURED: tf32x3i wins here too (dense 4423->4378,
 # rankdef 4413->4368 probe us, -1.0%) -- the W-reduction is the same pheight-row
 # contraction so the RAW-chain break applies. DEFAULT tf32x3i.
-_N512_2L_FI_PREC = _os.environ.get("QR_N512_2L_FI_PREC", "tf32x3i")
+# brief-47: DEFAULT flipped tf32x3i -> tf32x2 (3 MMA -> 2 MMA, the round-to-nearest
+# _dot_tf32x2; V=reflectors rounded, A/YT kept hi+lo). This extends brief-45's
+# RTN-tf32x2 wide-trailing win to the inner trailing, BUT only as a JOINT flip with
+# the cross_T Gram (_N512_2L_CT_PREC, also -> tf32x2). MEASURED (seq=16/24 over the
+# diff-guard seed families, gate=20 on scaled_factor): inner-trailing tf32x2 ALONE
+# (cross at tf32x3i) FAILS -- 2 shapes over the gate (rankdef-mixed sf 20.24,
+# clustered-mixed sf 21.06): the inner W-reduction IS more error-sensitive than the
+# wide trailing (its V is masked to NREF=IB out of the shared buffer, a thinner
+# contraction), as brief-45 warned. BUT flipping the inner AND cross_T together to
+# the SAME RTN-tf32x2 drops the joint worst-case to sf 17.66 (0 over gate, 1.13x
+# margin, stable seq=16->24): a CONSISTENT precision between the diagonal-block
+# trailing and the off-diagonal T01 coupling lets the unbiased RTN errors cancel
+# instead of the precision-mismatch compounding them. So both flip or neither.
+_N512_2L_FI_PREC = _os.environ.get("QR_N512_2L_FI_PREC", "tf32x2")
 # brief-26: software-pipeline stages for the fused2 inner-trailing W/apply sweeps.
 # Mirrors the wide trailing's NS knob (prefetch A/V loads ahead of the dot). NS=1
 # keeps the accepted plain-range path; >1 uses tl.range(num_stages=NS). MEASURED
@@ -1769,7 +1794,9 @@ def _trailing_fused2_kernel(
             achunk = tl.load(ap, mask=rrmask[:, None] & cmask[None, :], other=0.0)
             vp = v_base + krange[:, None] * stride_vk + rr[None, :] * stride_vn
             vchunk = tl.load(vp, mask=rrmask[None, :] & kvalid[:, None], other=0.0)
-            if IPREC == "tf32x3i":
+            if IPREC == "tf32x2":
+                W += _dot_tf32x2(vchunk, achunk)        # achunk (A) kept full precision
+            elif IPREC == "tf32x3i":
                 W += _dot_tf32x3i(vchunk, achunk)
             else:
                 W += tl.dot(vchunk, achunk, input_precision="tf32x3")
@@ -1781,7 +1808,9 @@ def _trailing_fused2_kernel(
             achunk = tl.load(ap, mask=rrmask[:, None] & cmask[None, :], other=0.0)
             vp = v_base + krange[:, None] * stride_vk + rr[None, :] * stride_vn
             vchunk = tl.load(vp, mask=rrmask[None, :] & kvalid[:, None], other=0.0)
-            if IPREC == "tf32x3i":
+            if IPREC == "tf32x2":
+                W += _dot_tf32x2(vchunk, achunk)        # achunk (A) kept full precision
+            elif IPREC == "tf32x3i":
                 W += _dot_tf32x3i(vchunk, achunk)
             else:
                 W += tl.dot(vchunk, achunk, input_precision="tf32x3")
@@ -1799,7 +1828,9 @@ def _trailing_fused2_kernel(
             rrmask = rr < pheight
             vp2 = v_base + krange[None, :] * stride_vk + rr[:, None] * stride_vn
             Vrow = tl.load(vp2, mask=rrmask[:, None] & kvalid[None, :], other=0.0)
-            if IPREC == "tf32x3i":
+            if IPREC == "tf32x2":
+                delta = _dot_tf32x2(Vrow, YT)            # YT (A-derived) kept full precision
+            elif IPREC == "tf32x3i":
                 delta = _dot_tf32x3i(Vrow, YT)
             else:
                 delta = tl.dot(Vrow, YT, input_precision="tf32x3")
@@ -1814,7 +1845,9 @@ def _trailing_fused2_kernel(
             rrmask = rr < pheight
             vp2 = v_base + krange[None, :] * stride_vk + rr[:, None] * stride_vn
             Vrow = tl.load(vp2, mask=rrmask[:, None] & kvalid[None, :], other=0.0)
-            if IPREC == "tf32x3i":
+            if IPREC == "tf32x2":
+                delta = _dot_tf32x2(Vrow, YT)            # YT (A-derived) kept full precision
+            elif IPREC == "tf32x3i":
                 delta = _dot_tf32x3i(Vrow, YT)
             else:
                 delta = tl.dot(Vrow, YT, input_precision="tf32x3")
@@ -2151,7 +2184,9 @@ def _cross_T_kernel(
         # V1 chunk (cols IB:2IB == kk+IB, rows rr)  -> (BM, IBP)
         v1p = v_base + (kk[None, :] + IB) * stride_vk + rr[:, None] * stride_vn
         V1 = tl.load(v1p, mask=(rmask[:, None] & real[None, :]), other=0.0)
-        if GPREC == "tf32x3i":
+        if GPREC == "tf32x2":
+            G += _dot_tf32x2(V0, V1)                         # V0 RTN-tf32, V1 kept hi+lo
+        elif GPREC == "tf32x3i":
             G += _dot_tf32x3i(V0, V1)                        # (IBP, IBP)
         else:
             G += tl.dot(V0, V1, input_precision=GPREC)       # (IBP, IBP)
