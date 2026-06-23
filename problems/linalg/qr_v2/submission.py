@@ -989,8 +989,14 @@ def _panel_factor_kernel(
         sgn = tl.where(alpha >= 0.0, 1.0, -1.0)
         beta = -sgn * normx
         has_refl = tail_n2 > 0.0
-        beta_safe = tl.where(beta == 0.0, 1.0, beta)
-        tau_k = tl.where(has_refl, (beta - alpha) / beta_safe, 0.0)
+        # brief-12 ALU trim (FP-exact): the `beta_safe = where(beta==0, 1, beta)`
+        # guard is redundant. beta==0 iff normx==0 iff alpha==0 AND tail_n2==0,
+        # which is exactly has_refl==False -- and tau_k = where(has_refl, .., 0)
+        # discards the division in that case. When has_refl is True, tail_n2>0 so
+        # normx=sqrt(alpha^2+tail_n2)>0 and beta!=0, so (beta-alpha)/beta never
+        # divides by zero on the TAKEN branch. The discarded 0/0=NaN (alpha=0 case)
+        # lands only in the where's false lane -> FP-exact. Use beta directly.
+        tau_k = tl.where(has_refl, (beta - alpha) / beta, 0.0)
 
         denom = alpha - beta
         denom = tl.where(denom == 0.0, 1.0, denom)
@@ -1497,8 +1503,10 @@ def _panel_factor2_kernel(
         sgn = tl.where(alpha >= 0.0, 1.0, -1.0)
         beta = -sgn * normx
         has_refl = tail_n2 > 0.0
-        beta_safe = tl.where(beta == 0.0, 1.0, beta)
-        tau_k = tl.where(has_refl, (beta - alpha) / beta_safe, 0.0)
+        # brief-12 ALU trim (FP-exact, same proof as _panel_factor_kernel): beta==0
+        # iff has_refl==False (the discarded tau branch), so the beta_safe guard is
+        # redundant -- on the taken branch (has_refl) tail_n2>0 => beta!=0.
+        tau_k = tl.where(has_refl, (beta - alpha) / beta, 0.0)
 
         denom = alpha - beta
         denom = tl.where(denom == 0.0, 1.0, denom)
