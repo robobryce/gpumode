@@ -850,6 +850,17 @@ _N2048_BLK = int(_os.environ.get("QR_N2048_BLK", "16"))
 # pays. Default OFF until measured -- the grid-starved B=8 regime previously favored
 # the split pair's separately-tuned tiles over a fused double-A-read at n=4096.
 _N2048_FUSED = int(_os.environ.get("QR_N2048_FUSED", "0")) != 0
+# n=2048 trailing GEMM precision. tf32x3 (3 passes: hi*hi+hi*lo+lo*hi) is the
+# accuracy floor used everywhere. EMPIRICAL FINDING (measured): the 2-pass/1-pass
+# tf32 GEMM relative error is ~CONSTANT in n (~4e-4 / ~7.7e-4) while the QR factor
+# tolerance GROWS ~20*n*eps, so error/tol SHRINKS like 1/n -- at n=2048 a single
+# trailing GEMM in plain tf32 is only ~0.16x tol (vs 0.63x at n=512 where it fails).
+# So a cheaper precision MIGHT hold at n>=2048 only. MEASURED: 1-pass tf32 PASSES all
+# n=2048 test shapes incl dense cond=2 (scaled_factor 2.04/20), rankdef (9.17/20),
+# mixed (1.94/20) -- the tightest, rankdef, is at 46% of the factor budget, real
+# headroom. Default is now "tf32" (1-pass) for the n=2048 trailing GEMM ONLY (gated
+# by N, a shape param). n=512/1024/4096 keep tf32x3 via the kernels' IPREC default.
+_N2048_PREC = _os.environ.get("QR_N2048_PREC", "tf32")
 # n=2048 panel num_warps override for the tall (MAXH>1024) panels. 0 = keep the
 # height-based default (32). The panel is L1/serial-latency bound, so fewer warps
 # (less cross-warp shared-mem sync per reflector reduction) MIGHT cut latency.
@@ -1014,6 +1025,7 @@ def _trailing_YT_kernel(
     stride_tb, stride_tk, stride_tn,
     stride_yb, stride_yk, stride_yn,
     BLK: tl.constexpr, BM: tl.constexpr, BNc: tl.constexpr,
+    IPREC: tl.constexpr = "tf32x3",
 ):
     col_tile = tl.program_id(0)
     bid = tl.program_id(1)
@@ -1037,9 +1049,9 @@ def _trailing_YT_kernel(
         achunk = tl.load(ap, mask=rrmask[:, None] & cmask[None, :], other=0.0)   # (BM,BNc)
         vp = v_base + krange[:, None] * stride_vk + rr[None, :] * stride_vn
         vchunk = tl.load(vp, mask=rrmask[None, :], other=0.0)                    # (BLK,BM)
-        W += tl.dot(vchunk, achunk, input_precision="tf32x3")
+        W += tl.dot(vchunk, achunk, input_precision=IPREC)
 
-    # YT = T^T @ W
+    # YT = T^T @ W  (tiny BLK x BLK dot -> keep full tf32x3, negligible cost)
     tp = Tbuf_ptr + bid * stride_tb + krange[:, None] * stride_tk + krange[None, :] * stride_tn
     Tm = tl.load(tp)
     YT = tl.dot(tl.trans(Tm), W, input_precision="tf32x3")                        # (BLK,BNc)
@@ -1057,6 +1069,7 @@ def _trailing_apply_kernel(
     stride_yb, stride_yk, stride_yn,
     Aout_ptr,                                 # separate store dest (block 0: read A, write H => fuses the clone)
     BLK: tl.constexpr, BM: tl.constexpr, BNc: tl.constexpr,
+    IPREC: tl.constexpr = "tf32x3",
 ):
     pid = tl.program_id(0)
     bid = tl.program_id(1)
@@ -1080,7 +1093,7 @@ def _trailing_apply_kernel(
     # YT[:, ccols] : (BLK, BNc)
     yp = YT_ptr + bid * stride_yb + krange[:, None] * stride_yk + ccols[None, :] * stride_yn
     YT = tl.load(yp, mask=cmask[None, :], other=0.0)
-    delta = tl.dot(Vrow, YT, input_precision="tf32x3")                            # (BM,BNc)
+    delta = tl.dot(Vrow, YT, input_precision=IPREC)                               # (BM,BNc)
 
     ap = a_trail_base + rrows[:, None] * stride_an + ccols[None, :]
     amask = rmask[:, None] & cmask[None, :]
@@ -1828,6 +1841,10 @@ def _w2_qr(data, blk_override=None):
         BM_F = int(_os.environ.get("QR_N2048_FBM", "128"))
         BNc_F = int(_os.environ.get("QR_N2048_FBNC", "64"))
         NW_F = int(_os.environ.get("QR_N2048_FNW", "4"))
+    # Trailing GEMM precision: only the n=2048 (blk_override) path may use a cheaper
+    # precision than tf32x3 (gated by N, a shape param -> invariance-safe). All other
+    # shapes keep tf32x3 via the kernels' IPREC default.
+    iprec = _N2048_PREC if blk_override is not None else "tf32x3"
     j = 0
     while j < N:
         b = min(BLK, N - j)
@@ -1899,7 +1916,7 @@ def _w2_qr(data, blk_override=None):
                     src, Vbuf, Tbuf, YTbuf,
                     B, N, j, pheight, ncols, j + b,
                     sab, san, svb, svk, svn, stb, stk, stn, syb, syk, syn,
-                    BLK=BLK, BM=BM_Y, BNc=BNc_Y, num_warps=NW_Y,
+                    BLK=BLK, BM=BM_Y, BNc=BNc_Y, num_warps=NW_Y, IPREC=iprec,
                 )
                 nct_a = triton.cdiv(ncols, BNc_A)
                 nrt_a = triton.cdiv(pheight, BM_A)
@@ -1908,7 +1925,7 @@ def _w2_qr(data, blk_override=None):
                     B, N, j, pheight, ncols, j + b,
                     sab, san, svb, svk, svn, syb, syk, syn,
                     H,
-                    BLK=BLK, BM=BM_A, BNc=BNc_A, num_warps=NW_A,
+                    BLK=BLK, BM=BM_A, BNc=BNc_A, num_warps=NW_A, IPREC=iprec,
                 )
         j += b
 
