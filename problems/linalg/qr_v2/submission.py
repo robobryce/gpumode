@@ -787,8 +787,25 @@ _NW_F = int(_os.environ.get("QR_NW_F", "2"))
 #     NACC=2 4181us -- (BM=32,BNc=32,NW=2,NACC=1,NS=3) is the local optimum.
 # So n=1024 reverts to the SMALL tile + NS=3 (supersedes the accepted big-tile graft,
 # which it beats locally). Tile set in _fused_tile_for_N; NS here. NACC stays 1.
+# brief-49: NS 3->4 on the NEW 1-MMA RTN-tf32 base (brief-48 dropped the n1024
+# trailing 2-MMA tf32x2 -> 1-MMA _dot_tf32_rn). The 1-MMA change FREED registers --
+# ncu on the 1-MMA base (BM=32,BNc=32,NW=2,NS=3): 136 r/thr (vs ~154 under 2-MMA),
+# NO spill, block-limit-registers=6, theoretical occ 18.75%, eligible-warps 0.50
+# (deeply latency-bound, 36% SM throughput). Those freed ~18 r/thr give the software-
+# pipeline the register headroom to run ONE STAGE DEEPER: NS=4 now hides more L1-miss
+# latency than it could under 2-MMA (where brief-22 measured NS=4=4104us LOSING to
+# NS=3). MEASURED on the 1-MMA base (single-shape n1024 A/B, std<0.4%, util=0, 2x
+# interleaved + re-confirmed): NS=4 3822us vs NS=3 3932us (-2.8% on the n1024 shape);
+# NS=5 3832us (past the knee), NS=6 3959us (too deep -> reg pressure). The tile axes
+# did NOT move -- BM=64 3857us, BNc=64 3998us, NW=4 3986us, BM=128 (old big tile) 3960-
+# 4716us ALL lose to (32,32,2): the freed registers fed the NS depth, not a bigger
+# tile, because B=60 is grid-starved and the small tile's program-count concurrency +
+# deeper pipeline beats any wider/taller chunk. So the 1-MMA optimum is (32,32,2,NS4).
+# NACC stays 1 (NACC=2 regressed on the OLD base and the deeper NS already fills the
+# issue slots). Same exact (H,tau) -- NS only re-pipelines the same dots. Gated to
+# N==1024 in _w2_qr (shape param -> invariance-safe).
 _FUSE_NACC_1024 = int(_os.environ.get("QR_FUSE_NACC_1024", "1"))
-_FUSE_NS_1024 = int(_os.environ.get("QR_FUSE_NS_1024", "3"))
+_FUSE_NS_1024 = int(_os.environ.get("QR_FUSE_NS_1024", "4"))
 
 
 def _fused_tile_for_N(N):
@@ -813,13 +830,15 @@ def _fused_tile_for_N(N):
         bnc = int(_os.environ.get("QR_BNC_F_512", str(bnc)))
         nw  = int(_os.environ.get("QR_NW_F_512",  str(nw)))
     elif N == 1024:
-        # brief-22: the small (32,32,2) tile + NS=3 software-pipeline (_FUSE_NS_1024)
-        # BEATS the accepted big (128,64,4) graft on THIS base (shape4 4146->4068us,
-        # -1.9%). The big tile was a sharp optimum only WITHOUT the pipeline; once the
-        # 3-stage pipeline hides the L1-miss latency, the small tile's register headroom
-        # (no spill) + higher program count (better SM fill at B=60) wins. Re-measured
-        # per the brief's BM=64-vs-32 ask: BM=64 4139us, BNc=64 4174us, NACC=2 4181us
-        # all lose to (32,32,2)+NS=3.
+        # brief-22: the small (32,32,2) tile + software-pipeline (_FUSE_NS_1024) BEATS
+        # the accepted big (128,64,4) graft (shape4 4146->4068us, -1.9%). The big tile
+        # was a sharp optimum only WITHOUT the pipeline; once the pipeline hides the
+        # L1-miss latency, the small tile's register headroom (no spill) + higher program
+        # count (better SM fill at B=60) wins. brief-49 RE-SWEPT this tile on the NEW
+        # 1-MMA RTN-tf32 base (the freed ~18 r/thr from brief-48's 2->1 MMA): the tile
+        # axes did NOT move -- BM=64 3857us, BNc=64 3998us, NW=4 3986us, BM=128 3960-
+        # 4716us ALL lose to (32,32,2). The freed registers went into NS depth (3->4,
+        # set in _FUSE_NS_1024 above), not a bigger tile.
         bm  = int(_os.environ.get("QR_BM_F_1024",  "32"))
         bnc = int(_os.environ.get("QR_BNC_F_1024", "32"))
         nw  = int(_os.environ.get("QR_NW_F_1024",  "2"))
