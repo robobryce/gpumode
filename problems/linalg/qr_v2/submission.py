@@ -965,19 +965,34 @@ _N4096_YT_NS = int(_os.environ.get("QR_N4096_YT_NS", "4"))
 # where it fails). n=1024 is the BOUNDARY CASE -- ratio 0.32 is 2x the n=2048 value, so
 # rankdef (the tightest ill-cond case, 9.17/20 = 46% of budget at n=2048) lands near
 # the cliff. MEASURED (the brief's mandatory boundary-case gate):
-#   1-pass tf32   n=1024 rankdef 17.8/20, nearrank 17.8/20, clustered 13.7/20 -> over
-#     the <=15/20 margin AND the diff_correctness_guard on the RANKED B=60 seeds FAILS
-#     (770002 mixed 2/8 wrong, 770005 nearrank 3/8 wrong). 1-pass is NOT shippable.
+#   1-pass tf32 (TRUNCATING)  n=1024 test rankdef 17.8/20, nearrank 17.8/20, clustered
+#     13.7/20 -> over the <=15/20 margin AND the diff_correctness_guard on the RANKED
+#     B=60 seeds FAILS (brief-48 re-measure: 770002 mixed worst 35.2, 770005 nearrank
+#     worst 34.1, multiple matrices over the gate). TRUNCATING 1-pass is NOT shippable
+#     -- but 1-pass ROUND-TO-NEAREST is (see _N1024_PREC default below).
 #   2-pass tf32x2 (the brief's fallback; _dot_tf32x2 splits each fp32 into tf32 hi+lo,
 #     keeps the 2 largest product terms) HALVES the residual -> rankdef 7.01/20,
 #     nearrank 7.10/20, clustered 5.66/20, dense 1.23-1.66/20, mixed 1.74/20. Worst
 #     case 7.1/20 = 35% of budget (SAFER than the shipped n=2048 rankdef 9.17/20); the
 #     ranked B=60 guard + invariance guard pass CLEAN. tf32x2 cuts the n=1024 trailing
 #     3->2 MMA: n=1024 nearrank 5042->4360us (-13.5%), geomean 2839->2738us (-3.6%).
-# So DEFAULT is "tf32x2" (1-pass rejected on the gate; 3-pass = the old accuracy floor,
-# still reachable via QR_N1024_PREC=tf32x3). Gated by N==1024 (a shape param ->
-# invariance-safe); n=512 keeps tf32x3 (shares the fused kernel but N!=1024).
-_N1024_PREC = _os.environ.get("QR_N1024_PREC", "tf32x2")
+# BRIEF-48: the OLD "1-pass tf32 rejected" verdict was with TRUNCATION. Triton's
+# input_precision="tf32" TRUNCATES the low 13 mantissa bits "without rounding, which
+# may bias the result" (its own tl.dot docstring) -- a sign-toward-zero DC bias that
+# accumulates over the n=1024 contraction (re-measured worst 35.2 on the diff-guard
+# families, FAILS). The new _dot_tf32_rn rounds BOTH operands to nearest tf32 then does
+# a SINGLE tf32 MMA: the unbiased per-element error CANCELS instead of compounding, so
+# 1-pass RTN-tf32 PASSES with margin -- worst-case (seq=24 diff-guard) nearrank 11.2/20
+# (1.79x under the gate, <=15 target), mixed 9.34; test rankdef 5.07/nearrank 5.0/
+# clustered 4.13/dense 0.94-1.21. RTN took the truncating worst 35.2 -> 11.2 (3.5x).
+# This HALVES the n=1024 trailing tensor work (2 MMA tf32x2 -> 1 MMA tf32rn) on the
+# 26.6%-geomean shape -- a measured NET wall-clock win (see iter log).
+# So DEFAULT is "tf32rn" (1-pass round-to-nearest tf32, SINGLE MMA). Fallbacks via
+# QR_N1024_PREC: "tf32x2" (2-MMA RTN), "tf32x3"/"tf32x3i" (3-MMA, the old floor),
+# "tf32" (1-pass TRUNCATING -- fails the gate, diagnostic only). Gated by N==1024 (a
+# shape param -> invariance-safe); n=512 keeps tf32x3i/tf32x2 (shares this kernel but
+# N!=1024).
+_N1024_PREC = _os.environ.get("QR_N1024_PREC", "tf32rn")
 # brief-14 PANEL BLOCKING knobs for the n=512/1024 mid regime. The BLK=32 panel
 # is register-walled (ncu gate above). Sweep BLK in {8,16,32} per N to find the
 # new optimum now that the trailing got cheaper (tf32x2 at n=1024). Default 32 =
@@ -1551,6 +1566,32 @@ def _dot_tf32x2(x, y):
     return acc
 
 
+# 1-pass tf32 with explicit ROUND-TO-NEAREST on BOTH operands (brief-48). Triton's
+# input_precision="tf32" lowers to a bare TF32 MMA that TRUNCATES the low 13 mantissa
+# bits of each fp32 operand "without rounding, which may bias the result" (Triton's
+# own tl.dot docstring) -- a systematic sign-toward-zero DC bias that accumulates
+# over the n=1024 contraction. The OLD 1-pass tf32 (plain input_precision="tf32",
+# truncating) was REJECTED on the n=1024 gate (rankdef/nearrank 17.8/20, over the
+# <=15 margin, AND the diff-guard FAILED). This helper rounds BOTH operands to the
+# nearest tf32 value (add half-ulp HALF=0x1000 of the dropped 13 bits, then mask)
+# BEFORE the MMA; the rounded values are already exactly tf32-representable so the
+# hardware's subsequent truncation is a NO-OP and the net is round-to-nearest. Same
+# unbiased-error mechanism that cut the 2-pass _dot_tf32x2 worst-case residual ~2.3x
+# (brief-45) -- but here applied to a SINGLE MMA (half the tensor work of 2-pass
+# tf32x2). Both operands rounded (vs tf32x2 which keeps y hi+lo full-precision):
+# 1-pass keeps only the leading tf32xtf32 product, so y must also be tf32-rounded.
+# Special-value guard omitted: the QR trailing operands (reflectors + the trailing
+# matrix) are finite after the panel; the +HALF carry into the exponent at a
+# power-of-two boundary is the correct round-up (sign bit is the MSB, untouched).
+@triton.jit
+def _dot_tf32_rn(x, y):
+    MASK: tl.constexpr = -8192
+    HALF: tl.constexpr = 4096
+    x_rn = ((x.to(tl.int32, bitcast=True) + HALF) & MASK).to(tl.float32, bitcast=True)
+    y_rn = ((y.to(tl.int32, bitcast=True) + HALF) & MASK).to(tl.float32, bitcast=True)
+    return tl.dot(x_rn, y_rn, input_precision="tf32")
+
+
 # 3-pass tf32 emulation with INDEPENDENT accumulators (brief-26). Triton's
 # BUILT-IN input_precision="tf32x3" emits a high-accuracy fine-split emulation
 # (~1.6e-7 relerr, measured) whose internal MMA passes ACCUMULATE into a single C
@@ -1639,6 +1680,8 @@ def _trailing_fused_kernel(
                 d = _dot_tf32x2(vchunk, achunk)
             elif IPREC == "tf32x3i":
                 d = _dot_tf32x3i(vchunk, achunk)
+            elif IPREC == "tf32rn":
+                d = _dot_tf32_rn(vchunk, achunk)
             else:
                 d = tl.dot(vchunk, achunk, input_precision=IPREC)
             if ci % 2 == 0:
@@ -1660,6 +1703,8 @@ def _trailing_fused_kernel(
                 W += _dot_tf32x2(vchunk, achunk)        # achunk (A) kept full precision
             elif IPREC == "tf32x3i":
                 W += _dot_tf32x3i(vchunk, achunk)
+            elif IPREC == "tf32rn":
+                W += _dot_tf32_rn(vchunk, achunk)
             else:
                 W += tl.dot(vchunk, achunk, input_precision=IPREC)
     else:
@@ -1680,6 +1725,8 @@ def _trailing_fused_kernel(
                 W += _dot_tf32x2(vchunk, achunk)        # achunk (A) kept full precision
             elif IPREC == "tf32x3i":
                 W += _dot_tf32x3i(vchunk, achunk)
+            elif IPREC == "tf32rn":
+                W += _dot_tf32_rn(vchunk, achunk)
             else:
                 W += tl.dot(vchunk, achunk, input_precision=IPREC)
 
@@ -1705,6 +1752,8 @@ def _trailing_fused_kernel(
                 delta = _dot_tf32x2(Vrow, YT)            # YT (A-derived) kept full precision
             elif IPREC == "tf32x3i":
                 delta = _dot_tf32x3i(Vrow, YT)
+            elif IPREC == "tf32rn":
+                delta = _dot_tf32_rn(Vrow, YT)
             else:
                 delta = tl.dot(Vrow, YT, input_precision=IPREC)                     # (BM,BNc)
             ap2 = a_trail_base + rr[:, None] * stride_an + ccols[None, :]
@@ -1722,6 +1771,8 @@ def _trailing_fused_kernel(
                 delta = _dot_tf32x2(Vrow, YT)            # YT (A-derived) kept full precision
             elif IPREC == "tf32x3i":
                 delta = _dot_tf32x3i(Vrow, YT)
+            elif IPREC == "tf32rn":
+                delta = _dot_tf32_rn(Vrow, YT)
             else:
                 delta = tl.dot(Vrow, YT, input_precision=IPREC)                     # (BM,BNc)
             ap2 = a_trail_base + rr[:, None] * stride_an + ccols[None, :]
