@@ -1022,14 +1022,17 @@ _N512_2L_NB = int(_os.environ.get("QR_N512_2L_NB", "32"))   # outer block / wide
 # trailing + cross_T fill SMs via the split variants. Distinct from the n>=2560
 # (grid-STARVED) tiles in _w2_qr_2level.
 _N512_2L_FBM = int(_os.environ.get("QR_N512_2L_FBM", "32"))   # fused wide-trail BM
-# brief-22 COMBINE: graft worker-0's brief-21 ILP tune onto the n=512 two-level
-# WIDE trailing (it still routes through _trailing_fused_kernel -- _trailing_fused2
-# is only the tiny inner trailing). The wide trailing is the n=512 dominant cost
-# (~59.8%) and it IS the W=V^T@A latency-bound reduction brief-21 measured. So the
-# brief-21 optimum (2 partial-W accumulators + 3-stage pipeline + wide BNc=64,
-# -7.3% on the n=512 trailing on the prior single-level base) transfers directly.
-# Re-measured PER-N on this two-level base because the optimum may shift.
-_N512_2L_FBNC = int(_os.environ.get("QR_N512_2L_FBNC", "64")) # fused wide-trail BNc (brief-21 ILP optimum)
+# brief-22 COMBINE: grafted worker-0's brief-21 ILP tune onto the n=512 two-level
+# WIDE trailing. The brief-21 optimum was the WIDE BNc=64 -- it gave the built-in
+# tf32x3's SINGLE chained accumulator more independent column work to hide MMA
+# latency. brief-26 OVERTURNS this for tf32x3i: now the 3 independent-accumulator
+# MMAs supply the ILP, so the wide tile is no longer needed to hide latency, and
+# the NARROWER BNc=32 wins by doubling the program count (better SM saturation at
+# B=640, which is grid-saturated) and fitting tighter in registers/L1. Measured
+# (tf32x3i, NACC=1, NS=3): BNc=32 beats BNc=64 on every n512 family (dense
+# 4512->4421, rankdef 4497->4414, clustered 4505->4424, mixed 4504->4422 probe us;
+# -2.0%). BNc=128 pathological (~6030us). So default BNc=32 (paired with tf32x3i).
+_N512_2L_FBNC = int(_os.environ.get("QR_N512_2L_FBNC", "32")) # fused wide-trail BNc (tf32x3i optimum, brief-26)
 _N512_2L_FNW = int(_os.environ.get("QR_N512_2L_FNW", "2"))    # fused wide-trail warps
 # brief-26: with tf32x3i the cross-chunk NACC ILP becomes REDUNDANT -- the 3
 # independent-accumulator MMAs inside each dot already supply the ILP that NACC=2
