@@ -931,6 +931,31 @@ _N2048_PREC = _os.environ.get("QR_N2048_PREC", "tf32")
 # "tf32" for the n=4096 WIDE trailing GEMM. The inner-trailing + cross-T GEMMs keep
 # tf32x3 (smaller cost, and cross-T forms the sub-panel-coupling T01 -- more delicate).
 _N4096_PREC = _os.environ.get("QR_N4096_PREC", "tf32")
+# brief-41: independent-accumulator (NACC) + software-pipeline (NS) ILP on the
+# SPLIT _trailing_YT_kernel W=V^T@A reduction the LARGE-N far-trailing uses. The
+# fused trailing already does this for n=512/1024; the large-n (n=2048 blk_override,
+# n>=2560 two-level) far-trailing runs the SPLIT YT kernel which had a single-chain
+# W+=dot. ncu (brief-41) shows that reduction is wait-stalled (MMA latency 1.48) at
+# only 0.18-0.25 eligible-warps -> ILP-fillable. Pure reassociation (1-pass tf32,
+# same products) so accuracy is bit-near-identical. Gated by N (shape param) so the
+# tiny tf32x3 n=512/1024 split callers (if any) and the YT2/cross paths are untouched.
+# MEASURED (brief-41, idle-B200, probe times custom_kernel directly so cuSOLVER-
+# degradation-immune): NACC=2 (the same independent-accumulator idea that won the
+# n=512/1024 fused trailing) + a software-pipeline wins on BOTH large-n shapes --
+# A/B interleaved 4 rounds, bands DISJOINT:
+#   n=2048: 8681 -> 8558us (-1.4%) at NACC=2/NS=3;
+#   n=4096: 34385 -> 33581us (-2.3%) at NACC=2/NS=4.
+# ncu profile-gate PASSED on the n=2048 YT reduction: wait-stall 1.48->1.11 (MMA
+# latency hidden), short_scoreboard 2.26->1.0 (smem latency pipelined), per-launch
+# duration 26->25us. The optimal NS differs by shape (n=4096's deeper W reduction --
+# BM=128 over up to 4096 rows = 32 chunks vs n=2048's 16 -- hides a deeper pipeline:
+# n=4096 NS=4 beats NS=3 by -0.7% A/B-confirmed; n=2048 NS=3 beats NS=4). Every
+# config WITHOUT NACC=2 OR with the wrong NS (NACC2/NS1, NACC2/NS2) was WORSE -- the
+# win needs the right NS depth WITH NACC=2; NS alone or NACC alone regress. Winners.
+_N2048_YT_NACC = int(_os.environ.get("QR_N2048_YT_NACC", "2"))
+_N2048_YT_NS = int(_os.environ.get("QR_N2048_YT_NS", "3"))
+_N4096_YT_NACC = int(_os.environ.get("QR_N4096_YT_NACC", "2"))
+_N4096_YT_NS = int(_os.environ.get("QR_N4096_YT_NS", "4"))
 # n=1024 trailing GEMM precision (the FUSED BLK==32 trailing _trailing_fused_kernel).
 # THE UNEXPLOITED MIDDLE CASE: n=1024 is 27% of the geomean (x3 ranked shapes) but
 # still runs the expensive 3-pass tf32x3 trailing. The SAME 1/n-shrinking error/tol
@@ -1076,7 +1101,15 @@ _N512_2L_CT_NW = int(_os.environ.get("QR_N512_2L_CT_NW", "1"))     # single-CTA 
 # flags. tf32x3i restructures it to 3 independent accumulators. The Gram feeds
 # T01 = -(T0 G) T1 which couples the two sub-panels' reflectors, so accuracy is
 # delicate -- gated and validated against the ill-cond gate before defaulting.
-_N512_2L_CT_PREC = _os.environ.get("QR_N512_2L_CT_PREC", "tf32x3")
+# brief-42 COMBINE graft (PARENT 3 = W0 brief-34 de5550c4, a7a2f3d2): flip the
+# DEFAULT from tf32x3 -> tf32x3i so leaderboard runs route the n512 cross_T gram
+# through the independent-accumulator helper (_dot_tf32x3i). W0 introduced this as
+# a parallel _N512_2L_CT_GPREC knob; this lineage already wired GPREC + the
+# _dot_tf32x3i branch in _cross_T_kernel (brief-26), so the entire P3 win reduces
+# to this one default flip. The n>=2560 _w2_qr_2level cross_T caller (line ~2271)
+# passes NO GPREC so it stays default tf32x3 (byte-unchanged); only the n512
+# _w2_qr_2level_n512 caller reads this knob. W0 sanity-benched de5550c4 at 2483us.
+_N512_2L_CT_PREC = _os.environ.get("QR_N512_2L_CT_PREC", "tf32x3i")
 _N512_2L_AP2_BM = int(_os.environ.get("QR_N512_2L_AP2_BM", "32"))  # inner-trailing apply2 row tile
 _N512_2L_AP2_NW = int(_os.environ.get("QR_N512_2L_AP2_NW", "2"))   # inner-trailing apply2 warps
 # Fuse the inner trailing (YT2+apply2 -> one _trailing_fused2_kernel: W on-chip,
@@ -1286,6 +1319,7 @@ def _trailing_YT_kernel(
     stride_yb, stride_yk, stride_yn,
     BLK: tl.constexpr, BM: tl.constexpr, BNc: tl.constexpr,
     IPREC: tl.constexpr = "tf32x3",
+    NACC: tl.constexpr = 1, NS: tl.constexpr = 1,
 ):
     col_tile = tl.program_id(0)
     bid = tl.program_id(1)
@@ -1299,17 +1333,55 @@ def _trailing_YT_kernel(
     a_trail_base = A_ptr + bid * stride_ab + j * stride_an + jb
     v_base = Vbuf_ptr + bid * stride_vb
 
-    # W = V^T @ A_trail over all panel rows, in chunks of BM
-    W = tl.zeros((BLK, BNc), dtype=tl.float32)
+    # W = V^T @ A_trail over all panel rows, in chunks of BM.
+    # LATENCY-HIDING (brief-41, the SAME ILP fix _trailing_fused_kernel uses for
+    # n=512/1024, applied to the SPLIT YT kernel the large-n far-trailing uses):
+    # ncu on the n=2048/4096 W-reduction shows wait-stall 1.48 (MMA latency)
+    # CO-DOMINANT with the DRAM scoreboard AND warps_eligible only 0.18-0.25 -- the
+    # single loop-carried W += dot(...) chain serialises the MMAs and there are too
+    # few resident warps to hide the latency. NACC=2 splits W into two independent
+    # partial accumulators (alternated by chunk parity) so the scheduler interleaves
+    # two MMA chains; NS>1 software-pipelines the A/V loads ahead of the dots. This
+    # is pure REASSOCIATION (same products, summed in two groups then once) so it is
+    # bit-near-identical -- safe for the 1-pass tf32 large-n trailing. Defaults
+    # NACC=1,NS=1 use the plain range, byte-identical to the prior path.
     nchunks = tl.cdiv(pheight, BM)
-    for ci in range(0, nchunks):
-        rr = ci * BM + tl.arange(0, BM)
-        rrmask = rr < pheight
-        ap = a_trail_base + rr[:, None] * stride_an + ccols[None, :]
-        achunk = tl.load(ap, mask=rrmask[:, None] & cmask[None, :], other=0.0)   # (BM,BNc)
-        vp = v_base + krange[:, None] * stride_vk + rr[None, :] * stride_vn
-        vchunk = tl.load(vp, mask=rrmask[None, :], other=0.0)                    # (BLK,BM)
-        W += tl.dot(vchunk, achunk, input_precision=IPREC)
+    if NACC == 2:
+        W0 = tl.zeros((BLK, BNc), dtype=tl.float32)
+        W1 = tl.zeros((BLK, BNc), dtype=tl.float32)
+        for ci in tl.range(0, nchunks, num_stages=NS):
+            rr = ci * BM + tl.arange(0, BM)
+            rrmask = rr < pheight
+            ap = a_trail_base + rr[:, None] * stride_an + ccols[None, :]
+            achunk = tl.load(ap, mask=rrmask[:, None] & cmask[None, :], other=0.0)
+            vp = v_base + krange[:, None] * stride_vk + rr[None, :] * stride_vn
+            vchunk = tl.load(vp, mask=rrmask[None, :], other=0.0)
+            d = tl.dot(vchunk, achunk, input_precision=IPREC)
+            if ci % 2 == 0:
+                W0 += d
+            else:
+                W1 += d
+        W = W0 + W1
+    elif NS > 1:
+        W = tl.zeros((BLK, BNc), dtype=tl.float32)
+        for ci in tl.range(0, nchunks, num_stages=NS):
+            rr = ci * BM + tl.arange(0, BM)
+            rrmask = rr < pheight
+            ap = a_trail_base + rr[:, None] * stride_an + ccols[None, :]
+            achunk = tl.load(ap, mask=rrmask[:, None] & cmask[None, :], other=0.0)   # (BM,BNc)
+            vp = v_base + krange[:, None] * stride_vk + rr[None, :] * stride_vn
+            vchunk = tl.load(vp, mask=rrmask[None, :], other=0.0)                    # (BLK,BM)
+            W += tl.dot(vchunk, achunk, input_precision=IPREC)
+    else:
+        W = tl.zeros((BLK, BNc), dtype=tl.float32)
+        for ci in range(0, nchunks):
+            rr = ci * BM + tl.arange(0, BM)
+            rrmask = rr < pheight
+            ap = a_trail_base + rr[:, None] * stride_an + ccols[None, :]
+            achunk = tl.load(ap, mask=rrmask[:, None] & cmask[None, :], other=0.0)   # (BM,BNc)
+            vp = v_base + krange[:, None] * stride_vk + rr[None, :] * stride_vn
+            vchunk = tl.load(vp, mask=rrmask[None, :], other=0.0)                    # (BLK,BM)
+            W += tl.dot(vchunk, achunk, input_precision=IPREC)
 
     # YT = T^T @ W  (tiny BLK x BLK dot -> keep full tf32x3, negligible cost)
     tp = Tbuf_ptr + bid * stride_tb + krange[:, None] * stride_tk + krange[None, :] * stride_tn
@@ -2183,6 +2255,7 @@ def _w2_qr_2level(data):
                     H, Vbuf, Tbuf, YTbuf, B, N, j, pheight, ncols, j + b,
                     sab, san, svb, svk, svn, stb, stk, stn, syb, syk, syn,
                     BLK=NB, BM=BM_Y, BNc=BNc_Y, num_warps=NW_Y, IPREC=_N4096_PREC,
+                    NACC=_N4096_YT_NACC, NS=_N4096_YT_NS,
                 )
                 nct_a = triton.cdiv(ncols, BNc_A)
                 nrt_a = triton.cdiv(pheight, BM_A)
@@ -2296,6 +2369,7 @@ def _w2_qr_2level(data):
                     H, Vbuf, Tbuf, YTbuf, B, N, j, pheight, ncols, j + bb,
                     sab, san, svb, svk, svn, stb, stk, stn, syb, syk, syn,
                     BLK=NB, BM=BM_Y, BNc=BNc_Y, num_warps=NW_Y, IPREC=_N4096_PREC,
+                    NACC=_N4096_YT_NACC, NS=_N4096_YT_NS,
                 )
                 nct_a = triton.cdiv(ncols, BNc_A)
                 nrt_a = triton.cdiv(pheight, BM_A)
@@ -2598,11 +2672,23 @@ def _w2_qr(data, blk_override=None):
     if blk_override is None and N == 1024:
         fuse_nacc, fuse_ns = _FUSE_NACC_1024, _FUSE_NS_1024
     else:
+        # brief-41 probe (clean NEGATIVE, reverted): NACC=2/NS=3 on the n=176/352
+        # fused trailing REGRESSED both (n=352 562->581us, n=176 233->243us). Those
+        # shapes are panel-dominated (grid-starved 40 matrices, at floor per brief-18);
+        # the trailing is a small fraction and the extra accumulator/pipeline register
+        # pressure costs more than the tiny W-reduction it pipelines. The independent-
+        # accumulator win is confined to the heavy-W-reduction shapes (n512/n1024 fused,
+        # large-n split YT). So all non-n1024 fused callers keep NACC=1,NS=1.
         fuse_nacc, fuse_ns = 1, 1
     # Trailing GEMM precision: only the n=2048 (blk_override) path may use a cheaper
     # precision than tf32x3 (gated by N, a shape param -> invariance-safe). All other
     # shapes keep tf32x3 via the kernels' IPREC default.
     iprec = _N2048_PREC if blk_override is not None else "tf32x3"
+    # brief-41: independent-accumulator/pipeline ILP on the SPLIT YT W-reduction,
+    # gated to the n=2048 (blk_override) path so n=512/1024 split callers (if any
+    # reach here) stay byte-identical. Defaults 1/1 == plain range.
+    yt_nacc = _N2048_YT_NACC if blk_override is not None else 1
+    yt_ns = _N2048_YT_NS if blk_override is not None else 1
     # FUSED (BLK==32) trailing precision: the n=1024 route (blk_override is None,
     # N==1024) may use 1-pass tf32 -- the SAME 1/n-shrinking error/tol argument as
     # n=2048, gated to N==1024 so n=512 (which shares this kernel) keeps tf32x3. All
@@ -2696,6 +2782,7 @@ def _w2_qr(data, blk_override=None):
                     B, N, j, pheight, ncols, j + b,
                     sab, san, svb, svk, svn, stb, stk, stn, syb, syk, syn,
                     BLK=BLK, BM=BM_Y, BNc=BNc_Y, num_warps=NW_Y, IPREC=iprec,
+                    NACC=yt_nacc, NS=yt_ns,
                 )
                 nct_a = triton.cdiv(ncols, BNc_A)
                 nrt_a = triton.cdiv(pheight, BM_A)
