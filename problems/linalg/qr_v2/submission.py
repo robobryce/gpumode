@@ -851,6 +851,15 @@ _N2048_BLK = int(_os.environ.get("QR_N2048_BLK", "16"))
 # (less cross-warp shared-mem sync per reflector reduction) MIGHT cut latency.
 _N2048_PNW = int(_os.environ.get("QR_N2048_PNW", "8"))
 _N2048_PNW_MID = int(_os.environ.get("QR_N2048_PNW_MID", "0"))  # 512<MAXH<=1024 band
+# n=2048 route selector: 1 = single-level _w2_qr (current best, BLK=16 panel nwp=8),
+# 2 = two-level _w2_qr_2level (ib=8 sub-panels + wide trailing, like n=4096). Test
+# whether the two-level structure (fewer wide trailing updates, smaller un-spilled
+# sub-panels) beats single-level at n=2048.
+_N2048_ROUTE = int(_os.environ.get("QR_N2048_ROUTE", "1"))
+# Override for the two-level _panel_factor2_kernel tall (MAXH>1024) sub-panel warps
+# (default in-code is 32). The ib=8 sub-panel tensor is (MAXH,8) -- half the BLK=16
+# footprint -> may take even fewer warps. 0 = keep in-code default.
+_2L_PNW = int(_os.environ.get("QR_2L_PNW", "0"))
 
 
 def _mcta_choose_G(B, pheight, SMs=148):
@@ -1584,6 +1593,8 @@ def _w2_qr_2level(data):
             # wide trailing applies all 16 reflectors. Exact geqrf.
             b = min(NB, N - j)
             nwp = 8 if MAXH <= 1024 else 32
+            if _2L_PNW > 0 and MAXH > 1024:
+                nwp = _2L_PNW
             _panel_factor_kernel[(B,)](
                 H, tau, Vbuf, Tbuf, B, N, j, pheight, b,
                 sab, san, svb, svk, svn, stb, stk, stn,
@@ -1609,6 +1620,8 @@ def _w2_qr_2level(data):
 
         b0 = min(IB, N - j)
         nwp0 = 4 if MAXH <= 512 else (8 if MAXH <= 1024 else 32)
+        if _2L_PNW > 0 and MAXH > 1024:
+            nwp0 = _2L_PNW
 
         # sub-panel 0: cols [j, j+IB), V/T at offset (0,0)
         _panel_factor2_kernel[(B,)](
@@ -1651,6 +1664,8 @@ def _w2_qr_2level(data):
             ph1 = N - (j + b0)
             MAXH1 = triton.next_power_of_2(ph1)
             nwp1 = 4 if MAXH1 <= 512 else (8 if MAXH1 <= 1024 else 32)
+            if _2L_PNW > 0 and MAXH1 > 1024:
+                nwp1 = _2L_PNW
             _panel_factor2_kernel[(B,)](
                 H, tau, Vbuf, Tbuf, B, N, j + b0, ph1, b1, IB, IB,
                 sab, san, svb, svk, svn, stb, stk, stn,
@@ -1987,6 +2002,8 @@ def custom_kernel(data: input_t) -> output_t:
     # serial barriers) independently of n=512/1024. _N2048_BLK=16 == the prior
     # default path, so this is perf-neutral until the knob is changed.
     if n == 2048:
+        if _N2048_ROUTE == 2:
+            return _w2_qr_2level(data)
         return _w2_qr(data, blk_override=_N2048_BLK)
     return _w2_qr(data)
 

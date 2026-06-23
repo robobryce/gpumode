@@ -44,7 +44,8 @@ def set_knobs(**kw):
     for k, v in kw.items():
         os.environ[k] = str(v)
     # module-global knobs (read at call time, not from environ): map QR_* -> _*
-    g = {"QR_N2048_BLK": "_N2048_BLK", "QR_N2048_PNW": "_N2048_PNW", "QR_N2048_PNW_MID": "_N2048_PNW_MID"}
+    g = {"QR_N2048_BLK": "_N2048_BLK", "QR_N2048_PNW": "_N2048_PNW", "QR_N2048_PNW_MID": "_N2048_PNW_MID",
+         "QR_N2048_ROUTE": "_N2048_ROUTE", "QR_2L_PNW": "_2L_PNW", "QR_2L_HYBRID_H": "_2L_HYBRID_H"}
     for qk, attr in g.items():
         if qk in kw:
             setattr(sub, attr, int(kw[qk]))
@@ -66,7 +67,7 @@ else:
 
 # Defaults to reset between configs so each config is isolated.
 DEFAULTS = dict(
-    QR_N2048_BLK=16, QR_N2048_PNW=8, QR_N2048_PNW_MID=0,
+    QR_N2048_BLK=16, QR_N2048_PNW=8, QR_N2048_PNW_MID=0, QR_N2048_ROUTE=1, QR_2L_PNW=0,
     QR_N2048_BMY=128, QR_N2048_BNCY=64, QR_N2048_NWY=4,
     QR_N2048_BMA=32, QR_N2048_BNCA=32, QR_N2048_NWA=2,
 )
