@@ -952,7 +952,7 @@ _N512_2L_SPLIT = int(_os.environ.get("QR_N512_2L_SPLIT", "0")) != 0
 _N512_2L_YT2_NW = int(_os.environ.get("QR_N512_2L_YT2_NW", "2"))   # single-CTA YT2 warps
 _N512_2L_YT2_BM = int(_os.environ.get("QR_N512_2L_YT2_BM", "32"))  # single-CTA YT2 row chunk
 _N512_2L_CT_BM = int(_os.environ.get("QR_N512_2L_CT_BM", "32"))    # single-CTA cross_T Gram chunk
-_N512_2L_CT_NW = int(_os.environ.get("QR_N512_2L_CT_NW", "2"))     # single-CTA cross_T warps
+_N512_2L_CT_NW = int(_os.environ.get("QR_N512_2L_CT_NW", "1"))     # single-CTA cross_T warps
 _N512_2L_AP2_BM = int(_os.environ.get("QR_N512_2L_AP2_BM", "32"))  # inner-trailing apply2 row tile
 _N512_2L_AP2_NW = int(_os.environ.get("QR_N512_2L_AP2_NW", "2"))   # inner-trailing apply2 warps
 # Fuse the inner trailing (YT2+apply2 -> one _trailing_fused2_kernel: W on-chip,
