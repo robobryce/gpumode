@@ -829,6 +829,12 @@ _YT2_BM = int(_os.environ.get("QR_YT2_BM", "128"))
 _YT2_NW = int(_os.environ.get("QR_YT2_NW", "4"))
 _AP2_BM = int(_os.environ.get("QR_AP2_BM", "128"))
 _AP2_NW = int(_os.environ.get("QR_AP2_NW", "4"))
+# Split-W inner trailing: row-tile the YT2 W reduction across SMs (grid=(nrt,B))
+# + finish, instead of the single-CTA grid=(1,B) YT2 (SM-starved). Measured at
+# n=4096 B=2 (hybrid panel): BM=128 cuts n=4096 41.7ms->39.0ms (-6.3%); BM=256
+# spills the V0 tiles. ON by default at BM=128 -- same SM-fill win as split-Gram.
+_YT2_SPLIT = int(_os.environ.get("QR_YT2_SPLIT", "1")) != 0
+_YT2_GRAM_BM = int(_os.environ.get("QR_YT2_GRAM_BM", "128"))
 
 
 def _mcta_choose_G(B, pheight, SMs=148):
@@ -1217,6 +1223,70 @@ def _trailing_apply2_kernel(
     tl.store(ap, aorig - delta, mask=amask)
 
 
+# Split inner-trailing YT2: the YT2 W=V0^T@A_sub1 reduction over pheight rows ran
+# grid=(1,B)=2 (SM-starved, ~10% of n=4096). Split the reduction across SMs: each
+# (row-tile, matrix) program computes a partial W with tensor cores into a
+# partials buffer; a tiny finish sums them, forms YT=T^T@W, stores YT. apply2 is
+# unchanged. ncols here is the b1<=IB inner columns -> one BNc-wide col tile.
+@triton.jit
+def _trailing_YT2_partW_kernel(
+    A_ptr, Vbuf_ptr, Wpart_ptr,
+    B, N, j, pheight, ncols, jb,
+    stride_ab, stride_an,
+    stride_vb, stride_vk, stride_vn,
+    stride_wb, stride_wt, stride_wk, stride_wn,
+    BLK: tl.constexpr, BM: tl.constexpr, BNc: tl.constexpr, NREF: tl.constexpr,
+):
+    rt = tl.program_id(0)
+    bid = tl.program_id(1)
+    if bid >= B:
+        return
+    ccols = tl.arange(0, BNc)
+    cmask = ccols < ncols
+    krange = tl.arange(0, BLK)
+    kvalid = krange < NREF
+
+    a_trail_base = A_ptr + bid * stride_ab + j * stride_an + jb
+    v_base = Vbuf_ptr + bid * stride_vb
+    rr = rt * BM + tl.arange(0, BM)
+    rrmask = rr < pheight
+    ap = a_trail_base + rr[:, None] * stride_an + ccols[None, :]
+    achunk = tl.load(ap, mask=rrmask[:, None] & cmask[None, :], other=0.0)   # (BM,BNc)
+    vp = v_base + krange[:, None] * stride_vk + rr[None, :] * stride_vn
+    vchunk = tl.load(vp, mask=rrmask[None, :] & kvalid[:, None], other=0.0)  # (BLK,BM)
+    Wp = tl.dot(vchunk, achunk, input_precision="tf32x3")                   # (BLK,BNc)
+    wp = Wpart_ptr + bid * stride_wb + rt * stride_wt + krange[:, None] * stride_wk + ccols[None, :] * stride_wn
+    tl.store(wp, Wp)
+
+
+@triton.jit
+def _trailing_YT2_finishW_kernel(
+    Wpart_ptr, Tbuf_ptr, YT_ptr,
+    B, nrt, ncols,
+    stride_wb, stride_wt, stride_wk, stride_wn,
+    stride_tb, stride_tk, stride_tn,
+    stride_yb, stride_yk, stride_yn,
+    BLK: tl.constexpr, BNc: tl.constexpr, NREF: tl.constexpr,
+):
+    bid = tl.program_id(0)
+    if bid >= B:
+        return
+    ccols = tl.arange(0, BNc)
+    cmask = ccols < ncols
+    krange = tl.arange(0, BLK)
+    kvalid = krange < NREF
+    W = tl.zeros((BLK, BNc), dtype=tl.float32)
+    for rt in range(0, nrt):
+        wp = Wpart_ptr + bid * stride_wb + rt * stride_wt + krange[:, None] * stride_wk + ccols[None, :] * stride_wn
+        W += tl.load(wp)
+    tp = Tbuf_ptr + bid * stride_tb + krange[:, None] * stride_tk + krange[None, :] * stride_tn
+    Tm = tl.load(tp)
+    Tm = tl.where(kvalid[:, None] & kvalid[None, :], Tm, 0.0)
+    YT = tl.dot(tl.trans(Tm), W, input_precision="tf32x3")
+    yp = YT_ptr + bid * stride_yb + krange[:, None] * stride_yk + ccols[None, :] * stride_yn
+    tl.store(yp, YT, mask=cmask[None, :] & kvalid[:, None])
+
+
 # =============================================================================
 # Two-level (nested) panel for the spilling tall few-matrix shapes (n>=4096).
 #
@@ -1468,6 +1538,10 @@ def _w2_qr_2level(data):
         nrt_max = triton.cdiv(N, _2L_GRAM_BM)
         Gpart = torch.empty((B, nrt_max, 16, 16), device=A.device, dtype=torch.float32)
         sgb, sgt, sgi, sgj = Gpart.stride(0), Gpart.stride(1), Gpart.stride(2), Gpart.stride(3)
+    if _YT2_SPLIT:
+        nrt_w = triton.cdiv(N, _YT2_GRAM_BM)
+        Wpart = torch.empty((B, nrt_w, NB, NB), device=A.device, dtype=torch.float32)
+        swb, swt, swk, swn = Wpart.stride(0), Wpart.stride(1), Wpart.stride(2), Wpart.stride(3)
 
     sab, san = H.stride(0), H.stride(1)
     svb, svk, svn = Vbuf.stride(0), Vbuf.stride(1), Vbuf.stride(2)
@@ -1533,11 +1607,24 @@ def _w2_qr_2level(data):
             # 1's b1 columns [j+b0, j+b0+b1). The masked (NREF=IB) trailing applies
             # ONLY sub-panel 0's IB reflectors out of the shared 16-wide buffer, so
             # cols IB:2IB may hold stale data (no per-block reset needed). K=16.
-            _trailing_YT2_kernel[(1, B)](
-                H, Vbuf, Tbuf, YTbuf, B, N, j, pheight, b1, j + b0,
-                sab, san, svb, svk, svn, stb, stk, stn, syb, syk, syn,
-                BLK=NB, BM=_YT2_BM, BNc=NB, NREF=IB, num_warps=_YT2_NW,
-            )
+            if _YT2_SPLIT:
+                nrt_y2 = triton.cdiv(pheight, _YT2_GRAM_BM)
+                _trailing_YT2_partW_kernel[(nrt_y2, B)](
+                    H, Vbuf, Wpart, B, N, j, pheight, b1, j + b0,
+                    sab, san, svb, svk, svn, swb, swt, swk, swn,
+                    BLK=NB, BM=_YT2_GRAM_BM, BNc=NB, NREF=IB, num_warps=4,
+                )
+                _trailing_YT2_finishW_kernel[(B,)](
+                    Wpart, Tbuf, YTbuf, B, nrt_y2, b1,
+                    swb, swt, swk, swn, stb, stk, stn, syb, syk, syn,
+                    BLK=NB, BNc=NB, NREF=IB, num_warps=2,
+                )
+            else:
+                _trailing_YT2_kernel[(1, B)](
+                    H, Vbuf, Tbuf, YTbuf, B, N, j, pheight, b1, j + b0,
+                    sab, san, svb, svk, svn, stb, stk, stn, syb, syk, syn,
+                    BLK=NB, BM=_YT2_BM, BNc=NB, NREF=IB, num_warps=_YT2_NW,
+                )
             _trailing_apply2_kernel[(triton.cdiv(pheight, _AP2_BM), B)](
                 H, Vbuf, YTbuf, B, N, j, pheight, b1, j + b0,
                 sab, san, svb, svk, svn, syb, syk, syn,
