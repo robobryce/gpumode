@@ -1752,8 +1752,17 @@ def _w2_qr(data, blk_override=None):
         BM_Y, BNc_Y, NW_Y = 32, 32, 1
         BM_A, BNc_A, NW_A = 128, 32, 4
     else:
-        BM_Y, BNc_Y, NW_Y = 128, 64, 4
-        BM_A, BNc_A, NW_A = 32, 32, 2
+        # BLK<=16 trailing tiles (n=2048 path; n=4096 uses _w2_qr_2level instead).
+        # ncu (n=2048 B=8): YT grid=232 is register-bound at 255 regs -> only
+        # 10.5% achieved occupancy (12.5% theoretical), 40% SM throughput, 22.2%
+        # of n=2048. Knob-tunable so the YT tile can be shrunk (lower regs ->
+        # higher occupancy) for the n=2048 latency regime without touching others.
+        BM_Y = int(_os.environ.get("QR_N2048_BMY", "128"))
+        BNc_Y = int(_os.environ.get("QR_N2048_BNCY", "64"))
+        NW_Y = int(_os.environ.get("QR_N2048_NWY", "4"))
+        BM_A = int(_os.environ.get("QR_N2048_BMA", "32"))
+        BNc_A = int(_os.environ.get("QR_N2048_BNCA", "32"))
+        NW_A = int(_os.environ.get("QR_N2048_NWA", "2"))
     # Fused single-kernel trailing (W kept on-chip, no YT HBM round-trip) for the
     # BLK==32 throughput-bound regime (n=512/1024). Bounded (BM_F, BNc_F) chunk
     # resident -> no spill; full-height column strip per program -> race-free.
