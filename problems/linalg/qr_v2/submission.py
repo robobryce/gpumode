@@ -898,6 +898,8 @@ _N1024_PREC = _os.environ.get("QR_N1024_PREC", "tf32x2")
 _N512_BLK = int(_os.environ.get("QR_N512_BLK", "32"))
 _N1024_BLK = int(_os.environ.get("QR_N1024_BLK", "32"))
 _MID_FUSE_LT32 = int(_os.environ.get("QR_MID_FUSE_LT32", "1")) != 0
+# Panel num_warps override for the n=512/1024 mid regime (0 = height default).
+_MID_PNW = int(_os.environ.get("QR_MID_PNW", "0"))
 # n=2048 panel num_warps override for the tall (MAXH>1024) panels. 0 = keep the
 # height-based default (32). The panel is L1/serial-latency bound, so fewer warps
 # (less cross-warp shared-mem sync per reflector reduction) MIGHT cut latency.
@@ -2023,6 +2025,14 @@ def _w2_qr(data, blk_override=None):
             nwp = 8
         else:
             nwp = 32
+        # brief-14: re-confirm the panel num_warps optimum for the mid regime on the
+        # CURRENT fast base (the prior nwp tuning was on a slower lineage). The
+        # alternative occupancy lever to BLK: MORE warps spreads the (MAXH,BLK) tile
+        # over more threads -> fewer regs/thread (un-spill) WITHOUT doubling the panel
+        # /trailing count. Knob forces the n=512/1024 (blk_override is None) panel nwp.
+        # 0 = keep the height-based default. Gated to the saturated mid shapes.
+        if blk_override is None and N in (512, 1024) and _MID_PNW > 0:
+            nwp = _MID_PNW
         # n=2048 panel-warp override: the panel is L1/serial-latency bound (ncu:
         # 56% L1, 2.97% SM, 41% no-eligible-warp at nwp=32). Fewer warps = fewer
         # per-reflector shared-mem barriers -> shorter serial latency. Swept:
