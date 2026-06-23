@@ -1031,7 +1031,15 @@ _N512_2L_FBM = int(_os.environ.get("QR_N512_2L_FBM", "32"))   # fused wide-trail
 # Re-measured PER-N on this two-level base because the optimum may shift.
 _N512_2L_FBNC = int(_os.environ.get("QR_N512_2L_FBNC", "64")) # fused wide-trail BNc (brief-21 ILP optimum)
 _N512_2L_FNW = int(_os.environ.get("QR_N512_2L_FNW", "2"))    # fused wide-trail warps
-_N512_2L_F_NACC = int(_os.environ.get("QR_N512_2L_F_NACC", "2"))  # split-W ILP accumulators
+# brief-26: with tf32x3i the cross-chunk NACC ILP becomes REDUNDANT -- the 3
+# independent-accumulator MMAs inside each dot already supply the ILP that NACC=2
+# was added to provide (for the built-in tf32x3's single-fragment dot). Measured
+# (tf32x3i): NACC=1 NS=3 beats NACC=2 NS=3 on every n512 family (dense
+# 4529->4504, rankdef 4525->4497, clustered 4530->4506, mixed 4529->4506; NACC=3
+# ties NACC=1). NACC=1 also frees the W1 register so the NS=3 pipeline has more
+# headroom. So default NACC=1 (paired with tf32x3i). NS=2 is pathological here
+# (~5080us) -- keep NS=3.
+_N512_2L_F_NACC = int(_os.environ.get("QR_N512_2L_F_NACC", "1"))  # split-W ILP accumulators
 _N512_2L_F_NS = int(_os.environ.get("QR_N512_2L_F_NS", "3"))      # software-pipeline stages
 # brief-26: precision mode for the n=512 dominant wide trailing. "tf32x3i" =
 # hand-written 3-product split with 3 INDEPENDENT accumulators (breaks the
