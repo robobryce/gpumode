@@ -43,8 +43,11 @@ def set_knobs(**kw):
     # read at dispatch, so set that one as an attribute too.
     for k, v in kw.items():
         os.environ[k] = str(v)
-    if "QR_N2048_BLK" in kw:
-        sub._N2048_BLK = int(kw["QR_N2048_BLK"])
+    # module-global knobs (read at call time, not from environ): map QR_* -> _*
+    g = {"QR_N2048_BLK": "_N2048_BLK", "QR_N2048_PNW": "_N2048_PNW"}
+    for qk, attr in g.items():
+        if qk in kw:
+            setattr(sub, attr, int(kw[qk]))
 
 # Parse config list from argv: each "KEY=VAL,KEY=VAL;..." group
 configs = []
@@ -61,8 +64,16 @@ if len(sys.argv) > 1:
 else:
     configs = [("default", {})]
 
+# Defaults to reset between configs so each config is isolated.
+DEFAULTS = dict(
+    QR_N2048_BLK=16, QR_N2048_PNW=0,
+    QR_N2048_BMY=128, QR_N2048_BNCY=64, QR_N2048_NWY=4,
+    QR_N2048_BMA=32, QR_N2048_BNCA=32, QR_N2048_NWA=2,
+)
+
 print(f"=== n=2048 B=8 timer (median/min us over 30 reps) ===")
 for label, d in configs:
-    set_knobs(**d)
+    set_knobs(**DEFAULTS)   # reset
+    set_knobs(**d)          # apply this config
     med, mn = bench()
-    print(f"  {label:40s}  median={med:9.1f}us  min={mn:9.1f}us")
+    print(f"  {label:46s}  median={med:9.1f}us  min={mn:9.1f}us")

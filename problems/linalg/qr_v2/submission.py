@@ -846,6 +846,10 @@ _YT2_GRAM_BM = int(_os.environ.get("QR_YT2_GRAM_BM", "128"))
 # serial chain of launches. Knob so BLK can be swept for the n=2048 panel without
 # touching n=512/1024 (which keep BLK=32 / BLK=16 via _w2_qr's own selection).
 _N2048_BLK = int(_os.environ.get("QR_N2048_BLK", "16"))
+# n=2048 panel num_warps override for the tall (MAXH>1024) panels. 0 = keep the
+# height-based default (32). The panel is L1/serial-latency bound, so fewer warps
+# (less cross-warp shared-mem sync per reflector reduction) MIGHT cut latency.
+_N2048_PNW = int(_os.environ.get("QR_N2048_PNW", "8"))
 
 
 def _mcta_choose_G(B, pheight, SMs=148):
@@ -1797,6 +1801,11 @@ def _w2_qr(data, blk_override=None):
             nwp = 8
         else:
             nwp = 32
+        # n=2048 panel-warp override: the panel is L1/serial-latency bound (ncu:
+        # 56% L1, 2.97% SM, 41% no-eligible-warp). Sweep panel warps for the tall
+        # panels independently. _N2048_PNW=0 -> keep the height-based default.
+        if blk_override is not None and _N2048_PNW > 0 and MAXH > 1024:
+            nwp = _N2048_PNW
 
         _panel_factor_kernel[(B,)](
             H, tau, Vbuf, Tbuf,
