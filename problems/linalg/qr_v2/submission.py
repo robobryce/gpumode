@@ -1476,9 +1476,11 @@ def _panel_factor2_kernel(
         do_k = k < b
         col_is_k = cols == k
         xk = tl.sum(tl.where(col_is_k[None, :], panel, 0.0), axis=1)
-        active = (rows >= k) & row_valid
-        xk = tl.where(active, xk, 0.0)
-
+        # brief-12 ALU trim (FP-exact, identical proof to _panel_factor_kernel):
+        # `xk = tl.where((rows>=k)&row_valid, xk, 0)` is redundant. xk is column k
+        # of panel (loaded mask=row_valid&col_valid, 0 at rows>=pheight for the
+        # whole sweep) so it is ALREADY 0 there; and the rows<k lanes are never
+        # read (alpha uses rows==k, tailv/v use rows>k, w reads v=0 for rows<k).
         alpha = tl.sum(tl.where(rows == k, xk, 0.0))
         tailv = tl.where(rows > k, xk, 0.0)
         tail_n2 = tl.sum(tailv * tailv)
