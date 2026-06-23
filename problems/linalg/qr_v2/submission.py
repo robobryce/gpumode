@@ -846,6 +846,10 @@ _YT2_GRAM_BM = int(_os.environ.get("QR_YT2_GRAM_BM", "128"))
 # serial chain of launches. Knob so BLK can be swept for the n=2048 panel without
 # touching n=512/1024 (which keep BLK=32 / BLK=16 via _w2_qr's own selection).
 _N2048_BLK = int(_os.environ.get("QR_N2048_BLK", "16"))
+# n=2048 fused trailing (BLK<=16 path): drop the YT HBM round-trip the split pair
+# pays. Default OFF until measured -- the grid-starved B=8 regime previously favored
+# the split pair's separately-tuned tiles over a fused double-A-read at n=4096.
+_N2048_FUSED = int(_os.environ.get("QR_N2048_FUSED", "0")) != 0
 # n=2048 panel num_warps override for the tall (MAXH>1024) panels. 0 = keep the
 # height-based default (32). The panel is L1/serial-latency bound, so fewer warps
 # (less cross-warp shared-mem sync per reflector reduction) MIGHT cut latency.
@@ -1811,7 +1815,19 @@ def _w2_qr(data, blk_override=None):
     # Fused single-kernel trailing (W kept on-chip, no YT HBM round-trip) for the
     # BLK==32 throughput-bound regime (n=512/1024). Bounded (BM_F, BNc_F) chunk
     # resident -> no spill; full-height column strip per program -> race-free.
-    use_fused = (BLK == 32) and _FUSED_TRAIL
+    # REDUNDANT-WORK: the BLK<=16 (n=2048) path uses the SPLIT YT/apply pair, which
+    # writes the (BLK,ncols) YT intermediate to HBM and reads it back -- a redundant
+    # round-trip the fused kernel eliminates (it keeps W/YT in registers between the
+    # two A sweeps). _N2048_FUSED gates the fused trailing for the BLK<=16 path with
+    # its own (tall-chunk, grid-starved) tile so the YT round-trip can be measured.
+    if BLK >= 32:
+        use_fused = _FUSED_TRAIL
+        BM_F, BNc_F, NW_F = _BM_F, _BNC_F, _NW_F
+    else:
+        use_fused = _N2048_FUSED
+        BM_F = int(_os.environ.get("QR_N2048_FBM", "128"))
+        BNc_F = int(_os.environ.get("QR_N2048_FBNC", "64"))
+        NW_F = int(_os.environ.get("QR_N2048_FNW", "4"))
     j = 0
     while j < N:
         b = min(BLK, N - j)
@@ -1869,13 +1885,13 @@ def _w2_qr(data, blk_override=None):
         ncols = N - (j + b)
         if ncols > 0:
             if use_fused:
-                nct_f = triton.cdiv(ncols, _BNC_F)
+                nct_f = triton.cdiv(ncols, BNc_F)
                 _trailing_fused_kernel[(nct_f, B)](
                     src, Vbuf, Tbuf,
                     B, N, j, pheight, ncols, j + b,
                     sab, san, svb, svk, svn, stb, stk, stn,
                     H,
-                    BLK=BLK, BM=_BM_F, BNc=_BNC_F, num_warps=_NW_F,
+                    BLK=BLK, BM=BM_F, BNc=BNc_F, num_warps=NW_F,
                 )
             else:
                 nct_y = triton.cdiv(ncols, BNc_Y)
