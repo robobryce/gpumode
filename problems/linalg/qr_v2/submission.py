@@ -897,6 +897,7 @@ def _panel_factor_kernel(
     stride_ab, stride_an,
     stride_vb, stride_vk, stride_vn,
     stride_tb, stride_tk, stride_tn,
+    Aout_ptr,                                 # separate store dest (block 0: read A, write H => fuses the clone)
     BLK: tl.constexpr, MAXH: tl.constexpr,
 ):
     bid = tl.program_id(0)
@@ -910,6 +911,8 @@ def _panel_factor_kernel(
 
     a_base = A_ptr + bid * stride_ab + j * stride_an + j
     aptr = a_base + rows[:, None] * stride_an + cols[None, :]
+    aout_base = Aout_ptr + bid * stride_ab + j * stride_an + j
+    aoutptr = aout_base + rows[:, None] * stride_an + cols[None, :]
     mask = row_valid[:, None] & col_valid[None, :]
     panel = tl.load(aptr, mask=mask, other=0.0)          # (MAXH, BLK)
 
@@ -971,7 +974,7 @@ def _panel_factor_kernel(
 
         tau_panel = tl.where(col_is_k & do_k, tau_k, tau_panel)
 
-    tl.store(aptr, panel, mask=mask)
+    tl.store(aoutptr, panel, mask=mask)
 
     tptr = tau_ptr + bid * N + j + cols
     tl.store(tptr, tau_panel, mask=col_valid)
@@ -1048,6 +1051,7 @@ def _trailing_apply_kernel(
     stride_ab, stride_an,
     stride_vb, stride_vk, stride_vn,
     stride_yb, stride_yk, stride_yn,
+    Aout_ptr,                                 # separate store dest (block 0: read A, write H => fuses the clone)
     BLK: tl.constexpr, BM: tl.constexpr, BNc: tl.constexpr,
 ):
     pid = tl.program_id(0)
@@ -1077,7 +1081,9 @@ def _trailing_apply_kernel(
     ap = a_trail_base + rrows[:, None] * stride_an + ccols[None, :]
     amask = rmask[:, None] & cmask[None, :]
     aorig = tl.load(ap, mask=amask, other=0.0)
-    tl.store(ap, aorig - delta, mask=amask)
+    aout_trail_base = Aout_ptr + bid * stride_ab + j * stride_an + jb
+    aoutp = aout_trail_base + rrows[:, None] * stride_an + ccols[None, :]
+    tl.store(aoutp, aorig - delta, mask=amask)
 
 
 # ---------------------------------------------------------------------------
@@ -1105,6 +1111,7 @@ def _trailing_fused_kernel(
     stride_ab, stride_an,
     stride_vb, stride_vk, stride_vn,
     stride_tb, stride_tk, stride_tn,
+    Aout_ptr,                                 # separate store dest (block 0: read A, write H => fuses the clone)
     BLK: tl.constexpr, BM: tl.constexpr, BNc: tl.constexpr,
 ):
     col_tile = tl.program_id(0)
@@ -1117,6 +1124,7 @@ def _trailing_fused_kernel(
     krange = tl.arange(0, BLK)
 
     a_trail_base = A_ptr + bid * stride_ab + j * stride_an + jb
+    aout_trail_base = Aout_ptr + bid * stride_ab + j * stride_an + jb
     v_base = Vbuf_ptr + bid * stride_vb
 
     # sweep 1: W = V^T @ A_trail over all panel rows, in chunks of BM.
@@ -1146,7 +1154,8 @@ def _trailing_fused_kernel(
         ap2 = a_trail_base + rr[:, None] * stride_an + ccols[None, :]
         amask = rrmask[:, None] & cmask[None, :]
         aorig = tl.load(ap2, mask=amask, other=0.0)
-        tl.store(ap2, aorig - delta, mask=amask)
+        aoutp2 = aout_trail_base + rr[:, None] * stride_an + ccols[None, :]
+        tl.store(aoutp2, aorig - delta, mask=amask)
 
 
 # NOTE: an A-RESIDENT variant (keep the whole full-height column strip in one
@@ -1598,6 +1607,7 @@ def _w2_qr_2level(data):
             _panel_factor_kernel[(B,)](
                 H, tau, Vbuf, Tbuf, B, N, j, pheight, b,
                 sab, san, svb, svk, svn, stb, stk, stn,
+                H,
                 BLK=NB, MAXH=MAXH, num_warps=nwp,
             )
             ncols = N - (j + b)
@@ -1613,6 +1623,7 @@ def _w2_qr_2level(data):
                 _trailing_apply_kernel[(nrt_a * nct_a, B)](
                     H, Vbuf, YTbuf, B, N, j, pheight, ncols, j + b,
                     sab, san, svb, svk, svn, syb, syk, syn,
+                    H,
                     BLK=NB, BM=BM_A, BNc=BNc_A, num_warps=NW_A,
                 )
             j += b
@@ -1707,6 +1718,7 @@ def _w2_qr_2level(data):
                 _trailing_fused_kernel[(nct_f, B)](
                     H, Vbuf, Tbuf, B, N, j, pheight, ncols, j + bb,
                     sab, san, svb, svk, svn, stb, stk, stn,
+                    H,
                     BLK=NB, BM=_BM_2L, BNc=_BNC_2L, num_warps=_NW_2L,
                 )
             else:
@@ -1721,6 +1733,7 @@ def _w2_qr_2level(data):
                 _trailing_apply_kernel[(nrt_a * nct_a, B)](
                     H, Vbuf, YTbuf, B, N, j, pheight, ncols, j + bb,
                     sab, san, svb, svk, svn, syb, syk, syn,
+                    H,
                     BLK=NB, BM=BM_A, BNc=BNc_A, num_warps=NW_A,
                 )
 
@@ -1733,9 +1746,21 @@ def _w2_qr_2level(data):
 
 
 def _w2_qr(data, blk_override=None):
-    A = data
+    # block 0 reads A directly (clone fusion), and the kernels assume unit stride in
+    # the last dim, so A must be contiguous. .contiguous() is a no-op (no copy, no
+    # HBM cost) for the already-contiguous benchmark inputs; it only copies if a
+    # caller ever passes a non-contiguous view (correctness guard, not the hot path).
+    A = data.contiguous()
     B, N, _ = A.shape
-    H = A.clone()
+    # CLONE FUSION: the old `H = A.clone()` did a full HBM read(A)+write(H) of the
+    # WHOLE input every call (n=512 B=640: ~209us = 3.5% of that shape), only so the
+    # kernels could factor in place without destroying A. But right-looking blocked
+    # QR's FIRST outer block already reads all of A exactly once -- the panel reads
+    # cols [0,b) and the trailing reads cols [b,N) -- and writes the corresponding
+    # H columns. So block 0 reads A (src) and writes H (dst); every later block
+    # reads+writes H in place. That populates ALL of H from block 0 with NO separate
+    # copy pass. H is uninitialized (empty_like); block 0 must touch every column.
+    H = torch.empty_like(A)
     tau = torch.zeros((B, N), device=A.device, dtype=torch.float32)
 
     if blk_override is not None:
@@ -1830,10 +1855,14 @@ def _w2_qr(data, blk_override=None):
             elif _N2048_PNW_MID > 0 and 512 < MAXH <= 1024:
                 nwp = _N2048_PNW_MID
 
+        # CLONE FUSION: block 0 reads the source A and writes H; later blocks
+        # read+write H in place. `src` is the read base, `H` is always the store base.
+        src = A if j == 0 else H
         _panel_factor_kernel[(B,)](
-            H, tau, Vbuf, Tbuf,
+            src, tau, Vbuf, Tbuf,
             B, N, j, pheight, b,
             sab, san, svb, svk, svn, stb, stk, stn,
+            H,
             BLK=BLK, MAXH=MAXH, num_warps=nwp,
         )
 
@@ -1842,15 +1871,16 @@ def _w2_qr(data, blk_override=None):
             if use_fused:
                 nct_f = triton.cdiv(ncols, _BNC_F)
                 _trailing_fused_kernel[(nct_f, B)](
-                    H, Vbuf, Tbuf,
+                    src, Vbuf, Tbuf,
                     B, N, j, pheight, ncols, j + b,
                     sab, san, svb, svk, svn, stb, stk, stn,
+                    H,
                     BLK=BLK, BM=_BM_F, BNc=_BNC_F, num_warps=_NW_F,
                 )
             else:
                 nct_y = triton.cdiv(ncols, BNc_Y)
                 _trailing_YT_kernel[(nct_y, B)](
-                    H, Vbuf, Tbuf, YTbuf,
+                    src, Vbuf, Tbuf, YTbuf,
                     B, N, j, pheight, ncols, j + b,
                     sab, san, svb, svk, svn, stb, stk, stn, syb, syk, syn,
                     BLK=BLK, BM=BM_Y, BNc=BNc_Y, num_warps=NW_Y,
@@ -1858,9 +1888,10 @@ def _w2_qr(data, blk_override=None):
                 nct_a = triton.cdiv(ncols, BNc_A)
                 nrt_a = triton.cdiv(pheight, BM_A)
                 _trailing_apply_kernel[(nrt_a * nct_a, B)](
-                    H, Vbuf, YTbuf,
+                    src, Vbuf, YTbuf,
                     B, N, j, pheight, ncols, j + b,
                     sab, san, svb, svk, svn, syb, syk, syn,
+                    H,
                     BLK=BLK, BM=BM_A, BNc=BNc_A, num_warps=NW_A,
                 )
         j += b
@@ -1937,6 +1968,7 @@ def _w2_qr_mcta(data):
                 H, tau, Vbuf, Tbuf,
                 B, N, j, pheight, b,
                 sab, san, svb, svk, svn, stb, stk, stn,
+                H,
                 BLK=BLK, MAXH=MAXH, num_warps=nwp,
             )
 
@@ -1948,6 +1980,7 @@ def _w2_qr_mcta(data):
                     H, Vbuf, Tbuf,
                     B, N, j, pheight, ncols, j + b,
                     sab, san, svb, svk, svn, stb, stk, stn,
+                    H,
                     BLK=BLK, BM=_BM_F, BNc=_BNC_F, num_warps=_NW_F,
                 )
             else:
@@ -1964,6 +1997,7 @@ def _w2_qr_mcta(data):
                     H, Vbuf, YTbuf,
                     B, N, j, pheight, ncols, j + b,
                     sab, san, svb, svk, svn, syb, syk, syn,
+                    H,
                     BLK=BLK, BM=BM_A, BNc=BNc_A, num_warps=NW_A,
                 )
         j += b
