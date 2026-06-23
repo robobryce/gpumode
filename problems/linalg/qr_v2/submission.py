@@ -823,6 +823,17 @@ def _fused_tile_for_N(N):
         bm  = int(_os.environ.get("QR_BM_F_1024",  "32"))
         bnc = int(_os.environ.get("QR_BNC_F_1024", "32"))
         nw  = int(_os.environ.get("QR_NW_F_1024",  "2"))
+    elif N == 176:
+        # brief-18: BM 32->64 (taller fused-trailing row chunk reuses the loaded W
+        # across more rows on this grid-starved B=40 shape) -> -2.9%. BNc/NW default.
+        if _N176_FBM > 0:  bm  = _N176_FBM
+        if _N176_FBNC > 0: bnc = _N176_FBNC
+        if _N176_FNW > 0:  nw  = _N176_FNW
+    elif N == 352:
+        # brief-18: BM 32->64 + panel nwp 8->4 (applied in _w2_qr) -> -2.6% combined.
+        if _N352_FBM > 0:  bm  = _N352_FBM
+        if _N352_FBNC > 0: bnc = _N352_FBNC
+        if _N352_FNW > 0:  nw  = _N352_FNW
     return bm, bnc, nw
 
 # Multi-CTA panel for the tall few-matrix shapes (n>=4096 B=2, n>=2048 B=8). The
@@ -967,6 +978,27 @@ _N2048_ROUTE = int(_os.environ.get("QR_N2048_ROUTE", "1"))
 # footprint -> may take even fewer warps. 0 = keep in-code default.
 _2L_PNW = int(_os.environ.get("QR_2L_PNW", "0"))
 
+# brief-18 SMALL-SHAPE wins (grafted onto W0's best base, brief-19 COMBINE).
+# n=176 / n=352 (B=40 mid shapes) route through _w2_qr at BLK=32 with the SAME
+# fused-trailing tile + panel num_warps as the big batch shapes, but at B=40 the
+# panel grid (=B=40) leaves ~108/148 SMs idle (grid-STARVED), so they want their
+# own tuning. MEASURED (brief-18 micro-harness, 3x interleaved A/B, err<0.1%, sf
+# headroom kept):
+#   n=176: fused-trailing row chunk BM 32->64 (taller chunk reuses the loaded W
+#          across more rows) -> -2.9%. Panel num_warps default 4 already optimal.
+#   n=352: panel num_warps 8->4 (the (512,32) panel no longer benefits from the
+#          extra warps on this base; the old "-6.8% at nwp8" was a STALE lineage)
+#          + fused BM 32->64 -> -2.6% combined; sf 0.020->0.018 (no precision risk).
+# Per-N gates (N is a shape param -> invariance-safe). 0 sentinel = shared default.
+_N176_FBM = int(_os.environ.get("QR_N176_FBM", "64"))  # fused-trailing row chunk (default 32)
+_N176_FBNC = int(_os.environ.get("QR_N176_FBNC", "0")) # fused-trailing col chunk (0=default 32)
+_N176_FNW = int(_os.environ.get("QR_N176_FNW", "0"))   # fused-trailing warps (0=default 2)
+_N176_PNW = int(_os.environ.get("QR_N176_PNW", "0"))   # panel num_warps (0=height default 4)
+_N352_FBM = int(_os.environ.get("QR_N352_FBM", "64"))
+_N352_FBNC = int(_os.environ.get("QR_N352_FBNC", "0"))
+_N352_FNW = int(_os.environ.get("QR_N352_FNW", "0"))
+_N352_PNW = int(_os.environ.get("QR_N352_PNW", "4"))   # 4 beats the height-default 8 here
+
 # brief-15 N=512 TWO-LEVEL DECOUPLING (IB=16 / NB=32). The BLK=32 single-level
 # panel at n=512 is register-WALLED (ncu: 255 r/thr -> 2 blocks/SM, 12.5% occ).
 # Naive BLK=16 un-spills (167 r/thr -> 3 blocks/SM, +50% occ) but DOUBLES the
@@ -1039,7 +1071,14 @@ def _tiny_qr(A):
     B, n, _ = A.shape
     kern = _get_kernel()
     H = torch.empty((B, n, n), device=A.device, dtype=torch.float32)
-    tau = torch.zeros((B, n), device=A.device, dtype=torch.float32)
+    # brief-18: qr_tiny writes EVERY tau[mid,k] (lane k, k<n) for every in-range
+    # matrix, so the buffer needs no pre-zeroing -- empty drops a memset launch on
+    # the launch-floor-bound n=32 shape (-5.2%). (zeros selectable via env for
+    # paranoia.)
+    if int(_os.environ.get("QR_TINY_TAU_ZERO", "0")):
+        tau = torch.zeros((B, n), device=A.device, dtype=torch.float32)
+    else:
+        tau = torch.empty((B, n), device=A.device, dtype=torch.float32)
     kern.launch_tiny(A.contiguous(), H, tau, B, n, _TINY_WPB)
     return H, tau
 
@@ -2329,7 +2368,15 @@ def _w2_qr(data, blk_override=None):
     # reads+writes H in place. That populates ALL of H from block 0 with NO separate
     # copy pass. H is uninitialized (empty_like); block 0 must touch every column.
     H = torch.empty_like(A)
-    tau = torch.zeros((B, N), device=A.device, dtype=torch.float32)
+    # brief-18: tau is fully written by the panel kernel: every panel stores its b
+    # columns (mask cols<b) at tptr=tau+bid*N+j, and the while loop covers all j ->
+    # all N columns written exactly once (identity reflectors write tau_k=0 explicitly).
+    # So empty needs no pre-zero, dropping a memset launch. The win is small-shape only
+    # (the big shapes are not launch-bound); env restores zeros for paranoia.
+    if int(_os.environ.get("QR_W2_TAU_ZERO", "0")):
+        tau = torch.zeros((B, N), device=A.device, dtype=torch.float32)
+    else:
+        tau = torch.empty((B, N), device=A.device, dtype=torch.float32)
 
     if blk_override is not None:
         BLK = min(blk_override, N)
@@ -2470,6 +2517,13 @@ def _w2_qr(data, blk_override=None):
         # 0 = keep the height-based default. Gated to the saturated mid shapes.
         if blk_override is None and N in (512, 1024) and _MID_PNW > 0:
             nwp = _MID_PNW
+        # brief-18: n=176/352 (B=40, grid-starved) panel num_warps override. n=352
+        # wins at nwp=4 (the (512,32) MAXH<=512 panel no longer benefits from the
+        # height-default 8 on this base). Gated per N (shape param -> invariance-safe).
+        if blk_override is None and N == 176 and _N176_PNW > 0:
+            nwp = _N176_PNW
+        if blk_override is None and N == 352 and _N352_PNW > 0:
+            nwp = _N352_PNW
         # n=2048 panel-warp override: the panel is L1/serial-latency bound (ncu:
         # 56% L1, 2.97% SM, 41% no-eligible-warp at nwp=32). Fewer warps = fewer
         # per-reflector shared-mem barriers -> shorter serial latency. Swept:
