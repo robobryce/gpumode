@@ -1,0 +1,12 @@
+# autocuda data directory.
+#
+# Only `layout.md` — the machine-AGNOSTIC project description — is committed.
+# Everything else here is per-host or per-run state that `/autocuda:discover`
+# and the optimize skills regenerate:
+#   - environment.md            (machine-specific: GPU, timings, noise, profilers)
+#   - log-schema-optimize.json  (regenerated at the start of each optimize run)
+#   - *-optimize-log.csv etc.   (per-run trial logs)
+#   - gpu-count, worker-limits.csv, worktrees/, clones/, profiles/
+*
+!.gitignore
+!layout.md
