@@ -955,6 +955,11 @@ _N512_2L_CT_BM = int(_os.environ.get("QR_N512_2L_CT_BM", "32"))    # single-CTA 
 _N512_2L_CT_NW = int(_os.environ.get("QR_N512_2L_CT_NW", "2"))     # single-CTA cross_T warps
 _N512_2L_AP2_BM = int(_os.environ.get("QR_N512_2L_AP2_BM", "32"))  # inner-trailing apply2 row tile
 _N512_2L_AP2_NW = int(_os.environ.get("QR_N512_2L_AP2_NW", "2"))   # inner-trailing apply2 warps
+# Fuse the inner trailing (YT2+apply2 -> one _trailing_fused2_kernel: W on-chip,
+# no YT HBM round-trip + one fewer launch/block). Default ON for n=512. Tile/warps.
+_N512_2L_FUSE_INNER = int(_os.environ.get("QR_N512_2L_FUSE_INNER", "1")) != 0
+_N512_2L_FI_BM = int(_os.environ.get("QR_N512_2L_FI_BM", "32"))    # fused-inner row chunk
+_N512_2L_FI_NW = int(_os.environ.get("QR_N512_2L_FI_NW", "2"))     # fused-inner warps
 
 
 def _mcta_choose_G(B, pheight, SMs=148):
@@ -1331,6 +1336,73 @@ def _trailing_fused_kernel(
 # kernel with explicit smem, not a Triton resident strip; the chunked fused-W
 # above (which still reads A twice but drops the YT HBM round-trip) is the right
 # Triton structure for this L1-pipe-bound trailing.
+
+
+# FUSED masked inner-trailing (brief-15 iter4): collapses the split YT2+apply2
+# pair into ONE kernel for the n=512 two-level inner trailing (apply sub-panel 0's
+# NREF=IB reflectors to sub-panel 1's b1<=IB cols). Same structure as
+# _trailing_fused_kernel (each program owns the full-height ncols-wide strip ->
+# W=V0^T@A_sub1 reduction is race-free in one program, no YT HBM round-trip), but
+# the V loads are masked to kvalid=krange<NREF so the stale cols IB:2IB of the
+# shared NB-wide V buffer are ignored (no per-block reset). Saves the YT2->apply2
+# HBM round-trip + one kernel launch per outer block at B=640. Separate Aout for
+# clone fusion (block 0 reads A_sub1 from A, writes H). tf32x3 (n=512).
+@triton.jit
+def _trailing_fused2_kernel(
+    A_ptr, Vbuf_ptr, Tbuf_ptr,
+    B, N, j, pheight, ncols, jb,
+    stride_ab, stride_an,
+    stride_vb, stride_vk, stride_vn,
+    stride_tb, stride_tk, stride_tn,
+    Aout_ptr,
+    BLK: tl.constexpr, BM: tl.constexpr, BNc: tl.constexpr, NREF: tl.constexpr,
+):
+    col_tile = tl.program_id(0)
+    bid = tl.program_id(1)
+    if bid >= B:
+        return
+    c0 = col_tile * BNc
+    ccols = c0 + tl.arange(0, BNc)
+    cmask = ccols < ncols
+    krange = tl.arange(0, BLK)
+    kvalid = krange < NREF
+
+    a_trail_base = A_ptr + bid * stride_ab + j * stride_an + jb
+    aout_trail_base = Aout_ptr + bid * stride_ab + j * stride_an + jb
+    v_base = Vbuf_ptr + bid * stride_vb
+
+    # sweep 1: W = V0^T @ A_sub1 over all panel rows, in chunks of BM. V masked to
+    # NREF reflectors -> W rows k>=NREF are 0 (stale-buffer-safe, same proof as
+    # _trailing_YT2_kernel).
+    W = tl.zeros((BLK, BNc), dtype=tl.float32)
+    nchunks = tl.cdiv(pheight, BM)
+    for ci in range(0, nchunks):
+        rr = ci * BM + tl.arange(0, BM)
+        rrmask = rr < pheight
+        ap = a_trail_base + rr[:, None] * stride_an + ccols[None, :]
+        achunk = tl.load(ap, mask=rrmask[:, None] & cmask[None, :], other=0.0)
+        vp = v_base + krange[:, None] * stride_vk + rr[None, :] * stride_vn
+        vchunk = tl.load(vp, mask=rrmask[None, :] & kvalid[:, None], other=0.0)
+        W += tl.dot(vchunk, achunk, input_precision="tf32x3")
+
+    # YT = T^T @ W (registers). Stale Tm rows k>=NREF hit W rows k>=NREF=0 -> g*0=0.
+    tp = Tbuf_ptr + bid * stride_tb + krange[:, None] * stride_tk + krange[None, :] * stride_tn
+    Tm = tl.load(tp)
+    YT = tl.dot(tl.trans(Tm), W, input_precision="tf32x3")
+
+    # sweep 2: A_sub1 -= V0 @ YT, re-reading each A chunk and storing to Aout. V
+    # masked to NREF -> delta's k>=NREF contributions are 0 (stale YT rows ignored).
+    for ci in range(0, nchunks):
+        rr = ci * BM + tl.arange(0, BM)
+        rrmask = rr < pheight
+        vp2 = v_base + krange[None, :] * stride_vk + rr[:, None] * stride_vn
+        Vrow = tl.load(vp2, mask=rrmask[:, None] & kvalid[None, :], other=0.0)
+        delta = tl.dot(Vrow, YT, input_precision="tf32x3")
+        ap2 = a_trail_base + rr[:, None] * stride_an + ccols[None, :]
+        amask = rrmask[:, None] & cmask[None, :]
+        aorig = tl.load(ap2, mask=amask, other=0.0)
+        aoutp2 = aout_trail_base + rr[:, None] * stride_an + ccols[None, :]
+        tl.store(aoutp2, aorig - delta, mask=amask)
 
 
 # Two-level-specific trailing kernels: identical to the single-level pair but
@@ -2015,32 +2087,42 @@ def _w2_qr_2level_n512(data):
             # inner trailing: apply sub-panel 0's IB reflectors to ONLY sub-panel
             # 1's b1 cols. Masked NREF=IB out of the NB-wide buffer (cols IB:2IB
             # may be stale -> no per-block reset). The A_sub1 columns are read from
-            # src (block 0: A); apply2 writes them to H.
-            if _N512_2L_SPLIT:
-                nrt_y2 = triton.cdiv(pheight, GRAM_BM)
-                _trailing_YT2_partW_kernel[(nrt_y2, B)](
-                    src, Vbuf, Wpart, B, N, j, pheight, b1, j + b0,
-                    sab, san, svb, svk, svn, swb, swt, swk, swn,
-                    BLK=NB, BM=GRAM_BM, BNc=NB, NREF=IB, num_warps=4,
-                )
-                _trailing_YT2_finishW_kernel[(B,)](
-                    Wpart, Tbuf, YTbuf, B, nrt_y2, b1,
-                    swb, swt, swk, swn, stb, stk, stn, syb, syk, syn,
-                    BLK=NB, BNc=NB, NREF=IB, num_warps=2,
+            # src (block 0: A); the result is written to H.
+            if _N512_2L_FUSE_INNER:
+                # FUSED: W kept on-chip (no YT HBM round-trip) + one launch. Each
+                # program owns the full-height b1-wide strip -> race-free.
+                _trailing_fused2_kernel[(triton.cdiv(b1, NB), B)](
+                    src, Vbuf, Tbuf, B, N, j, pheight, b1, j + b0,
+                    sab, san, svb, svk, svn, stb, stk, stn,
+                    H,
+                    BLK=NB, BM=_N512_2L_FI_BM, BNc=NB, NREF=IB, num_warps=_N512_2L_FI_NW,
                 )
             else:
-                # saturated grid: single-CTA YT2 (grid=(1,B)=640 fills the GPU).
-                _trailing_YT2_kernel[(1, B)](
-                    src, Vbuf, Tbuf, YTbuf, B, N, j, pheight, b1, j + b0,
-                    sab, san, svb, svk, svn, stb, stk, stn, syb, syk, syn,
-                    BLK=NB, BM=_N512_2L_YT2_BM, BNc=NB, NREF=IB, num_warps=_N512_2L_YT2_NW,
+                if _N512_2L_SPLIT:
+                    nrt_y2 = triton.cdiv(pheight, GRAM_BM)
+                    _trailing_YT2_partW_kernel[(nrt_y2, B)](
+                        src, Vbuf, Wpart, B, N, j, pheight, b1, j + b0,
+                        sab, san, svb, svk, svn, swb, swt, swk, swn,
+                        BLK=NB, BM=GRAM_BM, BNc=NB, NREF=IB, num_warps=4,
+                    )
+                    _trailing_YT2_finishW_kernel[(B,)](
+                        Wpart, Tbuf, YTbuf, B, nrt_y2, b1,
+                        swb, swt, swk, swn, stb, stk, stn, syb, syk, syn,
+                        BLK=NB, BNc=NB, NREF=IB, num_warps=2,
+                    )
+                else:
+                    # saturated grid: single-CTA YT2 (grid=(1,B)=640 fills the GPU).
+                    _trailing_YT2_kernel[(1, B)](
+                        src, Vbuf, Tbuf, YTbuf, B, N, j, pheight, b1, j + b0,
+                        sab, san, svb, svk, svn, stb, stk, stn, syb, syk, syn,
+                        BLK=NB, BM=_N512_2L_YT2_BM, BNc=NB, NREF=IB, num_warps=_N512_2L_YT2_NW,
+                    )
+                _trailing_apply2_kernel[(triton.cdiv(pheight, _N512_2L_AP2_BM), B)](
+                    src, Vbuf, YTbuf, B, N, j, pheight, b1, j + b0,
+                    sab, san, svb, svk, svn, syb, syk, syn,
+                    H,
+                    BLK=NB, BM=_N512_2L_AP2_BM, BNc=NB, NREF=IB, num_warps=_N512_2L_AP2_NW,
                 )
-            _trailing_apply2_kernel[(triton.cdiv(pheight, _N512_2L_AP2_BM), B)](
-                src, Vbuf, YTbuf, B, N, j, pheight, b1, j + b0,
-                sab, san, svb, svk, svn, syb, syk, syn,
-                H,
-                BLK=NB, BM=_N512_2L_AP2_BM, BNc=NB, NREF=IB, num_warps=_N512_2L_AP2_NW,
-            )
 
             # sub-panel 1: cols [j+b0, j+b0+b1), V/T at offset (row IB, col IB).
             # Always reads H (apply2 just wrote these columns), writes H.
