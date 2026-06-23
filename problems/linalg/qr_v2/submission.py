@@ -1080,8 +1080,23 @@ _N512_2L_F_NS = int(_os.environ.get("QR_N512_2L_F_NS", "3"))      # software-pip
 # ~1.6e-7) clears the n=512 ill-cond gate with margin: rankdef scaled_factor
 # 0.036, clustered 0.028, band 0.048, nearcollinear 0.041, mixed 0.061 (budget
 # 1.0). Only the n=512 caller opts in via this knob; every other caller keeps
-# the built-in tf32x3 untouched. DEFAULT tf32x3i so leaderboard runs get the win.
-_N512_2L_F_PREC = _os.environ.get("QR_N512_2L_F_PREC", "tf32x3i")
+# the built-in tf32x3 untouched.
+#
+# brief-45: DEFAULT now "tf32x2" (the 2-MMA scheme, NOW with ROUND-TO-NEAREST in
+# _dot_tf32x2 -- see that helper). The prior "n=512 irreducibly tf32x3" kill was
+# specific to TRUNCATING tf32x2, whose sign-toward-zero bias DC-accumulated over
+# the n=512 contraction and failed the mixed batch (54/640 matrices over the
+# scaled_factor gate of 20). Switching the truncation to round-to-nearest is
+# UNBIASED and cuts the worst-case residual ~2.3x, so the full ranked set now
+# passes 2-MMA: dense-cond2 sf 1.65 (12x margin), mixed 13.0 (1.5x), rankdef 6.07
+# (3.3x), clustered 4.89 (4.1x); the binding test case (band) sf 14.07 (1.4x).
+# This drops the dominant n=512 wide trailing from 3 MMAs -> 2 MMAs UNIFORMLY (no
+# per-matrix conditioning gate -- the reflector-norm signal does NOT separate the
+# tf32x2-borderline matrices from the safe ones; see brief-45 return note), a
+# ~33% FLOP cut on the bulk trailing reduction + apply of every n=512 batch.
+# tf32x3i remains reachable via QR_N512_2L_F_PREC=tf32x3i (the prior accuracy
+# floor). Gated by the n==512 route (a SHAPE param -> invariance-guard-safe).
+_N512_2L_F_PREC = _os.environ.get("QR_N512_2L_F_PREC", "tf32x2")
 _N512_2L_PNW = int(_os.environ.get("QR_N512_2L_PNW", "4"))    # IB=16 sub-panel warps
 _N512_2L_GRAM_BM = int(_os.environ.get("QR_N512_2L_GRAM_BM", "128"))  # cross-Gram/YT2 row tile
 # Split inner-trailing + cross-T across SMs. The split variants (partW+finishW,
@@ -1465,10 +1480,31 @@ def _trailing_apply_kernel(
 # parts are exactly tf32-representable so the tf32 MMA is exact on them). 2 MMAs.
 @triton.jit
 def _dot_tf32x2(x, y):
-    # mask = 0xFFFFE000 (zero low 13 mantissa bits) expressed as a SIGNED int32
-    # (-8192); Triton int32 is signed so the 0xFFFFE000 literal overflows.
+    # 2-MMA tf32 split with ROUND-TO-NEAREST on the truncated operand (brief-45).
+    # x (the V reflectors) is rounded to the nearest tf32 value (the top 19 bits)
+    # by adding a half-ulp of the dropped 13 mantissa bits (HALF=0x1000=4096)
+    # BEFORE masking, instead of plain truncation. y (A / its derived YT, the wide
+    # dynamic-range operand) is split exactly into hi + lo so the y side stays full
+    # precision. Two sub-dots: x_round*y_hi + x_round*y_lo (input_precision="tf32",
+    # exact on the tf32-representable parts). Cost is UNCHANGED (still 2 MMAs).
+    #
+    # Why round, not truncate: truncation has a SYSTEMATIC sign-toward-zero bias
+    # (mean ~0.5 ulp, max 1 ulp) that DC-accumulates over the n=512/1024 trailing
+    # contraction; round-to-nearest is UNBIASED (mean ~0.25 ulp, max 0.5 ulp) so
+    # the per-element errors cancel instead of compounding. MEASURED (brief-45, all
+    # four ranked n=512 batches, B=640, gate=20 on scaled_factor_residual): rounding
+    # cuts the worst-case residual ~2.3x -- dense-cond2 4.07->1.65, mixed 29.83 (54
+    # matrices over gate)->13.01 (0 over gate), rankdef 14.87->6.07, clustered
+    # 12.06->4.89. The mixed batch -- which the OLD truncating tf32x2 FAILED (54/640
+    # over the gate, the prior "n=512 irreducibly tf32x3" kill) -- now PASSES every
+    # matrix with ~1.5x margin, so the n=512 wide trailing drops 3-MMA tf32x3i -> this
+    # 2-MMA scheme uniformly (no per-matrix conditioning gate needed). The mask
+    # (0xFFFFE000 = -8192 as signed int32) zeroes the low 13 mantissa bits; the +HALF
+    # may carry into the exponent for x near a power-of-two boundary, which is the
+    # correct round-up.
     MASK: tl.constexpr = -8192
-    x_hi = (x.to(tl.int32, bitcast=True) & MASK).to(tl.float32, bitcast=True)
+    HALF: tl.constexpr = 4096
+    x_hi = ((x.to(tl.int32, bitcast=True) + HALF) & MASK).to(tl.float32, bitcast=True)
     y_hi = (y.to(tl.int32, bitcast=True) & MASK).to(tl.float32, bitcast=True)
     y_lo = y - y_hi
     acc = tl.dot(x_hi, y_hi, input_precision="tf32")
