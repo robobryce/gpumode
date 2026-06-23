@@ -890,6 +890,14 @@ _N4096_PREC = _os.environ.get("QR_N4096_PREC", "tf32")
 # still reachable via QR_N1024_PREC=tf32x3). Gated by N==1024 (a shape param ->
 # invariance-safe); n=512 keeps tf32x3 (shares the fused kernel but N!=1024).
 _N1024_PREC = _os.environ.get("QR_N1024_PREC", "tf32x2")
+# brief-14 PANEL BLOCKING knobs for the n=512/1024 mid regime. The BLK=32 panel
+# is register-walled (ncu gate above). Sweep BLK in {8,16,32} per N to find the
+# new optimum now that the trailing got cheaper (tf32x2 at n=1024). Default 32 =
+# the prior path (perf-neutral). _MID_FUSE_LT32 keeps the on-chip fused trailing
+# (no YT HBM round-trip) for BLK<32 too so the BLK sweep is apples-to-apples.
+_N512_BLK = int(_os.environ.get("QR_N512_BLK", "32"))
+_N1024_BLK = int(_os.environ.get("QR_N1024_BLK", "32"))
+_MID_FUSE_LT32 = int(_os.environ.get("QR_MID_FUSE_LT32", "1")) != 0
 # n=2048 panel num_warps override for the tall (MAXH>1024) panels. 0 = keep the
 # height-based default (32). The panel is L1/serial-latency bound, so fewer warps
 # (less cross-warp shared-mem sync per reflector reduction) MIGHT cut latency.
@@ -1906,7 +1914,20 @@ def _w2_qr(data, blk_override=None):
         # footprint -> much higher occupancy (~2x faster) than BLK=32.
         BLK = 16
     else:
-        BLK = 32
+        # n=512/1024 mid regime. PROFILE-GATE (brief-14): the BLK=32 panel is
+        # register-WALLED (ncu: 255 r/thr, occupancy limited to 2 blocks/SM at
+        # n=512 / 1 block/SM at n=1024, both at the 255 ceiling i.e. SPILLING).
+        # The (MAXH,BLK) register tile / blockDim threads = MAXH*BLK/(nwp*32);
+        # nwp does NOT track BLK, so halving BLK halves the per-thread tile and
+        # should drop regs below the spill knee -> more blocks/SM (n=512, grid
+        # saturated) and less spill traffic + shorter serial chain (n=1024).
+        # Knob-tunable per N; default 32 keeps the prior path (perf-neutral).
+        if N == 512:
+            BLK = _N512_BLK
+        elif N == 1024:
+            BLK = _N1024_BLK
+        else:
+            BLK = 32
 
     Vbuf = torch.empty((B, BLK, N), device=A.device, dtype=torch.float32)
     Tbuf = torch.empty((B, BLK, BLK), device=A.device, dtype=torch.float32)
@@ -1927,7 +1948,12 @@ def _w2_qr(data, blk_override=None):
     #   BLK<=16 (n>=2048, small batch B=2/8 -> grid starved): the YT must use a
     #       TALL reduction chunk + more warps to fill the SMs: BM=128/BNc=64/4w
     #       (45us vs 80us on n=4096, -44%); apply BM=32/BNc=32/2w (60us vs 70us).
-    if BLK >= 32:
+    # brief-14: the n=512/1024 mid regime with a REDUCED BLK (<32) still has a
+    # SATURATED grid (B=640/60 programs >> the grid the BLK=32 path already filled),
+    # so it wants the SAME small throughput-bound tiles + on-chip fused trailing as
+    # BLK==32 -- NOT the grid-starved n=2048 tiles. Treat it as the saturated case.
+    _mid_lt32 = (blk_override is None and N in (512, 1024) and BLK < 32)
+    if BLK >= 32 or _mid_lt32:
         BM_Y, BNc_Y, NW_Y = 32, 32, 1
         BM_A, BNc_A, NW_A = 128, 32, 4
     else:
@@ -1950,7 +1976,7 @@ def _w2_qr(data, blk_override=None):
     # round-trip the fused kernel eliminates (it keeps W/YT in registers between the
     # two A sweeps). _N2048_FUSED gates the fused trailing for the BLK<=16 path with
     # its own (tall-chunk, grid-starved) tile so the YT round-trip can be measured.
-    if BLK >= 32:
+    if BLK >= 32 or (_mid_lt32 and _MID_FUSE_LT32):
         use_fused = _FUSED_TRAIL
         BM_F, BNc_F, NW_F = _BM_F, _BNC_F, _NW_F
     else:
