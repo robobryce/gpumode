@@ -971,9 +971,17 @@ def _panel_factor_kernel(
         do_k = k < b
         col_is_k = cols == k
         xk = tl.sum(tl.where(col_is_k[None, :], panel, 0.0), axis=1)   # (MAXH,)
-        active = (rows >= k) & row_valid
-        xk = tl.where(active, xk, 0.0)
-
+        # brief-12 ALU trim (FP-exact): `xk = tl.where((rows>=k)&row_valid, xk, 0)`
+        # is REDUNDANT. xk is column k of `panel`, which was loaded with
+        # mask=row_valid&col_valid (other=0) and stays 0 at rows>=pheight for the
+        # whole sweep (the trailing update upd=tau*v*w has v[rows>=pheight]=0, and
+        # the col-k store writes new_colk[rows>=pheight]=v=0), so xk[rows>=pheight]
+        # is ALREADY 0 -- the row_valid mask adds nothing. The rows<k lanes of xk
+        # are never read: alpha uses rows==k, tailv/v use rows>k, and w reads `v`
+        # (=0 for rows<k via its own where(rows>k,...,0) default, independent of
+        # xk). So every later consumer (alpha, tailv->tail_n2, v) is FP-identical
+        # with the mask removed. Drops one (MAXH,)-wide select per column in the
+        # ALU-bound (47% pipe_alu) panel.
         alpha = tl.sum(tl.where(rows == k, xk, 0.0))
         tailv = tl.where(rows > k, xk, 0.0)
         tail_n2 = tl.sum(tailv * tailv)
