@@ -1077,6 +1077,12 @@ _N512_2L_AP2_NW = int(_os.environ.get("QR_N512_2L_AP2_NW", "2"))   # inner-trail
 _N512_2L_FUSE_INNER = int(_os.environ.get("QR_N512_2L_FUSE_INNER", "1")) != 0
 _N512_2L_FI_BM = int(_os.environ.get("QR_N512_2L_FI_BM", "32"))    # fused-inner row chunk
 _N512_2L_FI_NW = int(_os.environ.get("QR_N512_2L_FI_NW", "2"))     # fused-inner warps
+# brief-26: precision for the n=512 inner trailing (fused2). Same tf32x3i 3-indep-
+# accumulator restructure as the wide trailing; A/B'd separately because the inner
+# GEMM is thinner (ncols<=16). MEASURED: tf32x3i wins here too (dense 4423->4378,
+# rankdef 4413->4368 probe us, -1.0%) -- the W-reduction is the same pheight-row
+# contraction so the RAW-chain break applies. DEFAULT tf32x3i.
+_N512_2L_FI_PREC = _os.environ.get("QR_N512_2L_FI_PREC", "tf32x3i")
 
 
 def _mcta_choose_G(B, pheight, SMs=148):
@@ -1594,6 +1600,7 @@ def _trailing_fused2_kernel(
     stride_tb, stride_tk, stride_tn,
     Aout_ptr,
     BLK: tl.constexpr, BM: tl.constexpr, BNc: tl.constexpr, NREF: tl.constexpr,
+    IPREC: tl.constexpr = "tf32x3",
 ):
     col_tile = tl.program_id(0)
     bid = tl.program_id(1)
@@ -1621,7 +1628,10 @@ def _trailing_fused2_kernel(
         achunk = tl.load(ap, mask=rrmask[:, None] & cmask[None, :], other=0.0)
         vp = v_base + krange[:, None] * stride_vk + rr[None, :] * stride_vn
         vchunk = tl.load(vp, mask=rrmask[None, :] & kvalid[:, None], other=0.0)
-        W += tl.dot(vchunk, achunk, input_precision="tf32x3")
+        if IPREC == "tf32x3i":
+            W += _dot_tf32x3i(vchunk, achunk)
+        else:
+            W += tl.dot(vchunk, achunk, input_precision="tf32x3")
 
     # YT = T^T @ W (registers). Stale Tm rows k>=NREF hit W rows k>=NREF=0 -> g*0=0.
     tp = Tbuf_ptr + bid * stride_tb + krange[:, None] * stride_tk + krange[None, :] * stride_tn
@@ -1635,7 +1645,10 @@ def _trailing_fused2_kernel(
         rrmask = rr < pheight
         vp2 = v_base + krange[None, :] * stride_vk + rr[:, None] * stride_vn
         Vrow = tl.load(vp2, mask=rrmask[:, None] & kvalid[None, :], other=0.0)
-        delta = tl.dot(Vrow, YT, input_precision="tf32x3")
+        if IPREC == "tf32x3i":
+            delta = _dot_tf32x3i(Vrow, YT)
+        else:
+            delta = tl.dot(Vrow, YT, input_precision="tf32x3")
         ap2 = a_trail_base + rr[:, None] * stride_an + ccols[None, :]
         amask = rrmask[:, None] & cmask[None, :]
         aorig = tl.load(ap2, mask=amask, other=0.0)
@@ -2334,6 +2347,7 @@ def _w2_qr_2level_n512(data):
                     sab, san, svb, svk, svn, stb, stk, stn,
                     H,
                     BLK=NB, BM=_N512_2L_FI_BM, BNc=NB, NREF=IB, num_warps=_N512_2L_FI_NW,
+                    IPREC=_N512_2L_FI_PREC,
                 )
             else:
                 if _N512_2L_SPLIT:
