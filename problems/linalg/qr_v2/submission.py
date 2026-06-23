@@ -942,6 +942,16 @@ _N512_2L_FBNC = int(_os.environ.get("QR_N512_2L_FBNC", "32")) # fused wide-trail
 _N512_2L_FNW = int(_os.environ.get("QR_N512_2L_FNW", "2"))    # fused wide-trail warps
 _N512_2L_PNW = int(_os.environ.get("QR_N512_2L_PNW", "4"))    # IB=16 sub-panel warps
 _N512_2L_GRAM_BM = int(_os.environ.get("QR_N512_2L_GRAM_BM", "128"))  # cross-Gram/YT2 row tile
+# Split inner-trailing + cross-T across SMs. The split variants (partW+finishW,
+# gram+finish) were tuned for the grid-STARVED n>=2560 (B=2/8) case. At n=512
+# B=640 the grid is already SATURATED (grid=(1,B)=640 or grid=(B,)=640 fills the
+# GPU), so splitting just MULTIPLIES the launch count for no occupancy gain.
+# Default OFF for n=512 -> use the single-CTA YT2 + single-CTA cross_T (fewer
+# launches). _YT2_NW/_cross_T warps tunable.
+_N512_2L_SPLIT = int(_os.environ.get("QR_N512_2L_SPLIT", "0")) != 0
+_N512_2L_YT2_NW = int(_os.environ.get("QR_N512_2L_YT2_NW", "4"))   # single-CTA YT2 warps
+_N512_2L_YT2_BM = int(_os.environ.get("QR_N512_2L_YT2_BM", "128")) # single-CTA YT2 row chunk
+_N512_2L_CT_BM = int(_os.environ.get("QR_N512_2L_CT_BM", "128"))   # single-CTA cross_T Gram chunk
 
 
 def _mcta_choose_G(B, pheight, SMs=148):
@@ -1979,17 +1989,25 @@ def _w2_qr_2level_n512(data):
             # inner trailing: apply sub-panel 0's IB reflectors to ONLY sub-panel
             # 1's b1 cols. Masked NREF=IB out of the NB-wide buffer (cols IB:2IB
             # may be stale -> no per-block reset). Split-W reduction fills SMs.
-            nrt_y2 = triton.cdiv(pheight, GRAM_BM)
-            _trailing_YT2_partW_kernel[(nrt_y2, B)](
-                H, Vbuf, Wpart, B, N, j, pheight, b1, j + b0,
-                sab, san, svb, svk, svn, swb, swt, swk, swn,
-                BLK=NB, BM=GRAM_BM, BNc=NB, NREF=IB, num_warps=4,
-            )
-            _trailing_YT2_finishW_kernel[(B,)](
-                Wpart, Tbuf, YTbuf, B, nrt_y2, b1,
-                swb, swt, swk, swn, stb, stk, stn, syb, syk, syn,
-                BLK=NB, BNc=NB, NREF=IB, num_warps=2,
-            )
+            if _N512_2L_SPLIT:
+                nrt_y2 = triton.cdiv(pheight, GRAM_BM)
+                _trailing_YT2_partW_kernel[(nrt_y2, B)](
+                    H, Vbuf, Wpart, B, N, j, pheight, b1, j + b0,
+                    sab, san, svb, svk, svn, swb, swt, swk, swn,
+                    BLK=NB, BM=GRAM_BM, BNc=NB, NREF=IB, num_warps=4,
+                )
+                _trailing_YT2_finishW_kernel[(B,)](
+                    Wpart, Tbuf, YTbuf, B, nrt_y2, b1,
+                    swb, swt, swk, swn, stb, stk, stn, syb, syk, syn,
+                    BLK=NB, BNc=NB, NREF=IB, num_warps=2,
+                )
+            else:
+                # saturated grid: single-CTA YT2 (grid=(1,B)=640 fills the GPU).
+                _trailing_YT2_kernel[(1, B)](
+                    H, Vbuf, Tbuf, YTbuf, B, N, j, pheight, b1, j + b0,
+                    sab, san, svb, svk, svn, stb, stk, stn, syb, syk, syn,
+                    BLK=NB, BM=_N512_2L_YT2_BM, BNc=NB, NREF=IB, num_warps=_N512_2L_YT2_NW,
+                )
             _trailing_apply2_kernel[(triton.cdiv(pheight, FBM), B)](
                 H, Vbuf, YTbuf, B, N, j, pheight, b1, j + b0,
                 sab, san, svb, svk, svn, syb, syk, syn,
@@ -2005,18 +2023,26 @@ def _w2_qr_2level_n512(data):
                 BLK=IB, MAXH=MAXH1, num_warps=nwp0,
             )
 
-            # cross-block T01 (split-Gram across SMs then a finish forms T01).
-            nrt_g = triton.cdiv(pheight, GRAM_BM)
-            _cross_gram_kernel[(nrt_g, B)](
-                Vbuf, Gpart, B, pheight, IB,
-                svb, svk, svn, sgb, sgt, sgi, sgj,
-                BM=GRAM_BM, IBP=IBP,
-            )
-            _cross_finish_kernel[(B,)](
-                Gpart, Tbuf, B, nrt_g, IB,
-                sgb, sgt, sgi, sgj, stb, stk, stn,
-                IBP=IBP,
-            )
+            # cross-block T01 = -T0 (V0^T V1) T1.
+            if _N512_2L_SPLIT:
+                nrt_g = triton.cdiv(pheight, GRAM_BM)
+                _cross_gram_kernel[(nrt_g, B)](
+                    Vbuf, Gpart, B, pheight, IB,
+                    svb, svk, svn, sgb, sgt, sgi, sgj,
+                    BM=GRAM_BM, IBP=IBP,
+                )
+                _cross_finish_kernel[(B,)](
+                    Gpart, Tbuf, B, nrt_g, IB,
+                    sgb, sgt, sgi, sgj, stb, stk, stn,
+                    IBP=IBP,
+                )
+            else:
+                # saturated grid: single-CTA cross_T (grid=(B,)=640 fills the GPU).
+                _cross_T_kernel[(B,)](
+                    Vbuf, Tbuf, B, pheight, IB, IB,
+                    svb, svk, svn, stb, stk, stn,
+                    BM=_N512_2L_CT_BM, IBP=IBP,
+                )
 
         bb = b0 + b1                      # reflectors in this outer block (<=NB)
         ncols = N - (j + bb)
