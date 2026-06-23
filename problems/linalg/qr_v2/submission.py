@@ -875,11 +875,21 @@ _N4096_PREC = _os.environ.get("QR_N4096_PREC", "tf32")
 # ~CONSTANT in n (~7.7e-4) while the QR factor tolerance grows ~20*n*eps, so a single
 # trailing GEMM in plain tf32 is ~0.32x tol at n=1024 (vs 0.16 @ n=2048, 0.63 @ n=512
 # where it fails). n=1024 is the BOUNDARY CASE -- ratio 0.32 is 2x the n=2048 value, so
-# rankdef (the tightest ill-cond case, 9.17/20 = 46% of budget at n=2048) could land
-# near the cliff. Default is SAFE (tf32x3); flip to "tf32" ONLY after MEASURING every
-# n=1024 ill-cond ranked shape clears with margin (<=15/20). Gated by N==1024 (a shape
-# param -> invariance-safe); n=512 keeps tf32x3 (shares the fused kernel but N!=1024).
-_N1024_PREC = _os.environ.get("QR_N1024_PREC", "tf32x3")
+# rankdef (the tightest ill-cond case, 9.17/20 = 46% of budget at n=2048) lands near
+# the cliff. MEASURED (the brief's mandatory boundary-case gate):
+#   1-pass tf32   n=1024 rankdef 17.8/20, nearrank 17.8/20, clustered 13.7/20 -> over
+#     the <=15/20 margin AND the diff_correctness_guard on the RANKED B=60 seeds FAILS
+#     (770002 mixed 2/8 wrong, 770005 nearrank 3/8 wrong). 1-pass is NOT shippable.
+#   2-pass tf32x2 (the brief's fallback; _dot_tf32x2 splits each fp32 into tf32 hi+lo,
+#     keeps the 2 largest product terms) HALVES the residual -> rankdef 7.01/20,
+#     nearrank 7.10/20, clustered 5.66/20, dense 1.23-1.66/20, mixed 1.74/20. Worst
+#     case 7.1/20 = 35% of budget (SAFER than the shipped n=2048 rankdef 9.17/20); the
+#     ranked B=60 guard + invariance guard pass CLEAN. tf32x2 cuts the n=1024 trailing
+#     3->2 MMA: n=1024 nearrank 5042->4360us (-13.5%), geomean 2839->2738us (-3.6%).
+# So DEFAULT is "tf32x2" (1-pass rejected on the gate; 3-pass = the old accuracy floor,
+# still reachable via QR_N1024_PREC=tf32x3). Gated by N==1024 (a shape param ->
+# invariance-safe); n=512 keeps tf32x3 (shares the fused kernel but N!=1024).
+_N1024_PREC = _os.environ.get("QR_N1024_PREC", "tf32x2")
 # n=2048 panel num_warps override for the tall (MAXH>1024) panels. 0 = keep the
 # height-based default (32). The panel is L1/serial-latency bound, so fewer warps
 # (less cross-warp shared-mem sync per reflector reduction) MIGHT cut latency.
@@ -1148,6 +1158,29 @@ def _trailing_apply_kernel(
 # (BM, BNc) so nothing spills; the saving over the split pair is the whole YT
 # HBM round-trip + one kernel launch per block.
 # ---------------------------------------------------------------------------
+# 2-pass tf32 ("tf32x2") emulation: between 1-pass (1 MMA, ~2u error) and the
+# built-in tf32x3 (3 MMA, ~u^2 error). Triton's input_precision has no native
+# tf32x2, so split each fp32 operand into a tf32-representable hi (top 19 bits;
+# low 13 mantissa bits zeroed) plus residual lo = x - hi, and keep the TWO largest
+# product terms: x_hi*y_hi + x_hi*y_lo. That makes the SECOND operand y (the
+# ill-conditioned trailing matrix A / its derived YT, with wide column dynamic
+# range) effectively FULL precision while x (the V reflectors, O(1)) is tf32-
+# truncated -> error ~ u*|x| (half the bits of 1-pass's 2u). Both call sites pass
+# the conditioning operand as y. Each sub-dot uses input_precision="tf32" (hi/lo
+# parts are exactly tf32-representable so the tf32 MMA is exact on them). 2 MMAs.
+@triton.jit
+def _dot_tf32x2(x, y):
+    # mask = 0xFFFFE000 (zero low 13 mantissa bits) expressed as a SIGNED int32
+    # (-8192); Triton int32 is signed so the 0xFFFFE000 literal overflows.
+    MASK: tl.constexpr = -8192
+    x_hi = (x.to(tl.int32, bitcast=True) & MASK).to(tl.float32, bitcast=True)
+    y_hi = (y.to(tl.int32, bitcast=True) & MASK).to(tl.float32, bitcast=True)
+    y_lo = y - y_hi
+    acc = tl.dot(x_hi, y_hi, input_precision="tf32")
+    acc += tl.dot(x_hi, y_lo, input_precision="tf32")
+    return acc
+
+
 @triton.jit
 def _trailing_fused_kernel(
     A_ptr, Vbuf_ptr, Tbuf_ptr,
@@ -1185,7 +1218,10 @@ def _trailing_fused_kernel(
         achunk = tl.load(ap, mask=rrmask[:, None] & cmask[None, :], other=0.0)   # (BM,BNc)
         vp = v_base + krange[:, None] * stride_vk + rr[None, :] * stride_vn
         vchunk = tl.load(vp, mask=rrmask[None, :], other=0.0)                    # (BLK,BM)
-        W += tl.dot(vchunk, achunk, input_precision=IPREC)
+        if IPREC == "tf32x2":
+            W += _dot_tf32x2(vchunk, achunk)        # achunk (A) kept full precision
+        else:
+            W += tl.dot(vchunk, achunk, input_precision=IPREC)
 
     # YT = T^T @ W  (stays in registers, never written to HBM). Tiny BLKxBLK dot ->
     # keep full tf32x3 (negligible cost, and it couples all reflectors -> delicate).
@@ -1200,7 +1236,10 @@ def _trailing_fused_kernel(
         rrmask = rr < pheight
         vp2 = v_base + krange[None, :] * stride_vk + rr[:, None] * stride_vn
         Vrow = tl.load(vp2, mask=rrmask[:, None], other=0.0)                     # (BM,BLK)
-        delta = tl.dot(Vrow, YT, input_precision=IPREC)                         # (BM,BNc)
+        if IPREC == "tf32x2":
+            delta = _dot_tf32x2(Vrow, YT)            # YT (A-derived) kept full precision
+        else:
+            delta = tl.dot(Vrow, YT, input_precision=IPREC)                     # (BM,BNc)
         ap2 = a_trail_base + rr[:, None] * stride_an + ccols[None, :]
         amask = rrmask[:, None] & cmask[None, :]
         aorig = tl.load(ap2, mask=amask, other=0.0)
