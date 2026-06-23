@@ -1033,6 +1033,19 @@ _N512_2L_FBNC = int(_os.environ.get("QR_N512_2L_FBNC", "64")) # fused wide-trail
 _N512_2L_FNW = int(_os.environ.get("QR_N512_2L_FNW", "2"))    # fused wide-trail warps
 _N512_2L_F_NACC = int(_os.environ.get("QR_N512_2L_F_NACC", "2"))  # split-W ILP accumulators
 _N512_2L_F_NS = int(_os.environ.get("QR_N512_2L_F_NS", "3"))      # software-pipeline stages
+# brief-26: precision mode for the n=512 dominant wide trailing. "tf32x3i" =
+# hand-written 3-product split with 3 INDEPENDENT accumulators (breaks the
+# built-in tf32x3 RAW chain that ncu showed is the wait-0.94 / 49.7%-tensor-SOL
+# wall); "tf32x3" = the built-in. MEASURED (brief-26): tf32x3i wins -- it both
+# breaks the intra-dot RAW chain (the 3 MMAs become independent -> pipeline ->
+# hide MMA latency) AND is cheaper (3 products vs the built-in's finer multi-
+# product split). n=512 full-shape probe 4735->4531us dense / 4726->4526us
+# rankdef (-4.3%); geomean 2547.5->2512.5us. Accuracy ~1e-6 relerr (vs built-in
+# ~1.6e-7) clears the n=512 ill-cond gate with margin: rankdef scaled_factor
+# 0.036, clustered 0.028, band 0.048, nearcollinear 0.041, mixed 0.061 (budget
+# 1.0). Only the n=512 caller opts in via this knob; every other caller keeps
+# the built-in tf32x3 untouched. DEFAULT tf32x3i so leaderboard runs get the win.
+_N512_2L_F_PREC = _os.environ.get("QR_N512_2L_F_PREC", "tf32x3i")
 _N512_2L_PNW = int(_os.environ.get("QR_N512_2L_PNW", "4"))    # IB=16 sub-panel warps
 _N512_2L_GRAM_BM = int(_os.environ.get("QR_N512_2L_GRAM_BM", "128"))  # cross-Gram/YT2 row tile
 # Split inner-trailing + cross-T across SMs. The split variants (partW+finishW,
@@ -1360,6 +1373,35 @@ def _dot_tf32x2(x, y):
     return acc
 
 
+# 3-pass tf32 emulation with INDEPENDENT accumulators (brief-26). Triton's
+# BUILT-IN input_precision="tf32x3" emits a high-accuracy fine-split emulation
+# (~1.6e-7 relerr, measured) whose internal MMA passes ACCUMULATE into a single C
+# fragment => a RAW dependency chain. ncu on the n=512 dominant trailing showed
+# that chain is the wall: stall_wait=0.94 + math_pipe_throttle=0.61, tensor pipe
+# only 49.7% SOL (half-idle), eligible-warps 0.69 (latency-starved). This helper
+# computes the classic 3-product Ootomo&Yokota split hi*hi + hi*lo + lo*hi into
+# THREE SEPARATE accumulators c0/c1/c2 summed once at the end, so the 3 MMAs are
+# data-independent and the scheduler can pipeline them (fills the idle tensor
+# slots, hides the MMA latency). It is a DIFFERENT precision than the built-in:
+# 3 products (not the built-in's finer multi-product split) => relerr ~1e-6
+# (measured), strictly between tf32x2 (~4e-4) and built-in tf32x3 (~1.6e-7), and
+# uses 3 MMAs vs the built-in's larger count (so also less tensor work). Whether
+# ~1e-6 clears the n=512 ill-cond gate (rankdef/clustered/mixed) is a measured
+# question -- gated by IPREC so only the n=512 caller opts in; all other callers
+# keep the built-in. lo parts truncated to tf32 (exact tf32 MMA on every pass).
+@triton.jit
+def _dot_tf32x3i(x, y):
+    MASK: tl.constexpr = -8192
+    x_hi = (x.to(tl.int32, bitcast=True) & MASK).to(tl.float32, bitcast=True)
+    x_lo = ((x - x_hi).to(tl.int32, bitcast=True) & MASK).to(tl.float32, bitcast=True)
+    y_hi = (y.to(tl.int32, bitcast=True) & MASK).to(tl.float32, bitcast=True)
+    y_lo = ((y - y_hi).to(tl.int32, bitcast=True) & MASK).to(tl.float32, bitcast=True)
+    c0 = tl.dot(x_hi, y_hi, input_precision="tf32")
+    c1 = tl.dot(x_hi, y_lo, input_precision="tf32")
+    c2 = tl.dot(x_lo, y_hi, input_precision="tf32")
+    return c0 + c1 + c2
+
+
 @triton.jit
 def _trailing_fused_kernel(
     A_ptr, Vbuf_ptr, Tbuf_ptr,
@@ -1417,6 +1459,8 @@ def _trailing_fused_kernel(
             vchunk = tl.load(vp, mask=rrmask[None, :], other=0.0)
             if IPREC == "tf32x2":
                 d = _dot_tf32x2(vchunk, achunk)
+            elif IPREC == "tf32x3i":
+                d = _dot_tf32x3i(vchunk, achunk)
             else:
                 d = tl.dot(vchunk, achunk, input_precision=IPREC)
             if ci % 2 == 0:
@@ -1436,6 +1480,8 @@ def _trailing_fused_kernel(
             vchunk = tl.load(vp, mask=rrmask[None, :], other=0.0)                    # (BLK,BM)
             if IPREC == "tf32x2":
                 W += _dot_tf32x2(vchunk, achunk)        # achunk (A) kept full precision
+            elif IPREC == "tf32x3i":
+                W += _dot_tf32x3i(vchunk, achunk)
             else:
                 W += tl.dot(vchunk, achunk, input_precision=IPREC)
     else:
@@ -1454,6 +1500,8 @@ def _trailing_fused_kernel(
             vchunk = tl.load(vp, mask=rrmask[None, :], other=0.0)                    # (BLK,BM)
             if IPREC == "tf32x2":
                 W += _dot_tf32x2(vchunk, achunk)        # achunk (A) kept full precision
+            elif IPREC == "tf32x3i":
+                W += _dot_tf32x3i(vchunk, achunk)
             else:
                 W += tl.dot(vchunk, achunk, input_precision=IPREC)
 
@@ -1477,6 +1525,8 @@ def _trailing_fused_kernel(
             Vrow = tl.load(vp2, mask=rrmask[:, None], other=0.0)                     # (BM,BLK)
             if IPREC == "tf32x2":
                 delta = _dot_tf32x2(Vrow, YT)            # YT (A-derived) kept full precision
+            elif IPREC == "tf32x3i":
+                delta = _dot_tf32x3i(Vrow, YT)
             else:
                 delta = tl.dot(Vrow, YT, input_precision=IPREC)                     # (BM,BNc)
             ap2 = a_trail_base + rr[:, None] * stride_an + ccols[None, :]
@@ -1492,6 +1542,8 @@ def _trailing_fused_kernel(
             Vrow = tl.load(vp2, mask=rrmask[:, None], other=0.0)                     # (BM,BLK)
             if IPREC == "tf32x2":
                 delta = _dot_tf32x2(Vrow, YT)            # YT (A-derived) kept full precision
+            elif IPREC == "tf32x3i":
+                delta = _dot_tf32x3i(Vrow, YT)
             else:
                 delta = tl.dot(Vrow, YT, input_precision=IPREC)                     # (BM,BNc)
             ap2 = a_trail_base + rr[:, None] * stride_an + ccols[None, :]
@@ -2344,7 +2396,7 @@ def _w2_qr_2level_n512(data):
                 src, Vbuf, Tbuf, B, N, j, pheight, ncols, j + bb,
                 sab, san, svb, svk, svn, stb, stk, stn,
                 H,
-                BLK=NB, BM=FBM, BNc=FBNC, num_warps=FNW, IPREC="tf32x3",
+                BLK=NB, BM=FBM, BNc=FBNC, num_warps=FNW, IPREC=_N512_2L_F_PREC,
                 NACC=_N512_2L_F_NACC, NS=_N512_2L_F_NS,
             )
         j += bb
