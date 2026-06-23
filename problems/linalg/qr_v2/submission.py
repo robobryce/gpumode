@@ -964,10 +964,18 @@ def _panel_factor_kernel(
 
         denom = alpha - beta
         denom = tl.where(denom == 0.0, 1.0, denom)
+        # v construction (brief-10/11 ALU trims, FP-exact, grafted onto W0 base):
+        #  - `tl.where(active, v, 0)` is REDUNDANT: xk is already 0 for rows<k and
+        #    rows>=pheight (`xk = tl.where(active, xk, 0)` above, active =
+        #    (rows>=k)&row_valid), so `tl.where(rows>k, xk/denom, 0)` already yields
+        #    0 outside [k, pheight); k<BLK<=pheight so rows==k is always valid.
+        #  - the `has_refl=False` fallback (force v=e_k) is ALSO already satisfied:
+        #    has_refl=(tail_n2>0), tail_n2=sum(xk[rows>k]^2); tail_n2==0 is FP-exact
+        #    iff every xk[rows>k]==0, so v[rows>k]=xk/denom=0 (denom guarded != 0),
+        #    v[rows==k]=1, v[rows<k]=0 == e_k with NO extra select.
+        # Drops two (MAXH,)-wide selects per column in the ALU-bound (47%) panel.
         v = tl.where(rows > k, xk / denom, 0.0)
         v = tl.where(rows == k, 1.0, v)
-        v = tl.where(active, v, 0.0)
-        v = tl.where(has_refl, v, tl.where(rows == k, 1.0, 0.0))
 
         # w[c] = v_k . panel[:,c] -- used both for the trailing-panel update AND
         # the incremental T factor. Because v_k is supported only on rows >= k,
@@ -1418,10 +1426,13 @@ def _panel_factor2_kernel(
 
         denom = alpha - beta
         denom = tl.where(denom == 0.0, 1.0, denom)
+        # v construction (brief-10/11 ALU trims, FP-exact, grafted onto W0 base;
+        # identical to _panel_factor_kernel): `tl.where(active, v, 0)` is redundant
+        # (xk already 0 outside [k,pheight)) and the has_refl=False fallback already
+        # equals e_k (tail_n2==0 FP-exact => xk[rows>k]==0 => v==e_k). Two fewer
+        # (MAXH,)-wide selects per column in the ALU-bound panel.
         v = tl.where(rows > k, xk / denom, 0.0)
         v = tl.where(rows == k, 1.0, v)
-        v = tl.where(active, v, 0.0)
-        v = tl.where(has_refl, v, tl.where(rows == k, 1.0, 0.0))
 
         w = tl.sum(v[:, None] * panel, axis=0)
 
