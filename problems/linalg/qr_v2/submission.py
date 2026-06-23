@@ -1608,13 +1608,17 @@ def _cross_T_kernel(
     T0 = tl.load(t0p)
     t1p = t_base + (kk[:, None] + IB) * stride_tk + (kk[None, :] + IB) * stride_tn
     T1 = tl.load(t1p)
-    T0 = tl.where(real[:, None] & real[None, :], T0, 0.0)
-    T1 = tl.where(real[:, None] & real[None, :], T1, 0.0)
+    # brief-12 ALU trims (FP-exact): G has rows>=IB AND cols>=IB exactly 0 (V0
+    # masked real[:,None], V1 masked real[None,:] in every chunk dot). So in
+    # TG=T0@G the T0 cols>=IB hit G rows>=IB=0 (g*0=0, g finite) and TG cols>=IB
+    # are 0 (G cols>=IB=0); in T01=-(TG@T1) the T1 rows>=IB hit TG cols>=IB=0;
+    # TG/T01 rows>=IB and T01 cols>=IB are unobserved (T01 stored masked real&real).
+    # So the T0, T1 and pre-store T01 masks are all redundant -- the store mask
+    # alone is load-bearing. Drop the three (IBP,IBP) selects.
 
     # T01 = -(T0 @ G) @ T1   (IB x IB).  IBP>=16 keeps the dots legal.
     TG = tl.dot(T0, G, input_precision="tf32x3")
     T01 = -tl.dot(TG, T1, input_precision="tf32x3")
-    T01 = tl.where(real[:, None] & real[None, :], T01, 0.0)
 
     # store into [0:IB, IB:2IB]
     toutp = t_base + kk[:, None] * stride_tk + (kk[None, :] + IB) * stride_tn
@@ -1674,11 +1678,12 @@ def _cross_finish_kernel(
     T0 = tl.load(t0p)
     t1p = t_base + (kk[:, None] + IB) * stride_tk + (kk[None, :] + IB) * stride_tn
     T1 = tl.load(t1p)
-    T0 = tl.where(real[:, None] & real[None, :], T0, 0.0)
-    T1 = tl.where(real[:, None] & real[None, :], T1, 0.0)
+    # brief-12 ALU trims (FP-exact, same proof as _cross_T_kernel): G rows>=IB and
+    # cols>=IB are 0 (Gpart from _cross_gram_kernel's dot has V0 masked real[:,None]
+    # and V1 masked real[None,:]). So T0/T1 masks and the pre-store T01 mask are
+    # all redundant -- the store mask alone is load-bearing. Drop the three selects.
     TG = tl.dot(T0, G, input_precision="tf32x3")
     T01 = -tl.dot(TG, T1, input_precision="tf32x3")
-    T01 = tl.where(real[:, None] & real[None, :], T01, 0.0)
     toutp = t_base + kk[:, None] * stride_tk + (kk[None, :] + IB) * stride_tn
     tl.store(toutp, T01, mask=real[:, None] & real[None, :])
 
