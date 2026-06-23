@@ -822,6 +822,13 @@ _2L_HYBRID_H = int(_os.environ.get("QR_2L_HYBRID_H", "2048"))
 # at a worse BM -- the SM-starved reduction now clearly benefits from the split.)
 _2L_SPLITGRAM = int(_os.environ.get("QR_2L_SPLITGRAM", "1")) != 0
 _2L_GRAM_BM = int(_os.environ.get("QR_2L_GRAM_BM", "128"))
+# Inner-trailing (apply sub-panel 0 -> sub-panel 1's 8 cols) tiles. The YT2 half
+# runs grid=(1,B)=2 (SM-starved); more warps / a different chunk may speed its
+# tall row reduction. apply2 is grid=(cdiv(pheight,BM),B) (SM-filled).
+_YT2_BM = int(_os.environ.get("QR_YT2_BM", "128"))
+_YT2_NW = int(_os.environ.get("QR_YT2_NW", "4"))
+_AP2_BM = int(_os.environ.get("QR_AP2_BM", "128"))
+_AP2_NW = int(_os.environ.get("QR_AP2_NW", "4"))
 
 
 def _mcta_choose_G(B, pheight, SMs=148):
@@ -1467,9 +1474,13 @@ def _w2_qr_2level(data):
     stb, stk, stn = Tbuf.stride(0), Tbuf.stride(1), Tbuf.stride(2)
     syb, syk, syn = YTbuf.stride(0), YTbuf.stride(1), YTbuf.stride(2)
 
-    # trailing tiles for the n>=2048 (grid-starved) regime, BLK=16
-    BM_Y, BNc_Y, NW_Y = 128, 64, 4
-    BM_A, BNc_A, NW_A = 32, 32, 2
+    # trailing tiles for the n>=2048 (grid-starved) regime, BLK=16 (knob-tunable)
+    BM_Y = int(_os.environ.get("QR_2L_BMY", "128"))
+    BNc_Y = int(_os.environ.get("QR_2L_BNCY", "64"))
+    NW_Y = int(_os.environ.get("QR_2L_NWY", "4"))
+    BM_A = int(_os.environ.get("QR_2L_BMA", "32"))
+    BNc_A = int(_os.environ.get("QR_2L_BNCA", "32"))
+    NW_A = int(_os.environ.get("QR_2L_NWA", "2"))
 
     j = 0
     while j < N:
@@ -1525,12 +1536,12 @@ def _w2_qr_2level(data):
             _trailing_YT2_kernel[(1, B)](
                 H, Vbuf, Tbuf, YTbuf, B, N, j, pheight, b1, j + b0,
                 sab, san, svb, svk, svn, stb, stk, stn, syb, syk, syn,
-                BLK=NB, BM=128, BNc=NB, NREF=IB, num_warps=4,
+                BLK=NB, BM=_YT2_BM, BNc=NB, NREF=IB, num_warps=_YT2_NW,
             )
-            _trailing_apply2_kernel[(triton.cdiv(pheight, 128), B)](
+            _trailing_apply2_kernel[(triton.cdiv(pheight, _AP2_BM), B)](
                 H, Vbuf, YTbuf, B, N, j, pheight, b1, j + b0,
                 sab, san, svb, svk, svn, syb, syk, syn,
-                BLK=NB, BM=128, BNc=NB, NREF=IB, num_warps=4,
+                BLK=NB, BM=_AP2_BM, BNc=NB, NREF=IB, num_warps=_AP2_NW,
             )
 
             # sub-panel 1: cols [j+b0, j+b0+b1), V/T at offset (row IB, col IB)
