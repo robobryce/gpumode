@@ -850,6 +850,7 @@ _N2048_BLK = int(_os.environ.get("QR_N2048_BLK", "16"))
 # height-based default (32). The panel is L1/serial-latency bound, so fewer warps
 # (less cross-warp shared-mem sync per reflector reduction) MIGHT cut latency.
 _N2048_PNW = int(_os.environ.get("QR_N2048_PNW", "8"))
+_N2048_PNW_MID = int(_os.environ.get("QR_N2048_PNW_MID", "0"))  # 512<MAXH<=1024 band
 
 
 def _mcta_choose_G(B, pheight, SMs=148):
@@ -1802,10 +1803,17 @@ def _w2_qr(data, blk_override=None):
         else:
             nwp = 32
         # n=2048 panel-warp override: the panel is L1/serial-latency bound (ncu:
-        # 56% L1, 2.97% SM, 41% no-eligible-warp). Sweep panel warps for the tall
-        # panels independently. _N2048_PNW=0 -> keep the height-based default.
-        if blk_override is not None and _N2048_PNW > 0 and MAXH > 1024:
-            nwp = _N2048_PNW
+        # 56% L1, 2.97% SM, 41% no-eligible-warp at nwp=32). Fewer warps = fewer
+        # per-reflector shared-mem barriers -> shorter serial latency. Swept:
+        # nwp 8 (256 thr) wins -8.5% on the tall (MAXH>1024) panels; nwp=4 spills
+        # the (2048,16) tensor. _N2048_PNW applies to MAXH>1024; _N2048_PNW_MID to
+        # the 512<MAXH<=1024 band (smaller tensor -> may take fewer warps before
+        # spilling). 0 in either -> keep the height-based default.
+        if blk_override is not None:
+            if _N2048_PNW > 0 and MAXH > 1024:
+                nwp = _N2048_PNW
+            elif _N2048_PNW_MID > 0 and 512 < MAXH <= 1024:
+                nwp = _N2048_PNW_MID
 
         _panel_factor_kernel[(B,)](
             H, tau, Vbuf, Tbuf,
