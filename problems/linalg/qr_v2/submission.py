@@ -772,6 +772,16 @@ _FUSED_TRAIL = int(_os.environ.get("QR_FUSED_TRAIL", "1")) != 0
 _BM_F = int(_os.environ.get("QR_BM_F", "32"))
 _BNC_F = int(_os.environ.get("QR_BNC_F", "32"))
 _NW_F = int(_os.environ.get("QR_NW_F", "2"))
+# brief-22 COMBINE: n=1024 fused-trailing ILP knobs grafted from worker-0 brief-21.
+# The leader base routes n=1024 through _w2_qr -> _trailing_fused_kernel with the
+# accepted (BM=128,BNc=64,NW=4) tile (f8e3567, leaderboard id 829663). brief-21's
+# n=1024 optimum on the OLD (32,32,2) tile was NACC=1 (single chain) + NS=3 (the
+# longer K-loop already amortises the accumulate chain, so the win is purely the
+# software-pipeline that hides L1-miss latency). The pipeline lever is orthogonal
+# to tile size, so NS=3 transfers onto the big tile; NACC stays 1 (keep the bigger
+# tile's lower register pressure). Re-measured per-N on this base.
+_FUSE_NACC_1024 = int(_os.environ.get("QR_FUSE_NACC_1024", "1"))
+_FUSE_NS_1024 = int(_os.environ.get("QR_FUSE_NS_1024", "3"))
 
 
 def _fused_tile_for_N(N):
@@ -967,8 +977,17 @@ _N512_2L_NB = int(_os.environ.get("QR_N512_2L_NB", "32"))   # outer block / wide
 # trailing + cross_T fill SMs via the split variants. Distinct from the n>=2560
 # (grid-STARVED) tiles in _w2_qr_2level.
 _N512_2L_FBM = int(_os.environ.get("QR_N512_2L_FBM", "32"))   # fused wide-trail BM
-_N512_2L_FBNC = int(_os.environ.get("QR_N512_2L_FBNC", "32")) # fused wide-trail BNc
+# brief-22 COMBINE: graft worker-0's brief-21 ILP tune onto the n=512 two-level
+# WIDE trailing (it still routes through _trailing_fused_kernel -- _trailing_fused2
+# is only the tiny inner trailing). The wide trailing is the n=512 dominant cost
+# (~59.8%) and it IS the W=V^T@A latency-bound reduction brief-21 measured. So the
+# brief-21 optimum (2 partial-W accumulators + 3-stage pipeline + wide BNc=64,
+# -7.3% on the n=512 trailing on the prior single-level base) transfers directly.
+# Re-measured PER-N on this two-level base because the optimum may shift.
+_N512_2L_FBNC = int(_os.environ.get("QR_N512_2L_FBNC", "64")) # fused wide-trail BNc (brief-21 ILP optimum)
 _N512_2L_FNW = int(_os.environ.get("QR_N512_2L_FNW", "2"))    # fused wide-trail warps
+_N512_2L_F_NACC = int(_os.environ.get("QR_N512_2L_F_NACC", "2"))  # split-W ILP accumulators
+_N512_2L_F_NS = int(_os.environ.get("QR_N512_2L_F_NS", "3"))      # software-pipeline stages
 _N512_2L_PNW = int(_os.environ.get("QR_N512_2L_PNW", "4"))    # IB=16 sub-panel warps
 _N512_2L_GRAM_BM = int(_os.environ.get("QR_N512_2L_GRAM_BM", "128"))  # cross-Gram/YT2 row tile
 # Split inner-trailing + cross-T across SMs. The split variants (partW+finishW,
@@ -1299,6 +1318,7 @@ def _trailing_fused_kernel(
     Aout_ptr,                                 # separate store dest (block 0: read A, write H => fuses the clone)
     BLK: tl.constexpr, BM: tl.constexpr, BNc: tl.constexpr,
     IPREC: tl.constexpr = "tf32x3",
+    NACC: tl.constexpr = 1, NS: tl.constexpr = 1,
 ):
     col_tile = tl.program_id(0)
     bid = tl.program_id(1)
@@ -1317,19 +1337,54 @@ def _trailing_fused_kernel(
     # IPREC controls this big W=V^T@A reduction (the bulk FLOPs). Default tf32x3
     # keeps n=512 (which shares this kernel) at full accuracy; the n=1024 caller may
     # pass 1-pass "tf32" (gated by N==1024) once the residual gate is measured-clear.
-    W = tl.zeros((BLK, BNc), dtype=tl.float32)
+    #
+    # LATENCY-HIDING (brief-21 ILP tune, grafted onto the leader combine base):
+    # the n=512 W-reduction is latency-bound, not parallelism-starved across CTAs
+    # (ncu: 51% no-eligible-warp, 0.74 eligible warps/scheduler, occupancy register-
+    # capped at 6 blocks/SM). The stall is the loop-carried W += dot(...) accumulate
+    # chain: each warp issues a dot, then waits on its MMA + the next A/V load before
+    # it can accumulate, and there are too few resident warps to hide that. Co-batching
+    # MB matrices/CTA only RAISES OCCUPANCY but eligible warps DROP (more warps don't
+    # help a per-warp dependency chain). What DOES fill the idle issue slots is INTRA-
+    # warp: (a) NACC independent partial-W accumulators break the single loop-carried
+    # chain into NACC chains the scheduler interleaves (ILP hides the MMA latency), and
+    # (b) tl.range(num_stages=NS) software-pipelines the A/V loads ahead of the dots
+    # (hides the L1-miss latency). NACC=2,NS=3,BNc=64 measured -7.3% on the n=512
+    # trailing vs the single-chain BNc=32 fused. Defaults NACC=1,NS=1 reproduce the
+    # prior single-chain path exactly (perf-neutral).
     nchunks = tl.cdiv(pheight, BM)
-    for ci in range(0, nchunks):
-        rr = ci * BM + tl.arange(0, BM)
-        rrmask = rr < pheight
-        ap = a_trail_base + rr[:, None] * stride_an + ccols[None, :]
-        achunk = tl.load(ap, mask=rrmask[:, None] & cmask[None, :], other=0.0)   # (BM,BNc)
-        vp = v_base + krange[:, None] * stride_vk + rr[None, :] * stride_vn
-        vchunk = tl.load(vp, mask=rrmask[None, :], other=0.0)                    # (BLK,BM)
-        if IPREC == "tf32x2":
-            W += _dot_tf32x2(vchunk, achunk)        # achunk (A) kept full precision
-        else:
-            W += tl.dot(vchunk, achunk, input_precision=IPREC)
+    if NACC == 2:
+        W0 = tl.zeros((BLK, BNc), dtype=tl.float32)
+        W1 = tl.zeros((BLK, BNc), dtype=tl.float32)
+        for ci in tl.range(0, nchunks, num_stages=NS):
+            rr = ci * BM + tl.arange(0, BM)
+            rrmask = rr < pheight
+            ap = a_trail_base + rr[:, None] * stride_an + ccols[None, :]
+            achunk = tl.load(ap, mask=rrmask[:, None] & cmask[None, :], other=0.0)
+            vp = v_base + krange[:, None] * stride_vk + rr[None, :] * stride_vn
+            vchunk = tl.load(vp, mask=rrmask[None, :], other=0.0)
+            if IPREC == "tf32x2":
+                d = _dot_tf32x2(vchunk, achunk)
+            else:
+                d = tl.dot(vchunk, achunk, input_precision=IPREC)
+            if ci % 2 == 0:
+                W0 += d
+            else:
+                W1 += d
+        W = W0 + W1
+    else:
+        W = tl.zeros((BLK, BNc), dtype=tl.float32)
+        for ci in tl.range(0, nchunks, num_stages=NS):
+            rr = ci * BM + tl.arange(0, BM)
+            rrmask = rr < pheight
+            ap = a_trail_base + rr[:, None] * stride_an + ccols[None, :]
+            achunk = tl.load(ap, mask=rrmask[:, None] & cmask[None, :], other=0.0)   # (BM,BNc)
+            vp = v_base + krange[:, None] * stride_vk + rr[None, :] * stride_vn
+            vchunk = tl.load(vp, mask=rrmask[None, :], other=0.0)                    # (BLK,BM)
+            if IPREC == "tf32x2":
+                W += _dot_tf32x2(vchunk, achunk)        # achunk (A) kept full precision
+            else:
+                W += tl.dot(vchunk, achunk, input_precision=IPREC)
 
     # YT = T^T @ W  (stays in registers, never written to HBM). Tiny BLKxBLK dot ->
     # keep full tf32x3 (negligible cost, and it couples all reflectors -> delicate).
@@ -1338,8 +1393,9 @@ def _trailing_fused_kernel(
     YT = tl.dot(tl.trans(Tm), W, input_precision="tf32x3")                        # (BLK,BNc)
 
     # sweep 2: A_trail -= V @ YT, re-reading each A chunk and storing in place.
-    # delta=V@YT is the second bulk GEMM -> also IPREC-controlled.
-    for ci in range(0, nchunks):
+    # delta=V@YT is the second bulk GEMM -> also IPREC-controlled. Pipelined the same
+    # way (num_stages=NS prefetches the next A/V chunk while the current dot runs).
+    for ci in tl.range(0, nchunks, num_stages=NS):
         rr = ci * BM + tl.arange(0, BM)
         rrmask = rr < pheight
         vp2 = v_base + krange[None, :] * stride_vk + rr[:, None] * stride_vn
@@ -2191,12 +2247,15 @@ def _w2_qr_2level_n512(data):
             # ONE wide NB=32 trailing over the bulk, exact via the combined T.
             # Fused on-chip (W kept in regs, no YT HBM round-trip); race-free
             # (each program owns a full-height column strip). tf32x3 (n=512).
+            # brief-22: ILP split-accumulator (NACC) + software-pipeline (NS) +
+            # wide BNc=64 grafted from worker-0 brief-21 (latency-bound W-reduction).
             nct_f = triton.cdiv(ncols, FBNC)
             _trailing_fused_kernel[(nct_f, B)](
                 src, Vbuf, Tbuf, B, N, j, pheight, ncols, j + bb,
                 sab, san, svb, svk, svn, stb, stk, stn,
                 H,
                 BLK=NB, BM=FBM, BNc=FBNC, num_warps=FNW, IPREC="tf32x3",
+                NACC=_N512_2L_F_NACC, NS=_N512_2L_F_NS,
             )
         j += bb
 
@@ -2305,6 +2364,14 @@ def _w2_qr(data, blk_override=None):
         BM_F = int(_os.environ.get("QR_N2048_FBM", "128"))
         BNc_F = int(_os.environ.get("QR_N2048_FBNC", "64"))
         NW_F = int(_os.environ.get("QR_N2048_FNW", "4"))
+    # brief-22 COMBINE: n=1024 fused-trailing ILP (worker-0 brief-21). The software-
+    # pipeline (NS) hides L1-miss latency on the accepted (128,64,4) tile; gated to
+    # N==1024 (a shape param -> invariance-safe) so n=2048's grid-starved fused path
+    # keeps the single-chain non-pipelined tile. Defaults (1,1) elsewhere == no-op.
+    if blk_override is None and N == 1024:
+        fuse_nacc, fuse_ns = _FUSE_NACC_1024, _FUSE_NS_1024
+    else:
+        fuse_nacc, fuse_ns = 1, 1
     # Trailing GEMM precision: only the n=2048 (blk_override) path may use a cheaper
     # precision than tf32x3 (gated by N, a shape param -> invariance-safe). All other
     # shapes keep tf32x3 via the kernels' IPREC default.
@@ -2386,6 +2453,7 @@ def _w2_qr(data, blk_override=None):
                     sab, san, svb, svk, svn, stb, stk, stn,
                     H,
                     BLK=BLK, BM=BM_F, BNc=BNc_F, num_warps=NW_F, IPREC=fused_iprec,
+                    NACC=fuse_nacc, NS=fuse_ns,
                 )
             else:
                 nct_y = triton.cdiv(ncols, BNc_Y)
