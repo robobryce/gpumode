@@ -1512,9 +1512,11 @@ def _panel_factor2_kernel(
 
         w = tl.sum(v[:, None] * panel, axis=0)
 
-        z = tl.where(cols < k, w, 0.0)
-        Tcol = -tau_k * tl.sum(Tmat * z[None, :], axis=1)
-        Tcol = tl.where(cols < k, Tcol, 0.0)
+        # brief-12 ALU trims (FP-exact, identical proof to _panel_factor_kernel):
+        # Tmat strict-lower=0 and cols>=k still initial 0 at step k, so z=where(
+        # cols<k,w,0) is redundant (0*finite=0 for c>=k products) and Tcol=where(
+        # cols<k,Tcol,0) is redundant (Tcol[a>=k] already 0). Use w directly.
+        Tcol = -tau_k * tl.sum(Tmat * w[None, :], axis=1)
         Tcol = tl.where(cols == k, tau_k, Tcol)
         Tmat = tl.where(col_is_k[None, :], Tcol[:, None], Tmat)
 
