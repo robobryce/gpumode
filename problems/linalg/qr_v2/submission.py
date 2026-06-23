@@ -813,6 +813,15 @@ _NW_2L = int(_os.environ.get("QR_NW_2L", "4"))
 # path. At n=4096 this is the bottom HALF of the factorization -> ~half the
 # two-level overhead removed. Exact geqrf (one panel builds the full 16-wide T).
 _2L_HYBRID_H = int(_os.environ.get("QR_2L_HYBRID_H", "2048"))
+# Split-Gram cross-T: the single-CTA cross_T runs grid=(B,)=2, SM-starved on the
+# tall Gram reduction (was 9% of n=4096). The split version row-tiles the Gram
+# across SMs (grid=(nrt,B)) then a tiny finish forms T01. Measured at n=4096
+# (with the hybrid panel): BM=128 cuts n=4096 44.2ms->41.7ms (-5.8%); BM=256/512
+# spill the (16,BM) V tiles and regress. ON by default at BM=128. (An earlier
+# attempt lost 0.96x but that was BEFORE the hybrid halved the cross_T count and
+# at a worse BM -- the SM-starved reduction now clearly benefits from the split.)
+_2L_SPLITGRAM = int(_os.environ.get("QR_2L_SPLITGRAM", "1")) != 0
+_2L_GRAM_BM = int(_os.environ.get("QR_2L_GRAM_BM", "128"))
 
 
 def _mcta_choose_G(B, pheight, SMs=148):
@@ -1447,6 +1456,11 @@ def _w2_qr_2level(data):
     Vbuf = torch.zeros((B, NB, N), device=A.device, dtype=torch.float32)
     Tbuf = torch.zeros((B, NB, NB), device=A.device, dtype=torch.float32)
     YTbuf = torch.empty((B, NB, N), device=A.device, dtype=torch.float32)
+    # split-Gram partials buffer (only used when _2L_SPLITGRAM): (B, nrt_max, 16, 16)
+    if _2L_SPLITGRAM:
+        nrt_max = triton.cdiv(N, _2L_GRAM_BM)
+        Gpart = torch.empty((B, nrt_max, 16, 16), device=A.device, dtype=torch.float32)
+        sgb, sgt, sgi, sgj = Gpart.stride(0), Gpart.stride(1), Gpart.stride(2), Gpart.stride(3)
 
     sab, san = H.stride(0), H.stride(1)
     svb, svk, svn = Vbuf.stride(0), Vbuf.stride(1), Vbuf.stride(2)
@@ -1529,15 +1543,27 @@ def _w2_qr_2level(data):
                 BLK=IB, MAXH=MAXH1, num_warps=nwp1,
             )
 
-            # cross-block T01 (single CTA/matrix). Swept the reduction chunk BM:
-            # 128 is best; BM=512 register-spills the (16,512) V tiles (0.36x),
-            # and a 2-kernel split-Gram added launches+HBM that lost (0.96x). Both
-            # reverted -- the single-CTA BM=128 Gram is the cross-T floor here.
-            _cross_T_kernel[(B,)](
-                Vbuf, Tbuf, B, pheight, IB, IB,
-                svb, svk, svn, stb, stk, stn,
-                BM=128, IBP=16,
-            )
+            # cross-block T01. Default single-CTA (grid=(B,)); split-Gram option
+            # row-tiles the tall Gram across SMs (grid=(nrt,B)) then a finish forms
+            # T01 -- fills SMs for the few-matrix SM-starved reduction.
+            if _2L_SPLITGRAM:
+                nrt_g = triton.cdiv(pheight, _2L_GRAM_BM)
+                _cross_gram_kernel[(nrt_g, B)](
+                    Vbuf, Gpart, B, pheight, IB,
+                    svb, svk, svn, sgb, sgt, sgi, sgj,
+                    BM=_2L_GRAM_BM, IBP=16,
+                )
+                _cross_finish_kernel[(B,)](
+                    Gpart, Tbuf, B, nrt_g, IB,
+                    sgb, sgt, sgi, sgj, stb, stk, stn,
+                    IBP=16,
+                )
+            else:
+                _cross_T_kernel[(B,)](
+                    Vbuf, Tbuf, B, pheight, IB, IB,
+                    svb, svk, svn, stb, stk, stn,
+                    BM=128, IBP=16,
+                )
 
         bb = b0 + b1                      # reflectors in this outer block
         ncols = N - (j + bb)
