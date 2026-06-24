@@ -1521,9 +1521,8 @@ static int g_prec_w = 0;   // set internally by set_n512_good_flags; no Python s
 // marginal band/rowscale/clustered bad matrices the single-pass TF32 (~19-bit) Gram
 // rounding compounds with the trailing GEMM rounding and leaves the worst residual at
 // ~15. Modes: 0 -> single-pass TF32 (cheapest); 1 -> exact SIMT-FP32 (drives residual to
-// ~0.02). ROBUSTNESS (worker-2 brief-25, ported from board-accepted b3ef4435): the
-// remote secret s7 run amplifies a latent orth instability the local toolchain cannot
-// reproduce; exact-S restores the wide margin the board-accepted entry had.
+// ~0.02). ROBUSTNESS: the remote secret s7 run amplifies a latent orth instability the
+// local toolchain cannot reproduce, so exact-S is required to hold the wide margin.
 static int g_prec_s = 0;
 // DETERMINISM: forbid split-K in the blocked_qr_2level trailing GEMMs.
 // On the n512-mixed BAD subset (qr_n512_mixed_driver), the exact SIMT-FP32 trailing
@@ -6375,8 +6374,8 @@ __global__ void diag_lu_static_fused_kernel(float* __restrict__ Mg,
 // 64x64 block. Only the pivot row kk (srow) and pivot column kk (scol) cross __shared__
 // per column; the trailing FMA reads them from smem and updates the thread's registers
 // in place -- no per-column smem round-trip of the whole block. ~22% faster than the
-// static kernel (1967 vs 2534us over the 64 panels at n=4096,b2, measured). The math is
-// IDENTICAL (bit-for-bit verified): same on-the-fly multiplier (scol[r]*inv)*srow[c],
+// static kernel. The math is IDENTICAL (bit-for-bit verified): same on-the-fly
+// multiplier (scol[r]*inv)*srow[c],
 // same deferred-scale write-back (diag:=piv, strict-lower:=raw/pivs[c]), same D signs --
 // so V (strict-lower) and the recon's (H,tau) are unchanged. TX*TY==256 threads; the
 // 64x64 tile is 16(TX) x 16(TY) threads x 4(RX) x 4(RY) registers.
@@ -7888,13 +7887,9 @@ std::vector<torch::Tensor> oz_slice(torch::Tensor A, int64_t NS) {
     // cjf zero-initialized: oz_colmax atomicMax's row-block partials into it.
     auto cjf = torch::zeros({batch, n}, A.options().dtype(torch::kFloat32));
     dim3 cmblk(OZ_CM_TILE, 16);
-    // RB row-blocks along grid.y so the launch fills the device (was 1 -> ~16% BW).
-    // ~16 rows/thread per block keeps each block's serial walk short while bounding
-    // the atomicMax contention to RB writers per column.
-    // RB=8 row-blocks (down from 16): halves the per-column atomicMax writer set
-    // (8 vs 16 races) while still launching 8*(n/128)*batch blocks that fill the
-    // device; the float4 kernel is now BW-bound (~64% DRAM) so the longer 512-row
-    // walk is free. Measured colmax-only 28.58us (RB16) -> 27.49us (RB8), bit-exact.
+    // RB=8 row-blocks along grid.y fill the device while bounding the per-column atomicMax
+    // contention to 8 writers; 8*(n/128)*batch blocks keep each block's serial row-walk
+    // short, and the float4 kernel is BW-bound (~64% DRAM) so the 512-row walk is free.
     constexpr int OZ_CM_RB = 8;
     if ((n & 3) == 0) {
         // float4 fast path: each thread owns 4 contiguous columns, so a block
@@ -7941,8 +7936,6 @@ void oz_recombine_2pass(torch::Tensor P, torch::Tensor wg, torch::Tensor cj,
     dim3 grid((n + 31) / 32, (n + 7) / 8, batch);
     // Pass A: int2-vectorized (2 cols/thread, 8B coalesced load + 16B ST.128 store;
     // bit-exact, same per-element k-order as the scalar kernel). x-grid shrinks 2x.
-    // (An int4 4-cols/thread variant was tried but lost occupancy -- int4 65% -- and
-    // under-packed its 32B store; int2's full-sector store and higher occupancy won.)
     if ((n & 1) == 0) {
         dim3 gridA(((n / 2) + 31) / 32, (n + 7) / 8, batch);
         oz_recombine_S_v2_kernel<<<gridA, blk>>>(P.data_ptr<int>(), npairs,
@@ -7951,10 +7944,8 @@ void oz_recombine_2pass(torch::Tensor P, torch::Tensor wg, torch::Tensor cj,
         oz_recombine_S_kernel<<<grid, blk>>>(P.data_ptr<int>(), npairs,
             wg.data_ptr<double>(), n, batch, S.data_ptr<double>());
     }
-    // Pass B: scalar GfromS. (A smem-transpose-tiled pass-B variant was tried and
-    // REGRESSED on shape6 -- 1024-thread/8.4KB-smem block caps to 2-3 blocks/SM, its
-    // __syncthreads stalls the near-empty SM, and it loses the scalar read's incidental
-    // L2 reuse on S[j,i]; the scattered transpose read is better left to L2 than staged.)
+    // Pass B: scalar GfromS (the scattered transpose read on S[j,i] is better left to L2
+    // than staged through smem).
     oz_recombine_GfromS_kernel<<<grid, blk>>>(P.data_ptr<int>(), wg.data_ptr<double>(),
         (int)ndiag, S.data_ptr<double>(), n, batch,
         cj.data_ptr<double>(), G.data_ptr<double>(), (int)lower);
