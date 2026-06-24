@@ -1462,16 +1462,20 @@ def _panel_factor_kernel(
         Tcol = tl.where(cols == k, tau_k, Tcol)
         Tmat = tl.where(col_is_k[None, :], Tcol[:, None], Tmat)
 
-        # apply H_k to trailing panel columns (c > k)
+        # apply H_k to trailing panel columns (c > k) + store column k, in ONE
+        # tile pass (brief-46/W0 grafting W1 brief-40, both panel kernels). The
+        # single-CTA panel tile SPILLS to local (L1) at MAXH>=1024; the trailing
+        # update (c>k: panel-=tau*v*w) and the col-k write (c==k,rows>=k) touch
+        # DISJOINT columns, so merging their two full-tile write passes into ONE
+        # tl.where reads+writes the spilled tile ONCE per step instead of twice.
+        # Math identical -> H,tau BYTE-EXACT.
         upd = tau_k * v[:, None] * w[None, :]
-        col_gt_k = cols > k
-        panel = tl.where(col_gt_k[None, :], panel - upd, panel)
-
-        # store this column: R[k,k] on diag, reflector below; leave rows<k
-        # (already-finalized R entries from earlier steps) untouched.
         diagval = tl.where(has_refl, beta, alpha)
         new_colk = tl.where(rows == k, diagval, v)        # row==k -> beta, row>k -> v
-        panel = tl.where(col_is_k[None, :] & (rows[:, None] >= k), new_colk[:, None], panel)
+        col_gt_k = cols > k
+        colk_write = col_is_k[None, :] & (rows[:, None] >= k)
+        panel = tl.where(colk_write, new_colk[:, None],
+                         tl.where(col_gt_k[None, :], panel - upd, panel))
 
         tau_panel = tl.where(col_is_k & do_k, tau_k, tau_panel)
 
