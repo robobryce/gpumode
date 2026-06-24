@@ -7475,61 +7475,19 @@ torch::Tensor recon_lu_cpp(torch::Tensor M, torch::Tensor R, torch::Tensor D, in
 // for non-negative floats: the IEEE-754 bit pattern is monotone for x>=0). cjf must
 // be zero-initialized by the caller; the 1e-30 floor is applied by oz_finalize_cj /
 // in the peel division so an all-zero column does not divide by zero.
-constexpr int OZ_CM_TILE = 32;             // columns/block for oz_colmax (== blockDim.x)
+constexpr int OZ_CM_TILE = 32;             // threads/row-partition for oz_colmax_v4 (== blockDim.x)
 __device__ __forceinline__ void oz_atomic_max_pos(float* addr, float val) {
     // atomicMax on the int reinterpretation; valid because val>=0 (max-abs) and the
     // IEEE-754 ordering of non-negative floats matches their signed-int bit ordering.
     atomicMax(reinterpret_cast<int*>(addr), __float_as_int(val));
 }
-__global__ void oz_colmax_kernel(const float* __restrict__ Ag, int n, int batch,
-                                 float* __restrict__ cjf) {
-    constexpr int TILE = OZ_CM_TILE;
-    int b = blockIdx.z;
-    int c0 = blockIdx.x * TILE;
-    int col = c0 + threadIdx.x;             // threadIdx.x in [0,TILE)
-    const float* A = Ag + (long)b * n * n;
-    // Row-slab owned by this block along grid.y (gridDim.y row-blocks).
-    int rows_per_blk = (n + gridDim.y - 1) / gridDim.y;
-    int r0 = blockIdx.y * rows_per_blk;
-    int r1 = r0 + rows_per_blk; if (r1 > n) r1 = n;
-    float loc = 0.f;
-    if (col < n) {
-        for (int i = r0 + threadIdx.y; i < r1; i += blockDim.y)
-            loc = fmaxf(loc, fabsf(A[(long)i * n + col]));   // coalesced over col within row i
-    }
-    // Cross-row-partition (threadIdx.y) reduction.  fmaxf is a selection, so the
-    // result is BIT-IDENTICAL regardless of reduction order/method -- swapping the
-    // prior 4-step barrier tree (which was scoreboard-stalled ~80% on the smem
-    // RMW chain: 96% occupied but only 0.59 eligible warps/cycle) for a SINGLE
-    // smem write + one barrier, then a serial register fold in warp 0 only. Warp 0
-    // re-reads the per-partition partials (read-only after the barrier, no further
-    // barrier needed) and folds them in registers, removing the dependent
-    // barrier->read->barrier ladder that produced the stall. Output bytes unchanged.
-    __shared__ float sm[TILE * 32];          // blockDim.y <= 32 row-partitions
-    sm[threadIdx.y * TILE + threadIdx.x] = loc;
-    __syncthreads();
-    if (threadIdx.y == 0 && col < n) {
-        float m = sm[threadIdx.x];
-        #pragma unroll
-        for (int yy = 1; yy < 32; ++yy) {
-            if (yy >= blockDim.y) break;
-            m = fmaxf(m, sm[yy * TILE + threadIdx.x]);
-        }
-        // atomicMax the row-block partial into the shared cjf entry (RB blocks race).
-        oz_atomic_max_pos(&cjf[(long)b * n + col], m);
-    }
-}
-
 // VECTORIZED column-max (n%4==0): each thread owns FOUR contiguous columns
-// [4*tx, 4*tx+4) read as one 16B float4 per row (the same coalesced 128B-line/warp
-// access pattern oz_peel_v4 uses), holding 4 INDEPENDENT register accumulators.
-// This (a) reads A with float4 transactions -> fewer LSU requests + full line use,
-// (b) gives the scheduler 4 independent fmax chains per thread (ILP that hides the
-// dependent-fmax + smem-reduce latency that left the scalar kernel at 0.59 eligible
-// warps/cycle), and (c) covers 4*OZ_CM_TILE columns/block so the column-tile count
-// (and thus the per-column atomicMax writer set) is the SAME RB, but a quarter as
-// many blocks issue. fmaxf is a selection so the emitted cj is BIT-IDENTICAL to the
-// scalar kernel. cjf must be zero-initialized (1e-30 floor applied later).
+// [4*tx, 4*tx+4) read as one 16B float4 per row, holding 4 INDEPENDENT register
+// accumulators -> float4 transactions (fewer LSU requests, full line use) + 4
+// independent fmax chains/thread (ILP). Covers 4*OZ_CM_TILE columns/block. fmaxf is a
+// selection so the emitted cj is order-independent. cjf must be zero-initialized
+// (1e-30 floor applied later). Single-barrier cross-partition reduction (warp 0
+// register-folds). atomicMax races RB row-block partials into the shared cjf entry.
 __global__ void oz_colmax_v4_kernel(const float* __restrict__ Ag, int n, int batch,
                                     float* __restrict__ cjf) {
     constexpr int TILE = OZ_CM_TILE;            // threads/row-partition (== blockDim.x)
@@ -7668,41 +7626,17 @@ __global__ void oz_peel_kernel(const float* __restrict__ Ag, int n, int batch, i
     }
 }
 
-// TWO-PASS recombine (reduces the latency-bound transpose-read pressure). The fused
-// single-pass kernel does, per kept-triangle element, npairs coalesced reads of
-// P[k,i,j] PLUS the off-diagonal transpose reads P[k,j,i] -- 5 strided reads scattered
-// across 5 separate 134MB int32 buffers, which thrash L2 (ncu: 23% SM / 20% DRAM /
-// 58% combined = latency-bound). Restructure using G's symmetry:
-//   G[i,j] = ci*cj * (S[i,j] + S[j,i] - Udiag[i,j])
-// where S[i,j] = sum_k wg[k]*P[k,i,j] (ALL pairs, fully coalesced) and
-//       Udiag[i,j] = sum_{p==q pairs} wg[k]*P[k,i,j] (the diagonal self-pairs).
-// Pass A writes the full S (one n*n f64 buffer); pass B's only transpose read is
-// S[j,i] -- ONE buffer instead of 5 -> far better L2 reuse.
-__global__ void oz_recombine_S_kernel(const int* __restrict__ Pg, int npairs,
-                                      const double* __restrict__ wg,
-                                      int n, int batch, double* __restrict__ Sg) {
-    int j = blockIdx.x * blockDim.x + threadIdx.x;
-    int i = blockIdx.y * blockDim.y + threadIdx.y;
-    int b = blockIdx.z;
-    if (j >= n || i >= n || b >= batch) return;
-    long nn = (long)n * n;
-    long off = (long)b * nn + (long)i * n + j;
-    long batch_nn = (long)batch * nn;
-    double acc = 0.0;
-    for (int k = 0; k < npairs; ++k)
-        acc += wg[k] * (double)Pg[(long)k * batch_nn + off];
-    Sg[off] = acc;
-}
-
-// VECTORIZED pass A, int2 width (n%2==0; 2 cols/thread). The scalar kernel above is
-// DRAM-latency-bound at 50% of peak (ncu: 85.7% of stall = L1TEX scoreboard): each thread
-// issues npairs serially-dependent int32 loads (the FP64 acc chain serializes them),
-// starving memory-level parallelism on the npairs-buffer gather (each k-step jumps a FULL
-// batch*n*n int32 buffer). This variant gives each thread TWO columns via one 8B int2 load
-// per pair (2 independent FP64 accumulators, so the loads of all npairs pairs can be in
-// flight at once) and a single 16B double2 ST.128 store -- a full-sector-aligned store at
-// high occupancy. BIT-EXACT: each S[off] = sum_k wg[k]*P[k][off] in the SAME k-order as
-// the scalar kernel; only the transaction width changes. Dispatched on (n&1)==0.
+// TWO-PASS recombine (reduces the latency-bound transpose-read pressure) using G's
+// symmetry: G[i,j] = ci*cj * (S[i,j] + S[j,i] - Udiag[i,j]), where
+//   S[i,j] = sum_k wg[k]*P[k,i,j]   (ALL pairs, fully coalesced) and
+//   Udiag[i,j] = sum_{p==q pairs} wg[k]*P[k,i,j]   (the diagonal self-pairs).
+// Pass A writes the full S (one n*n f64 buffer); pass B's only transpose read is S[j,i]
+// -- ONE buffer instead of the fused kernel's 5 -> far better L2 reuse.
+//
+// PASS A, int2-vectorized (n%2==0; 2 cols/thread): each thread gets TWO columns via one
+// 8B int2 load per pair (2 independent FP64 accumulators, so all npairs loads can be in
+// flight at once) + a single 16B double2 ST.128 store. S[off] = sum_k wg[k]*P[k][off] in
+// k-order; only the transaction width differs from a scalar accumulation.
 __global__ void oz_recombine_S_v2_kernel(const int* __restrict__ Pg, int npairs,
                                          const double* __restrict__ wg,
                                          int n, int batch, double* __restrict__ Sg) {
@@ -7794,15 +7728,10 @@ std::vector<torch::Tensor> oz_slice(torch::Tensor A, int64_t NS) {
     // device; the float4 kernel is now BW-bound (~64% DRAM) so the longer 512-row
     // walk is free. Measured colmax-only 28.58us (RB16) -> 27.49us (RB8), bit-exact.
     constexpr int OZ_CM_RB = 8;
-    if ((n & 3) == 0) {
-        // float4 fast path: each thread owns 4 contiguous columns, so a block
-        // covers 4*OZ_CM_TILE columns -> grid.x = n/(4*TILE). Bit-identical cj.
-        dim3 cmgrid((n + 4 * OZ_CM_TILE - 1) / (4 * OZ_CM_TILE), OZ_CM_RB, batch);
-        oz_colmax_v4_kernel<<<cmgrid, cmblk>>>(A.data_ptr<float>(), n, batch, cjf.data_ptr<float>());
-    } else {
-        dim3 cmgrid((n + OZ_CM_TILE - 1) / OZ_CM_TILE, OZ_CM_RB, batch);
-        oz_colmax_kernel<<<cmgrid, cmblk>>>(A.data_ptr<float>(), n, batch, cjf.data_ptr<float>());
-    }
+    // The Ozaki Gram is reached only by the n>=4096 CholeskyQR path (n=4096), so n%4==0
+    // always holds and the float4 colmax (4 contiguous columns/thread) is always taken.
+    dim3 cmgrid((n + 4 * OZ_CM_TILE - 1) / (4 * OZ_CM_TILE), OZ_CM_RB, batch);
+    oz_colmax_v4_kernel<<<cmgrid, cmblk>>>(A.data_ptr<float>(), n, batch, cjf.data_ptr<float>());
     dim3 pblk(32, 8);
     if ((n & 3) == 0) {
         // float4 fast path: blockDim.x threads cover 4*blockDim.x columns. NS is the
@@ -7831,18 +7760,12 @@ void oz_recombine_2pass(torch::Tensor P, torch::Tensor wg, torch::Tensor cj,
     int npairs = P.size(0), batch = G.size(0), n = G.size(1);
     dim3 blk(32, 8);
     dim3 grid((n + 31) / 32, (n + 7) / 8, batch);
-    // Pass A: int2-vectorized (2 cols/thread, 8B coalesced load + 16B ST.128 store;
-    // bit-exact, same per-element k-order as the scalar kernel). x-grid shrinks 2x.
-    // (An int4 4-cols/thread variant was tried but lost occupancy -- int4 65% -- and
-    // under-packed its 32B store; int2's full-sector store and higher occupancy won.)
-    if ((n & 1) == 0) {
-        dim3 gridA(((n / 2) + 31) / 32, (n + 7) / 8, batch);
-        oz_recombine_S_v2_kernel<<<gridA, blk>>>(P.data_ptr<int>(), npairs,
-            wg.data_ptr<double>(), n, batch, S.data_ptr<double>());
-    } else {
-        oz_recombine_S_kernel<<<grid, blk>>>(P.data_ptr<int>(), npairs,
-            wg.data_ptr<double>(), n, batch, S.data_ptr<double>());
-    }
+    // Pass A: int2-vectorized (2 cols/thread, 8B coalesced load + 16B ST.128 store).
+    // The Ozaki Gram is reached only by the n>=4096 CholeskyQR path (n=4096), so n%2==0
+    // always holds and the int2 pass is always taken.
+    dim3 gridA(((n / 2) + 31) / 32, (n + 7) / 8, batch);
+    oz_recombine_S_v2_kernel<<<gridA, blk>>>(P.data_ptr<int>(), npairs,
+        wg.data_ptr<double>(), n, batch, S.data_ptr<double>());
     // Pass B: scalar GfromS. (A smem-transpose-tiled pass-B variant was tried and
     // REGRESSED on shape6 -- 1024-thread/8.4KB-smem block caps to 2-3 blocks/SM, its
     // __syncthreads stalls the near-empty SM, and it loses the scalar read's incidental
