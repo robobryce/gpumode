@@ -1107,6 +1107,7 @@ _N512_2L = int(_os.environ.get("QR_N512_2L", "1")) != 0
 # shorten the serial reflector chain + add tensor-core trailing, exploiting the
 # n=1024 grid-starvation (idle SMs absorb the n=512-killing spill). Default OFF.
 _N1024_2L = int(_os.environ.get("QR_N1024_2L", "0")) != 0
+_N1024_2L_ROUTE = int(_os.environ.get("QR_N1024_2L_ROUTE", "1"))  # 1=IB16/NB32, 2=IB8/NB16 grid-starved
 _N512_2L_IB = int(_os.environ.get("QR_N512_2L_IB", "16"))   # sub-panel width
 _N512_2L_NB = int(_os.environ.get("QR_N512_2L_NB", "32"))   # outer block / wide-trailing width
 # Saturated-grid tiles for the n=512 (B=640, grid-saturated) two-level path. The
@@ -3424,6 +3425,10 @@ def custom_kernel(data: input_t) -> output_t:
     # SMs absorb the lower occupancy). Gated _N1024_2L (default OFF), n==1024 (shape
     # param -> invariance-safe). Exact geqrf.
     if n == 1024 and _N1024_2L:
+        # _N1024_2L: 1 = n512-style IB=16/NB=32; 2 = grid-starved IB=8/NB=16 (the
+        # _w2_qr_2level structure, force-blocked via QR_2L_HYBRID_H<1024).
+        if _N1024_2L_ROUTE == 2:
+            return _w2_qr_2level(data)
         return _w2_qr_2level_n512(data)
     return _w2_qr(data)
 
