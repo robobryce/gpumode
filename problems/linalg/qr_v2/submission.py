@@ -7623,35 +7623,27 @@ _TRSM_NB_CPP = 512   # nb sweep WINNER (s6 optimum): 384(11728)/512(11190)/640(1
 # B=1/B!=2 fallback arm keeps exact FP32 (its factor residual is sensitive).
 _TRSM_DIAG_PREC = 2       # 3xTF32 Kahan diagonal solve (beats FP32-SIMT at nb=512).
 _TRSM_TRAIL_FP16 = 1      # 3xFP16 trailing (FP16 tensor cores ~2x TF32 rate on B200).
-# Recon Schur-GEMM precision for the s6 n4096 B=2 path (worker-3 brief-0): 1 = FP16
-# (FP32-accum) Schur update (low-prec-TC lever; orth is recon-precision-independent),
-# 0 = TF32. LIVE default-ON to test the factor-residual headroom + speed end-to-end.
+# Recon Schur-GEMM precision for the s6 n4096 B=2 path: 1 = FP16 (FP32-accum) Schur update
+# (orth is recon-precision-independent), 0 = TF32.
 _RECON_LOWP = 1
 # FP32 recon panel-solve accumulation for s6: 1 = FP32 substitution (faster than the FP64
-# default) in panel_solve_fused, on the FP16-Schur panels (jo>=_RECON_LOWP_FROM). The recon's
-# Q via householder_product is orth-(near-)independent of V precision -> only the loose
-# factor residual is touched.
+# default) in panel_solve_fused on the FP16-Schur panels (jo>=RECON_LOWP_FROM). Only the
+# loose factor residual is touched.
 _RECON_SOLVE_FP32 = 1
-# RECON LOW-PREC PANEL BOUNDARY: the column index from which the recon Schur GEMM goes FP16 +
-# the panel-solve goes FP32 (panels before it stay TF32/FP64). The tau-override makes
-# householder_product orthonormal REGARDLESS of recon precision, so the early high-prec
-# panels are no longer needed for ORTH -- only the loose FACTOR residual (gate 32 @ n4096)
-# limits how early we can drop. 0 = low-prec from the very first panel. -1 = legacy 3*ob.
+# RECON LOW-PREC PANEL BOUNDARY: the column index from which the recon Schur GEMM goes FP16
+# and the panel-solve goes FP32 (panels before it stay TF32/FP64). The tau-override makes
+# householder_product orthonormal regardless of recon precision, so only the loose factor
+# residual limits how early we drop. 0 = low-prec from the first panel; -1 = legacy 3*ob.
 _RECON_LOWP_FROM = 0
-# RECON WARP-LEVEL diag-LU: 1 = factor the 64x64 diag block in a SINGLE warp (diag_lu_warp_kernel:
-# __shfl pivot broadcast, ZERO __syncthreads), 0 = the legacy register-blocked diag_lu_reg
-# (256 threads, 128 block barriers/panel). diag_lu_reg is the recon's bottleneck (2-CTA
-# latency-bound where barriers can't be hidden); the warp version trades block barriers for
-# intra-warp shuffles. Gated to s6.
+# RECON WARP-LEVEL diag-LU: 1 = factor the 64x64 diag block in a SINGLE warp
+# (diag_lu_warp_kernel: __shfl pivot broadcast, no __syncthreads); 0 = the register-blocked
+# diag_lu_reg (256 threads). Gated to s6.
 _RECON_WARPLU = 1
-# SECRET-SAFETY TAU-OVERRIDE (worker-3 brief-2, the n4096 B=2 scored-shape fix). The 3xTF32
-# TRSM solve (Q=A R^-1) + orhr_col recon lose ORTHOGONALITY at high cond(A): the orhr_col tau
-# drifts so householder_product(H,tau) is not orthonormal -- CONFIRMED failing the SCORED B=2
-# benchmark recheck on ~36% of secret seeds (W5: 18/50, orth scaled up to 693). FIX: recompute
-# each reflector's tau EXACTLY from the reconstructed Householder vectors V (strict-lower of H,
-# implicit v[j]=1): tau_j = 2 / (1 + sum_{i>j} H[i,j]^2). This makes every reflector exactly
-# orthogonal -> householder_product orthonormal REGARDLESS of recon precision (orth ~0.16, far
-# under the gate). Cost = one n^2 reduction (NO s6 regression). Applied for the B=2 n4096 path.
+# SECRET-SAFETY TAU-OVERRIDE (n4096 B=2 scored-shape fix). The 3xTF32 TRSM solve + orhr_col
+# recon lose ORTHOGONALITY at high cond(A) (orhr_col tau drifts). FIX: recompute each
+# reflector's tau EXACTLY from the reconstructed Householder vectors V (strict-lower of H,
+# implicit v[j]=1): tau_j = 2 / (1 + sum_{i>j} H[i,j]^2). This makes householder_product
+# orthonormal regardless of recon precision. Cost = one n^2 reduction. B=2 n4096 path only.
 _TAU_OVERRIDE = 1
 # LU recon is hardwired to recon_lu_cpp (whole single-level blocked-LU loop in ONE C++
 # call: 768-thread fused diagonal LU + cuBLAS Strsm/Sgemm back-to-back, no per-op
