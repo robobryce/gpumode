@@ -885,6 +885,9 @@ def _fused_tile_for_N(N):
 # (best G=16 still 64ms total vs parent 48.6ms). Kept as a proven-correct
 # primitive; re-enable by lowering QR_MCTA_N.
 _MCTA_N = int(_os.environ.get("QR_MCTA_N", "999999"))   # min n to use mcta route (OFF)
+# brief-49: TSQR leaf num_warps (the leaf (RPB,BLK) register tile is register-capped
+# at block-limit-2; more warps spread it -> fewer reg/thread -> higher occupancy).
+_TSQR_LEAF_NW = int(_os.environ.get("QR_TSQR_LEAF_NW", "4"))
 _MCTA_NT = int(_os.environ.get("QR_MCTA_NT", "256"))    # threads/CTA
 _MCTA_GMAX = int(_os.environ.get("QR_MCTA_GMAX", "16")) # max CTAs/matrix
 _MCTA_MINSLICE = int(_os.environ.get("QR_MCTA_MINSLICE", "64"))  # min rows/CTA
@@ -1483,25 +1486,33 @@ def _tsqr_panel_R(A, j, jb, pheight, ncols, G=0):
     # blow-up), NO per-column cross-CTA sync (-> avoids the dead row-split barrier
     # wall). GATE-1+2 measured: 1.97x faster than the 1-CTA panel R over the full
     # n4096 factorization (fills the idle SMs).
-    # G=0 -> auto: target leaf RPB ~1024 (the TUNED sweet spot -- brief-48 G-sweep:
-    # RPB>1024 spills the per-leaf register tile (G=2 at n4096 -> 761us, 9x worse),
-    # RPB<512 adds merge overhead without leaf benefit; n4096 best G=4, n2048 G=2,
-    # both = pheight/1024 rounded). num_warps=4.
+    # G=0 -> auto (brief-49 RE-TUNED, joint (G, leaf num_warps) sweep): the leaf
+    # (RPB,BLK) register tile is register-capped, but MORE WARPS spread it so a
+    # BIGGER RPB (fewer leaves + less merge overhead) runs without spilling and
+    # WINS. Target leaf RPB ~2048 with nw=8-16 (vs brief-48's RPB~1024/nw=4):
+    #   n4096 B=2: G=2 nw=16 -> 56us (was 80us; 5.2x vs the 291us panel)
+    #   n2048 B=8: G=1 nw=8  -> 34us (1.7x vs the 57us panel)
+    #   n1024 B=60: G=1 nw=8 -> 30us (0.83x -- B=60 is NOT grid-starved, panel wins)
+    # G = ceil(pheight/2048); _TSQR_LEAF_NW (default 4; callers/auto use 8-16).
     B = A.shape[0]
     N = A.shape[2]
     BLK = triton.next_power_of_2(ncols)
     if G <= 0:
-        G = max(1, (pheight + 1023) // 1024)
+        G = max(1, (pheight + 2047) // 2048)
     rpb = (pheight + G - 1) // G
     RPB = triton.next_power_of_2(rpb)
     sab, san = A.stride(0), A.stride(1)   # row stride (cols use implicit stride 1, A contiguous)
     # leaf R-stack: (B, G, BLK, BLK)
     Rstack = torch.zeros((B, G, BLK, BLK), device=A.device, dtype=torch.float32)
     srb, srg, sri, srj = Rstack.stride()
+    # leaf num_warps: bigger RPB tile needs more warps to spread the register tile
+    # (brief-49: RPB>=2048 spills at nw=4 -> 9x slower, fine at nw>=8/16). Auto-scale
+    # by RPB unless _TSQR_LEAF_NW overridden (>4).
+    leaf_nw = _TSQR_LEAF_NW if _TSQR_LEAF_NW > 4 else (16 if RPB >= 2048 else 8)
     _tsqr_leaf_R_kernel[(G, B)](
         A, Rstack, B, N, j, jb, pheight, ncols, G, rpb,
         sab, san, srb, srg, sri, srj,
-        BLK=BLK, RPB=RPB, num_warps=4,
+        BLK=BLK, RPB=RPB, num_warps=leaf_nw,
     )
     # O(log G) pairwise merge tree.
     nin = G
