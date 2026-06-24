@@ -833,7 +833,7 @@ qr_mega_resident_kernel(const float* __restrict__ Ain, float* __restrict__ Hout,
             // (depth 5 + 1 bcast, carrying both ss0,ss1) instead of two serial back-to-back
             // reductions, halving the reduction-latency exposure on the bulk spine. The pivot vj[]
             // stays register-cached across the pair; FLAT reg0[MR]/reg1[MR] (not reg[2][MR]) keeps
-            // the allocator from spilling -- the 2D form measured 263us vs this 257us. Reflector
+            // the allocator from spilling (the 2D form spills). Reflector
             // is identical per column -> BIT-IDENTICAL result. An odd trailing count leaves the
             // last column to the scalar tail below.
             const int step = NWARPS - 1;
@@ -1683,10 +1683,9 @@ __global__ void compact_n512_bad_input_kernel(const float* __restrict__ A,
     // waste is that cols 0 and 1 live in the SAME 32B sector but were fetched by two scalar
     // loads, and with the L1 hit rate at ~10% the 2nd load re-tags that sector cold. Fuse
     // them into ONE 8-byte float2 load -> one sector fetch instead of two. BIT-EXACT: the
-    // float bits are identical; only the load instruction merges. (Measured: 72.1us -> 70.1us
-    // on the kernel, -2.7%; full unroll/ILP hoist was tried and REGRESSED via register
-    // pressure -- the rolled 2-trip loop already pipelines, the kernel is latency- not
-    // ILP-bound, so the float2 sector merge is the only net win.)
+    // float bits are identical; only the load instruction merges. (The rolled 2-trip loop
+    // already pipelines and the kernel is latency- not ILP-bound, so the float2 sector merge
+    // is the net win, not unrolling.)
     for (int r = tid; r < 512; r += 256) {
         const float2 c01 = *reinterpret_cast<const float2*>(Am + (size_t)r * 512 + 0);
         float c0 = c01.x;
@@ -5485,9 +5484,8 @@ std::tuple<torch::Tensor, torch::Tensor> blocked_qr_2level_bf16_indexed(torch::T
             // even-mr <24,4/6/8/10> + non-mrfine <24,6> (the OB=64 block stepping yields mr
             // only in {1,3,5,7,9,11}) were dropped -- their registration was the sole thing
             // forcing those 8 dead ptxas instantiations onto the critical compile path.
-            // brief-51 NWARPS SWEEP: register the 6 live precise-MROWS instances for each
-            // swept warp count (16/24/32) so the cmf NWARPS sweep's <WV,*> launches get the
-            // large-smem opt-in (b=64,m=352 -> ~90KB > 48KB default). 24 is the tuned default.
+            // Register the 6 live precise-MROWS instances for each candidate warp count so
+            // the cmf <WV,*> launches get the large-smem opt-in (b=64,m=352 -> ~90KB > 48KB).
             #define CMF_OPTIN(WV) do { \
                 cudaFuncSetAttribute(panel_factor_smem_wsp_cmf_tmpl_kernel<WV,2,__half>,  cudaFuncAttributeMaxDynamicSharedMemorySize, want); \
                 cudaFuncSetAttribute(panel_factor_smem_wsp_cmf_tmpl_kernel<WV,3,__half>,  cudaFuncAttributeMaxDynamicSharedMemorySize, want); \
@@ -5655,11 +5653,10 @@ std::tuple<torch::Tensor, torch::Tensor> blocked_qr_2level_bf16_indexed(torch::T
                 // The cmf panel always reads bf16-rounded input (the FP32-input block-0 path
                 // was a measured no-win and never enabled).
                 const float* Af32 = nullptr;
-                // NWARPS sweep (brief-51): the n=352 cmf panel is 1-CTA/SM, 40 CTAs, sync-
-                // bound on warp-0's serial per-column look-ahead chain -> the per-column
-                // __syncthreads waits on min(WV warps). g_cmf_warps picks WV (default 24, the
-                // historical tuned value). Fewer warps trim the barrier thread count but
-                // starve the bulk trailing cols; sweep to find the matched-toolchain optimum.
+                // The n=352 cmf panel is 1-CTA/SM (40 CTAs), sync-bound on warp-0's serial
+                // per-column look-ahead chain, so the per-column __syncthreads waits on WV
+                // warps. g_cmf_warps picks WV (16 is the tuned optimum; fewer warps trim the
+                // barrier thread count but starve the bulk trailing cols). Default 24.
                 int cw = (g_cmf_warps > 0) ? g_cmf_warps : 24;
                 #define CMF_LAUNCH(WV) do { switch (mr) { \
                     case 0: case 1: case 2: panel_factor_smem_wsp_cmf_tmpl_kernel<WV,2,__half> <<<B, dim3(32, WV), cmf_sm>>>(Hb, taup, n, k, b, m, Vfold, Hpanel, cmf_ldm, Af32); break; \
