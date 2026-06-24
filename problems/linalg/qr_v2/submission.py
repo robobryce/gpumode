@@ -6809,10 +6809,7 @@ __device__ __forceinline__ void tf32_split_store(float xv, float* __restrict__ h
 // 16B stores. x/hi/lo are contiguous torch buffers (16B-aligned) and `count` is
 // batch*n*n with n a multiple of 4, so count%4==0 and the vec4 grid covers it exactly
 // (no scalar tail on any live caller). BYTE-IDENTICAL math: tf32_split_store is applied
-// per lane exactly as the scalar path did. ncu (n4096 s6): the scalar 1-elem/thread
-// split ran at ~45% DRAM (one in-flight load per thread); the 4-wide pass issues 4x
-// fewer memory instructions with the same byte traffic -> higher achieved BW, lower
-// per-launch time. A scalar fallback handles any (unused) count%4!=0 caller.
+// per lane exactly as the scalar path. A scalar fallback handles any count%4!=0 caller.
 __global__ void split_flat_kernel(const float* __restrict__ x, float* __restrict__ hi,
                                   float* __restrict__ lo, long count) {
     long v = (long)blockIdx.x * blockDim.x + threadIdx.x;   // float4 index
@@ -6904,13 +6901,10 @@ __global__ void split_flat_fp16_kernel(const float* __restrict__ x,
 // _TRSM_NB_CPP=384 (or the n4096 tail 256) -- both %4==0 -- and j=bi*nb is %4==0, so
 // every float4 base (j+c and r*w+c and pbase+r*w+c) is 16B-aligned. A scalar tail
 // covers any (currently unreachable) w%4!=0. BYTE-IDENTICAL: tf32_split_store applied
-// per lane exactly as the scalar path. ncu (n4096 s6): the scalar 1-(r,c)/thread
-// version ran at ~12% DRAM / 36% SM (latency-bound on tiny per-thread work across
-// 13 small launches); the 4-wide pass cuts memory instructions 4x for the same byte
-// traffic -> better MLP / coalescing, lower per-launch latency.
+// per lane exactly as the scalar path.
 // hi16/lo16 (optional) add a FUSED FP16 hi/lo split of the solved panel in
-// the SAME pass as the scatter -> the 3xFP16 trailing needs no separate split kernel (saves
-// ~8us/block). Pass hi/lo (FP32 TF32-split) for the 3xTF32 trailing, hi16/lo16 (FP16-split)
+// the SAME pass as the scatter -> the 3xFP16 trailing needs no separate split kernel.
+// Pass hi/lo (FP32 TF32-split) for the 3xTF32 trailing, hi16/lo16 (FP16-split)
 // for the 3xFP16 trailing, or all-null (last block) to just scatter.
 __global__ void scatter_split_panel_kernel(float* __restrict__ Xg,
                                            const float* __restrict__ Tmpg,
@@ -7079,9 +7073,8 @@ torch::Tensor tri_solve_right_inv(torch::Tensor A, torch::Tensor Rin, int nb) {
     cublasSetMathMode(h, CUBLAS_TF32_TENSOR_OP_MATH);
 
     // --- Pre-split R once into hi/lo for the 3xTF32 trailing. R is contiguous, so a
-    // single FLAT vectorized split runs it in ~38us. SKIP this FP32 split
-    // when the trailing is 3xFP16 (g_trsm_trail_fp16) -- the FP16 path uses Rh16/Rl16 only,
-    // so the FP32 Rh/Rl split was ~58us of pure WASTE (ncu). Rh/Rl are static scratch.
+    // single FLAT vectorized split. SKIP this FP32 split when the trailing is 3xFP16
+    // (g_trsm_trail_fp16) -- the FP16 path uses Rh16/Rl16 only. Rh/Rl are static scratch.
     // split_flat_kernel is float4-vectorized: one thread per 4 contiguous elements.
     // rcount = batch*n*n with n%4==0 -> rcount%4==0, so the vec4 grid covers it exactly.
     if (!g_trsm_trail_fp16) {
@@ -7354,14 +7347,11 @@ torch::Tensor recon_lu_cpp(torch::Tensor M, torch::Tensor R, torch::Tensor D, in
     const float negone = -1.f, one = 1.f;
     int nt = kLuNt;
     bool rlowp_on = (g_recon_lowp != 0);
-    // HYBRID PRECISION: the first few right-looking panels'
-    // Schur updates propagate FP16 error through ALL subsequent panels, so keep them
-    // TF32 (exact-class) and only drop to FP16 once jo >= RECON_LOWP_FROM. iter2's
-    // pure-FP16 Schur was 1.19x over the orth gate on 1/8 s6 draws; the early-panel
-    // TF32 guard targets that residual without losing the bulk (most panels) FP16 win.
-    // brief-4: tunable low-prec boundary (g_recon_lowp_from). -1 keeps the legacy 3*ob
-    // (first 3 panels high-prec). tau-override now owns orthogonality, so 0 (low-prec from
-    // panel 0) is admissible if the factor residual holds -- tested on s6.
+    // HYBRID PRECISION: the first few right-looking panels' Schur updates propagate FP16
+    // error through ALL subsequent panels, so keep them TF32 (exact-class) and only drop to
+    // FP16 once jo >= RECON_LOWP_FROM. g_recon_lowp_from sets the boundary: -1 = legacy 3*ob
+    // (first 3 panels high-prec); >=0 = explicit column (tau-override owns orthogonality, so
+    // 0 = low-prec from panel 0 is admissible if the factor residual holds).
     const int RECON_LOWP_FROM = (g_recon_lowp_from >= 0) ? g_recon_lowp_from : (3 * ob);
     // FP16 Schur scratch (rlowp): full M cast to half once per panel into the trailing
     // region is wasteful; instead cast the two operand panels (L21 mrows x w, U12 w x rest)
