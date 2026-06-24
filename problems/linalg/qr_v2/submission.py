@@ -1521,6 +1521,95 @@ def _tsqr_panel_R(A, j, jb, pheight, ncols, G=0):
     return cur[:, 0, :ncols, :ncols]
 
 
+def _orhr_col(Qc, R):
+    # brief-48: GRAFTED from W1 brief-43 (the shared ORHR_COL primitive W1 built
+    # W0-graftable, derived in-tag from the published Yamamoto/Ballard method -- NOT
+    # the other-tag d60e14e6). Reconstruct flat (H,tau) from an orthonormal economy
+    # Qc (m x b) + R (b x b) via LU-of-(E - Qc*diag(s)), s_k=-sign(Qc[k,k]) so
+    # |pivots|>=1 (no pivoting). The tall part Y2 = M[b:]*U^-1 is a triangular solve
+    # = embarrassingly PARALLEL over the m-b rows (fills idle SMs). The checker needs
+    # only a VALID Householder QR (Q orth, R=triu(H), QR=A), so the sign-fix suffices.
+    m = Qc.shape[-2]
+    b = Qc.shape[-1]
+    dtype = Qc.dtype
+    diagQ = torch.diagonal(Qc[..., :b, :], dim1=-2, dim2=-1)
+    s = -torch.sign(diagQ)
+    s = torch.where(s == 0, torch.ones_like(s), s)
+    QcS = Qc * s.unsqueeze(-2)
+    eye = torch.eye(b, device=Qc.device, dtype=dtype)
+    E = torch.zeros_like(Qc)
+    E[..., :b, :] = eye
+    M = E - QcS
+    M1 = M[..., :b, :]
+    M2 = M[..., b:, :]
+    Y1 = eye.expand(M1.shape).clone()
+    U = M1.clone()
+    for k in range(b):
+        piv = U[..., k, k]
+        Y1[..., k + 1:, k] = U[..., k + 1:, k] / piv.unsqueeze(-1)
+        U[..., k + 1:, :] = U[..., k + 1:, :] - Y1[..., k + 1:, k:k + 1] * U[..., k:k + 1, :]
+    U = torch.triu(U)
+    tau = torch.diagonal(U, dim1=-2, dim2=-1).clone()
+    if M2.shape[-2] > 0:
+        Y2 = torch.linalg.solve_triangular(U, M2, upper=True, left=False)
+    else:
+        Y2 = M2
+    Y = torch.cat([Y1, Y2], dim=-2)
+    R_out = R * s.unsqueeze(-1)
+    return Y, tau, R_out
+
+
+def _qr_tsqr_orhr_largen(data, BLK=16):
+    # brief-48: LARGE-N (n2048/n4096) blocked right-looking QR whose PANEL R-factor
+    # comes from my FAST TSQR (_tsqr_panel_R: G independent leaf QRs + O(log) R-tree,
+    # fills the idle SMs -- measured 1.97x faster than the 1-CTA panel at n4096),
+    # replacing W1's slow cuSOLVER torch.linalg.qr Qc source. Per panel: R=TSQR(panel);
+    # Qc = panel @ R^-1 (parallel triangular solve, fills SMs); (Y,tau,R_out) =
+    # _orhr_col(Qc,R) (W1's graftable primitive); WY trailing. fp64 like W1's
+    # correctness node (the ORHR LU + WY trailing drift over the orth gate in fp32 on
+    # ill-cond). Distinct from W1 (n1024) -- different shapes, no kernel collision.
+    A = data.contiguous()
+    B, n, _ = A.shape
+    out_dtype = A.dtype
+    Af = A.double()
+    H = Af.clone()
+    tau = torch.zeros(B, n, device=A.device, dtype=torch.float64)
+    j = 0
+    while j < n:
+        b = min(BLK, n - j)
+        ph = n - j
+        # R via my fast TSQR (computed in fp32, cast to fp64 for the recon); then
+        # Qc = panel @ R^-1. The panel is H[:, j:, j:j+b] (B, ph, b).
+        panelf = H[:, j:, j:j + b]                            # fp64 panel
+        Rf = _tsqr_panel_R(panelf.float().contiguous(), 0, 0, ph, b, 0).double()  # (B,b,b)
+        # Qc = panel R^-1 -> solve Qc R = panel  ->  R^T Qc^T = panel^T
+        Qct = torch.linalg.solve_triangular(Rf.transpose(-2, -1), panelf.transpose(-2, -1),
+                                            upper=False, left=True)
+        Qc = Qct.transpose(-2, -1).contiguous()               # (B, ph, b) orthonormal
+        Y, tau_p, R_out = _orhr_col(Qc, Rf)
+        blk = torch.zeros(B, ph, b, device=A.device, dtype=H.dtype)
+        blk[:, :b, :] = torch.triu(R_out)
+        il = torch.tril_indices(ph, b, offset=-1, device=A.device)
+        blk[:, il[0], il[1]] = Y[:, il[0], il[1]]
+        H[:, j:, j:j + b] = blk
+        tau[:, j:j + b] = tau_p
+        ncols = n - (j + b)
+        if ncols > 0:
+            V = Y
+            Atr = H[:, j:, j + b:]
+            VtV = V.transpose(-1, -2) @ V
+            Tm = torch.zeros(B, b, b, device=A.device, dtype=H.dtype)
+            for k in range(b):
+                Tm[:, k, k] = tau_p[:, k]
+                if k > 0:
+                    z = VtV[:, :k, k]
+                    Tm[:, :k, k] = -tau_p[:, k:k + 1] * torch.einsum('bij,bj->bi', Tm[:, :k, :k], z)
+            W = V.transpose(-1, -2) @ Atr
+            H[:, j:, j + b:] = Atr - V @ (Tm.transpose(-1, -2) @ W)
+        j += b
+    return H.to(out_dtype), tau.to(out_dtype)
+
+
 @triton.jit
 def _panel_factor_kernel(
     A_ptr, tau_ptr, Vbuf_ptr, Tbuf_ptr,
@@ -3623,6 +3712,15 @@ def custom_kernel(data: input_t) -> output_t:
     # ib=8 path keeps the panel un-spilled while doing one wide trailing. Same
     # exact geqrf (H,tau).
     if n >= 2560:
+        # brief-48: the TSQR+ORHR_COL panel (_qr_tsqr_orhr_largen: my fast SM-filling
+        # TSQR R + W1's _orhr_col) VALIDATES end-to-end at n4096 (22/22 + diff-guard)
+        # but is 22x SLOWER (693083us vs 31483us) -- the per-panel python LU/solve x256
+        # panels + fp64 reconstruction TAIL dominates and swamps my 2x R-mechanism win
+        # (recon-cost GATE predicted this; W1's own node is "SLOW per-panel python LU").
+        # So n4096 stays on the proven Householder _w2_qr_2level; the TSQR+ORHR path is
+        # banked correct-but-slow infrastructure (the reconstruction tail must be
+        # kernelized/batched to net-win -- see brief-48 log). NOT a gate: the fast
+        # correct path is live; the slow path is committed-unrouted like other nodes.
         return _w2_qr_2level(data)
     # n=2048 (B=8): the single-level panel is the latency-bound wall (52.9%,
     # ncu 2.97% SM throughput, grid=8). Route through _w2_qr with an n=2048-only
