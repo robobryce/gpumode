@@ -683,48 +683,37 @@ __global__ void panel_factor_smem_fnorm_ov_kernel(float* __restrict__ H, float* 
 // =============================================================================
 // WARP-PER-MATRIX, SHUFFLE-ONLY, ZERO-__syncthreads TINY QR (the n=32 tiny case)
 // =============================================================================
-// ONE WARP factors ONE WHOLE matrix: lane c owns column c, the matrix lives
-// entirely in REGISTERS, and EVERY cross-lane dependency is a __shfl_sync -- there
-// is NO __syncthreads anywhere and NO shared memory. A warp is implicitly
-// synchronous (and the shuffle's own sync mask covers the independent-thread-
-// scheduling model), so the 32-deep serial column chain pays a 1-cycle shuffle per
-// dependency step instead of a hundreds-of-ns barrier. Math is the EXACT
-// LAPACK-compact Householder (deferred inv-scale at write-back), numerically
-// identical and sharing all validation. Separate IO: reads Ain untouched, writes a
-// fresh Hout + every tau, so blocked_qr_tiny passes a FRESH empty Hout and skips
-// the clone of A entirely (A stays the untouched checker input).
+// ONE WARP factors ONE WHOLE matrix: lane c owns column c, the matrix lives entirely in
+// REGISTERS, and EVERY cross-lane dependency is a __shfl_sync -- NO __syncthreads, NO smem.
+// A warp is implicitly synchronous, so the 32-deep serial column chain pays a 1-cycle
+// shuffle per dependency step instead of a barrier. Math is EXACT LAPACK-compact Householder
+// (deferred inv-scale at write-back). Reads Ain untouched, writes a fresh Hout + tau, so
+// blocked_qr_tiny skips the clone of A.
 //
-// CORRECTNESS NOTE on the shuffles: every __shfl_sync below uses the FULL 0xffffffff
-// mask and is issued by ALL 32 lanes UNCONDITIONALLY (the c>j apply guard is applied
-// only AFTER the broadcast result is in hand), so the collective is always complete.
-// __launch_bounds__(32, minBlocksPerSM=1): with only B=20 single-warp blocks spread
-// one-per-SM there is no occupancy to protect, so tell the compiler minBlocks=1 -> it
-// may use ALL the registers it wants and keep the column in REGISTERS instead of
-// spilling to local memory. The FULLY-SCALARIZED kernel (32 NAMED scalar registers
-// c0..c31, Python-generated below, marker replaced before load_inline) achieves
-// STACK:0 / 0 spills / ~80 regs -- a `float col[32]` array would stay in LOCAL memory
-// (ptxas refuses to register-promote it even fully unrolled with constant indices).
+// CORRECTNESS NOTE on the shuffles: every __shfl_sync uses the FULL 0xffffffff mask and is
+// issued by ALL 32 lanes UNCONDITIONALLY (the c>j apply guard is applied AFTER the broadcast),
+// so the collective is always complete. __launch_bounds__(32, minBlocks=1): with only B=20
+// single-warp blocks (one/SM) there is no occupancy to protect, so minBlocks=1 lets ptxas use
+// all the registers it wants and keep the column in REGISTERS. The FULLY-SCALARIZED kernel
+// (32 NAMED scalar registers c0..c31, Python-generated below) achieves STACK:0 / 0 spills --
+// a `float col[32]` array would stay in LOCAL memory (ptxas refuses to register-promote it).
 // __TINY_WARP_SCALAR_INJECT__
 
 // ===========================================================================
-// FULLY-RESIDENT register/warp Householder megakernel for the SMALL launch/
-// overhead-bound shapes (n<=~232 so the whole n x n matrix fits in one CTA's
-// dynamic smem). One CTA owns one matrix; grid = batch -> the ENTIRE batched QR
-// is ONE launch (no per-panel / per-trailing-GEMM kernel-launch storm, no global
-// round-trips). The matrix is loaded once (row-major global -> column-major smem),
-// the right-looking Householder QR runs entirely in smem (every reflector + every
-// trailing rank-1 update), and R (upper) + V (strict-lower, unit-diagonal implied)
-// are written back once in the geqrf compact (H,tau) convention. FP32 reflectors
-// keep orthogonality exact at any conditioning. This sidesteps every prior
-// small-shape disproof (Gram/QDWH/CholeskyQR) because it emits native (H,tau)
-// directly -- no normal-equations, no orhr_col reconstruction.
+// FULLY-RESIDENT register/warp Householder megakernel for the SMALL launch-overhead-bound
+// shapes (n<=~232 so the whole n x n matrix fits in one CTA's dynamic smem). One CTA owns
+// one matrix; grid = batch -> the ENTIRE batched QR is ONE launch (no per-panel launch storm,
+// no global round-trips). The matrix is loaded once (row-major global -> column-major smem),
+// the right-looking Householder QR runs entirely in smem, and R (upper) + V (strict-lower,
+// unit-diag implied) are written back once in the geqrf compact (H,tau) convention. FP32
+// reflectors keep orthogonality exact at any conditioning; emits native (H,tau) directly
+// (no normal-equations, no orhr_col reconstruction).
 //
-// Layout: column-major smem s[(size_t)c*LDC + r], r the fast index, LDC = n|1 (odd
-// -> the within-column m-stride reductions hit 32 distinct banks, conflict-free).
-// Threads: NWARPS warps. Warp 0 factors the pivot column (norm reduce -> reflector
-// scalars). All warps cooperate on the trailing apply: the trailing columns
-// (j+1..n-1) are striped across warps; each warp walks rows of its column with the
-// 32 lanes, reducing v_j^T c_c via warp shuffles and applying c_c -= w*v_j.
+// Layout: column-major smem s[(size_t)c*LDC + r], r the fast index, LDC = n|1 (odd ->
+// within-column m-stride reductions hit 32 distinct banks, conflict-free). Threads: NWARPS
+// warps. Warp 0 factors the pivot column (norm reduce -> reflector scalars); all warps
+// cooperate on the trailing apply (columns j+1..n-1 striped across warps, each reducing
+// v_j^T c_c via warp shuffles and applying c_c -= w*v_j).
 // ===========================================================================
 template <int NWARPS, int MR>
 __global__ void __launch_bounds__(NWARPS * 32, 1)
@@ -1112,28 +1101,18 @@ __global__ void build_Minv_blk4_kernel(const float* __restrict__ S, const float*
     minv_store_M(Msh, M, Mb, W + (size_t)mat * b * rest, tau_s, b, rest, t, nt, LD);
 }
 
-// RECURSIVE 2-level blk2 build_Minv: invert L (b x b) by splitting into two h=b/2
-// halves A=[0,h), B=[h,b), each inverted ITSELF via blk2 (split into q=b/4 blocks), then
-// one OUTER off-diagonal step M21 = -M_B @ (L_C @ M_A). Same depth-b/4 diagonal forward-
-// sub as blk4 (q-blocks) but with FEWER __syncthreads: the two h-half inverses are
-// INDEPENDENT (no cross-half dependency) so their inner blk2 steps share syncs, and the
-// outer step is a clean 2-matmul (vs blk4's column-by-column block-forward-sub with a
-// dependency chain). Sync count ~5 vs blk4's ~12 -- helps the latency-bound B=60/640
-// regime where syncs sit on the critical path. NUMERICALLY IDENTICAL to blk2/blk4 (FP32,
-// reassociated). Requires b % 4 == 0. Smem: [Lsh b*LD][Msh b*LD][tau_s b][tmpA q*QD]
-// [tmpB q*QD][tmpO h*HD]. (M_A/M_B written in place into Msh's diagonal h-blocks.)
-// GENERALIZED recursive blk build_Minv. nlev levels: depth-(b>>nlev) diagonal
-// base-block inverses + nlev independent-merge phases (each a 2-matmul outer step on
-// disjoint tiles, ~2 syncs/level).
-// g_minv_blk4==2 -> nlev=2 (depth-b/4, requires b%4==0: the recursive 2-level blk2 the
-// shapes 1,2 single-level path uses); ==3 -> nlev=3 (rblk4: depth-b/8, b%8==0); ==4 ->
-// nlev=4 (rblk8: depth-b/16, b%16==0). Deeper recursion shortens the serial forward-sub
-// chain (the B=8/60 latency bottleneck) at the cost of more parallel merge matmuls; the
-// kernel is at 7-10% SM so it absorbs them. NUMERICALLY IDENTICAL to blk2/blk4 (same FP32
-// triangular inverse up to tree-reduction reassociation). nlev=2 is live on the n=176
-// single-level FP32 path; nlev=3 (minv_rblk=3) on the n=352 bf16 and n=2048 _qr_largehi
-// paths. Writes the optional FP16 Mb16 mirror for the fused-apply path (same
-// convention as build_Minv_blk4_kernel).
+// GENERALIZED recursive blk build_Minv: invert L (b x b) via nlev levels of
+// depth-(b>>nlev) diagonal base-block inverses + nlev INDEPENDENT-merge phases (each a
+// clean 2-matmul outer step M21 = -M_B @ (L_C @ M_A) on disjoint tiles, ~2 syncs/level --
+// far fewer than blk4's column-by-column forward-sub chain, which helps the latency-bound
+// B=8/60/640 regime). Deeper recursion shortens the serial forward-sub chain at the cost
+// of more parallel merge matmuls (the kernel is at 7-10% SM so absorbs them). NUMERICALLY
+// IDENTICAL to blk2/blk4 (FP32 triangular inverse up to tree-reduction reassociation).
+//   g_minv_blk4==2 -> nlev=2 (depth-b/4, b%4==0; n=176 single-level FP32 path);
+//   ==3 -> nlev=3 (rblk4: depth-b/8, b%8==0; n=352 bf16 + n=2048 _qr_largehi);
+//   ==4 -> nlev=4 (rblk8: depth-b/16, b%16==0).
+// Writes the optional FP16 Mb16 mirror for the fused-apply path (same convention as
+// build_Minv_blk4_kernel).
 __global__ void build_Minv_rblk_gen_kernel(const float* __restrict__ S, const float* __restrict__ tau,
                                            float* __restrict__ Mout, float* __restrict__ W,
                                            int n, int k, int b, int rest, int nlev,
@@ -1853,19 +1832,16 @@ void compact_n512_bad_input(torch::Tensor A, torch::Tensor bad_idx,
         A.data_ptr<float>(), bad_ptr, good_ptr, counts.data_ptr<int>(), B, max_bad, max_good);
 }
 
-// FUSED classify + FP32->BF16 convert-ALL (n == 512). One CTA per matrix sweeps its
-// full 512x512 matrix in ONE coalesced pass: it (1) converts every element to BF16
-// (vectorized 8-float -> int4 store, byte-identical to f32_to_bf16_kernel), (2)
-// accumulates the SAME classify signals the standalone compact_n512_bad_input_kernel
-// computes -- folding the classifier's separate scattered re-read of A (~61us) into the
-// convert that has to read A anyway -- and (3) optionally ORs the rank-reveal trailing
-// block-column mask (the f32_to_bf16_rr work) into counts[4..]. The detector math is
-// FP32 and the gate thresholds are byte-identical to the standalone classifier; only the
-// REDUCTION ORDER differs (the coalesced convert maps threads to column-contiguous chunks
-// rather than the classifier's row-per-thread sampling), and every gate has orders of
-// magnitude of threshold margin (row_ratio<1e-6 vs ~1e-7/O(1); mid_ratio<1e-9 vs
-// >=6.7e-6; off_frac>0.92 counting exact zeros), so the bad/good DECISION is identical
-// (validated by the 22-shape tests + diff_correctness + the B=1280 invariance sweep).
+// FUSED classify + FP32->BF16 convert-ALL (n == 512). One CTA per matrix sweeps its full
+// 512x512 matrix in ONE coalesced pass: (1) converts every element to BF16 (vectorized
+// 8-float -> int4 store, byte-identical to f32_to_bf16_kernel), (2) accumulates the SAME
+// classify signals as the standalone compact_n512_bad_input_kernel -- folding the
+// classifier's separate scattered re-read of A into the convert that reads A anyway -- and
+// (3) optionally ORs the rank-reveal trailing block-column mask into counts[4..]. The detector
+// math is FP32 and the gate thresholds are byte-identical to the standalone classifier; only
+// the REDUCTION ORDER differs (column-contiguous chunks vs the classifier's row-per-thread
+// sampling), and every gate has orders-of-magnitude threshold margin, so the bad/good DECISION
+// is identical (validated by the 22-shape tests + diff_correctness + the B=1280 invariance sweep).
 //
 // counts layout (extends the classifier's 4 slots): [0]=bad, [1]=good, [2]=rank-reveal
 // stage-1 "tail not negligible" flag, [3]=hard-bad count, [4]=rank-reveal trailing
