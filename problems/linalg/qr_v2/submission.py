@@ -1105,7 +1105,16 @@ _N512_2L_FBM = int(_os.environ.get("QR_N512_2L_FBM", "32"))   # fused wide-trail
 # (tf32x3i, NACC=1, NS=3): BNc=32 beats BNc=64 on every n512 family (dense
 # 4512->4421, rankdef 4497->4414, clustered 4505->4424, mixed 4504->4422 probe us;
 # -2.0%). BNc=128 pathological (~6030us). So default BNc=32 (paired with tf32x3i).
-_N512_2L_FBNC = int(_os.environ.get("QR_N512_2L_FBNC", "32")) # fused wide-trail BNc (tf32x3i optimum, brief-26)
+# brief-52: the BNc=32 optimum was specific to the 2-MMA-everywhere register balance.
+# Dropping sweep 2 to 1-MMA RTN-tf32 (_N512_2L_F_PREC2) FREED registers, and the wider
+# BNc=64 strip now fits and wins again -- it amortises the V/T loads over twice the
+# columns and the freed budget absorbs the larger chunk. RE-SWEPT on the split-sweep
+# base (real benchmark, idle GPU): BNc=64 geomean 2358.6us / n512-clustered 4158us beats
+# BNc=32 2361.0 / 4178us (-0.1% geomean, -0.5% n512). BM=64 (2424us), NW=4 (2513us),
+# BNc=64+BM=64+NW=4 (2587us) all regress hard -- only the BNc widening helps. So default
+# BNc=64 on the split-sweep base. (Tile changes the work decomposition only -> (H,tau)
+# byte-exact, accuracy unchanged from the BNc=32 split-sweep config.)
+_N512_2L_FBNC = int(_os.environ.get("QR_N512_2L_FBNC", "64")) # fused wide-trail BNc (split-sweep optimum, brief-52)
 _N512_2L_FNW = int(_os.environ.get("QR_N512_2L_FNW", "2"))    # fused wide-trail warps
 # brief-26: with tf32x3i the cross-chunk NACC ILP becomes REDUNDANT -- the 3
 # independent-accumulator MMAs inside each dot already supply the ILP that NACC=2
@@ -1116,7 +1125,14 @@ _N512_2L_FNW = int(_os.environ.get("QR_N512_2L_FNW", "2"))    # fused wide-trail
 # headroom. So default NACC=1 (paired with tf32x3i). NS=2 is pathological here
 # (~5080us) -- keep NS=3.
 _N512_2L_F_NACC = int(_os.environ.get("QR_N512_2L_F_NACC", "1"))  # split-W ILP accumulators
-_N512_2L_F_NS = int(_os.environ.get("QR_N512_2L_F_NS", "3"))      # software-pipeline stages
+# brief-52: NS 3->4 on the SPLIT-SWEEP base (sweep1=tf32x3i 3-MMA, sweep2=tf32rn
+# 1-MMA via _N512_2L_F_PREC2). Dropping sweep 2 from 2-MMA to 1-MMA FREED registers
+# (same mechanism as brief-49's n1024 2->1 MMA), and the freed budget lets the W-
+# reduction software-pipeline run one stage deeper. MEASURED (real benchmark, idle
+# GPU): NS=4 geomean 2362.9us / n512-clustered 4183us, beats NS=3 2367.4 / 4205us
+# (-0.2% geomean, -0.5% n512); NS=5 regresses (2421us, past the reg knee); NACC=2
+# regresses (2373.9us). NS only re-pipelines the same dots -> (H,tau) byte-identical.
+_N512_2L_F_NS = int(_os.environ.get("QR_N512_2L_F_NS", "4"))      # software-pipeline stages
 # brief-26: precision mode for the n=512 dominant wide trailing. "tf32x3i" =
 # hand-written 3-product split with 3 INDEPENDENT accumulators (breaks the
 # built-in tf32x3 RAW chain that ncu showed is the wait-0.94 / 49.7%-tensor-SOL
@@ -1144,7 +1160,26 @@ _N512_2L_F_NS = int(_os.environ.get("QR_N512_2L_F_NS", "3"))      # software-pip
 # ~33% FLOP cut on the bulk trailing reduction + apply of every n=512 batch.
 # tf32x3i remains reachable via QR_N512_2L_F_PREC=tf32x3i (the prior accuracy
 # floor). Gated by the n==512 route (a SHAPE param -> invariance-guard-safe).
-_N512_2L_F_PREC = _os.environ.get("QR_N512_2L_F_PREC", "tf32x2")
+_N512_2L_F_PREC = _os.environ.get("QR_N512_2L_F_PREC", "tf32x3i")
+# brief-52: SPLIT-SWEEP precision for the n512 wide trailing. F_PREC drives sweep 1
+# (W=V^T@A, the long pheight-row contraction); F_PREC2 drives sweep 2 (delta=V@YT,
+# a SHORT BLK-deep contraction whose YT is already error-coupled through T). Default
+# "" => sweep 2 inherits F_PREC (byte-identical to the pre-brief-52 single-knob path).
+# brief-52 RESULT: dropping sweep 2 (delta=V@YT) from 2-MMA to 1-MMA RTN-tf32 is the
+# lever. The wide trailing is pipeline/register-bound (brief-49 ncu: 36% SM throughput,
+# latency-bound, NOT tensor-bound), so the half-precision-drop on sweep 2 RELIEVES
+# register pressure and the software-pipeline schedule improves MORE than the saved MMA
+# alone predicts -- and the freed registers let the W-reduction pipeline run one stage
+# DEEPER (NS 3->4, see _N512_2L_F_NS). Sweep 1 (the long error-dominant pheight-row
+# contraction) is kept at 3-MMA tf32x3i (_N512_2L_F_PREC) so the worst-case n512 ill-
+# cond margin stays large (band 14.1, rowscale 14.8, mixed 14.1 -- all <=15 vs gate 20,
+# diff-guard + invariance CLEAN). A bare 2-MMA sweep 1 (tf32x2) is FASTER still but the
+# batch-640 mixed diff-guard hits 20.6 (FAIL), and the V-low 2-MMA sweep 1 lands band at
+# 18.8 (invariance-flaky) -- only the 3-MMA sweep 1 + 1-MMA sweep 2 split is both safe
+# and a net win. MEASURED (real benchmark, idle GPU, interleaved A/B vs the tf32x2:tf32x2
+# NS=3 parent): geomean 2360us vs 2371us, -0.47%; n512 wide trailing 4226->4175us, -1.2%.
+# DEFAULT sweep2 = tf32rn (1-MMA). "" inherits F_PREC (the pre-brief-52 single-knob path).
+_N512_2L_F_PREC2 = _os.environ.get("QR_N512_2L_F_PREC2", "tf32rn")
 _N512_2L_PNW = int(_os.environ.get("QR_N512_2L_PNW", "4"))    # IB=16 sub-panel warps
 _N512_2L_GRAM_BM = int(_os.environ.get("QR_N512_2L_GRAM_BM", "128"))  # cross-Gram/YT2 row tile
 # Split inner-trailing + cross-T across SMs. The split variants (partW+finishW,
@@ -1651,11 +1686,20 @@ def _trailing_fused_kernel(
     BLK: tl.constexpr, BM: tl.constexpr, BNc: tl.constexpr,
     IPREC: tl.constexpr = "tf32x3",
     NACC: tl.constexpr = 1, NS: tl.constexpr = 1,
+    IPREC2: tl.constexpr = "",                 # brief-52: delta-sweep precision; "" => same as IPREC
 ):
     col_tile = tl.program_id(0)
     bid = tl.program_id(1)
     if bid >= B:
         return
+    # brief-52 SPLIT-SWEEP PRECISION: the wide trailing runs TWO bulk GEMMs --
+    # sweep 1 W = V^T@A (the contraction over all pheight rows, the error-dominant
+    # accumulation) and sweep 2 delta = V@YT (YT is the tiny BLKxBNc coupling, a
+    # SHORT BLK-deep contraction). If the residual is concentrated in ONE sweep,
+    # using the 2-MMA correction on only that sweep and 1-MMA on the other is a
+    # genuine "1.5-MMA" cheaper than full 2-MMA-everywhere. IPREC drives sweep 1;
+    # IPREC2 (default = IPREC) drives sweep 2.
+    DPREC: tl.constexpr = IPREC if IPREC2 == "" else IPREC2
     c0 = col_tile * BNc
     ccols = c0 + tl.arange(0, BNc)
     cmask = ccols < ncols
@@ -1767,14 +1811,14 @@ def _trailing_fused_kernel(
             rrmask = rr < pheight
             vp2 = v_base + krange[None, :] * stride_vk + rr[:, None] * stride_vn
             Vrow = tl.load(vp2, mask=rrmask[:, None], other=0.0)                     # (BM,BLK)
-            if IPREC == "tf32x2":
+            if DPREC == "tf32x2":
                 delta = _dot_tf32x2(Vrow, YT)            # YT (A-derived) kept full precision
-            elif IPREC == "tf32x3i":
+            elif DPREC == "tf32x3i":
                 delta = _dot_tf32x3i(Vrow, YT)
-            elif IPREC == "tf32rn":
+            elif DPREC == "tf32rn":
                 delta = _dot_tf32_rn(Vrow, YT)
             else:
-                delta = tl.dot(Vrow, YT, input_precision=IPREC)                     # (BM,BNc)
+                delta = tl.dot(Vrow, YT, input_precision=DPREC)                     # (BM,BNc)
             ap2 = a_trail_base + rr[:, None] * stride_an + ccols[None, :]
             amask = rrmask[:, None] & cmask[None, :]
             aorig = tl.load(ap2, mask=amask, other=0.0)
@@ -1786,14 +1830,14 @@ def _trailing_fused_kernel(
             rrmask = rr < pheight
             vp2 = v_base + krange[None, :] * stride_vk + rr[:, None] * stride_vn
             Vrow = tl.load(vp2, mask=rrmask[:, None], other=0.0)                     # (BM,BLK)
-            if IPREC == "tf32x2":
+            if DPREC == "tf32x2":
                 delta = _dot_tf32x2(Vrow, YT)            # YT (A-derived) kept full precision
-            elif IPREC == "tf32x3i":
+            elif DPREC == "tf32x3i":
                 delta = _dot_tf32x3i(Vrow, YT)
-            elif IPREC == "tf32rn":
+            elif DPREC == "tf32rn":
                 delta = _dot_tf32_rn(Vrow, YT)
             else:
-                delta = tl.dot(Vrow, YT, input_precision=IPREC)                     # (BM,BNc)
+                delta = tl.dot(Vrow, YT, input_precision=DPREC)                     # (BM,BNc)
             ap2 = a_trail_base + rr[:, None] * stride_an + ccols[None, :]
             amask = rrmask[:, None] & cmask[None, :]
             aorig = tl.load(ap2, mask=amask, other=0.0)
@@ -2703,7 +2747,7 @@ def _w2_qr_2level_n512(data):
                 sab, san, svb, svk, svn, stb, stk, stn,
                 H,
                 BLK=NB, BM=FBM, BNc=FBNC, num_warps=FNW, IPREC=_N512_2L_F_PREC,
-                NACC=_N512_2L_F_NACC, NS=_N512_2L_F_NS,
+                NACC=_N512_2L_F_NACC, NS=_N512_2L_F_NS, IPREC2=_N512_2L_F_PREC2,
             )
         j += bb
 
