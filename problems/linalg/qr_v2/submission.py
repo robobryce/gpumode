@@ -8190,9 +8190,6 @@ _LARGE_LO = {   # n in [1024,2048); FP16 trailing wants a NARROW outer block (ba
     "paf_warps": 32,
     "paf_help": 2,   # PHASE-P pivot cooperation: 2 warps split warp-0's serial m-pass (m_i<=1024).
     "ov_coop": 2,    # standalone OV panel pivot-coop: split next-pivot m-pass over 2 warps.
-    # SWEEP (same-session per-shape A/B on n1024 s4/s8/s11): HELP=2 -> 0.978-0.979x parent
-    # (~2.1% faster); HELP=4 -> 0.988-0.989x (~1.2%). 2 is the sweet spot -- more warps add
-    # barrier/coordination overhead that outweighs the extra m-pass split at m_i<=1024.
     # fp32-fallback knobs (the B<16 cond=0 stress route): OB=128/IB=32; prec=1 here, but
     # fp32_prec=1 is the STRESS-hardening knob (3xTF32 trailing for the n=1024 stress); raw=0.
     "fp32_ob": 128, "fp32_ib": 32, "fp32_prec": 1, "fp32_warps": 32,
@@ -8200,27 +8197,14 @@ _LARGE_LO = {   # n in [1024,2048); FP16 trailing wants a NARROW outer block (ba
 }
 _LARGE_HI = {   # n in [2048,4096); B=8 is SM-starved -> the coop panel
     # FP16 two-level path: OB=64/IB=32 (IB divides OB -> 2 inner panels; the n2048_h FP16-smem
-    # coop panel's smem = IB*~2056*2B = 132KB at IB=32, well under the 228KB cap). On the
-    # MATCHED cuBLAS 13.1/cu130 stack (brief-26 same-session A/B on shape 5) the WIDER OB=64
-    # wins: OB=48/IB=24=7353us -> OB=64/IB=32=6923us (-5.9%), +minv_rblk=2=6899us (-6.2%).
-    # The fresh cuBLAS trailing GEMM is fast enough that a wider OB (fewer, wider panels + a
-    # wider trailing apply) beats the previously-optimal narrow OB=48/IB=24. defer=5 = wsp
-    # panel; ov_fold=0 (REGRESSION here, keep standalone build_V); wsp_pad=0; minv_nt=640
-    # (B=8 underfills, spread blk2 wider); minv_rblk=2 (the rblk2 forward-sub now edges the
-    # deeper rblk3/4 at OB=64); wsp_help=2 + cm_coop=1 = column-major pivot-coop panel.
+    # coop panel's smem = IB*~2056*2B = 132KB at IB=32, well under the 228KB cap). defer=5 = wsp
+    # panel; ov_fold=0 (keep standalone build_V); wsp_pad=0; minv_nt=640 (B=8 underfills, spread
+    # blk2 wider); minv_rblk=2 (rblk2 forward-sub); wsp_help=2 + cm_coop=1 = column-major
+    # pivot-coop panel.
     "fp16_min_batch": 4,    # B>=4 -> FP16 trailing (n=2048,B=8 fills); perf floor, FP16-V orth-exact
     "ob": 64, "ib": 32, "defer": 5,
-    # bf16_nt=512 (was 576): build_Minv (T^-1) threads/CTA for the FP16 trailing compact-WY
-    # apply (g_bf16_nt -> apply_block_reflector_t<bf16>). brief-43 re-swept the n2048 trailing
-    # geometry on the matched cuBLAS 13.x; the bf16-build_Minv thread count is the ONE trailing
-    # knob whose optimum the matched lib MOVED. Same-session s5 A/B (sharp basin, err 0.026%,
-    # replicated): bf16_nt {448,480,496,512,528,544,576} -> {+1.32,+1.10,+0.67,-0.38,+0.19,
-    # -0.16, parent}% -- 512 (=16 full warps, a round CTA the b<=64 rblk2 inverse partitions
-    # cleanly) is the clear minimum, -0.38% on s5. Bit-exact (thread count only, output
-    # identical). OB/IB/rblk were RE-CONFIRMED optimal at 64/32/2 (the brief's primary axes):
-    # OB {48,80,96,128}@IB32 all +3.8..+6.9%; IB48 +12..14%; rblk {3,4} +0.15/+0.57%; minv_nt
-    # {512,768,1024} sub-noise. The matched-cuBLAS "fewer-wider panels" shift did NOT push the
-    # OB optimum past 64 -- only this trailing build_Minv thread count moved.
+    # bf16_nt=512: build_Minv (T^-1) threads/CTA for the FP16 trailing compact-WY apply
+    # (16 full warps, a round CTA the b<=64 rblk2 inverse partitions cleanly).
     "warps": 32, "bf16_nt": 512,
     "ov_fold": 0, "wsp_pad": 0, "minv_nt": 640,
     "minv_blk4": 0,
@@ -8399,34 +8383,20 @@ def _qr_small_bf16(Ac: torch.Tensor, n: int):
     # _two_level is False (no ov_fold); panel_raw=0 (defer!=0); set_panel_cm2 selects
     # the cmf column-major fused panel. set_wsp_pad(2) is a no-op here (g_wsp_pad is
     # always 2 on entry -- only _qr_large_fp16 perturbs it + restores), so it is not set.
-    # set_bf16_nt(512) IS set (and _run_blocked restores it to _BF16_NT=256): at B=40
-    # the single 64x64 outer build_Minv_rblk merge phases are device-underfilled, so the
-    # rblk kernel's nlev=3 merges run faster with 512 threads/CTA than the 256 default
-    # (s2 ~754->731us wall-proxy; the value saturates by 512, higher is neutral).
-    # set_cmf_warps(24): the cmf BF16 panel (the n=352 dominant kernel, ~70% of s2) runs
-    # 1 CTA/SM here (40 CTAs), so the per-column __syncthreads waits on warp-0's serial
-    # look-ahead chain; 24 warps trims the barrier thread count while keeping enough bulk
-    # warps for the b<=64 trailing cols (16 starves them: 758us). s2 ~731->728us wall-proxy
-    # (reproducible). _run_blocked restores g_cmf_warps to 0 (=>32) so no leak.
-    # set_cmf_mrfine(1): pick the smallest instantiated MROWS in {2,4,6,8,10,11} covering
-    # ceil(m/32) for each shrinking outer block (m=352->11, 288->9->10, 224->7->8, 160->5->6,
-    # 96->3->4, 32->1->2), instead of the coarse 6/11 split that over-tiled the m=288/224
-    # (11) and m=96/32 (6) blocks with masked unroll iterations + dead register cache. The
-    # per-column serial chain shortens by the trimmed MROWS trip count: s2 ~730->698us
-    # wall-proxy (-4.5%, reproducible). _run_blocked restores g_cmf_mrfine to 0 (no leak).
+    # bf16_nt=512: at B=40 the single 64x64 outer build_Minv_rblk nlev=3 merge phases are
+    # device-underfilled, so the rblk kernel runs faster with 512 threads/CTA than the 256
+    # default. cmf_warps=16: the cmf BF16 panel (the n=352 dominant kernel, 1 CTA/SM, 40 CTAs)
+    # is sync-bound on warp-0's serial per-column look-ahead, so fewer warps trim the
+    # per-column __syncthreads thread count. cmf_mrfine=1: pick the smallest instantiated
+    # MROWS in {2,4,6,8,10,11} covering ceil(m/32) for each shrinking outer block (instead of
+    # the coarse 6/11 split), shortening the per-column serial fold trip count.
     sets = [("set_prec", 1), ("set_fp16_pure", 0), ("set_warps", 32),
             ("set_panel_defer", 5), ("set_panel_raw", 0), ("set_panel_cm2", 1),
             ("set_bf16_wf16", 1), ("set_minv_blk4", 3), ("set_minv_blk4_minw", 0),
             ("set_bf16_nt", 512), ("set_cmf_warps", 16), ("set_cmf_mrfine", 1)]
-    # brief-51 (worker-1) NWARPS SWEEP: the n=352 cmf panel is 1-CTA/SM, 40-CTA, sync-bound
-    # on warp-0's serial per-column look-ahead -> fewer warps trim the per-column barrier.
-    # Same-session s2 sweep (matched cuda130/torch212 toolchain): warps=8->633us, 12->569us,
-    # 16->550us (BEST), 24->557us (the old default), 32->581us. 16 wins -- the prior note that
-    # "16 starves: 758us" was on the OLD toolchain; the matched toolchain moved the optimum
-    # from 24 to 16 (~1.2% faster s2). cmf_mrfine still picks the precise per-block MROWS.
     # _run_blocked restores every set knob to its _RDEF default (warps->32, fp16_pure->
     # _FP16_PURE, rest->0); only set_prec deliberately leaks (re-set by the next n=512/1024/
-    # 2048/4096 shape), so it is the lone skip -- byte-identical to the prior mirror list.
+    # 2048/4096 shape), so it is the lone skip.
     return _run_blocked("blocked_qr_2level_bf16", (Ac, 64, 64), sets, skip=("set_prec",))
 
 
