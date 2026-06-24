@@ -1228,7 +1228,16 @@ _N512_2L_CT_NW = int(_os.environ.get("QR_N512_2L_CT_NW", "1"))     # single-CTA 
 # with inner tf32x2 -- the joint flip is the safe subset, not either single one.
 # Uses the asymmetric RTN _dot_tf32x2 (V0 rounded to nearest tf32, V1 kept hi+lo);
 # both Gram operands are O(1) reflectors so the asymmetry is harmless.
-_N512_2L_CT_PREC = _os.environ.get("QR_N512_2L_CT_PREC", "tf32x2")
+# brief-52: the inner trailing AND cross_T Gram BOTH flip tf32x2 -> fp16x2 (the fp16
+# analog: V0 fp16, V1 split fp16 hi+lo, 2 fp16 MMAs). The Gram operands are O(1)
+# reflectors so fp16's narrow exponent is safe, and fp16x2's ~20-bit mantissa matches
+# tf32x2's precision while fp16 MMAs are ~2x throughput on B200. brief-47's joint-flip
+# rule still holds (inner+cross must share a precision so the unbiased errors cancel
+# rather than the mismatch compounding) -- the JOINT fp16x2 flip validates PASS (band
+# 13.5/rowscale 15.5/mixed 15.1, diff-guard+invariance CLEAN), and MEASURED (real
+# benchmark interleaved A/B) it nets geomean 2336.5us / n512c 4048us vs the tf32x2 joint
+# 2344us / 4080us (-0.3% geomean, -0.8% n512). See _N512_2L_FI_PREC (the paired inner).
+_N512_2L_CT_PREC = _os.environ.get("QR_N512_2L_CT_PREC", "fp16x2")
 _N512_2L_AP2_BM = int(_os.environ.get("QR_N512_2L_AP2_BM", "32"))  # inner-trailing apply2 row tile
 _N512_2L_AP2_NW = int(_os.environ.get("QR_N512_2L_AP2_NW", "2"))   # inner-trailing apply2 warps
 # Fuse the inner trailing (YT2+apply2 -> one _trailing_fused2_kernel: W on-chip,
@@ -1254,7 +1263,14 @@ _N512_2L_FI_NW = int(_os.environ.get("QR_N512_2L_FI_NW", "2"))     # fused-inner
 # margin, stable seq=16->24): a CONSISTENT precision between the diagonal-block
 # trailing and the off-diagonal T01 coupling lets the unbiased RTN errors cancel
 # instead of the precision-mismatch compounding them. So both flip or neither.
-_N512_2L_FI_PREC = _os.environ.get("QR_N512_2L_FI_PREC", "tf32x2")
+# brief-52: inner trailing tf32x2 -> fp16x2 (paired with _N512_2L_CT_PREC=fp16x2, the
+# joint flip brief-47's rule requires). fp16x2 has the same ~20-bit mantissa as tf32x2
+# but fp16 MMAs are ~2x throughput on B200. JOINT fp16x2 (inner+cross) validates PASS
+# (band 13.5/rowscale 15.5/mixed 15.1, all guards CLEAN) and nets -0.3% geomean / -0.8%
+# n512 (2336.5 vs 2344us). Inner-fp16 ALONE (1-MMA, no hi/lo) FAILS -- the thin masked
+# contraction (ncols<=16, NREF=16) needs the doubled fp16x2 mantissa, and the cross_T
+# must match. So fp16x2 both, or tf32x2 both -- never a single fp16 inner.
+_N512_2L_FI_PREC = _os.environ.get("QR_N512_2L_FI_PREC", "fp16x2")
 # brief-26: software-pipeline stages for the fused2 inner-trailing W/apply sweeps.
 # Mirrors the wide trailing's NS knob (prefetch A/V loads ahead of the dot). NS=1
 # keeps the accepted plain-range path; >1 uses tl.range(num_stages=NS). MEASURED
@@ -2407,6 +2423,10 @@ def _cross_T_kernel(
             G += _dot_tf32x2(V0, V1)                         # V0 RTN-tf32, V1 kept hi+lo
         elif GPREC == "tf32x3i":
             G += _dot_tf32x3i(V0, V1)                        # (IBP, IBP)
+        elif GPREC == "fp16":
+            G += _dot_fp16(V0, V1)
+        elif GPREC == "fp16x2":
+            G += _dot_fp16x2(V0, V1)
         else:
             G += tl.dot(V0, V1, input_precision=GPREC)       # (IBP, IBP)
 
