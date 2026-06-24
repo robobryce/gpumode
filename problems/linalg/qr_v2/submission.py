@@ -1395,9 +1395,22 @@ def _panel_factor_kernel(
         # xk). So every later consumer (alpha, tailv->tail_n2, v) is FP-identical
         # with the mask removed. Drops one (MAXH,)-wide select per column in the
         # ALU-bound (47% pipe_alu) panel.
-        alpha = tl.sum(tl.where(rows == k, xk, 0.0))
-        tailv = tl.where(rows > k, xk, 0.0)
-        tail_n2 = tl.sum(tailv * tailv)
+        # brief-46 (W0, grafting W3 brief-4 + extending it to BOTH panel kernels):
+        # fuse the alpha + tail_n2 axis=0 reductions into ONE cross-thread (smem)
+        # reduction. ncu (W3) proves the panel is MIO-bound (42.5% of stall cycles =
+        # scoreboard waits on the smem-backed tl.sum(axis=0) reductions), so one
+        # fewer smem-reduction pass per column cuts the stall (-3.9% n512 measured by
+        # W3 on _panel_factor2_kernel; this also applies to _panel_factor_kernel which
+        # n1024/n512-single-level use). Stack [xk*(rows==k), xk^2*(rows>k)] into
+        # (MAXH,2), reduce once -> [alpha, tail_n2]. FP-exact: identical per-lane
+        # summands as the two separate reductions.
+        is_k = (rows == k).to(tl.float32)
+        gt_k = (rows > k).to(tl.float32)
+        stacked = tl.where(tl.arange(0, 2)[None, :] == 0,
+                           (xk * is_k)[:, None], (xk * xk * gt_k)[:, None])
+        red = tl.sum(stacked, axis=0)                          # (2,) = [alpha, tail_n2]
+        alpha = tl.sum(tl.where(tl.arange(0, 2) == 0, red, 0.0))
+        tail_n2 = tl.sum(tl.where(tl.arange(0, 2) == 1, red, 0.0))
         normx = tl.sqrt(alpha * alpha + tail_n2)
         sgn = tl.where(alpha >= 0.0, 1.0, -1.0)
         beta = -sgn * normx
@@ -2454,9 +2467,22 @@ def _panel_factor2_kernel(
         # of panel (loaded mask=row_valid&col_valid, 0 at rows>=pheight for the
         # whole sweep) so it is ALREADY 0 there; and the rows<k lanes are never
         # read (alpha uses rows==k, tailv/v use rows>k, w reads v=0 for rows<k).
-        alpha = tl.sum(tl.where(rows == k, xk, 0.0))
-        tailv = tl.where(rows > k, xk, 0.0)
-        tail_n2 = tl.sum(tailv * tailv)
+        # brief-46 (W0, grafting W3 brief-4 + extending it to BOTH panel kernels):
+        # fuse the alpha + tail_n2 axis=0 reductions into ONE cross-thread (smem)
+        # reduction. ncu (W3) proves the panel is MIO-bound (42.5% of stall cycles =
+        # scoreboard waits on the smem-backed tl.sum(axis=0) reductions), so one
+        # fewer smem-reduction pass per column cuts the stall (-3.9% n512 measured by
+        # W3 on _panel_factor2_kernel; this also applies to _panel_factor_kernel which
+        # n1024/n512-single-level use). Stack [xk*(rows==k), xk^2*(rows>k)] into
+        # (MAXH,2), reduce once -> [alpha, tail_n2]. FP-exact: identical per-lane
+        # summands as the two separate reductions.
+        is_k = (rows == k).to(tl.float32)
+        gt_k = (rows > k).to(tl.float32)
+        stacked = tl.where(tl.arange(0, 2)[None, :] == 0,
+                           (xk * is_k)[:, None], (xk * xk * gt_k)[:, None])
+        red = tl.sum(stacked, axis=0)                          # (2,) = [alpha, tail_n2]
+        alpha = tl.sum(tl.where(tl.arange(0, 2) == 0, red, 0.0))
+        tail_n2 = tl.sum(tl.where(tl.arange(0, 2) == 1, red, 0.0))
         normx = tl.sqrt(alpha * alpha + tail_n2)
         sgn = tl.where(alpha >= 0.0, 1.0, -1.0)
         beta = -sgn * normx
