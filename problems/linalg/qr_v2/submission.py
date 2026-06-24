@@ -6444,8 +6444,7 @@ __global__ void diag_lu_static_fused_kernel(float* __restrict__ Mg,
 // column loop: a 16x16 thread grid (256 threads), each owning a 4x4 register tile of the
 // 64x64 block. Only the pivot row kk (srow) and pivot column kk (scol) cross __shared__
 // per column; the trailing FMA reads them from smem and updates the thread's registers
-// in place -- no per-column smem round-trip of the whole block. ~22% faster than the
-// static kernel (1967 vs 2534us over the 64 panels at n=4096,b2, measured). The math is
+// in place -- no per-column smem round-trip of the whole block. The math is
 // IDENTICAL (bit-for-bit verified): same on-the-fly multiplier (scol[r]*inv)*srow[c],
 // same deferred-scale write-back (diag:=piv, strict-lower:=raw/pivs[c]), same D signs --
 // so V (strict-lower) and the recon's (H,tau) are unchanged. TX*TY==256 threads; the
@@ -6623,9 +6622,9 @@ std::vector<torch::Tensor> build_H_inplace(torch::Tensor M, torch::Tensor R, tor
 // via `transpose`: =1 reads a LOWER factor L (R = L^T, so R[r,c]=L[c,r]) for the
 // per-matrix cholesky_ex path; =0 reads a source that already holds the row-major-upper
 // factor in place (R[r,c]=src[r,c]) for the B=2 fused potrf path. The transpose=1 case
-// replaces L64.float().transpose(-1,-2).contiguous() (cast + transposed materialize-copy,
-// ~244us at n=4096,B=2) with one strided FP64 read + contiguous FP32 write (~98us). Every
-// element is written each call, so a persistent reused R buffer is safe.
+// replaces L64.float().transpose(-1,-2).contiguous() (a cast + transposed materialize-copy)
+// with one strided FP64 read + contiguous FP32 write. Every element is written each call,
+// so a persistent reused R buffer is safe.
 __global__ void chol_tri_to_R_kernel(const double* __restrict__ Sg, float* __restrict__ Rg,
                                      int n, int transpose) {
     int mat = blockIdx.z;
@@ -7207,9 +7206,9 @@ torch::Tensor tri_solve_right_inv(torch::Tensor A, torch::Tensor Rin, int nb) {
 // ===========================================================================
 // CUSTOM FUSED PANEL SOLVE for the orhr_col recon LU (launch-overhead elimination).
 // At n=4096/ob=64/B=2 the recon issues, PER PANEL, three sequential launch-bound
-// kernels: the 64x64 diag LU (~27us, only B=2 CTAs -> device-underfilled) plus TWO
-// triangular solves (cublasStrsm L21=M21*U^-1 and U12w=L^-1*M12, ~10-24us each, pure
-// launch latency at this size). Across 63 trailing panels that is the recon's wall.
+// kernels: the 64x64 diag LU (only B=2 CTAs -> device-underfilled) plus TWO triangular
+// solves (cublasStrsm L21=M21*U^-1 and U12w=L^-1*M12, pure launch latency at this size).
+// Across 63 trailing panels that is the recon's wall.
 // This kernel collapses the TWO per-panel triangular solves into ONE launch covering
 // BOTH the L21 back-solve and the U12w forward-solve for ALL B matrices: identical
 // FP32 arithmetic (each independent row/column solve is a w-step substitution against
@@ -7624,20 +7623,12 @@ __global__ void oz_recombine_S_v2_kernel(const int* __restrict__ Pg, int npairs,
 // Pass B: G[i,j] = ci*cj*(S[i,j] + S[j,i] - Udiag[i,j]), kept triangle only. ndiag is
 // the number of LEADING pairs that are diagonal (p==q) -- the caller orders the pair
 // list so the diagonal self-pairs come first, so Udiag = sum_{k<ndiag} wg[k]*P[k,i,j].
-// MLP-prefetch form. ncu on the parent's scalar loop showed this kernel is
-// LATENCY-bound (74.9% of warp stall cycles = long-scoreboard waits on global loads;
-// only 0.92 eligible warps/scheduler on the underfilled 2-batch grid) -- NOT
-// bandwidth-bound (DRAM read 471MB is already ~the minimum: each S element read once +
-// ndiag int diag-P reads). The original `for k: udiag += wg[k]*Pg[...]` chains each
-// diag-P load behind the FP64 accumulator, so the ndiag loads + the 2 S loads issue
-// serially and each warp stalls the full memory latency per load. This form ISSUES all
-// loads (the ndiag int diag-P reads, then both S reads) BEFORE the dependent FP64 math,
-// so they overlap in flight (more memory-level parallelism) and the scoreboard wait is
-// paid once, not ndiag+2 times. BIT-EXACT: udiag = (((0+wg0*p0)+wg1*p1)+...) is the same
-// left-assoc FP64 sum (0+x is exact), and G is the same expression; only load SCHEDULING
-// changes, no reordering of the arithmetic. No smem, no occupancy change (per-thread
-// register buffer is ndiag ints, ndiag<=4 here). Cross-warp L1 reuse on the strided S
-// transpose read is preserved (the access pattern per thread is unchanged).
+// MLP-prefetch form (this kernel is latency-bound on the underfilled 2-batch grid): ISSUE
+// all loads (the ndiag int diag-P reads, then both S reads) BEFORE the dependent FP64 math
+// so they overlap in flight and the scoreboard wait is paid once, not ndiag+2 times.
+// BIT-EXACT: udiag = (((0+wg0*p0)+wg1*p1)+...) is the same left-assoc FP64 sum and G is the
+// same expression; only load SCHEDULING changes. Cross-warp L1 reuse on the strided S
+// transpose read is preserved.
 __global__ void oz_recombine_GfromS_kernel(const int* __restrict__ Pg, const double* __restrict__ wg,
                                            int ndiag, const double* __restrict__ Sg,
                                            int n, int batch, const double* __restrict__ cjg,
@@ -7680,13 +7671,9 @@ std::vector<torch::Tensor> oz_slice(torch::Tensor A, int64_t NS) {
     // cjf zero-initialized: oz_colmax atomicMax's row-block partials into it.
     auto cjf = torch::zeros({batch, n}, A.options().dtype(torch::kFloat32));
     dim3 cmblk(OZ_CM_TILE, 16);
-    // RB row-blocks along grid.y so the launch fills the device (was 1 -> ~16% BW).
-    // ~16 rows/thread per block keeps each block's serial walk short while bounding
-    // the atomicMax contention to RB writers per column.
-    // RB=8 row-blocks (down from 16): halves the per-column atomicMax writer set
-    // (8 vs 16 races) while still launching 8*(n/128)*batch blocks that fill the
-    // device; the float4 kernel is now BW-bound (~64% DRAM) so the longer 512-row
-    // walk is free. Measured colmax-only 28.58us (RB16) -> 27.49us (RB8), bit-exact.
+    // RB row-blocks along grid.y so the launch fills the device. RB=8 balances the
+    // per-column atomicMax writer set (8 races) against launching enough blocks
+    // (8*(n/128)*batch) to keep the BW-bound float4 kernel busy.
     constexpr int OZ_CM_RB = 8;
     // The Ozaki Gram is reached only by the n>=4096 CholeskyQR path (n=4096), so n%4==0
     // always holds and the float4 colmax (4 contiguous columns/thread) is always taken.
@@ -7720,10 +7707,8 @@ void oz_recombine_2pass(torch::Tensor P, torch::Tensor wg, torch::Tensor cj,
     dim3 gridA(((n / 2) + 31) / 32, (n + 7) / 8, batch);
     oz_recombine_S_v2_kernel<<<gridA, blk>>>(P.data_ptr<int>(), npairs,
         wg.data_ptr<double>(), n, batch, S.data_ptr<double>());
-    // Pass B: scalar GfromS. (A smem-transpose-tiled pass-B variant was tried and
-    // REGRESSED on shape6 -- 1024-thread/8.4KB-smem block caps to 2-3 blocks/SM, its
-    // __syncthreads stalls the near-empty SM, and it loses the scalar read's incidental
-    // L2 reuse on S[j,i]; the scattered transpose read is better left to L2 than staged.)
+    // Pass B: scalar GfromS (the scattered transpose read is left to L2 rather than staged
+    // through smem, which loses the incidental L2 reuse on S[j,i] at this tiny batch).
     oz_recombine_GfromS_kernel<<<grid, blk>>>(P.data_ptr<int>(), wg.data_ptr<double>(),
         (int)ndiag, S.data_ptr<double>(), n, batch,
         cj.data_ptr<double>(), G.data_ptr<double>(), (int)lower);
