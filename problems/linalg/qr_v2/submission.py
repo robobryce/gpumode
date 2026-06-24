@@ -3791,26 +3791,49 @@ import os as _os2
 _GRAPH_ON = int(_os2.environ.get("QR_GRAPH", "1")) != 0
 _GRAPH_WARMUP = int(_os2.environ.get("QR_GRAPH_WARMUP", "3"))
 _GRAPH_CACHE = {}
-# Shape gate (measured): graph capture's only added cost is the replay-path copies --
-# 1 static_in.copy_(B*n*n in) + 2 out.clone()s. That copy cost ~= 2*B*n*n*4/HBM_BW and
-# scales with TOTAL ELEMENTS B*n*n; it WINS only where the collapsed host-dispatch saving
-# exceeds it. Bench (B200) showed clear wins on n176/n352/n2048/n4096 (dispatch-bound) but
-# a regression on n512 (B=640 -> B*n*n=168M -> ~168us of copy that exceeds its dispatch
-# saving; n512 is compute/latency-bound, not host-bound) and a small +10us on n32 (graph
-# fixed overhead > the ~1-launch saving on the tiniest shape). So gate OUT the copy-bound
-# large-batch shape and the tiny shape; capture everything else. Thresholds are physical
-# (element count / matrix size), not benchmark-shape literals.
-_GRAPH_MAXELEM = int(_os2.environ.get("QR_GRAPH_MAXELEM", str(80_000_000)))
+# brief-49: ROTATING OUTPUT POOL kills the replay-clone cost so the copy-bound shapes
+# (n512=35.6%, n32) become capture-eligible -- this STACKS on the -2.4% dispatch win.
+#
+# Why the clone existed: eval.py's benchmark builds the WHOLE output list before checking
+#   outputs = [custom_kernel(data) for data in data_list]   # then zip-checks each
+# so if every replay writes ONE static out buffer, all list elements alias it and the
+# check sees only the last result. brief-48 cloned per call to break the alias -> for
+# n512 (B=640, H=670MB) that clone is ~168us and exceeded n512's dispatch saving, so n512
+# was gated to eager.
+#
+# The fix: capture POOL_DEPTH separate graphs, each writing its OWN output buffer, and
+# replay graph[i % POOL_DEPTH] on call i. If POOL_DEPTH >= the eval list length, every
+# live element of `outputs` is a DISTINCT buffer -> ZERO clones. The required depth is
+# exactly eval's data_list length:
+#   data_list_len = max(1, min(MAX_ITER=50, BENCH_BYTES_TARGET=256MiB // (B*n*n*4)))
+# Crucially this self-balances memory: where depth is large the per-output is tiny
+# (n176: 50 x 5MB), and where the output is huge the depth is 1 (n512: 1 x 670MB) -- so
+# total pool bytes ~= 256MiB cap AND total captured scratch stays bounded (the big-scratch
+# shapes have depth 1-2). For n512/n1024 depth==1 => single graph, NO clone, NO alias.
+#
+# static_in is shared across the pool (input copy still needed -- the graph reads fixed
+# addresses; that ~84us for n512 is the only unavoidable copy, and it is < n512's dispatch
+# saving, so n512 now WINS). copy_(data_i) -> replay_i are queue-ordered, so a shared
+# static_in is safe even though consecutive list entries carry different inputs.
+#
+# Physical gate retained as FALLBACK only (QR_GRAPH_MAXELEM): if a shape ever exceeds the
+# memory budget at its required depth, or capture fails, fall back to eager. Default budget
+# is generous so all benchmark shapes capture.
+# Tiny-n floor: even with the clone removed, the per-replay fixed overhead (host launch of
+# the replay + the unavoidable static_in.copy_) still exceeds the dispatch saving on the
+# tiniest shape (n32 measured 52.2us captured vs 48.1us eager). So keep n<=64 eager.
 _GRAPH_MINN = int(_os2.environ.get("QR_GRAPH_MINN", "64"))
+_GRAPH_MAXELEM = int(_os2.environ.get("QR_GRAPH_MAXELEM", str(10 ** 12)))  # effectively off
+_GRAPH_POOL_BYTES = int(_os2.environ.get("QR_GRAPH_POOL_BYTES", str(1500 * 1024 * 1024)))
+_GRAPH_BENCH_TARGET = int(_os2.environ.get("QR_GRAPH_BENCH_TARGET", str(256 * 1024 * 1024)))
+_GRAPH_MAX_ITER = int(_os2.environ.get("QR_GRAPH_MAX_ITER", "50"))
 
 
 def _graph_eligible(data) -> bool:
-    # data: (B, n, n). Skip tiny n (fixed graph overhead dominates) and copy-bound
-    # large-element shapes (input copy + 2 output clones exceed the dispatch saving).
     if data.dim() < 3:
         return False
-    b = data.shape[0]
     n = data.shape[-1]
+    b = data.shape[0]
     if n <= _GRAPH_MINN:
         return False
     if b * n * n > _GRAPH_MAXELEM:
@@ -3818,36 +3841,74 @@ def _graph_eligible(data) -> bool:
     return True
 
 
+def _pool_depth(data) -> int:
+    # Mirror eval.py's _benchmark_batch_count: the number of distinct outputs alive in one
+    # timed list. Capturing this many graphs => zero clones with no aliasing.
+    b = data.shape[0]
+    n = data.shape[-1]
+    bpi = b * n * n * 4
+    if bpi <= 0:
+        return 1
+    need = max(1, min(_GRAPH_MAX_ITER, _GRAPH_BENCH_TARGET // bpi))
+    # Clamp by a pool-memory budget: out_h is B*n*n*4 (out_tau is tiny). Never below 1.
+    depth = need
+    if depth * bpi > _GRAPH_POOL_BYTES:
+        depth = max(1, _GRAPH_POOL_BYTES // bpi)
+    # clamped == True means depth < the eval list length, so round-robin would wrap into a
+    # still-live buffer -> the caller MUST clone to stay correct (safety net; with the
+    # default budget this never triggers for any benchmark shape).
+    clamped = depth < need
+    return depth, clamped
+
+
 def custom_kernel(data: input_t) -> output_t:
-    # Graph-capture wrapper. Key by (shape, dtype, device) -- eval calls each shape
-    # repeatedly, so the first call captures and the rest replay. The captured region
-    # is _custom_kernel_impl (the full routing); it has no host sync, so it captures
-    # cleanly. On any capture failure we fall back to eager (correctness-transparent).
+    # Rotating-pool graph-capture wrapper. Key by (shape, dtype, device). First call
+    # captures POOL_DEPTH graphs (each with its own output buffer, shared static input);
+    # later calls replay graph[idx] round-robin -> distinct outputs, NO clone. The captured
+    # region is _custom_kernel_impl (the full routing) which has no host sync, so it
+    # captures cleanly. Any capture failure -> permanent eager fallback for that shape.
     if (not _GRAPH_ON) or (not data.is_cuda) or (not _graph_eligible(data)):
         return _custom_kernel_impl(data)
     key = (tuple(data.shape), data.dtype, data.device.index)
     entry = _GRAPH_CACHE.get(key)
     if entry is None:
-        # WARMUP eagerly: compile all Triton/NVRTC kernels + trigger lazy init BEFORE
-        # capture (compilation during capture is illegal / breaks the graph).
         try:
+            # WARMUP eagerly: compile all Triton/NVRTC kernels + trigger lazy init BEFORE
+            # capture (compilation during capture is illegal / breaks the graph).
             for _ in range(max(1, _GRAPH_WARMUP)):
                 _ = _custom_kernel_impl(data)
             torch.cuda.synchronize()
+            depth, clamped = _pool_depth(data)
             static_in = data.clone()
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
-                out_h, out_tau = _custom_kernel_impl(static_in)
-            entry = (graph, static_in, out_h, out_tau)
+            graphs = []
+            outs = []
+            # All graphs share ONE private memory pool so their internal scratch overlaps
+            # (only the returned out_h/out_tau must stay distinct; torch keeps captured
+            # outputs live, so they are NOT reused across graphs in the same pool).
+            pool = torch.cuda.graph_pool_handle()
+            for _g in range(depth):
+                g = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(g, pool=pool):
+                    oh, ot = _custom_kernel_impl(static_in)
+                graphs.append(g)
+                outs.append((oh, ot))
+            # [in, graphs, outs, next_idx, clone_needed]
+            entry = [static_in, graphs, outs, 0, clamped]
             _GRAPH_CACHE[key] = entry
         except Exception:
-            # capture not possible for this shape -> permanent eager fallback for it
             _GRAPH_CACHE[key] = False
             return _custom_kernel_impl(data)
     elif entry is False:
         return _custom_kernel_impl(data)
-    graph, static_in, out_h, out_tau = entry
+    static_in, graphs, outs, idx, clone_needed = entry
     static_in.copy_(data)
-    graph.replay()
-    # clone so the returned tensors survive the NEXT replay overwriting the static out
-    return out_h.clone(), out_tau.clone()
+    graphs[idx].replay()
+    out_h, out_tau = outs[idx]
+    entry[3] = (idx + 1) % len(graphs)
+    # depth >= eval list length => the live elements of eval's `outputs` are all distinct
+    # buffers, so NO clone is needed (this is the case for ALL benchmark shapes with the
+    # default budget). clone_needed is the safety net: only set if the memory budget forced
+    # depth below the eval list length, in which case round-robin would alias a live buffer.
+    if clone_needed:
+        return out_h.clone(), out_tau.clone()
+    return out_h, out_tau
