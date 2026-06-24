@@ -5953,43 +5953,16 @@ std::tuple<torch::Tensor, torch::Tensor> blocked_qr_2level_bf16(torch::Tensor A,
 // knobs FOR THE CAPPED LOOP ONLY, leaving the dense good path (and the bad-subset
 // indexed path) byte-identical. Sentinel -1 = "no override" (inherit the dense
 // good-flag value), so the default build reproduces the parent bit-for-bit.
-static int g_rr_bf16_nt    = -1;   // build_Minv threads/CTA for the FP16 trailing apply (else g_bf16_nt)
-static int g_rr_paf_warps  = -1;   // PAF warps/CTA on the capped loop (else g_paf_warps=8)
-static int g_rr_minv_nt    = -1;   // FP32 build_Minv threads (else g_minv_nt=224)
 // CAPPED-LOOP TUNE (worker-2 brief-52, measured): the rank-reveal good path runs the
 // SHORTER capped two-level loop (clustered ncap=256 -> 4 outer blocks, rankdef ncap=384
-// -> 6). Same-session interleaved A/B (10 rounds) on s9/s10 found ONE trailing knob that
-// genuinely beats the shared dense config FOR THE CAPPED LOOP: PAF pivot-cooperation
-// HELP=2 (vs the dense HELP=1). It is clustered -0.34% (s10) and rankdef-neutral (+0.02%,
-// s9), validated correct on BOTH (official checker PASS, factor/orth far under gate). On
-// the SHORTER loop the per-outer-block panel chain is a larger share, so giving warp-0 a
-// 2nd pivot-cooperation warp (HELP=2) shaves the panel's barrier-bound critical path
-// where on the full dense loop (HELP=1) the extra barriers cost more than they save. Every
-// other scalar trailing knob (bf16_nt, paf_warps, minv_nt, inner_wmma_wmax, IB, OB) was
-// A/B'd and is AT the dense optimum for the capped loop too (they parametrize per-OB-block
-// kernels -- the 64-wide T-inverse, per-sub-panel PAF, cuBLAS auto-tiled GEMMs -- whose
-// shapes are ncap-INVARIANT; only the loop COUNT changes). Set to -1 via set_rr_paf_help
-// to disable for A/B.
-static int g_rr_paf_help   = 2;    // PAF pivot-coop HELP on the capped loop (dense g_paf_help=1)
-static int g_rr_wmma_wmax  = -1;   // inner-WMMA width cap on the capped loop (else g_inner_wmma_wmax=32)
-static int g_rr_ib         = 16;   // inner-block IB on the capped loop (dense default 16; 32 must %OB and <=wmax)
-static int g_rr_ob         = 64;   // outer-block OB on the capped loop (dense default 64; 128 must divide ncap)
-void set_rr_ib(int v)        { g_rr_ib        = v; }
-void set_rr_ob(int v)        { g_rr_ob        = v; }
-void set_rr_bf16_nt(int v)   { g_rr_bf16_nt   = v; }
-void set_rr_paf_warps(int v) { g_rr_paf_warps = v; }
-void set_rr_minv_nt(int v)   { g_rr_minv_nt   = v; }
-void set_rr_paf_help(int v)  { g_rr_paf_help  = v; }
-void set_rr_wmma_wmax(int v) { g_rr_wmma_wmax = v; }
-// Apply the rank-reveal overrides on top of the already-set dense good flags.
-// Only the knobs with a non-sentinel override change; all others stay at the
-// dense values. Returns nothing -- restore_after_n512_good() resets everything.
+// -> 6). The one trailing knob that beats the shared dense config there is PAF
+// pivot-cooperation HELP=2 (vs the dense HELP=1): clustered -0.34%, rankdef-neutral,
+// validated correct on both. Every other scalar trailing knob (bf16_nt, paf_warps,
+// minv_nt, inner_wmma_wmax, IB, OB) is AT the dense optimum for the capped loop too, so
+// only g_paf_help is overridden (the others' override sentinels were never set).
+// Apply the rank-reveal override on top of the already-set dense good flags.
 static inline void apply_n512_rr_overrides() {
-    if (g_rr_bf16_nt   >= 0) g_bf16_nt        = g_rr_bf16_nt;
-    if (g_rr_paf_warps >= 0) g_paf_warps      = g_rr_paf_warps;
-    if (g_rr_minv_nt   >= 0) g_minv_nt        = g_rr_minv_nt;
-    if (g_rr_paf_help  >= 0) g_paf_help       = g_rr_paf_help;
-    if (g_rr_wmma_wmax >= 0) g_inner_wmma_wmax = g_rr_wmma_wmax;
+    g_paf_help = 2;
 }
 
 static inline void set_n512_good_flags() {
@@ -6103,13 +6076,8 @@ static std::tuple<torch::Tensor, torch::Tensor> n512_good_rankreveal(torch::Tens
     // g_n512_rr_detect stays 0 for dense and the threshold only ever sees rankdef/clustered.
     // (Rank-reveal is unconditionally on; there is no Python gate.)
     if (tail_small) g_n512_rr_detect = 3.0e-3f;
-    // IB/OB overrides only on the capped loop (tail_small); dense keeps OB=64/IB=16.
-    // IB must divide OB and stay <= the inner-WMMA width cap, %16 for WMMA (16 or 32).
-    // OB=128 must divide ncap (rankdef 384, clustered 256 -- both /128); it falls off
-    // the n512 OB64/IB16 fill_R fast path to the generic tiled fill (correct, slower).
-    const int rr_ib = (tail_small && g_rr_ib == 32) ? 32 : 16;
-    const int rr_ob = (tail_small && g_rr_ob == 128) ? 128 : 64;
-    auto out = blocked_qr_2level_bf16(A, rr_ob, rr_ib);
+    // The capped loop runs at the dense OB=64/IB=16 (the A/B'd optimum for it too).
+    auto out = blocked_qr_2level_bf16(A, 64, 16);
     g_n512_rr_detect = 0.0f;
     restore_after_n512_good();
     g_bf16_nt = saved_bf16_nt;   // restore the import default the override may have changed
@@ -6331,13 +6299,6 @@ void set_paf_warps(int v);
 void set_n2048_h(int v);
 void set_paf_help(int v);
 void set_ov_coop(int v);
-void set_rr_bf16_nt(int v);
-void set_rr_paf_warps(int v);
-void set_rr_minv_nt(int v);
-void set_rr_paf_help(int v);
-void set_rr_wmma_wmax(int v);
-void set_rr_ib(int v);
-void set_rr_ob(int v);
 void set_yfold(int v);
 void set_yfold_maxrest(int v);
 """
@@ -6366,7 +6327,7 @@ def _compile_qr(name, cpp, cuda, functions, ldflags):
 
 
 def _compile_ext():
-    functions = ["blocked_qr", "illcond_mask", "n352_illcond_mask_cuda", "blocked_qr_2level", "blocked_qr_2level_bf16", "qr_n512_mixed_driver", "blocked_qr_tiny", "qr_mega_small", "set_mega_warps", "set_bf16_nt", "set_bf16_wf16", "set_fp16_pure", "set_prec", "set_warps", "set_minv_nt", "set_minv_blk4", "set_minv_blk4_minw", "set_minv_nt_sl", "set_panel_defer", "set_panel_raw", "set_wsp_pad", "set_wsp_cm_coop", "set_panel_cm", "set_panel_cm2", "set_cmf_warps", "set_cmf_mrfine", "set_cmf_f32in0", "set_ov_fold", "set_inner_wmma", "set_inner_wmma_wmax", "set_panel_apply_fused", "set_paf_warps", "set_n2048_h", "set_paf_help", "set_yfold", "set_yfold_maxrest", "set_ov_coop", "set_rr_bf16_nt", "set_rr_paf_warps", "set_rr_minv_nt", "set_rr_paf_help", "set_rr_wmma_wmax", "set_rr_ib", "set_rr_ob"]
+    functions = ["blocked_qr", "illcond_mask", "n352_illcond_mask_cuda", "blocked_qr_2level", "blocked_qr_2level_bf16", "qr_n512_mixed_driver", "blocked_qr_tiny", "qr_mega_small", "set_mega_warps", "set_bf16_nt", "set_bf16_wf16", "set_fp16_pure", "set_prec", "set_warps", "set_minv_nt", "set_minv_blk4", "set_minv_blk4_minw", "set_minv_nt_sl", "set_panel_defer", "set_panel_raw", "set_wsp_pad", "set_wsp_cm_coop", "set_panel_cm", "set_panel_cm2", "set_cmf_warps", "set_cmf_mrfine", "set_cmf_f32in0", "set_ov_fold", "set_inner_wmma", "set_inner_wmma_wmax", "set_panel_apply_fused", "set_paf_warps", "set_n2048_h", "set_paf_help", "set_yfold", "set_yfold_maxrest", "set_ov_coop"]
     return _compile_qr("qr_blocked_v7k_wf16", _CPP_SRC, _CUDA_SRC, functions, ["-lcublas"])
 
 _CUDA_LU_SRC = r"""
