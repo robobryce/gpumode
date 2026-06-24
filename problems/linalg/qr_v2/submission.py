@@ -769,6 +769,21 @@ _TINY_WPB = int(_os.environ.get("QR_TINY_WPB", "2"))
 # per column strip, W kept on-chip (no YT HBM round-trip). Bounded (BM_F, BNc_F)
 # chunk resident across the two row sweeps so nothing spills.
 _FUSED_TRAIL = int(_os.environ.get("QR_FUSED_TRAIL", "1")) != 0
+# brief-37 SYNC-FREE GPU-SIDE ROUTE: on-device per-matrix effective-rank probe ->
+# rankdef trailing WORK-SKIP. Default ON: the probe is memory-bound O(n^2) (cheap
+# vs the O(n^3) trailing) and bit-exact (only EXACTLY-zero trailing columns skip,
+# whose trailing delta is provably 0). Gated to N==512 (the ranked rankdef shape).
+# QR_RANKSKIP=0 disables (perf-neutral byte-identical fallback) for A/B measurement.
+# Grafted onto the brief-52 split-sweep+fp16 base: DISJOINT region (this skips whole
+# zero column tiles; brief-52 changes the dot precision of the tiles that run).
+_RANKSKIP = int(_os.environ.get("QR_RANKSKIP", "1")) != 0
+_RANKSKIP_BM = int(_os.environ.get("QR_RANKSKIP_BM", "64"))
+_RANKSKIP_BN = int(_os.environ.get("QR_RANKSKIP_BN", "128"))
+# Probe only the trailing band [CSTART, N), CSTART = floor(N*FRAC) tile-aligned.
+# rankdef zero band is EXACTLY [3n/4:n] (reference.py rank=max(1,3n//4)), so FRAC=0.75
+# -> CSTART=3n/4 probes precisely that band (col 3n/4 is the first zero col; cols
+# <3n/4 conservatively active so no nonzero col is ever skipped -> CORRECTNESS).
+_RANKSKIP_CSTART_FRAC = float(_os.environ.get("QR_RANKSKIP_CSTART_FRAC", "0.75"))
 _BM_F = int(_os.environ.get("QR_BM_F", "32"))
 _BNC_F = int(_os.environ.get("QR_BNC_F", "32"))
 _NW_F = int(_os.environ.get("QR_NW_F", "2"))
@@ -1750,6 +1765,84 @@ def _dot_tf32x3i(x, y):
     return c0 + c1 + c2
 
 
+# =============================================================================
+# SYNC-FREE GPU-SIDE ROUTING PRIMITIVE (brief-37, grafted into the brief-52 base).
+#
+# _probe_zeroband_kernel computes a per-matrix effective column rank -- the index
+# (+1) of the highest column that is NOT exactly zero -- into a device int32
+# buffer eff_rank[B], and in the SAME pass pre-zeros H[:, c] for the all-zero
+# columns. eff_rank is NEVER copied to host (no .item()): it lives on the device
+# and is read back by the trailing kernel as a per-program skip bound.
+#
+# Structure: the rankdef case sets columns [3n/4 : n] to EXACTLY 0.0, so those
+# columns produce identity reflectors (tau=0) and an all-zero H column. A column c
+# is "active" iff max_r |A[r,c]| > 0; eff_rank = 1 + max{c : active}. Because the
+# test fires only on EXACTLY-zero columns, the work-skip is BIT-EXACT: the skipped
+# trailing delta = V @ (T^T V^T A_trail) over zero columns is provably 0, so
+# aorig - delta == aorig, and the pre-zeroed band already holds the correct 0.
+# Dense / nearrank / clustered / band have NO exactly-zero trailing columns -> the
+# probe returns N -> the full path runs unchanged (perf-neutral, byte-identical).
+# =============================================================================
+def use_fused_rankskip_eligible(N, blk_override):
+    # Perf gate for the rankdef WORK-SKIP. The skip is bit-exact wherever it fires,
+    # but only PAYS where a benchmark shape carries an exactly-zero trailing band:
+    # that is n=512 rankdef (the ranked rankdef shape). Gated to N==512 (a SHAPE
+    # param -> invariance-safe); other N keep the byte-identical full path.
+    return blk_override is None and N == 512
+
+
+# MERGED probe+zeroband in ONE pass. Reads A's trailing band [CSTART, N) ONCE
+# (grid=(B, col_tiles), each program owns one column tile, OR-reduces over all rows)
+# and does TWO things: (1) ROUTE atomic_max eff_rank[bid] with (highest active
+# absolute column)+1; (2) PRE-ZERO H[:, c]=0 for exactly the all-zero columns it
+# found. Columns [0,CSTART) are conservatively active (eff seeded to CSTART) so no
+# nonzero column is ever skipped. BIT-EXACT: only EXACTLY-zero columns get H=0.
+@triton.jit
+def _probe_zeroband_kernel(
+    A_ptr, H_ptr, eff_ptr,
+    B, N, CSTART,
+    stride_ab, stride_an,
+    stride_hb, stride_hn,
+    BM: tl.constexpr, BN: tl.constexpr,
+):
+    bid = tl.program_id(0)
+    ct = tl.program_id(1)
+    if bid >= B:
+        return
+    c0 = CSTART + ct * BN
+    if c0 >= N:
+        return
+    cc = c0 + tl.arange(0, BN)
+    cmask = cc < N
+    a_base = A_ptr + bid * stride_ab
+    n_rtiles = tl.cdiv(N, BM)
+    # pass 1: per-column nonzero count over all rows of this band column tile.
+    col_nz = tl.zeros((BN,), dtype=tl.int32)
+    for rt in range(0, n_rtiles):
+        rr = rt * BM + tl.arange(0, BM)
+        rmask = rr < N
+        ap = a_base + rr[:, None] * stride_an + cc[None, :]
+        chunk = tl.load(ap, mask=rmask[:, None] & cmask[None, :], other=0.0)
+        col_nz += tl.sum(tl.where(chunk != 0.0, 1, 0), axis=0)   # (BN,) per-column
+    active = (col_nz > 0) & cmask                                # (BN,)
+    # ROUTE: raise eff_rank to the highest active absolute column +1 in this tile.
+    rank_tile = tl.max(tl.where(active, cc + 1, 0))
+    tl.atomic_max(eff_ptr + bid, rank_tile)
+    # PRE-ZERO: write H[:, c]=0 for the all-zero columns of this tile (the trailing
+    # skip will bare-return on them). UNIFORM early-out when none are zero (the
+    # dense/mixed/clustered case: every band column active -> nothing to write).
+    nzero = tl.sum(tl.where(~active & cmask, 1, 0))
+    if nzero > 0:
+        zcol = ~active & cmask                                   # (BN,) cols to zero
+        hbase = H_ptr + bid * stride_hb
+        z = tl.zeros((BM, BN), dtype=tl.float32)
+        for rt in range(0, n_rtiles):
+            rr = rt * BM + tl.arange(0, BM)
+            rmask = rr < N
+            hp = hbase + rr[:, None] * stride_hn + cc[None, :]
+            tl.store(hp, z, mask=rmask[:, None] & zcol[None, :])
+
+
 @triton.jit
 def _trailing_fused_kernel(
     A_ptr, Vbuf_ptr, Tbuf_ptr,
@@ -1758,10 +1851,12 @@ def _trailing_fused_kernel(
     stride_vb, stride_vk, stride_vn,
     stride_tb, stride_tk, stride_tn,
     Aout_ptr,                                 # separate store dest (block 0: read A, write H => fuses the clone)
+    eff_ptr,                                  # brief-37: device int32 eff_rank[B] (route primitive); ignored unless RANKSKIP
     BLK: tl.constexpr, BM: tl.constexpr, BNc: tl.constexpr,
     IPREC: tl.constexpr = "tf32x3",
     NACC: tl.constexpr = 1, NS: tl.constexpr = 1,
     IPREC2: tl.constexpr = "",                 # brief-52: delta-sweep precision; "" => same as IPREC
+    RANKSKIP: tl.constexpr = False,            # brief-37: skip provably-zero trailing column tiles
 ):
     col_tile = tl.program_id(0)
     bid = tl.program_id(1)
@@ -1783,6 +1878,26 @@ def _trailing_fused_kernel(
     a_trail_base = A_ptr + bid * stride_ab + j * stride_an + jb
     aout_trail_base = Aout_ptr + bid * stride_ab + j * stride_an + jb
     v_base = Vbuf_ptr + bid * stride_vb
+
+    # SYNC-FREE GPU-SIDE ROUTE (brief-37): block-granularity UNIFORM skip. eff_ptr
+    # holds the per-matrix effective rank (highest active column +1), computed
+    # on-device by _probe_zeroband_kernel and NEVER copied to host. This program's
+    # column tile covers ABSOLUTE columns [jb+c0, jb+c0+BNc). When jb+c0 >= the
+    # matrix's eff_rank, the WHOLE tile lies in the exactly-zero trailing band, so
+    # the trailing update delta = V @ (T^T V^T A_trail) is provably 0 (A_trail's
+    # columns are 0 => W=0 => YT=0 => delta=0) and the correct output is exactly 0.
+    # _w2_qr_2level_n512 pre-zeroed H[:, eff_rank:N] with _probe_zeroband_kernel, so
+    # this program can just RETURN (no GEMM, no YT dot, no copy) and the band stays
+    # at the correct 0. This is a uniform top-level branch on a runtime scalar at
+    # BLOCK granularity -- decided ONCE before the pipelined loop, NOT a per-iteration
+    # data-dependent if -- so the MMA software-pipeline in the full path is untouched.
+    # Bit-exact (fires only on EXACTLY-zero trailing columns); stacks with the brief-52
+    # split-sweep precision (different code region: this skips whole tiles, that
+    # changes the dot precision of the tiles that DO run).
+    if RANKSKIP:
+        er = tl.load(eff_ptr + bid)
+        if jb + c0 >= er:
+            return
 
     # sweep 1: W = V^T @ A_trail over all panel rows, in chunks of BM.
     # IPREC controls this big W=V^T@A reduction (the bulk FLOPs). Default tf32x3
@@ -2685,6 +2800,7 @@ def _w2_qr_2level(data):
                     H, Vbuf, Tbuf, B, N, j, pheight, ncols, j + bb,
                     sab, san, svb, svk, svn, stb, stk, stn,
                     H,
+                    H,                          # brief-37 eff_ptr placeholder (RANKSKIP off here)
                     BLK=NB, BM=_BM_2L, BNc=_BNC_2L, num_warps=_NW_2L,
                 )
             else:
@@ -2759,6 +2875,28 @@ def _w2_qr_2level_n512(data):
     swb, swt, swk, swn = Wpart.stride(0), Wpart.stride(1), Wpart.stride(2), Wpart.stride(3)
 
     FBM, FBNC, FNW = _N512_2L_FBM, _N512_2L_FBNC, _N512_2L_FNW
+
+    # SYNC-FREE GPU-SIDE ROUTE (brief-37): per-matrix effective rank, computed
+    # ENTIRELY on-device (no .item()), so the wide trailing can SKIP the exactly-zero
+    # trailing column band (rankdef: cols [3n/4:n] are 0 -> identity reflectors). The
+    # probe (parallel grid=(B,ntiles), atomic_max) is cheap and only fires on EXACTLY-
+    # zero columns (bit-exact); dense/mixed/clustered have eff=N -> no skip -> byte-
+    # identical full path. The zero band is pre-zeroed ONCE so the skip is a bare return.
+    use_rankskip = bool(_RANKSKIP and use_fused_rankskip_eligible(N, None))
+    eff_rank = None
+    if use_rankskip:
+        # Probe only the trailing band [CSTART, N) (half-matrix read); [0, CSTART) cols
+        # are conservatively active (eff seeded to CSTART). For rankdef the zero band
+        # [3n/4:n] is fully inside [n/2:n], so no skip is lost. CSTART tile-aligned to FBNC.
+        cstart = (int(N * _RANKSKIP_CSTART_FRAC) // FBNC) * FBNC
+        eff_rank = torch.full((B,), cstart, device=A.device, dtype=torch.int32)
+        ncol_tiles = (N - cstart + _RANKSKIP_BN - 1) // _RANKSKIP_BN
+        # ONE merged pass: probe (-> eff_rank for the skip) AND pre-zero the band.
+        _probe_zeroband_kernel[(B, ncol_tiles)](
+            A, H, eff_rank, B, N, cstart,
+            A.stride(0), A.stride(1), H.stride(0), H.stride(1),
+            BM=_RANKSKIP_BM, BN=_RANKSKIP_BN, num_warps=4,
+        )
 
     j = 0
     while j < N:
@@ -2871,8 +3009,10 @@ def _w2_qr_2level_n512(data):
                 src, Vbuf, Tbuf, B, N, j, pheight, ncols, j + bb,
                 sab, san, svb, svk, svn, stb, stk, stn,
                 H,
+                eff_rank if eff_rank is not None else H,   # brief-37 eff_ptr (placeholder when off)
                 BLK=NB, BM=FBM, BNc=FBNC, num_warps=FNW, IPREC=_N512_2L_F_PREC,
                 NACC=_N512_2L_F_NACC, NS=_N512_2L_F_NS, IPREC2=_N512_2L_F_PREC2,
+                RANKSKIP=use_rankskip,
             )
         j += bb
 
@@ -3096,6 +3236,7 @@ def _w2_qr(data, blk_override=None):
                     B, N, j, pheight, ncols, j + b,
                     sab, san, svb, svk, svn, stb, stk, stn,
                     H,
+                    tau,                        # brief-37 eff_ptr placeholder (n512 routes via _w2_qr_2level_n512; RANKSKIP off here)
                     BLK=BLK, BM=BM_F, BNc=BNc_F, num_warps=NW_F, IPREC=fused_iprec,
                     NACC=fuse_nacc, NS=fuse_ns,
                 )
@@ -3204,6 +3345,7 @@ def _w2_qr_mcta(data):
                     B, N, j, pheight, ncols, j + b,
                     sab, san, svb, svk, svn, stb, stk, stn,
                     H,
+                    H,                          # brief-37 eff_ptr placeholder (RANKSKIP off here)
                     BLK=BLK, BM=_BM_F, BNc=_BNC_F, num_warps=_NW_F,
                 )
             else:
