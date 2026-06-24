@@ -359,20 +359,16 @@ __device__ __forceinline__ void trailing_col_rm_fp32(
 // kernel's pruned dispatch arms are guarded by TORCH_CHECK(false,...).
 
 // Deferred-scale ("raw-V") panel factorization. Same math as the base kernel but the
-// strict-lower reflector column is NOT scaled by
-// inv=1/(alpha-beta) inside the per-column loop. Instead the trailing rank-1
-// update is applied in the UNNORMALIZED Householder form:
+// strict-lower reflector column is NOT scaled by inv=1/(alpha-beta) inside the per-column
+// loop; instead the trailing rank-1 update is applied in the UNNORMALIZED Householder form:
 //   v_raw = [alpha-beta; a_strict_lower]  (a = raw, unscaled column entries)
 //   H = I - tau*v*v^T = I - (tau*inv^2)*v_raw*v_raw^T   (v = inv*v_raw)
-// so the update C -= tau*v*(v^T C) == C -= (tau*inv^2)*v_raw*(v_raw^T C). The
-// diagonal head (alpha-beta) is carried as a scalar (sh_hd), the strict-lower as
-// the raw smem entries -- so NO per-column scale pass and NO post-scale barrier
-// are needed (one fewer sync/column + one fewer m-row pass). Each column's inv is
-// stashed in inv_col[]; the strict-lower is converted to the standard unit-diagonal
-// v (a*inv) ONCE, folded into the write-back pass. The panel is latency-bound on
-// its serial barrier chain, so cutting a barrier + the m-row scale pass per column
-// is a direct win. BMAX caps inv_col[]; b<=BMAX enforced by caller. Wired ON for
-// the n=512 big-batch case only (QR_BIGBATCH_PANEL_RAW=1).
+// so C -= tau*v*(v^T C) == C -= (tau*inv^2)*v_raw*(v_raw^T C). The diagonal head (alpha-beta)
+// is a scalar (sh_hd), the strict-lower stays raw in smem -- so NO per-column scale pass and
+// NO post-scale barrier (one fewer sync + one fewer m-row pass/column, a direct win on this
+// latency-bound panel). Each column's inv is stashed in inv_col[]; the strict-lower is
+// converted to unit-diagonal v (a*inv) ONCE in the write-back. BMAX caps inv_col[]; wired ON
+// for the n=512 big-batch case only (QR_BIGBATCH_PANEL_RAW=1).
 template <int NWARPS, int BMAX>
 __global__ void panel_factor_smem_raw_kernel(float* __restrict__ H, float* __restrict__ tau,
                                              int n, int k, int b, int m,
@@ -486,21 +482,14 @@ __global__ void panel_factor_smem_raw_kernel(float* __restrict__ H, float* __res
 // panel_factor_smem_wsp_cmf_tmpl_kernel<NWARPS,MROWS,float> (defined after build_V_cvt;
 // launch sites pass Hout=nullptr -> single FP32 output). Their dispatch arms are gone.
 
-// DEEP-PIPELINE 1-sync panel: takes the fused-norm idea one step further down the
-// critical path. The fnorm kernel still pays 2 syncs/column: (A) broadcast the
-// reflector scalars tau/inv/beta computed by warp0,lane0, then (B) finish the
-// trailing + next-column norm. But at the END of column j's trailing phase warp 0
-// already holds BOTH the next column's norm^2 (just reduced into sh_norm2) AND its
-// pivot alpha = s[(j+1),(j+1)] (warp 0,lane 0 wrote that entry while updating
-// trailing column c=j+1, rows>=j+1). So warp 0,lane 0 can compute column (j+1)'s
-// tau/inv/beta RIGHT THERE -- before sync B -- and stash them. Column (j+1) then
-// reads them with NO sync A: a single __syncthreads per column for j>=1 (sync B of
-// column j publishes both the updated trailing block AND column j+1's scalars).
-// Column 0's scalars are computed the normal way after its norm reduction. Cutting
-// one of two barriers on a B=8 / 8-of-148-SM latency-bound panel directly shortens
-// the per-column serial chain. Numerically identical to fnorm/defer (same betas/
-// taus/V): the only change is WHEN the same scalar arithmetic runs, not WHAT.
-// Wired for the n=1024 case AND the n=2048 case.
+// DEEP-PIPELINE 1-sync panel: at the END of column j's trailing phase warp 0 already holds
+// both column j+1's norm^2 (reduced into sh_norm2) AND its pivot alpha = s[(j+1),(j+1)], so
+// warp 0,lane 0 computes column j+1's tau/inv/beta RIGHT THERE (before sync B) and stashes
+// them. Column j+1 reads them with NO separate broadcast sync -> a single __syncthreads per
+// column for j>=1 (column 0's scalars computed after its norm reduction). Cutting one of the
+// fnorm panel's two barriers shortens the per-column serial chain on this B=8/underfilled
+// latency-bound panel. Numerically identical to fnorm/defer (same betas/taus/V; only WHEN the
+// scalar arithmetic runs changes). Wired for the n=1024 AND n=2048 cases.
 template <int NWARPS>
 __global__ void panel_factor_smem_pipe_kernel(float* __restrict__ H, float* __restrict__ tau,
                                               int n, int k, int b, int m,
@@ -570,22 +559,18 @@ __global__ void panel_factor_smem_pipe_kernel(float* __restrict__ H, float* __re
     }
 }
 
-// Fused-norm panel with optional outer-V fold. Householder math + per-column
-// fused-norm pipeline; when an outer-V target is supplied (OVbase != nullptr) its
-// write-back ALSO emits this diagonal inner sub-panel's columns directly into the
-// WIDE OUTER-block FP32 V buffer (OVbase, ovmo x ovld) -- eliminating the standalone
-// build_V_kernel pass the two-
-// level driver otherwise runs over the OB-wide reflector band (a pure HBM round-trip).
-// the n=1024 case (n=1024,B=60,OB=128) uses the fnorm panel and that build_V over the wide
-// OB=128 band is a bigger absolute round-trip than the n=512 big-batch case's OB=64; folding it drops
-// the launch + traffic. Geometry mirrors panel_factor_smem_raw_ov_kernel: this square
-// diagonal sub-panel sits at outer offset `ovroff`, R_outer-C_outer == r_local-c_local,
-// so the unit-diag/reflector/strict-upper-0 pattern in outer coords is identical to the
-// panel's own; it also zero-fills the ovroff x b triangle above its columns. Across all
-// inner sub-panels the full ovmo x ovld outer V is materialized with NO extra kernel and
-// NO re-read of H. Numerically identical to fnorm (same betas/taus/V). `Vout` (stride b)
-// is the inner V the inner-update apply reads; written in the SAME pass (null for the
-// last sub-panel of an outer block, which feeds no inner update).
+// Fused-norm panel with optional outer-V fold. Householder math + per-column fused-norm
+// pipeline; when an outer-V target is supplied (OVbase != nullptr) the write-back ALSO emits
+// this diagonal inner sub-panel's columns directly into the WIDE OUTER-block FP32 V buffer
+// (OVbase, ovmo x ovld), eliminating the standalone build_V_kernel HBM round-trip the
+// two-level driver otherwise runs over the OB-wide band (used by the n=1024 OB=128 path).
+// Geometry mirrors panel_factor_smem_raw_ov_kernel: the square diagonal sub-panel sits at
+// outer offset `ovroff` with R_outer-C_outer == r_local-c_local, so the unit-diag/reflector/
+// strict-upper-0 pattern is identical in outer coords; it also zero-fills the ovroff x b
+// triangle above its columns. Across all inner sub-panels the full ovmo x ovld outer V is
+// materialized with NO extra kernel and NO re-read of H. Numerically identical to fnorm.
+// `Vout` (stride b) is the inner V the inner-update apply reads, written in the SAME pass
+// (null for the last sub-panel of an outer block, which feeds no inner update).
 template <int NWARPS>
 __global__ void panel_factor_smem_fnorm_ov_kernel(float* __restrict__ H, float* __restrict__ tau,
                                                   int n, int k, int b, int m,
@@ -897,24 +882,15 @@ qr_mega_resident_kernel(const float* __restrict__ Ain, float* __restrict__ Hout,
 // we also zero W row j (matching larft's zero row & column j in T).
 // Smem row stride padded ODD (b|1) so the strided column reads of M during the
 // forward-sub hit 32 distinct banks (no conflicts) regardless of b.
-// NOTE: the plain static build_Minv_kernel<BMAX> (single b-wide forward-sub) and the
-// dynamic-smem build_Minv_dyn_kernel were the original fallbacks; every benchmark and
-// test shape now routes to the block-recursive variants below (rblk_gen / blk4 -- all
-// reachable reflector widths are even and on the blk2/blk4 path), so both were deleted.
-// The dispatch sites keep a TORCH_CHECK guard on the (now unreachable) fallback arm.
-
-// FOUR-block-merge build_Minv: invert the b x b lower-triangular L via a 4x4 block
-// scheme (block size q=b/4) instead of blk2's 2x2 (h=b/2). The four DIAGONAL q-blocks
-// invert via q-deep forward-subs (HALF blk2's h-deep chain -> the latency-bound chain
-// shrinks again), and the 6 below-diagonal blocks fill by block-forward-substitution
-// (thread-parallel q x q matmuls -- throughput work; the kernel sits at ~7% SM
-// throughput so it has huge headroom for more matmul work in exchange for a shorter
-// serial chain). Done with PROPERLY-STAGED accumulators (acc[I] += L[I][K]@M[K][J] as
-// the inner index K advances) so each off-diagonal inner product is computed ONCE, not
-// recomputed per output element. tau==0
-// columns: the diagonal forward-subs zero those rows/cols and the zeros propagate
-// through the block matmuls, matching blk2. NUMERICALLY IDENTICAL to blk2 (same FP32
-// math, just reassociated by blocks) -> shares all validation. Requires b % 4 == 0.
+// FOUR-block-merge build_Minv: invert the b x b lower-triangular L via a 4x4 block scheme
+// (block size q=b/4) instead of blk2's 2x2. The four DIAGONAL q-blocks invert via q-deep
+// forward-subs (HALF blk2's h-deep chain), and the 6 below-diagonal blocks fill by
+// block-forward-substitution (thread-parallel q x q matmuls; the kernel is ~7% SM so it has
+// headroom for the extra matmul work in exchange for a shorter serial chain), with
+// PROPERLY-STAGED accumulators (acc[I] += L[I][K]@M[K][J] as K advances) so each off-diagonal
+// inner product is computed ONCE. tau==0 columns: the diagonal forward-subs zero those
+// rows/cols and the zeros propagate through the block matmuls, matching blk2. NUMERICALLY
+// IDENTICAL to blk2 (FP32 reassociated by blocks). Requires b % 4 == 0.
 // Smem: [Lsh b*LD][Msh b*LD][tau_s b][acc 3*q*QD].
 
 // SHARED build_Minv diagonal-block L-inverse forward-sub (both variants; caller passes its
@@ -932,18 +908,14 @@ __device__ __forceinline__ void minv_diag_invert(const float* __restrict__ Lsh,
                                                   const float* __restrict__ tau_s,
                                                   int b, int bw, int t, int nt, int LD) {
     // REGISTER-CACHE the thread's own column-j M values across the diagonal forward-sub.
-    // The column M[p][j] (rows p in [blk0,be)) is WRITTEN by this thread at iteration i=p
-    // (Msh[i*LD+j]) and then RE-READ as Msh[p*LD+j] for every later i>p of the same column.
-    // The compiler cannot keep it in registers: the store Msh[i*LD+j] may alias the loads
-    // Msh[p*LD+j] through smem (i!=p is not provable across the LD-strided index), so it
-    // reloads from smem every inner iteration -- the short_scoreboard stall ncu attributes
-    // ~2.6 inst/issue to on build_Minv at n=1024 (latency-bound, 60 CTAs / 148 SMs, every
-    // build_Minv shape is CTA-underfilled so the +<=bw regs are FREE -- occupancy is not the
-    // limiter, latency hiding within the one CTA is). Hoist column j into mj[row-blk0]: the
-    // diagonal and each produced M[i][j] go to a register, and the inner reduce reads mj[]
-    // instead of Msh. The Msh STORES stay (the merge phases read Msh). Bit-identical (same
-    // FP32 values, same accumulation order). Gated on bw<=MJCACHE so the (currently dead)
-    // bw>16 arm keeps the original byte-identical smem-read loop.
+    // The column M[p][j] is WRITTEN by this thread at iteration i=p and RE-READ for every
+    // later i>p. The compiler can't register-keep it (the store Msh[i*LD+j] may alias the
+    // loads Msh[p*LD+j] through the LD-strided smem index), so it reloads every iteration --
+    // a short_scoreboard stall on this latency-bound CTA-underfilled kernel (the +<=bw regs
+    // are FREE; occupancy is not the limiter). Hoist column j into mj[row-blk0] so the inner
+    // reduce reads registers; the Msh STORES stay (the merge phases read Msh). Bit-identical
+    // (same FP32 values + order). Gated on bw<=MJCACHE; the (dead) bw>16 arm keeps the
+    // original smem-read loop.
     if (bw <= MINV_MJCACHE) {
         for (int j = t; j < b; j += nt) {
             int blk0 = (j / bw) * bw;
@@ -1211,18 +1183,14 @@ __device__ __forceinline__ __half build_V_cvt(float x, __half) { return __float2
 __device__ __forceinline__ float cmf_load_cvt(float  x, float)  { return x; }
 __device__ __forceinline__ float cmf_load_cvt(__half x, __half) { return __half2float(x); }
 
-// MERGED column-major shapes-1,2 panel: ONE template over storage type ST (float or
-// __half) that subsumes the former panel_factor_smem_wsp_cmf_kernel (FP32 storage) and
-// panel_factor_smem_wsp_cmf_bf16_kernel (FP16/bf16 storage). The shared tile `s` is
-// `float` in BOTH instantiations, so the per-column HOT LOOP (the j-loop below) is
-// byte-for-byte the same FP32 arithmetic regardless of ST and compiles to identical SASS
-// -- a prior diff confirmed the two former hot loops were bit-identical. Only the load /
-// store epilogues dispatch on ST (via cmf_load_cvt / build_V_cvt), plus the bf16-only
-// b==24 uint4 vectorized fast-load (guarded by `if constexpr` so the FP32 instantiation
-// never emits it) and the dual Hout(FP32)/Vout(ST) output. When Hout==nullptr (the FP32
-// callers always pass nullptr) the FP32-output write is skipped -> behavior-identical to
-// the old single-output FP32 kernel. MROWS bounds the per-lane cache; at 1024 thr (59
-// reg) it stays under the 64-reg ceiling.
+// MERGED column-major shapes-1,2 panel: ONE template over storage type ST (float or __half)
+// subsuming the former FP32-storage and bf16-storage cmf panels. The shared tile `s` is
+// `float` in BOTH instantiations, so the per-column HOT LOOP (j-loop below) is the same FP32
+// arithmetic regardless of ST and compiles to identical SASS; only the load/store epilogues
+// dispatch on ST (cmf_load_cvt / build_V_cvt), plus the bf16-only b==24 uint4 fast-load
+// (`if constexpr`-guarded) and the dual Hout(FP32)/Vout(ST) output. When Hout==nullptr (FP32
+// callers) the FP32-output write is skipped. MROWS bounds the per-lane cache (under the
+// 64-reg ceiling at 1024 threads).
 template <int NWARPS, int MROWS, class ST>
 __global__ void __launch_bounds__(NWARPS * 32, 1)
 panel_factor_smem_wsp_cmf_tmpl_kernel(ST* __restrict__ H, float* __restrict__ tau,
@@ -1232,12 +1200,8 @@ panel_factor_smem_wsp_cmf_tmpl_kernel(ST* __restrict__ H, float* __restrict__ ta
     const int mat = blockIdx.x;
     ST* A = H + (size_t)mat * n * n;
     float* Aout = (Hout != nullptr) ? Hout + (size_t)mat * n * n : nullptr;
-    // FP32-INPUT BLOCK-0 PANEL (brief-51 worker-1): when Af32 != null the panel reads its
-    // input columns from the FP32 original (full-precision reflectors) instead of from the
-    // bf16 working matrix H, while STILL writing the bf16 V back to H (and FP32 V to Hout).
-    // Only legal at k==0 (the only block whose source columns have not yet been bf16-rounded
-    // by a prior bf16 trailing apply -- blocks k>0 read trailing-updated columns that live
-    // only in bf16 H). null => the historical bf16-input path, byte-identical SASS.
+    // Af32 (always null at the live call sites): when non-null the panel would read its k==0
+    // input columns from the FP32 original instead of bf16 H; null = the bf16-input path.
     const float* Af = (Af32 != nullptr) ? Af32 + (size_t)mat * n * n : nullptr;
     float* TAU = tau + (size_t)mat * n;
     const int lane = threadIdx.x, warp = threadIdx.y;
@@ -1412,22 +1376,15 @@ panel_factor_smem_wsp_cmf_tmpl_kernel(ST* __restrict__ H, float* __restrict__ ta
     }
 }
 
-// Build the (m x b) reflector V slice: unit diagonal, strict-lower from H, zero
-// above. Templated on storage type T (float or bf16) -- the 0/1 constants are exact
-// in either format, so each instantiation is identical to a hand-written T kernel.
-//
-// BW-PATTERN RESTRUCTURE (the (16,16)-block version was ncu-pinned at ~12% DRAM /
-// ld_sec~3.9 -- 16-wide warps issue 32-byte (1-sector) loads, 1 elem/thread, no MLP,
-// fully issue/latency-bound). KEY STRUCTURE: per row r the slice is
-//   c == r -> 1 ; c < r (and c<b) -> A[(k+r)*n + (k+c)] ; c > r -> 0
-// so EVERY row r >= b is a PURE CONTIGUOUS b-wide copy of H[(k+r), k:k+b) (all c<r),
-// and only the first b rows carry the unit-diagonal/zero triangle. This kernel maps
-// ONE WARP to ONE ROW (8 warps/CTA, grid-strided over rows x B): the bulk rows
-// (r >= b) become a coalesced 128-bit-vectorized row copy (b BF16 = one int4 per 8
-// cols), the triangle rows (r < b) are handled per-lane (diag=1, lower=H, upper=0).
-// Bit-identical to the elementwise version (same value at every (r,c), only the
-// thread->element map + load width change). Coalesced reads (full cache lines instead
-// of 32-byte sectors) + MLP from the wide loads lift it off the latency floor.
+// Build the (m x b) reflector V slice: unit diagonal, strict-lower from H, zero above.
+// Templated on storage type T (float or bf16) -- the 0/1 constants are exact in either
+// format. Per row r: c==r -> 1 ; c<r (and c<b) -> A[(k+r)*n + (k+c)] ; c>r -> 0. So EVERY
+// row r >= b is a PURE CONTIGUOUS b-wide copy of H[(k+r), k:k+b), and only the first b rows
+// carry the unit-diagonal/zero triangle. This kernel maps ONE WARP to ONE ROW (8 warps/CTA,
+// grid-strided over rows x B): bulk rows (r>=b) become a coalesced 128-bit-vectorized row
+// copy (8 BF16/int4), triangle rows (r<b) are per-lane (diag=1, lower=H, upper=0).
+// Bit-identical to the elementwise version (the coalesced/MLP reads just lift it off the
+// latency floor).
 template <typename T>
 __device__ __forceinline__ T bv_load(const T* __restrict__ src) { return *src; }
 
@@ -1532,25 +1489,21 @@ void set_panel_defer(int v) { g_panel_defer = v; }
 // g_panel_defer off). Default OFF.
 static int g_panel_raw = 0;
 void set_panel_raw(int v) { g_panel_raw = v; }
-// extra smem leading-dim pad (added to b|1) for the warp-specialized-pivot
-// BF16 panel (defer==5). The 2D-flattened panel load s[r*LDS+c] (c the fast index)
-// aliases shared-memory banks when LDS+ (b-1) lines up to 0 mod 32 (e.g. b=16 ->
-// b|1=17, 17+15==32==0 mod 32 -> 10.3% bank-conflict on stores per ncu). An extra
-// even pad keeps LDS odd (column reads s[r*LDS+j] conflict-free, gcd(LDS,32)=1) while
-// breaking the row-alias. Swept; +2 is the the n=512 big-batch case optimum. Only the wsp kernels read it.
+// extra smem leading-dim pad (added to b|1) for the warp-specialized-pivot BF16 panel
+// (defer==5). The 2D-flattened panel load s[r*LDS+c] (c fast) aliases shared-memory banks
+// when LDS+(b-1) == 0 mod 32 (e.g. b=16 -> b|1=17, 17+15==32). An extra even pad keeps LDS
+// odd (column reads conflict-free, gcd(LDS,32)=1) while breaking the row-alias. +2 is the
+// n=512 big-batch optimum. Only the wsp kernels read it.
 static int g_wsp_pad = 2;
 void set_wsp_pad(int v) { g_wsp_pad = v; }
-// PIVOT-COOPERATIVE column-major wsp panel gate: when set (==1) route the next-pivot
-// m-pass cooperation through the COLUMN-MAJOR float4-VECTORIZED coop kernel
-// panel_factor_smem_wsp_cm_coop_bf16_kernel, which splits warp 0's barrier-bound m=2048
-// pivot chain across the idle warps the b<NWARPS regime leaves (keeping the single
-// full-CTA __syncthreads/column; helper reductions use a named barrier) AND lays the smem
-// panel column-major (s[c*LDM+r], r fast) -- the cm+float4 m-pass cuts the dominant BULK
-// column's serial iteration count ~4x vs the row-major coop's 128-iter/column floor at
-// m=2048 and removes the 26% shared-bank-conflict gather. The kernel hardcodes MHELP=2;
-// the help COUNT is implicit (never read at runtime -- the former g_wsp_help flag that
-// carried it was dead and is removed). Set (==1) only on the PLAIN (non-OV) defer==5
-// n=2048 case; default OFF (the n=512 big-batch case keeps the plain single-warp-pivot wsp).
+// PIVOT-COOPERATIVE column-major wsp panel gate: when set (==1) route the next-pivot m-pass
+// cooperation through the COLUMN-MAJOR float4-VECTORIZED coop kernel
+// panel_factor_smem_wsp_cm_coop_bf16_kernel, which splits warp 0's barrier-bound m=2048 pivot
+// chain across the idle warps the b<NWARPS regime leaves (keeping the single full-CTA
+// __syncthreads/column; helper reductions use a named barrier) AND lays the smem panel
+// column-major (s[c*LDM+r], r fast) so the dominant bulk column's m-pass is coalesced. The
+// kernel hardcodes MHELP=2 (the help count is implicit). Set (==1) only on the PLAIN (non-OV)
+// defer==5 n=2048 case; default OFF (n=512 keeps the plain single-warp-pivot wsp).
 static int g_wsp_cm_coop = 0;
 void set_wsp_cm_coop(int v) { g_wsp_cm_coop = v; }
 // FP16-SMEM PRECISION variant of the cm_coop panel (half8 m-pass, 8 rows/lane/iter, FP32
@@ -1601,19 +1554,18 @@ static int   g_pre_rr_ncap = 0;
 static int g_panel_cm2 = 0;
 void set_panel_cm2(int v) { g_panel_cm2 = v; }
 
-// NWARPS for the single-level cmf BF16 panel (the n=352 path). 0 = the historical 32.
-// At n=352 B=40 the panel is a 40-CTA, 1-CTA/SM, sync/latency-bound kernel: warp 0 runs
-// the serial per-column look-ahead chain (the critical path) while warps 1.. update the
-// trailing columns c>=j+2. The per-column __syncthreads cost scales with the CTA thread
-// count, so FEWER warps cheapen every barrier; the trailing bulk (b<=64 cols spread over
-// NWARPS-1 warps) still has enough parallelism at 16. Only 16/24/32 instances are
-// instantiated + opted-in; the dispatch clamps to {16,24,32} and falls back to 32.
+// NWARPS for the single-level cmf BF16 panel (the n=352 path). 0 = 32. At n=352 B=40 the
+// panel is 40-CTA, 1-CTA/SM, sync/latency-bound: warp 0 runs the serial per-column look-ahead
+// chain while warps 1.. update trailing columns, and the per-column __syncthreads cost scales
+// with the CTA thread count, so FEWER warps cheapen every barrier (the b<=64 trailing bulk
+// still has enough parallelism at 16). Only 16/24/32 are instantiated; dispatch clamps to
+// {16,24,32}, fallback 32.
 static int g_cmf_warps = 0;
 void set_cmf_warps(int v) { g_cmf_warps = v; }
 
 // PRECISE per-block MROWS for the cmf panel. SHARED by two independent dispatch sites
 // (UNION of two MROWS wins -- the flag is set per-path and never co-active across them):
-//   (a) n=352 __half cw=24 path (set via Python set_cmf_mrfine(1) in _qr_small_bf16,
+//   (a) n=352 __half path (set via Python set_cmf_mrfine(1) in _qr_small_bf16,
 //       restored to 0 by _run_blocked's _RDEF): 0 = coarse 6/11 split; 1 = pick the
 //       smallest instantiated MROWS in {2,4,6,8,10,11} that covers ceil(m/32).
 //   (b) n=512-bad FP32 cmf path (set/restored in C++ set_n512_bad_flags /
@@ -2452,10 +2404,7 @@ static void run_two_level_loop(int n, int OB, int IB, int ncap,
         if (!fold_ov) {
             // One warp per row (8 warps/CTA, grid-strided over rows x B): coalesced
             // 128-bit row copies for the bulk r>=ob rows, triangle for r<ob. Cap the
-            // row-block grid; the kernel grid-strides any remainder. (Supersedes the
-            // earlier dim3(32,8) elementwise launch -- f8b6c72e -- which the one-warp-
-            // per-row kernel body below replaces: full cache-line int4 copies instead
-            // of 32-byte elementwise sectors lift build_V off the latency floor.)
+            // row-block grid; the kernel grid-strides any remainder.
             int rblocks = ceildiv(m_o, 8);
             if (rblocks > 1024) rblocks = 1024;
             build_V_kernel<T><<<dim3(1, rblocks, B), dim3(256)>>>(H, Vp, n, ko, ob, m_o);
@@ -3053,13 +3002,11 @@ void scatter_exact_n512(torch::Tensor Hsrc, torch::Tensor tausrc,
 // inner sub-panel start of column c: ko_c = (c/OB)*OB, ki_c = ko_c + ((c-ko_c)/IB)*IB.
 // Only these above-panel uppers are touched; the panel-written lower/diag is left.
 //
-// This block-tiled kernel visits ONLY the block-upper-triangle tiles
-// (T=nbc*(nbc+1)/2 per mat, 36 at n=512 -> 23040 CTAs) and vectorizes the
-// BF16->FP32 copy (half2->float2). Off-diagonal tiles (br<bc) copy in full (every entry
-// is above-panel since i < r1 <= bc*OB <= ki_c); the diagonal tile (br==bc) applies the
-// i<ki_c inner-block-triangular mask so the panel-written FP32 R-diag is left untouched.
-// A dense n x n x B grid alternative is COMPUTE-bound (most threads idle on the lower
-// triangle, pure index/predicate math) and runs far off its bandwidth floor.
+// This block-tiled kernel visits ONLY the block-upper-triangle tiles (T=nbc*(nbc+1)/2 per
+// mat) and vectorizes the BF16->FP32 copy (half2->float2). Off-diagonal tiles (br<bc) copy
+// in full (every entry is above-panel since i < r1 <= bc*OB <= ki_c); the diagonal tile
+// (br==bc) applies the i<ki_c inner-block-triangular mask so the panel-written FP32 R-diag
+// is left untouched. (A dense n x n x B grid is compute-bound on the idle lower triangle.)
 
 // Decode the t-th block-upper-triangle tile (0-indexed, ROW-major over the upper
 // triangle) into (br, bc): t = br*nbc - br*(br-1)/2 + (bc-br). nbc is small (<=16 since
@@ -3203,23 +3150,17 @@ __device__ __forceinline__ void cp_async_commit_wait() {
 }
 
 // FUSED above-panel-R fill + rank-reveal zero-tail (n512/OB64/IB16, non-indexed).
-// Replaces the fill_R_n512 + n512_zero_tail PAIR with ONE launch. The two passes
-// were two full-grid sweeps over the SAME FP32 output H, touching DISJOINT columns:
-// fill_R copied the above-panel R from BF16 Hb into the block-upper-triangle tiles
-// of columns [0, nfac); zero_tail zeroed the rank-deficient tail columns [nfac, n)
-// (both would-be-R upper and would-be-V lower) + tau[:, nfac:]. On a rank-reveal
-// shape the OLD fill_R ALSO filled tail block-cols bc>=nfac/64 that zero_tail then
-// immediately OVERWROTE with zeros (3 of 8 block-cols wasted at clustered nfac=320).
-// This kernel both (a) SKIPS the wasted tail fill and (b) folds the zero pass in.
+// Folds the fill_R_n512 + n512_zero_tail PAIR into ONE launch: fill the above-panel R from
+// BF16 Hb into the block-upper-triangle tiles of columns [0, nfac), AND zero the
+// rank-deficient tail columns [nfac, n) (both upper and lower) + tau[:, nfac:], SKIPPING the
+// tail block-cols that the separate fill would have filled then immediately overwritten.
 //
-// Grid: dim3(36 + ztb, B), blockDim (32, 8). blockIdx.x in [0,36) is an upper-tri
-// fill tile (decoded as before); a tile whose block-col bc >= nfac/64 is SKIPPED
-// (its columns are zeroed by the tail CTAs). blockIdx.x in [36, 36+ztb) is a
-// tail CTA: warp-per-row float4-zeroing of [nfac, n) over all B*n rows, grid-strided
-// across the ztb tail CTAs (matching the standalone zero_tail's bandwidth-saturating
-// shape). The first tail CTA also zeros tau[:, nfac:]. When nfac==512 (dense, no
-// rank-reveal) the caller passes ztb=0 -> grid is exactly dim3(36,B) and the kernel
-// is byte-for-byte the old fill_R (no tail block-col exists, no tail CTA launched).
+// Grid: dim3(36 + ztb, B), blockDim (32, 8). blockIdx.x in [0,36) is an upper-tri fill tile;
+// a tile whose block-col bc >= nfac/64 is SKIPPED (zeroed by the tail CTAs). blockIdx.x in
+// [36, 36+ztb) is a tail CTA: warp-per-row float4-zeroing of [nfac, n) over all B*n rows,
+// grid-strided across the ztb tail CTAs. The first tail CTA also zeros tau[:, nfac:]. When
+// nfac==512 (dense, no rank-reveal) the caller passes ztb=0 -> grid is exactly dim3(36,B) and
+// the kernel is byte-for-byte the old fill_R.
 __global__ void fill_R_zero_tail_n512_kernel(float* __restrict__ Hout,
                                              const bf16* __restrict__ Hb,
                                              float* __restrict__ tau,
@@ -3791,21 +3732,15 @@ __device__ __forceinline__ float cmv_update_help(const float* __restrict__ colj,
 
 // COLUMN-MAJOR-SMEM warp-specialized-pivot OV BF16 panel. Identical math and
 // warp-specialization to panel_factor_smem_wsp_ov_bf16_kernel, but the panel lives in
-// smem COLUMN-MAJOR: s[c*LDM + r] (row r is the fast index). The per-column m-passes
-// (dot v_j^T col_c, the update of col_c, the start-of-block sub-norm) all stride r by
-// 32 within a warp -> the 32 lanes read s[c*LDM + L..L+31], i.e. 32 CONSECUTIVE smem
-// words -> fully coalesced / conflict-free. The original ROW-MAJOR layout (s[r*LDS+c],
-// c fast) makes the same warp read s[L*LDS+c] for L=0..31 = a stride-LDS gather across
-// rows -- the dominant smem-access cost in this latency-bound (11.7% SM throughput,
-// 1.64 barrier-stall) panel. LDM = m padded to an ODD leading dim so that simultaneous
-// bulk-warp reads of DIFFERENT columns at the same row (s[c_w*LDM + r]) hit different
-// banks. The trailing R/V layout written back to HBM is unchanged (row-major H).
-// Shared body for the cm-OV panel, instantiated by the plain (Aout=mat, in place) and
-// the indexed (Aout=out_idx[mat], scattered) __global__ wrappers below. Factored as a
-// __forceinline__ device function so the two entry points share ONE body but each keeps
-// its own parameter list -- the plain wrapper's signature is unchanged, so its inlined
-// codegen is byte-identical to the former monolithic kernel; the indexed wrapper differs
-// only by the out_idx -> omat load it does before calling this.
+// smem COLUMN-MAJOR: s[c*LDM + r] (row r fast). The per-column m-passes (dot v_j^T col_c,
+// update col_c, start-of-block sub-norm) stride r by 32 within a warp, so the 32 lanes read
+// 32 CONSECUTIVE smem words -> fully coalesced / conflict-free (the row-major layout would
+// gather across rows, the dominant smem cost on this latency-bound panel). LDM = m padded to
+// an ODD leading dim so simultaneous bulk-warp reads of DIFFERENT columns at the same row hit
+// different banks. The trailing R/V written back to HBM is unchanged (row-major H).
+// Shared body for the cm-OV panel, instantiated by the plain (in-place) and indexed
+// (scattered Aout=out_idx[mat]) __global__ wrappers below as a __forceinline__ device
+// function so both share ONE body; the indexed wrapper only adds the out_idx -> omat load.
 template <int NWARPS>
 __device__ __forceinline__ void panel_cm_ov_bf16_body(
         bf16* __restrict__ A, float* __restrict__ Aout, float* __restrict__ TAU,
@@ -4017,23 +3952,19 @@ panel_factor_smem_wsp_cm_ov_bf16_indexed_kernel(bf16* __restrict__ H, float* __r
 
 // ===================================================================================
 // COLUMN-MAJOR float4-VECTORIZED PIVOT-COOPERATIVE BF16 panel (non-OV).
-// Combines THREE ideas for the SM-starved the n=2048 case panel (8 CTAs / 148 SMs, pure
-// latency-bound):
-//   (1) PIVOT-COOP (race-free): HELP warps split the next-pivot column's
-//       two m-passes so warp-0's serial pivot chain leaves the per-column critical path.
-//   (2) COLUMN-MAJOR smem s[c*LDM+r]: the per-column m-pass reads stride r by
-//       32 -> 32 lanes read 32 CONSECUTIVE words = coalesced/conflict-free (the row-major
-//       coop's 26%-bank-conflict gather is gone).
-//   (3) float4 m-passes (cmv_dot/update + the HELP-aware *_help variants): the body
-//       processes 4 contiguous rows/lane -> a warp covers 128 rows/iter (vs 32 scalar),
-//       4x fewer iterations on the dominant BULK columns (each bulk warp owns 1 full
-//       column at m=2048 -> the 128-iter floor the row-major coop hit drops to ~32).
-// RACE FIX preserved: Ajc=colc[j] read BEFORE the pass-1 named barrier (register-cached
-// per helper), warp0's later in-place write colc[j]=Ajc-tw cannot poison a slower helper.
+// Combines THREE ideas for the SM-starved n=2048 panel (8 CTAs / 148 SMs, latency-bound):
+//   (1) PIVOT-COOP (race-free): HELP warps split the next-pivot column's two m-passes so
+//       warp-0's serial pivot chain leaves the per-column critical path.
+//   (2) COLUMN-MAJOR smem s[c*LDM+r]: the per-column m-pass strides r by 32 -> 32 lanes read
+//       32 CONSECUTIVE words, coalesced/conflict-free (no row-major gather).
+//   (3) float4 m-passes (cmv_dot/update + HELP-aware *_help variants): 4 contiguous rows/lane
+//       -> a warp covers 128 rows/iter, 4x fewer iterations on the dominant bulk columns.
+// RACE FIX preserved: Ajc=colc[j] read BEFORE the pass-1 named barrier (register-cached per
+// helper), so warp0's later in-place write colc[j]=Ajc-tw cannot poison a slower helper.
 // Helper reductions use __barrier_sync_count(1, HELP*32) (intra-CTA, NO device-wide fence).
 // LDM is a MULTIPLE OF 4 (every column base s+c*LDM is 16-byte aligned for float4).
-// Numerically a VALID QR: same betas/taus/V as the plain panel; the FP32 reduction is
-// reassociated by row-stripe; orth FP32-exact via FP32-V. HELP must divide NWARPS, >=1.
+// Numerically a VALID QR: same betas/taus/V as the plain panel (FP32 reduction reassociated
+// by row-stripe; orth FP32-exact via FP32-V). HELP must divide NWARPS, >=1.
 template <int NWARPS, int HELP, int MINB = 6>
 __global__ void __launch_bounds__(NWARPS * 32, MINB)
 panel_factor_smem_wsp_cm_coop_bf16_kernel(bf16* __restrict__ H, float* __restrict__ tau,
