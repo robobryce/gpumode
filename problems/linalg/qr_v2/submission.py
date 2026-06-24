@@ -6891,30 +6891,6 @@ __global__ void split_flat_fp16_kernel(const float* __restrict__ x,
             fp16_split_store(x[jj], hi + jj, lo + jj);
     }
 }
-// STRIDED X-panel -> PACKED FP16 (hi, lo) (batch, n, w), row-stride w. Mirrors
-// split_panel_strided_kernel but emits FP16. One thread owns 4 contiguous cols of one row.
-__global__ void split_panel_strided_fp16_kernel(const float* __restrict__ Xg,
-                                                __half* __restrict__ hi, __half* __restrict__ lo,
-                                                int n, int j, int w) {
-    int mat = blockIdx.z;
-    const float* X = Xg + (long)mat * n * n;
-    __half* H = hi + (long)mat * n * w;
-    __half* L = lo + (long)mat * n * w;
-    int r = blockIdx.y * blockDim.y + threadIdx.y;
-    if (r >= n) return;
-    int c = (blockIdx.x * blockDim.x + threadIdx.x) << 2;
-    if (c >= w) return;
-    const float4 xv = *reinterpret_cast<const float4*>(X + (long)r * n + j + c);
-    __half hh[4], ll[4];
-    fp16_split_store(xv.x, &hh[0], &ll[0]);
-    fp16_split_store(xv.y, &hh[1], &ll[1]);
-    fp16_split_store(xv.z, &hh[2], &ll[2]);
-    fp16_split_store(xv.w, &hh[3], &ll[3]);
-    long pidx = (long)r * w + c;
-    *reinterpret_cast<uint2*>(H + pidx) = *reinterpret_cast<uint2*>(hh);
-    *reinterpret_cast<uint2*>(L + pidx) = *reinterpret_cast<uint2*>(ll);
-}
-
 // Fused scatter-back + (optional) hi/lo split of the solved diagonal panel: reads
 // the packed (batch, n, w) Tmp, writes (a) the strided X panel X[:, :, j:j+w] (the
 // final Q columns) AND, when hi != nullptr, (b) the packed hi/lo buffers for the
@@ -7034,9 +7010,6 @@ torch::Tensor tri_solve_right_inv(torch::Tensor A, torch::Tensor Rin, int nb) {
     // FP16 hi/lo for the 3xFP16 trailing (g_trsm_trail_fp16==1). cRh16/cRl16
     // = FP16 hi/lo of R (split ONCE); cXph16/cXpl16 = FP16 hi/lo of the solved panel (per block).
     static torch::Tensor cRh16, cRl16, cXph16, cXpl16;
-    // FP16 hi/lo for the 3xFP16 DIAGONAL solve (g_trsm_diag_prec==3): cRinvh16/cRinvl16 = FP16
-    // hi/lo of the pre-inverted blocks (ONCE); cXbh16/cXbl16 = FP16 hi/lo of the input X-panel.
-    static torch::Tensor cRinvh16, cRinvl16, cXbh16, cXbl16;
     static int s_B = -1, s_n = -1, s_nb = -1;
     auto opts16 = opts.dtype(torch::kHalf);
     bool shape_changed = (s_B != batch || s_n != n || s_nb != nb);
@@ -7056,10 +7029,6 @@ torch::Tensor tri_solve_right_inv(torch::Tensor A, torch::Tensor Rin, int nb) {
         cRl16  = torch::empty({batch, n, n}, opts16);
         cXph16 = torch::empty({batch, n, nb}, opts16);
         cXpl16 = torch::empty({batch, n, nb}, opts16);
-        cRinvh16 = torch::empty({(long)nmat, nb, nb}, opts16);
-        cRinvl16 = torch::empty({(long)nmat, nb, nb}, opts16);
-        cXbh16   = torch::empty({batch, n, nb}, opts16);
-        cXbl16   = torch::empty({batch, n, nb}, opts16);
         s_B = batch; s_n = n; s_nb = nb;
     }
     torch::Tensor& Rop  = cRop;  torch::Tensor& Rinv = cRinv;
@@ -7069,8 +7038,6 @@ torch::Tensor tri_solve_right_inv(torch::Tensor A, torch::Tensor Rin, int nb) {
     torch::Tensor& Xbh = cXbh; torch::Tensor& Xbl = cXbl;
     torch::Tensor& Rh16 = cRh16; torch::Tensor& Rl16 = cRl16;
     torch::Tensor& Xph16 = cXph16; torch::Tensor& Xpl16 = cXpl16;
-    torch::Tensor& Rinvh16 = cRinvh16; torch::Tensor& Rinvl16 = cRinvl16;
-    torch::Tensor& Xbh16 = cXbh16; torch::Tensor& Xbl16 = cXbl16;
     {
         dim3 blk(32, 8);
         dim3 grid(cdiv(nb, 32), cdiv(nb, 8), nmat);
@@ -7131,12 +7098,6 @@ torch::Tensor tri_solve_right_inv(torch::Tensor A, torch::Tensor Rin, int nb) {
         long ivec = (icount + 3) >> 2;
         split_flat_kernel<<<cdiv((int)ivec, 256), 256>>>(
             Rinv.data_ptr<float>(), Rinvh.data_ptr<float>(), Rinvl.data_ptr<float>(), icount);
-    } else if (g_trsm_diag_prec == 3) {
-        // FP16 hi/lo of the pre-inverted blocks for the 3xFP16 diagonal solve (ONCE).
-        long icount = (long)nmat * nb * nb;
-        long ivec = (icount + 3) >> 2;
-        split_flat_fp16_kernel<<<cdiv((int)ivec, 256), 256>>>(
-            Rinv.data_ptr<float>(), (__half*)Rinvh16.data_ptr(), (__half*)Rinvl16.data_ptr(), icount);
     }
     // for the 3xFP16 trailing (g_trsm_trail_fp16==1), pre-split R into
     // FP16 hi/lo ONCE here (the solved panel's FP16 hi/lo is split per block in the loop).
@@ -7158,8 +7119,6 @@ torch::Tensor tri_solve_right_inv(torch::Tensor A, torch::Tensor Rin, int nb) {
     float* xbhp = Xbh.data_ptr<float>(); float* xblp = Xbl.data_ptr<float>();
     __half* rh16p = (__half*)Rh16.data_ptr(); __half* rl16p = (__half*)Rl16.data_ptr();
     __half* xph16p = (__half*)Xph16.data_ptr(); __half* xpl16p = (__half*)Xpl16.data_ptr();
-    __half* rinvh16p = (__half*)Rinvh16.data_ptr(); __half* rinvl16p = (__half*)Rinvl16.data_ptr();
-    __half* xbh16p = (__half*)Xbh16.data_ptr(); __half* xbl16p = (__half*)Xbl16.data_ptr();
 
     for (int bi = 0; bi < nblk; ++bi) {
         int j = bi * nb;
@@ -7173,36 +7132,9 @@ torch::Tensor tri_solve_right_inv(torch::Tensor A, torch::Tensor Rin, int nb) {
         //   C_rm(n,w) = Xblk_rm(n,w) @ Rij_rm(w,w)
         //   <=> C_cm(w,n) = Rij_cm(w,w) @ Xblk_cm(w,n)
         //   => gemm(N, N, m=w, n=n, k=w, A=Rij(ld=nb,stride nb*nb), B=Xblk(ld=n,stride
-        //      nn), C=Xpan(ld=w,stride n*w)).  Precision per g_trsm_diag_prec (worker-0
-        //      brief-9): legacy exact-FP32 SIMT (slow, ~63us/blk at n4096), single TF32
-        //      tensor-op (3-4x faster), or 3xTF32 Kahan (tensor-core, ~FP32-accurate).
-        if (g_trsm_diag_prec == 3) {
-            // 3xFP16 tensor-core diagonal solve: FP16 hi/lo of the input X-panel + FP16 Rinv
-            // (split once) -> 3 accumulating FP16 GEMMs (FP32 accum). FP16 ~2x TF32 rate on
-            // B200, same Kahan ~FP32 accuracy. gemm(N,N, w,n,w, A=Rinvh16, B=Xbh16, C=xpan).
-            {
-                dim3 sblk(32, 8);
-                int scols = (w + 3) >> 2;
-                dim3 sgrid(cdiv(scols, 32), cdiv(n, 8), batch);
-                split_panel_strided_fp16_kernel<<<sgrid, sblk>>>(Xp, xbh16p, xbl16p, n, j, w);
-            }
-            long rinv_off = (long)(bi * batch) * nb * nb;
-            // Xpan = Rinvh16 @ Xbh16  (beta=0)
-            BKL(cublasGemmStridedBatchedEx(h, CUBLAS_OP_N, CUBLAS_OP_N, w, n, w, &one,
-                rinvh16p + rinv_off, CUDA_R_16F, nb, (long)nb * nb,
-                xbh16p, CUDA_R_16F, w, (long)n * w,
-                &zero, xpan, CUDA_R_32F, w, (long)n * w, batch, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
-            // Xpan += Rinvh16 @ Xbl16
-            BKL(cublasGemmStridedBatchedEx(h, CUBLAS_OP_N, CUBLAS_OP_N, w, n, w, &one,
-                rinvh16p + rinv_off, CUDA_R_16F, nb, (long)nb * nb,
-                xbl16p, CUDA_R_16F, w, (long)n * w,
-                &one, xpan, CUDA_R_32F, w, (long)n * w, batch, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
-            // Xpan += Rinvl16 @ Xbh16
-            BKL(cublasGemmStridedBatchedEx(h, CUBLAS_OP_N, CUBLAS_OP_N, w, n, w, &one,
-                rinvl16p + rinv_off, CUDA_R_16F, nb, (long)nb * nb,
-                xbh16p, CUDA_R_16F, w, (long)n * w,
-                &one, xpan, CUDA_R_32F, w, (long)n * w, batch, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
-        } else if (g_trsm_diag_prec == 2) {
+        //      nn), C=Xpan(ld=w,stride n*w)).  Precision per g_trsm_diag_prec: exact-FP32
+        //      SIMT (==0, the test path) or 3xTF32 Kahan tensor-core (==2, the s6 path).
+        if (g_trsm_diag_prec == 2) {
             // 3xTF32 tensor-core diagonal solve: split the CURRENT X[:,j:je] panel into
             // packed hi/lo, then 3 accumulating TF32 GEMMs (Rinvh@Xbh + Rinvh@Xbl + Rinvl@Xbh)
             // -> ~FP32 accuracy on tensor cores, far faster than the SIMT FP32 GEMM. The
@@ -7231,17 +7163,8 @@ torch::Tensor tri_solve_right_inv(torch::Tensor A, torch::Tensor Rin, int nb) {
                 rinvlp + rinv_off, nb, (long)nb * nb,
                 xbhp, w, (long)n * w,
                 &one, xpan, w, (long)n * w, batch));
-        } else if (g_trsm_diag_prec == 1) {
-            // single TF32 tensor-op: one GEMM, ~10-bit mantissa, 3-4x faster than SIMT FP32.
-            // (iter1 proved cuBLAS picks a pathological strided-batched TF32 kernel for this
-            // exact shape -> this mode is a measured regression; kept for completeness.)
-            cublasSetMathMode(h, CUBLAS_TF32_TENSOR_OP_MATH);
-            BKL(cublasSgemmStridedBatched(h, CUBLAS_OP_N, CUBLAS_OP_N, w, n, w, &one,
-                Rinvp + (long)(bi * batch) * nb * nb, nb, (long)nb * nb,
-                Xp + j, n, nn,
-                &zero, xpan, w, (long)n * w, batch));
         } else {
-            cublasSetMathMode(h, CUBLAS_DEFAULT_MATH);   // exact FP32 SIMT (legacy / fallback arm)
+            cublasSetMathMode(h, CUBLAS_DEFAULT_MATH);   // exact FP32 SIMT (the test path)
             BKL(cublasSgemmStridedBatched(h, CUBLAS_OP_N, CUBLAS_OP_N, w, n, w, &one,
                 Rinvp + (long)(bi * batch) * nb * nb, nb, (long)nb * nb,
                 Xp + j, n, nn,
