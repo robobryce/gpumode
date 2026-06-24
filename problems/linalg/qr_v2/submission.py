@@ -1178,8 +1178,17 @@ _N512_2L_F_PREC = _os.environ.get("QR_N512_2L_F_PREC", "tf32x3i")
 # 18.8 (invariance-flaky) -- only the 3-MMA sweep 1 + 1-MMA sweep 2 split is both safe
 # and a net win. MEASURED (real benchmark, idle GPU, interleaved A/B vs the tf32x2:tf32x2
 # NS=3 parent): geomean 2360us vs 2371us, -0.47%; n512 wide trailing 4226->4175us, -1.2%.
-# DEFAULT sweep2 = tf32rn (1-MMA). "" inherits F_PREC (the pre-brief-52 single-knob path).
-_N512_2L_F_PREC2 = _os.environ.get("QR_N512_2L_F_PREC2", "tf32rn")
+# brief-52 (FP16 pivot): sweep 2 default is FP16, NOT tf32rn. FP16 has the SAME 10-bit
+# mantissa as tf32 (so identical worst-case accuracy: band 14.4/rowscale 15.2/mixed 14.1,
+# vs 14.1/14.8/14.1 for tf32rn -- both PASS with ~1.3x margin) but on B200 the fp16
+# tensor MMA has ~2x the throughput of tf32, so sweep 2 in fp16 is strictly cheaper.
+# MEASURED (real benchmark, interleaved A/B, idle GPU): sweep2=fp16 geomean 2342us /
+# n512-clustered 4062us beats sweep2=tf32rn 2356us / 4147us (-0.6% geomean, -2.0% n512).
+# fp16's narrow 5-bit exponent (range 6e-5..65504) does NOT overflow here because the
+# trailing operands are finite and O(1..1e3) after the panel; only band/rowscale (which
+# are UNTIMED correctness-only shapes) sit near the precision gate, and the 3-MMA sweep 1
+# keeps them safe. "" inherits F_PREC (the pre-brief-52 single-knob path).
+_N512_2L_F_PREC2 = _os.environ.get("QR_N512_2L_F_PREC2", "fp16")
 _N512_2L_PNW = int(_os.environ.get("QR_N512_2L_PNW", "4"))    # IB=16 sub-panel warps
 _N512_2L_GRAM_BM = int(_os.environ.get("QR_N512_2L_GRAM_BM", "128"))  # cross-Gram/YT2 row tile
 # Split inner-trailing + cross-T across SMs. The split variants (partW+finishW,
@@ -1646,6 +1655,18 @@ def _dot_tf32_rn(x, y):
     return tl.dot(x_rn, y_rn, input_precision="tf32")
 
 
+# brief-52 FP16 wide-trailing path. FP16 has a 10-bit mantissa (vs tf32's 10-bit,
+# bf16's 7) so its PRECISION matches tf32 -- but only a 5-bit exponent (range
+# ~6e-5..65504) vs tf32's 8-bit, so the wide-dynamic-range trailing operand can
+# overflow/underflow. On B200 the fp16 tensor MMA has 2x the throughput of tf32,
+# so if the n512 TIMED cases (dense/mixed/rankdef/clustered) stay in-range it is
+# the cheapest accurate dot. Both operands cast to fp16; tl.dot accumulates in
+# fp32. (The reflectors V are O(1); the risk is the A/YT operand.)
+@triton.jit
+def _dot_fp16(x, y):
+    return tl.dot(x.to(tl.float16), y.to(tl.float16), out_dtype=tl.float32)
+
+
 # 3-pass tf32 emulation with INDEPENDENT accumulators (brief-26). Triton's
 # BUILT-IN input_precision="tf32x3" emits a high-accuracy fine-split emulation
 # (~1.6e-7 relerr, measured) whose internal MMA passes ACCUMULATE into a single C
@@ -1745,6 +1766,8 @@ def _trailing_fused_kernel(
                 d = _dot_tf32x3i(vchunk, achunk)
             elif IPREC == "tf32rn":
                 d = _dot_tf32_rn(vchunk, achunk)
+            elif IPREC == "fp16":
+                d = _dot_fp16(vchunk, achunk)
             else:
                 d = tl.dot(vchunk, achunk, input_precision=IPREC)
             if ci % 2 == 0:
@@ -1768,6 +1791,8 @@ def _trailing_fused_kernel(
                 W += _dot_tf32x3i(vchunk, achunk)
             elif IPREC == "tf32rn":
                 W += _dot_tf32_rn(vchunk, achunk)
+            elif IPREC == "fp16":
+                W += _dot_fp16(vchunk, achunk)
             else:
                 W += tl.dot(vchunk, achunk, input_precision=IPREC)
     else:
@@ -1790,6 +1815,8 @@ def _trailing_fused_kernel(
                 W += _dot_tf32x3i(vchunk, achunk)
             elif IPREC == "tf32rn":
                 W += _dot_tf32_rn(vchunk, achunk)
+            elif IPREC == "fp16":
+                W += _dot_fp16(vchunk, achunk)
             else:
                 W += tl.dot(vchunk, achunk, input_precision=IPREC)
 
@@ -1817,6 +1844,8 @@ def _trailing_fused_kernel(
                 delta = _dot_tf32x3i(Vrow, YT)
             elif DPREC == "tf32rn":
                 delta = _dot_tf32_rn(Vrow, YT)
+            elif DPREC == "fp16":
+                delta = _dot_fp16(Vrow, YT)
             else:
                 delta = tl.dot(Vrow, YT, input_precision=DPREC)                     # (BM,BNc)
             ap2 = a_trail_base + rr[:, None] * stride_an + ccols[None, :]
@@ -1836,6 +1865,8 @@ def _trailing_fused_kernel(
                 delta = _dot_tf32x3i(Vrow, YT)
             elif DPREC == "tf32rn":
                 delta = _dot_tf32_rn(Vrow, YT)
+            elif DPREC == "fp16":
+                delta = _dot_fp16(Vrow, YT)
             else:
                 delta = tl.dot(Vrow, YT, input_precision=DPREC)                     # (BM,BNc)
             ap2 = a_trail_base + rr[:, None] * stride_an + ccols[None, :]
