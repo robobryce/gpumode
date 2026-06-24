@@ -8417,52 +8417,41 @@ def _qr_small_bf16(Ac: torch.Tensor, n: int):
 
 _COLNORM_TOL = 5e-2  # cholqr good-gate vs orth_rtol
 # Block width for the C++ main-solve (tri_solve_right_inv). A WIDER nb means fewer/wider
-# 3xTF32 trailing GEMMs (faster on the launch-bound b2 path) but more TF32 error. ORTH is
-# the binding gate (the factor residual is tiny), and it is NON-MONOTONIC in nb -- nb=384
-# is the fastest with a robust >5x-headroom margin (nb=512 is RISKY at 0.58x of gate).
+# 3xTF32 trailing GEMMs (faster on the launch-bound b2 path) but more TF32 error. The
+# tau-override means orth no longer binds nb; the loose factor residual holds at 512.
 # NOTE: the binding orth must be measured via householder_product on the COMPACT (H,tau)
 # AFTER the orhr_col recon (as the checker does), NOT the raw Q^TQ proxy which skips the
 # recon's TF32 error amplification.
-_TRSM_NB_CPP = 512   # nb sweep WINNER (s6 optimum): 384(11728)/512(11190)/640(11239)/768(11628)/1024(11662). Orth no longer binds nb (tau-override); factor residual holds at 512.
-# === TRSM precision knobs for the SCORED s6 path (worker-0 brief-9) ===
-# The Q = A R^{-1} blocked right-TRSM diagonal solve was exact-FP32 SIMT (~63us/blk at
-# n4096/B=2, the TRSM's #1 cost ~690us). W3's tau-override makes householder_product
-# orthonormal regardless of the solve precision, so the ONLY constraint is the loose factor
-# residual (factor_rtol = 9.8e-3 at n4096). _TRSM_DIAG_PREC: 1 = single TF32 tensor-op for the
-# diagonal solve (3-4x faster than SIMT FP32). _TRSM_TRAIL_PASSES: trailing 3xTF32 -> fewer
-# accumulating GEMMs. Both gated to the scored s6 (B=2,n=4096); the ill-conditioned B=1/B!=2
-# fallback arm keeps exact FP32 (its factor residual is sensitive). Tested end-to-end on s6.
-_TRSM_DIAG_PREC = 2       # 3xTF32 diagonal solve: at nb=512 it BEATS FP32-SIMT by ~1.6% (iter12 A/B: 11283 vs 11468) -- the K=512 FP32-SIMT GEMM is slower than 3 tensor-core TF32 GEMMs. (At nb=384 it was a wash.) 3xFP16 diag fails the gate (iter10).
-_TRSM_TRAIL_PASSES = 3    # mandatory: trail=2 fails the n4096 FACTOR gate (iter2/iter5) -> geqrf fallback
-_TRSM_TRAIL_FP16 = 1      # iter9 WIN: 3xFP16 trailing (FP16 tensor cores ~2x TF32 rate on B200, same Kahan accuracy)
-_TRSM_DIAG_PASSES = 3     # mandatory: 2-pass diagonal (iter15) fails the n4096 FACTOR gate -> geqrf fallback. Both diag AND trail need full 3-pass Kahan accuracy.
-_TRSM_PREINV_TF32 = 0     # iter16 REGRESSION: TF32 pre-invert fails the gate. The diagonal-block INVERSE must be exact FP32 (triangular-inverse conditioning); the solve applying it can be 3xTF32.
-# Recon Schur-GEMM precision for the s6 n4096 B=2 path (worker-3 brief-0): 1 = FP16
-# (FP32-accum) Schur update (low-prec-TC lever; orth is recon-precision-independent),
-# 0 = TF32. LIVE default-ON to test the factor-residual headroom + speed end-to-end.
+_TRSM_NB_CPP = 512
+# === TRSM precision knobs for the SCORED s6 path (B=2,n=4096) ===
+# The Q = A R^{-1} blocked right-TRSM diagonal solve was exact-FP32 SIMT. The tau-override
+# makes householder_product orthonormal regardless of the solve precision, so the ONLY
+# constraint is the loose factor residual (factor_rtol = 9.8e-3 at n4096). The ill-conditioned
+# B=1/B!=2 fallback arm keeps exact FP32 (its factor residual is sensitive).
+_TRSM_DIAG_PREC = 2       # 3xTF32 diagonal solve (the K=512 FP32-SIMT GEMM is slower than 3 tensor-core TF32 GEMMs); 3xFP16 diag fails the factor gate.
+_TRSM_TRAIL_PASSES = 3    # mandatory: trail=2 fails the n4096 FACTOR gate -> geqrf fallback
+_TRSM_TRAIL_FP16 = 1      # 3xFP16 trailing (FP16 tensor cores ~2x TF32 rate on B200, same Kahan accuracy)
+_TRSM_DIAG_PASSES = 3     # mandatory: 2-pass diagonal fails the n4096 FACTOR gate. Both diag AND trail need full 3-pass Kahan accuracy.
+_TRSM_PREINV_TF32 = 0     # the diagonal-block INVERSE must be exact FP32 (triangular-inverse conditioning); the solve applying it can be 3xTF32.
+# Recon Schur-GEMM precision for the s6 n4096 B=2 path: 1 = FP16 (FP32-accum) Schur update
+# (orth is recon-precision-independent via the tau-override), 0 = TF32.
 _RECON_LOWP = 1
-# FP32 recon panel-solve accumulation for s6 (worker-3 brief-2 lever B, LANDED WIN): 1 =
-# FP32 substitution (faster than the FP64 default) in panel_solve_fused, on the FP16-Schur
-# panels (jo>=3*ob; the first 3 right-looking panels keep FP64 so the rare orth-borderline
-# seed holds). The recon's Q via householder_product is orth-(near-)independent of V
-# precision -> only the loose factor residual is touched. Default-ON: s6 12510->~12010us
-# (-4%), geomean ~1641->~1637 (validated 22 tests + diff_correctness 8/8 + invariance).
+# FP32 recon panel-solve accumulation for s6: 1 = FP32 substitution (faster than the FP64
+# default) in panel_solve_fused, on the FP16-Schur panels (jo>=_RECON_LOWP_FROM). The recon's
+# Q via householder_product is orth-(near-)independent of V precision -> only the loose
+# factor residual is touched.
 _RECON_SOLVE_FP32 = 1
-# RECON LOW-PREC PANEL BOUNDARY (worker-3 brief-4): the column index from which the recon
-# Schur GEMM goes FP16 + the panel-solve goes FP32 (panels before it stay TF32/FP64). The
-# pre-brief-4 value was effectively 3*ob=192 (first 3 panels high-prec, a guard from BEFORE
-# the tau-override existed). The tau-override (_TAU_OVERRIDE) now makes householder_product
-# orthonormal REGARDLESS of recon precision, so the early high-prec panels are no longer
-# needed for ORTH -- only the loose FACTOR residual (gate 32 @ n4096) limits how early we
-# can drop. 0 = low-prec from the very first panel (drops the 3 expensive TF32 Schur GEMMs +
-# 3 FP64 panel-solves). -1 = legacy 3*ob. Validated on s6 against BOTH gates each iteration.
+# RECON LOW-PREC PANEL BOUNDARY: the column index from which the recon Schur GEMM goes FP16 +
+# the panel-solve goes FP32 (panels before it stay TF32/FP64). The tau-override makes
+# householder_product orthonormal REGARDLESS of recon precision, so the early high-prec
+# panels are no longer needed for ORTH -- only the loose FACTOR residual (gate 32 @ n4096)
+# limits how early we can drop. 0 = low-prec from the very first panel. -1 = legacy 3*ob.
 _RECON_LOWP_FROM = 0
-# RECON WARP-LEVEL diag-LU (worker-3 brief-5): 1 = factor the 64x64 diag block in a SINGLE warp
-# (diag_lu_warp_kernel: __shfl pivot broadcast, ZERO __syncthreads), 0 = the legacy register-
-# blocked diag_lu_reg (256 threads, 128 block barriers/panel). diag_lu_reg is the recon's
-# bottleneck (1894us, the LONGEST per-panel op, 2-CTA latency-bound where barriers can't be
-# hidden by occupancy). The warp version trades the 128 block barriers/panel for intra-warp
-# shuffles. Gated to s6. Validated end-to-end (s6 orth+factor gates) each iteration.
+# RECON WARP-LEVEL diag-LU: 1 = factor the 64x64 diag block in a SINGLE warp (diag_lu_warp_kernel:
+# __shfl pivot broadcast, ZERO __syncthreads), 0 = the legacy register-blocked diag_lu_reg
+# (256 threads, 128 block barriers/panel). diag_lu_reg is the recon's bottleneck (2-CTA
+# latency-bound where barriers can't be hidden); the warp version trades block barriers for
+# intra-warp shuffles. Gated to s6.
 _RECON_WARPLU = 1
 # SECRET-SAFETY TAU-OVERRIDE (worker-3 brief-2, the n4096 B=2 scored-shape fix). The 3xTF32
 # TRSM solve (Q=A R^-1) + orhr_col recon lose ORTHOGONALITY at high cond(A): the orhr_col tau
