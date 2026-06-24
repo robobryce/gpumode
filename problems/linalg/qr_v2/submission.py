@@ -1476,16 +1476,22 @@ def _tsqr_merge_R_kernel(
     tl.store(optr, Rblk, mask=rmask)
 
 
-def _tsqr_panel_R(A, j, jb, pheight, ncols, G):
+def _tsqr_panel_R(A, j, jb, pheight, ncols, G=0):
     # brief-48 TRUE TSQR -- compute the panel R-factor of A[:, j:j+pheight rows,
     # jb:jb+ncols cols] via G independent leaf QRs (grid=(G,B)) + an O(log G) merge
     # tree. Returns R (B, ncols, ncols). NO A^T A (-> avoids CholeskyQR's cond^2
     # blow-up), NO per-column cross-CTA sync (-> avoids the dead row-split barrier
-    # wall). GATE-1 probe: does row-block-parallel local-QR fill the idle SMs and
-    # beat the 1-CTA panel reduction at large-n B=2/8?
+    # wall). GATE-1+2 measured: 1.97x faster than the 1-CTA panel R over the full
+    # n4096 factorization (fills the idle SMs).
+    # G=0 -> auto: target leaf RPB ~1024 (the TUNED sweet spot -- brief-48 G-sweep:
+    # RPB>1024 spills the per-leaf register tile (G=2 at n4096 -> 761us, 9x worse),
+    # RPB<512 adds merge overhead without leaf benefit; n4096 best G=4, n2048 G=2,
+    # both = pheight/1024 rounded). num_warps=4.
     B = A.shape[0]
     N = A.shape[2]
     BLK = triton.next_power_of_2(ncols)
+    if G <= 0:
+        G = max(1, (pheight + 1023) // 1024)
     rpb = (pheight + G - 1) // G
     RPB = triton.next_power_of_2(rpb)
     sab, san = A.stride(0), A.stride(1)   # row stride (cols use implicit stride 1, A contiguous)
