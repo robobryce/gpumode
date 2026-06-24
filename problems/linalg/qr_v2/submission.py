@@ -2001,6 +2001,10 @@ def _trailing_fused2_kernel(
                 W += _dot_tf32x2(vchunk, achunk)        # achunk (A) kept full precision
             elif IPREC == "tf32x3i":
                 W += _dot_tf32x3i(vchunk, achunk)
+            elif IPREC == "fp16":
+                W += _dot_fp16(vchunk, achunk)
+            elif IPREC == "fp16x2":
+                W += _dot_fp16x2(vchunk, achunk)
             else:
                 W += tl.dot(vchunk, achunk, input_precision="tf32x3")
     else:
@@ -2015,6 +2019,10 @@ def _trailing_fused2_kernel(
                 W += _dot_tf32x2(vchunk, achunk)        # achunk (A) kept full precision
             elif IPREC == "tf32x3i":
                 W += _dot_tf32x3i(vchunk, achunk)
+            elif IPREC == "fp16":
+                W += _dot_fp16(vchunk, achunk)
+            elif IPREC == "fp16x2":
+                W += _dot_fp16x2(vchunk, achunk)
             else:
                 W += tl.dot(vchunk, achunk, input_precision="tf32x3")
 
@@ -2035,6 +2043,10 @@ def _trailing_fused2_kernel(
                 delta = _dot_tf32x2(Vrow, YT)            # YT (A-derived) kept full precision
             elif IPREC == "tf32x3i":
                 delta = _dot_tf32x3i(Vrow, YT)
+            elif IPREC == "fp16":
+                delta = _dot_fp16(Vrow, YT)
+            elif IPREC == "fp16x2":
+                delta = _dot_fp16x2(Vrow, YT)
             else:
                 delta = tl.dot(Vrow, YT, input_precision="tf32x3")
             ap2 = a_trail_base + rr[:, None] * stride_an + ccols[None, :]
@@ -2052,6 +2064,10 @@ def _trailing_fused2_kernel(
                 delta = _dot_tf32x2(Vrow, YT)            # YT (A-derived) kept full precision
             elif IPREC == "tf32x3i":
                 delta = _dot_tf32x3i(Vrow, YT)
+            elif IPREC == "fp16":
+                delta = _dot_fp16(Vrow, YT)
+            elif IPREC == "fp16x2":
+                delta = _dot_fp16x2(Vrow, YT)
             else:
                 delta = tl.dot(Vrow, YT, input_precision="tf32x3")
             ap2 = a_trail_base + rr[:, None] * stride_an + ccols[None, :]
