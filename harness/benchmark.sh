@@ -1,9 +1,18 @@
 #!/usr/bin/env bash
 # BENCHMARK step — autocuda <-> GPU MODE bridge.
 #
-# Runs the official GPU MODE eval harness in `benchmark` mode over the problem's
+# Runs the official GPU MODE eval harness in `leaderboard` mode over the problem's
 # benchmark shapes, then reduces the per-shape mean runtimes to a single scalar:
 # the GEOMETRIC MEAN of the per-shape means, in microseconds (lower is better).
+#
+# We run `leaderboard` (NOT `benchmark`) mode on purpose: it is byte-for-byte the
+# same code path the GPU MODE leaderboard scores with — same iteration counts
+# (warmup 1000 / 5e8 ns, timed 1000 / 30e9 ns vs benchmark mode's 200 / 10e7 and
+# 200 / 10e9), same per-iteration recheck, same break-on-first-failure. So a local
+# number here matches what the ranked secret run measures, instead of an
+# under-sampled proxy. eval.py logs the identical `benchmark-count` / `benchmark.N.*`
+# keys in both modes, so the parser below is unchanged.
+#
 # That is exactly how the GPU MODE leaderboard ranks, and
 # geomean(baseline)/geomean(trial) == geomean(baseline_i/trial_i), so reporting
 # this one scalar to autocuda with direction=min makes the baseline/trial
@@ -38,9 +47,9 @@ cd "$PROBLEM_DIR" || exit 1
 OUT="$(mktemp)"
 # $EVAL_PY is the manifest-resolved eval.py (set-root or problem-local); env.sh
 # put its dir on PYTHONPATH so eval.py's bare imports resolve under the Pool.
-POPCORN_FD=3 "$PYTHON" "$EVAL_PY" benchmark "$SPECFILE" 3>"$OUT"
+POPCORN_FD=3 "$PYTHON" "$EVAL_PY" leaderboard "$SPECFILE" 3>"$OUT"
 rc=$?
-{ echo "----- eval.py benchmark output -----"; cat "$OUT"; echo "------------------------------------"; } >&2
+{ echo "----- eval.py leaderboard output -----"; cat "$OUT"; echo "--------------------------------------"; } >&2
 [ $rc -eq 0 ] || { echo "benchmark: FAILED (eval.py exited $rc)" >&2; exit $rc; }
 
 METRIC_NAME="$METRIC_NAME" "$PYTHON" - "$OUT" <<'PY'
