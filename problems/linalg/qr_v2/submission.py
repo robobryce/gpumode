@@ -6734,38 +6734,19 @@ __global__ void oz_colmax_v4_kernel(const float* __restrict__ Ag, int n, int bat
     }
 }
 
-// Peel A (B,n,n) into NS signed-int8 slices slN[p] (NS,B,n,n) in NORMAL [b,i,j]
-// layout (the GEMM's transposed operand is taken as slN[p].t() -- a cublasLt view,
-// so no separate slT tensor / transpose copy).  thread (i,j) reads A[b,i,j] and
-// writes slN[p][b,i,j] both row-major.  cjf (B,n) f32 read broadcast.
+// Peel A (B,n,n) into NS signed-int8 slices slN[p] (NS,B,n,n) in NORMAL [b,i,j] layout
+// (the GEMM's transposed operand is taken as slN[p].t() -- a cublasLt view, so no separate
+// slT tensor / transpose copy). thread (i,j) reads A[b,i,j], writes slN[p][b,i,j] row-major;
+// cjf (B,n) f32 read broadcast. Per element: r = a/max(cj,1e-30); each plane p takes
+// sp=clamp(rint(r*127),-127,127); r=127*(r-sp/127).
 //
-// Compute the int8 peel of ONE A element into out[NS] (bit-identical to the
-// original per-element loop): r = a / max(cj,1e-30); each plane p takes
-// sp=clamp(rint(r*127),-127,127); r=127*(r-sp/127). Shared by the scalar tail
-// and the float4 fast path so the written bytes are byte-for-byte identical.
-__device__ __forceinline__ void oz_peel_one(float a, float cj, int NS, signed char* out) {
-    float r = a / fmaxf(cj, 1e-30f);
-    #pragma unroll
-    for (int p = 0; p < 8; ++p) {
-        if (p >= NS) break;
-        float sp = rintf(r * 127.0f);
-        sp = fmaxf(-127.0f, fminf(127.0f, sp));
-        out[p] = (signed char)sp;
-        r = 127.0f * (r - sp * (1.0f / 127.0f));
-    }
-}
-
-// VECTORIZED peel: each thread handles FOUR contiguous columns (j..j+3) of one
-// (b,i) row.  The Ag read is a single 16B float4 (vs 4 scalar f32 loads -> 1/4
-// the load requests, full 128B line/warp), and each plane's 4 int8 results are
-// PACKED into one 4B store (char4 reinterpreted as int) -- so a warp writes 128
-// contiguous bytes = a FULL 128B line per plane in one transaction, instead of
-// COMPILE-TIME-NS vectorized peel (float4, 4 columns/thread): NS is a template
-// constant (the n>=4096 CholeskyQR path always uses NS=_OZ_NS=4), so the compiler
-// sizes everything to exactly NS planes and carries only FOUR running residuals (one
-// per lane), emitting each plane's char4 the instant it is computed. Bit-exact: each
-// lane runs r=a/max(cj,1e-30); per-plane sp=clamp(rint(r*127),-127,127);
-// r=127*(r-sp/127) in order, and the store interleaving does not affect any byte.
+// VECTORIZED, COMPILE-TIME-NS peel (float4, 4 contiguous columns/thread): the Ag read is
+// one 16B float4 (1/4 the load requests, full 128B line/warp) and each plane's 4 int8
+// results are PACKED into one 4B char4 store. NS is a template constant (the n>=4096 path
+// always uses NS=_OZ_NS=4), so the compiler sizes everything to exactly NS planes and
+// carries only FOUR running residuals (one per lane), emitting each plane's char4 the
+// instant it is computed. Bit-exact: each lane runs the per-element recurrence in order;
+// the store interleaving does not affect any emitted byte.
 template <int NS_C>
 __global__ void oz_peel_v4t_kernel(const float* __restrict__ Ag, int n, int batch,
                                    const float* __restrict__ cjf, signed char* __restrict__ slN) {
@@ -6807,27 +6788,6 @@ __global__ void oz_peel_v4t_kernel(const float* __restrict__ Ag, int n, int batc
             r2 = 127.0f * (r2 - s2 * (1.0f / 127.0f));
             r3 = 127.0f * (r3 - s3 * (1.0f / 127.0f));
         }
-    }
-}
-
-// Scalar peel (one column/thread) -- the n%4!=0 fallback (never hit by the
-// active shapes, kept for correctness on any n).
-__global__ void oz_peel_kernel(const float* __restrict__ Ag, int n, int batch, int NS,
-                               const float* __restrict__ cjf, signed char* __restrict__ slN) {
-    int j = blockIdx.x * blockDim.x + threadIdx.x;
-    int i = blockIdx.y * blockDim.y + threadIdx.y;
-    int b = blockIdx.z;
-    if (j >= n || i >= n || b >= batch) return;
-    long nn = (long)n * n;
-    // 1e-30 floor on the column max (an all-zero column -> divide-by-zero guard);
-    // colmax now atomicMax's into a zero-initialized cjf, so the floor moves here.
-    long idx = (long)b * nn + (long)i * n + j;
-    signed char out[8];
-    oz_peel_one(Ag[idx], cjf[(long)b * n + j], NS, out);
-    #pragma unroll
-    for (int p = 0; p < 8; ++p) {
-        if (p >= NS) break;
-        slN[(long)p * batch * nn + idx] = out[p];
     }
 }
 
@@ -6934,18 +6894,12 @@ std::vector<torch::Tensor> oz_slice(torch::Tensor A, int64_t NS) {
     dim3 cmgrid((n + 4 * OZ_CM_TILE - 1) / (4 * OZ_CM_TILE), OZ_CM_RB, batch);
     oz_colmax_v4_kernel<<<cmgrid, cmblk>>>(A.data_ptr<float>(), n, batch, cjf.data_ptr<float>());
     dim3 pblk(32, 8);
-    if ((n & 3) == 0) {
-        // float4 fast path: blockDim.x threads cover 4*blockDim.x columns. NS is the
-        // module constant _OZ_NS=4 (the only value oz_slice is ever called with), so the
-        // compile-time-NS templated peel is always taken. Bit-identical output bytes.
-        dim3 pgrid((n / 4 + 31) / 32, (n + 7) / 8, batch);
-        oz_peel_v4t_kernel<4><<<pgrid, pblk>>>(A.data_ptr<float>(), n, batch,
-            cjf.data_ptr<float>(), slN.data_ptr<signed char>());
-    } else {
-        dim3 pgrid((n + 31) / 32, (n + 7) / 8, batch);
-        oz_peel_kernel<<<pgrid, pblk>>>(A.data_ptr<float>(), n, batch, (int)NS,
-            cjf.data_ptr<float>(), slN.data_ptr<signed char>());
-    }
+    // n%4==0 (Ozaki path is n=4096) and NS is the module constant _OZ_NS=4 (the only value
+    // oz_slice is ever called with), so the float4 compile-time-NS templated peel (4
+    // contiguous columns/thread) is always taken.
+    dim3 pgrid((n / 4 + 31) / 32, (n + 7) / 8, batch);
+    oz_peel_v4t_kernel<4><<<pgrid, pblk>>>(A.data_ptr<float>(), n, batch,
+        cjf.data_ptr<float>(), slN.data_ptr<signed char>());
     // cj as f64 for the recombine column scaling, with the 1e-30 floor applied
     // (matches the pre-atomic kernel that wrote max(m,1e-30) directly).
     auto cj = cjf.clamp_min(1e-30).to(torch::kFloat64);
