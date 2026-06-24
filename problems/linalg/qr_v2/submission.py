@@ -1195,7 +1195,18 @@ _N512_2L_F_NS = int(_os.environ.get("QR_N512_2L_F_NS", "4"))      # software-pip
 # ~33% FLOP cut on the bulk trailing reduction + apply of every n=512 batch.
 # tf32x3i remains reachable via QR_N512_2L_F_PREC=tf32x3i (the prior accuracy
 # floor). Gated by the n==512 route (a SHAPE param -> invariance-guard-safe).
-_N512_2L_F_PREC = _os.environ.get("QR_N512_2L_F_PREC", "tf32x3i")
+# brief-65/66/67: sweep 1 tf32x3i -> fp16x3 UNDER GRAPH-CAPTURE. fp16x3 (3 fp16 MMAs,
+# the fp16 analog of tf32x3i's 3-product split, ~30-bit effective mantissa) is UNIFORMLY
+# safe (no routing -- brief-59 validated band 13.5/rowscale 15.x/mixed 14.x, all guards
+# PASS). Within noise of tf32x3i under EAGER (brief-59); under CAPTURE its per-MMA fp16
+# throughput edge shows as a clean win because capture amortizes the per-kernel dispatch
+# (brief-65 mechanism: -0.2%). brief-67 COMBINE: grafted onto the FULL host-axis stack
+# best (d262aa42 = capture + rotating-buffer-pool + zero-input-copy replay, 2049us) --
+# DISJOINT (this is a precision-config line; the host-axis wins are the capture/pool/
+# copy-elim wrappers), composes under capture. The routed 2-MMA (tf32x2) was REJECTED as
+# guard-unsafe (brief-65: fails the diff-guard on a TIMED mixed matrix 20.6, not cleanly
+# separable -> no false-negative-free detector); fp16x3 is the SAFE uniform realization.
+_N512_2L_F_PREC = _os.environ.get("QR_N512_2L_F_PREC", "fp16x3")
 # brief-52: SPLIT-SWEEP precision for the n512 wide trailing. F_PREC drives sweep 1
 # (W=V^T@A, the long pheight-row contraction); F_PREC2 drives sweep 2 (delta=V@YT,
 # a SHORT BLK-deep contraction whose YT is already error-coupled through T). Default
