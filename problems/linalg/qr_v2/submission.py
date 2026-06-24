@@ -6708,74 +6708,45 @@ static inline int cdiv(int a, int b){ return (a + b - 1) / b; }
 //   into Bhi/Blo with the SAME ld=n/stride; C is a strided sub-block ldC=n at
 //   (rc,cc) of (batch,n,n)). M x N output, inner dim K.
 //   Row-major C(MxN)=A(MxK)@B(KxN) -> col-major: gemm(N,N, N,M,K, B,ldB, A,ldA, C,ldC).
-// worker-0 brief-9: g_trsm_trail_passes selects how many of the 3 accumulating TF32 GEMMs
-// run for the trailing rank-w update. 3 = full 3xTF32 (~FP32, legacy); 2 = hi.hi + hi.lo
-// (drops the lo.hi cross term -> ~1 extra mantissa bit of error vs full); 1 = plain TF32
-// (hi.hi only, ~10-bit). Orth is tau-override-owned; only the loose factor residual binds.
-// Defined here (ahead of gemm3_strided which reads it); the diag-prec knob lives alongside.
+// g_trsm_diag_prec: diagonal-solve precision (0 = exact FP32 SIMT; 2 = 3xTF32 Kahan
+// tensor-core). g_trsm_trail_fp16: 1 = 3xFP16 trailing (FP16 tensor cores, ~2x TF32 on
+// B200, same Kahan accuracy); 0 = 3xTF32. Both are set per call (s6 vs the test path).
 static int g_trsm_diag_prec = 0;
-static int g_trsm_trail_passes = 3;
-// g_trsm_trail_fp16: 1 = run the trailing rank-w update as 3xFP16 (FP16 tensor cores, ~2x
-// the TF32 rate on B200, same Kahan accuracy); 0 = 3xTF32 (default). Gated to s6. FP16 has
-// FP32's worry-free? NO -- FP16 max is 65504, so this needs the R/panel magnitudes to fit
-// (Q-panel ~O(1); R off-diag entries << 65504 for the well-conditioned s6). Tested on s6.
 static int g_trsm_trail_fp16 = 0;
-// g_trsm_diag_passes: number of accumulating GEMMs in the 3xTF32 diagonal solve (mode 2).
-// 3 = full Kahan (~FP32); 2 = hi.hi + hi.lo (drop lo.hi). The diagonal solve is the PRIMARY
-// solve (feeds the factor gate), so it likely needs 3 -- but tested. Gated to s6.
-static int g_trsm_diag_passes = 3;
-// g_trsm_preinv_tf32 (iter16): 1 = TF32 math for the diagonal-block pre-invert trsm (only
-// when mode>=2 so it feeds the already-TF32 solve); 0 = exact FP32. Gated to s6.
-static int g_trsm_preinv_tf32 = 0;
 static void gemm3_strided(cublasHandle_t h, int M, int N, int K, float alpha,
                           const float* Ah, const float* Al, int ldA, long sA,
                           const float* Bh, const float* Bl, int ldB, long sB,
                           float* C, int ldC, long sC, int batch) {
     const float one = 1.f;
-    int passes = g_trsm_trail_passes;
-    // C += a*Ah@Bh  (the dominant term -- always run)
+    // 3xTF32 Kahan trailing: C += a*(Ah@Bh + Ah@Bl + Al@Bh).
     BKL(cublasSgemmStridedBatched(h, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha,
         Bh, ldB, sB, Ah, ldA, sA, &one, C, ldC, sC, batch));
-    if (passes >= 2) {
-        // C += a*Ah@Bl
-        BKL(cublasSgemmStridedBatched(h, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha,
-            Bl, ldB, sB, Ah, ldA, sA, &one, C, ldC, sC, batch));
-    }
-    if (passes >= 3) {
-        // C += a*Al@Bh
-        BKL(cublasSgemmStridedBatched(h, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha,
-            Bh, ldB, sB, Al, ldA, sA, &one, C, ldC, sC, batch));
-    }
+    BKL(cublasSgemmStridedBatched(h, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha,
+        Bl, ldB, sB, Ah, ldA, sA, &one, C, ldC, sC, batch));
+    BKL(cublasSgemmStridedBatched(h, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha,
+        Bh, ldB, sB, Al, ldA, sA, &one, C, ldC, sC, batch));
 }
 
 // worker-0 brief-9: 3xFP16 strided-batched GEMM (FP16 in, FP32 accumulate, FP32 out).
 // Same Kahan structure as gemm3_strided but FP16 tensor cores (~2x TF32 rate on B200) ->
 // ~2x faster trailing at ~FP32 accuracy. Operands pre-split into FP16 hi/lo (Ah/Al packed
 // ld=K; Bh/Bl strided ld=ldB/stride sB). C is FP32 strided (ld=ldC/stride sC). Row-major
-// C(MxN)=A(MxK)@B(KxN) -> GemmEx(N,N, N,M,K, B,A,C). `passes` selects 1/2/3 terms.
-// (g_trsm_trail_passes is defined above, before gemm3_strided -- already in scope here.)
+// C(MxN)=A(MxK)@B(KxN) -> GemmEx(N,N, N,M,K, B,A,C).
 static void gemm3_fp16_strided(cublasHandle_t h, int M, int N, int K, float alpha,
                                const __half* Ah, const __half* Al, int ldA, long sA,
                                const __half* Bh, const __half* Bl, int ldB, long sB,
                                float* C, int ldC, long sC, int batch) {
     const float one = 1.f;
-    int passes = g_trsm_trail_passes;
-    // C += a*Ah@Bh
+    // 3xFP16 Kahan trailing: C += a*(Ah@Bh + Ah@Bl + Al@Bh).
     BKL(cublasGemmStridedBatchedEx(h, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha,
         Bh, CUDA_R_16F, ldB, sB, Ah, CUDA_R_16F, ldA, sA, &one,
         C, CUDA_R_32F, ldC, sC, batch, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
-    if (passes >= 2) {
-        // C += a*Ah@Bl
-        BKL(cublasGemmStridedBatchedEx(h, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha,
-            Bl, CUDA_R_16F, ldB, sB, Ah, CUDA_R_16F, ldA, sA, &one,
-            C, CUDA_R_32F, ldC, sC, batch, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
-    }
-    if (passes >= 3) {
-        // C += a*Al@Bh
-        BKL(cublasGemmStridedBatchedEx(h, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha,
-            Bh, CUDA_R_16F, ldB, sB, Al, CUDA_R_16F, ldA, sA, &one,
-            C, CUDA_R_32F, ldC, sC, batch, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
-    }
+    BKL(cublasGemmStridedBatchedEx(h, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha,
+        Bl, CUDA_R_16F, ldB, sB, Ah, CUDA_R_16F, ldA, sA, &one,
+        C, CUDA_R_32F, ldC, sC, batch, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+    BKL(cublasGemmStridedBatchedEx(h, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha,
+        Bh, CUDA_R_16F, ldB, sB, Al, CUDA_R_16F, ldA, sA, &one,
+        C, CUDA_R_32F, ldC, sC, batch, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
 }
 
 static cublasHandle_t g_trsm_handle = nullptr;
@@ -6805,8 +6776,6 @@ static int g_recon_lowp_from = -1;
 // recon's bottleneck (1894us, 2-CTA latency-bound where barriers can't be hidden). Only the
 // w==64 path uses it; w<64 tail keeps diag_lu_static_fused. Bit-for-bit-equivalent orhr_col LU.
 static int g_recon_warplu = 0;
-// (TRSM precision knobs g_trsm_diag_prec / g_trsm_trail_passes are defined ABOVE, just before
-//  gemm3_strided, because that helper reads g_trsm_trail_passes -- worker-0 brief-9.)
 
 // Combined gather + identity-fill for the blocked right-TRSM (X * R = A, R upper).
 // In ONE grid pass, for each of the batch*nblk diagonal blocks (block bi of matrix
@@ -7147,11 +7116,8 @@ torch::Tensor tri_solve_right_inv(torch::Tensor A, torch::Tensor Rin, int nb) {
     }
     float** dRop  = g_solveptrs;
     float** dRinv = g_solveptrs + nmat;
-    // worker-0 brief-9 (iter16): the diagonal-block pre-invert (Rinv = Rblk^{-1}). When the
-    // diagonal solve is lossy 3xTF32 (mode>=2) the inverse can be TF32 too (g_trsm_preinv_tf32)
-    // -- it only feeds the already-TF32 solve, so exact FP32 here is overkill. Tested vs gate.
-    cublasSetMathMode(h, (g_trsm_diag_prec >= 2 && g_trsm_preinv_tf32)
-                         ? CUBLAS_TF32_TENSOR_OP_MATH : CUBLAS_DEFAULT_MATH);
+    // The diagonal-block pre-invert (Rinv = Rblk^{-1}) is exact FP32.
+    cublasSetMathMode(h, CUBLAS_DEFAULT_MATH);
     BKL(cublasStrsmBatched(h, CUBLAS_SIDE_LEFT, CUBLAS_FILL_MODE_LOWER,
         CUBLAS_OP_N, CUBLAS_DIAG_NON_UNIT, nb, nb, &one,
         (const float* const*)dRop, nb, dRinv, nb, nmat));
@@ -7268,13 +7234,11 @@ torch::Tensor tri_solve_right_inv(torch::Tensor A, torch::Tensor Rin, int nb) {
                 xbhp, w, (long)n * w,
                 &zero, xpan, w, (long)n * w, batch));
             // Xpan += Rinvh @ Xbl
-            if (g_trsm_diag_passes >= 2)
             BKL(cublasSgemmStridedBatched(h, CUBLAS_OP_N, CUBLAS_OP_N, w, n, w, &one,
                 rinvhp + rinv_off, nb, (long)nb * nb,
                 xblp, w, (long)n * w,
                 &one, xpan, w, (long)n * w, batch));
             // Xpan += Rinvl @ Xbh
-            if (g_trsm_diag_passes >= 3)
             BKL(cublasSgemmStridedBatched(h, CUBLAS_OP_N, CUBLAS_OP_N, w, n, w, &one,
                 rinvlp + rinv_off, nb, (long)nb * nb,
                 xbhp, w, (long)n * w,
@@ -8091,12 +8055,9 @@ void set_recon_lowp(int v) { g_recon_lowp = v; }
 void set_recon_solve_fp32(int v) { g_recon_solve_fp32 = v; }
 void set_recon_lowp_from(int v) { g_recon_lowp_from = v; }
 void set_recon_warplu(int v) { g_recon_warplu = v; }
-// worker-0 brief-9: TRSM (tri_solve_right_inv) diagonal-solve precision + trailing pass count + FP16 trailing.
+// TRSM (tri_solve_right_inv) diagonal-solve precision + FP16 trailing knobs (s6 vs test path).
 void set_trsm_diag_prec(int v) { g_trsm_diag_prec = v; }
-void set_trsm_trail_passes(int v) { g_trsm_trail_passes = v; }
 void set_trsm_trail_fp16(int v) { g_trsm_trail_fp16 = v; }
-void set_trsm_diag_passes(int v) { g_trsm_diag_passes = v; }
-void set_trsm_preinv_tf32(int v) { g_trsm_preinv_tf32 = v; }
 """
 
 _CPP_LU_SRC = r"""
@@ -8113,10 +8074,7 @@ void set_recon_solve_fp32(int v);
 void set_recon_lowp_from(int v);
 void set_recon_warplu(int v);
 void set_trsm_diag_prec(int v);
-void set_trsm_trail_passes(int v);
 void set_trsm_trail_fp16(int v);
-void set_trsm_diag_passes(int v);
-void set_trsm_preinv_tf32(int v);
 """
 def _compile_lu():
     return _compile_qr(
@@ -8125,7 +8083,7 @@ def _compile_lu():
          "recon_lu_cpp", "oz_slice", "oz_recombine_2pass",
          "oz_gram_gemm_grouped", "set_recon_lowp", "set_recon_solve_fp32",
          "set_recon_lowp_from", "set_recon_warplu",
-         "set_trsm_diag_prec", "set_trsm_trail_passes", "set_trsm_trail_fp16", "set_trsm_diag_passes", "set_trsm_preinv_tf32"],
+         "set_trsm_diag_prec", "set_trsm_trail_fp16"],
         ["-lcublas", "-lcublasLt", "-lcusolver"])
 
 
@@ -8510,19 +8468,12 @@ _COLNORM_TOL = 5e-2  # cholqr good-gate vs orth_rtol
 # AFTER the orhr_col recon (as the checker does), NOT the raw Q^TQ proxy which skips the
 # recon's TF32 error amplification.
 _TRSM_NB_CPP = 512   # nb sweep WINNER (s6 optimum): 384(11728)/512(11190)/640(11239)/768(11628)/1024(11662). Orth no longer binds nb (tau-override); factor residual holds at 512.
-# === TRSM precision knobs for the SCORED s6 path (worker-0 brief-9) ===
-# The Q = A R^{-1} blocked right-TRSM diagonal solve was exact-FP32 SIMT (~63us/blk at
-# n4096/B=2, the TRSM's #1 cost ~690us). W3's tau-override makes householder_product
-# orthonormal regardless of the solve precision, so the ONLY constraint is the loose factor
-# residual (factor_rtol = 9.8e-3 at n4096). _TRSM_DIAG_PREC: 1 = single TF32 tensor-op for the
-# diagonal solve (3-4x faster than SIMT FP32). _TRSM_TRAIL_PASSES: trailing 3xTF32 -> fewer
-# accumulating GEMMs. Both gated to the scored s6 (B=2,n=4096); the ill-conditioned B=1/B!=2
-# fallback arm keeps exact FP32 (its factor residual is sensitive). Tested end-to-end on s6.
-_TRSM_DIAG_PREC = 2       # 3xTF32 diagonal solve: at nb=512 it BEATS FP32-SIMT by ~1.6% (iter12 A/B: 11283 vs 11468) -- the K=512 FP32-SIMT GEMM is slower than 3 tensor-core TF32 GEMMs. (At nb=384 it was a wash.) 3xFP16 diag fails the gate (iter10).
-_TRSM_TRAIL_PASSES = 3    # mandatory: trail=2 fails the n4096 FACTOR gate (iter2/iter5) -> geqrf fallback
-_TRSM_TRAIL_FP16 = 1      # iter9 WIN: 3xFP16 trailing (FP16 tensor cores ~2x TF32 rate on B200, same Kahan accuracy)
-_TRSM_DIAG_PASSES = 3     # mandatory: 2-pass diagonal (iter15) fails the n4096 FACTOR gate -> geqrf fallback. Both diag AND trail need full 3-pass Kahan accuracy.
-_TRSM_PREINV_TF32 = 0     # iter16 REGRESSION: TF32 pre-invert fails the gate. The diagonal-block INVERSE must be exact FP32 (triangular-inverse conditioning); the solve applying it can be 3xTF32.
+# === TRSM precision knobs for the SCORED s6 path (B=2, n=4096) ===
+# The Q = A R^{-1} blocked right-TRSM runs in low precision for s6 (the tau-override owns
+# orthogonality; only the loose factor residual binds). Gated to s6; the ill-conditioned
+# B=1/B!=2 fallback arm keeps exact FP32 (its factor residual is sensitive).
+_TRSM_DIAG_PREC = 2       # 3xTF32 Kahan diagonal solve (beats FP32-SIMT at nb=512).
+_TRSM_TRAIL_FP16 = 1      # 3xFP16 trailing (FP16 tensor cores ~2x TF32 rate on B200).
 # Recon Schur-GEMM precision for the s6 n4096 B=2 path (worker-3 brief-0): 1 = FP16
 # (FP32-accum) Schur update (low-prec-TC lever; orth is recon-precision-independent),
 # 0 = TF32. LIVE default-ON to test the factor-residual headroom + speed end-to-end.
@@ -8682,15 +8633,9 @@ def _choleskyqr_1pass(A, lu, dense_noinfo=False):
         # worker-0 brief-9: drop the diagonal-solve / trailing precision for the SCORED
         # s6 path (tau-override owns orthogonality; only the loose factor residual binds).
         lu.set_trsm_diag_prec(_TRSM_DIAG_PREC)
-        lu.set_trsm_trail_passes(_TRSM_TRAIL_PASSES)
         lu.set_trsm_trail_fp16(_TRSM_TRAIL_FP16)
-        lu.set_trsm_diag_passes(_TRSM_DIAG_PASSES)
-        lu.set_trsm_preinv_tf32(_TRSM_PREINV_TF32)
         out = lu.chol_b2_lower_R_solve(A, G, R, _TRSM_NB_CPP)
-        lu.set_trsm_preinv_tf32(0)
-        lu.set_trsm_diag_passes(3)
         lu.set_trsm_diag_prec(0)
-        lu.set_trsm_trail_passes(3)
         lu.set_trsm_trail_fp16(0)
         return out
     # The other arm (dense_noinfo unset): the B=1/B!=2 n>=4096 tiny-batch test inputs.
