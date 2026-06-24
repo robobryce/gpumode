@@ -1667,6 +1667,25 @@ def _dot_fp16(x, y):
     return tl.dot(x.to(tl.float16), y.to(tl.float16), out_dtype=tl.float32)
 
 
+# brief-52 FP16x2: the fp16 analog of tf32x2 -- keep V at fp16 (O(1), exact in
+# fp16's 10-bit mantissa), split the wide operand y (A/YT) into an fp16 hi + an
+# fp16 lo of the residual, and keep the two largest products Vh.yhi + Vh.ylo. This
+# doubles the effective mantissa on the y side (~20 bits) to recover the band/
+# rowscale margin that uniform 1-MMA fp16 just misses (20.2/20.1), at the cost of
+# TWO fp16 MMAs -- which on B200 (fp16 ~2x tf32 throughput) is still ~1 tf32-MMA of
+# tensor work, cheaper than the 3-MMA tf32x3i it would replace on sweep 1. The lo
+# residual is formed in fp32 then cast to fp16; the exponent stays in fp16 range
+# because |ylo| <= 0.5 ulp(yhi) << |yhi|.
+@triton.jit
+def _dot_fp16x2(x, y):
+    xh = x.to(tl.float16)
+    yh = y.to(tl.float16)
+    yl = (y - yh.to(tl.float32)).to(tl.float16)
+    acc = tl.dot(xh, yh, out_dtype=tl.float32)
+    acc += tl.dot(xh, yl, out_dtype=tl.float32)
+    return acc
+
+
 # 3-pass tf32 emulation with INDEPENDENT accumulators (brief-26). Triton's
 # BUILT-IN input_precision="tf32x3" emits a high-accuracy fine-split emulation
 # (~1.6e-7 relerr, measured) whose internal MMA passes ACCUMULATE into a single C
@@ -1768,6 +1787,8 @@ def _trailing_fused_kernel(
                 d = _dot_tf32_rn(vchunk, achunk)
             elif IPREC == "fp16":
                 d = _dot_fp16(vchunk, achunk)
+            elif IPREC == "fp16x2":
+                d = _dot_fp16x2(vchunk, achunk)
             else:
                 d = tl.dot(vchunk, achunk, input_precision=IPREC)
             if ci % 2 == 0:
@@ -1793,6 +1814,8 @@ def _trailing_fused_kernel(
                 W += _dot_tf32_rn(vchunk, achunk)
             elif IPREC == "fp16":
                 W += _dot_fp16(vchunk, achunk)
+            elif IPREC == "fp16x2":
+                W += _dot_fp16x2(vchunk, achunk)
             else:
                 W += tl.dot(vchunk, achunk, input_precision=IPREC)
     else:
@@ -1817,6 +1840,8 @@ def _trailing_fused_kernel(
                 W += _dot_tf32_rn(vchunk, achunk)
             elif IPREC == "fp16":
                 W += _dot_fp16(vchunk, achunk)
+            elif IPREC == "fp16x2":
+                W += _dot_fp16x2(vchunk, achunk)
             else:
                 W += tl.dot(vchunk, achunk, input_precision=IPREC)
 
@@ -1846,6 +1871,8 @@ def _trailing_fused_kernel(
                 delta = _dot_tf32_rn(Vrow, YT)
             elif DPREC == "fp16":
                 delta = _dot_fp16(Vrow, YT)
+            elif DPREC == "fp16x2":
+                delta = _dot_fp16x2(Vrow, YT)
             else:
                 delta = tl.dot(Vrow, YT, input_precision=DPREC)                     # (BM,BNc)
             ap2 = a_trail_base + rr[:, None] * stride_an + ccols[None, :]
@@ -1867,6 +1894,8 @@ def _trailing_fused_kernel(
                 delta = _dot_tf32_rn(Vrow, YT)
             elif DPREC == "fp16":
                 delta = _dot_fp16(Vrow, YT)
+            elif DPREC == "fp16x2":
+                delta = _dot_fp16x2(Vrow, YT)
             else:
                 delta = tl.dot(Vrow, YT, input_precision=DPREC)                     # (BM,BNc)
             ap2 = a_trail_base + rr[:, None] * stride_an + ccols[None, :]
