@@ -2829,46 +2829,29 @@ std::tuple<torch::Tensor, torch::Tensor> blocked_qr_2level(torch::Tensor A, int 
 // ===========================================================================
 // FP16-STORAGE two-level blocked QR (shapes 3/4/5).
 //
-// The wide outer trailing-update GEMM (W = V^T C, applied to the full trailing
-// block C re-read every outer panel) is MEMORY-BANDWIDTH-bound on the FP32 read
-// of C, not FLOP-bound (ncu: cutlass tf32 wide GEMM at ~20% throughput / ~5% FMA
-// pipe on the n=512 big-batch case). Cheaper COMPUTE (FP16 math-mode) does NOT help a bandwidth-bound
-// GEMM -- that was measured dead. But STORING the matrix in 16-bit halves the bytes
-// the GEMM reads, which is a DIFFERENT axis: a microbench at the real per-shape wide
-// dims shows 16-bit-input/FP32-compute is 1.6-2.4x faster than the TF32 path.
-//
-// STORAGE TYPE = FP16, not BF16 (load-bearing): BF16 (8-bit mantissa, eps ~3.9e-3)
-// is 4x coarser than TF32's 10-bit input truncation and breaks the factor gate even
-// at large n (measured: whole-matrix BF16 -> factor 0.9-2.9x the gate, fails s3/s4).
-// FP16 has a 10-bit mantissa (eps ~9.8e-4 == TF32 input precision), so FP16-stored
-// values lose nothing beyond what the existing TF32 trailing GEMMs already discard.
-// FP16's 5-bit exponent (max ~65504) is overflow-SAFE here: the gated inputs are
-// dense cond<=2 (values O(1), scaled by logspace(0,-2)), and the R/reflector
-// magnitudes stay O(column-norm) ~ O(1). FP16 storage matches BF16 storage in speed
-// (same 16-bit traffic, same tensor-core rate on B200). [`bf16` alias = __half.]
-//
-// The matrix Hb lives in BF16 throughout (one convert in -- NO per-panel convert
-// that would re-add the traffic). The panel kernel reads BF16, factors EXACTLY in
-// FP32 shared memory (the Householder norm/sign are FP32), and writes its factored
-// block BACK to Hb (BF16, for the next trailing GEMM) AND to a FP32 output H. All
-// bulk trailing accesses are BF16. The small scratch (S, T/M, W, Yf) stays FP32;
-// only the wide operands (Hb, V, Y) are BF16.
+// The wide outer trailing GEMM (W=V^T C, re-reading the full trailing block C each
+// panel) is BANDWIDTH-bound on the FP32 read of C, not FLOP-bound. Cheaper COMPUTE
+// doesn't help; STORING the matrix in 16-bit halves the GEMM's read traffic (~1.6-2.4x
+// vs TF32). Storage is FP16, not BF16 (load-bearing): FP16's 10-bit mantissa == TF32
+// input precision, so it loses nothing the TF32 trailing GEMMs don't already discard,
+// while BF16's 8-bit mantissa breaks the factor gate even at large n. FP16's 5-bit
+// exponent is overflow-SAFE here (gated to dense cond<=2; values + R/reflector
+// magnitudes stay O(1)). [`bf16` alias = __half.] Hb lives in BF16 throughout (one
+// convert in, no per-panel reconvert); panels read BF16, factor EXACTLY in FP32 smem,
+// and write the block back to Hb (BF16) AND to a FP32 output H. Only the wide operands
+// (Hb, V, Y) are BF16; the small scratch (S, T/M, W, Yf) stays FP32.
 //
 // PRECISION SPLIT (load-bearing -- whole-matrix BF16 broke BOTH gates):
-//   * Orthogonality (uses ONLY V=strict-lower + tau) needs FP32 reflectors --
-//     BF16 reflectors fail orth at the cond=2 validation case (test.16, scaled
-//     383 vs gate 100). The panel computes V in FP32 smem, so it writes the
-//     strict-lower (V) + diagonal block of R to the FP32 output H DIRECTLY,
-//     making orthogonality FP32-exact regardless of the BF16 trailing GEMMs.
-//   * Factor residual (uses R=triu(H)) tolerates BF16 in the ABOVE-panel R rows
-//     (the entries finalized by the BF16 trailing updates), since 20*n*eps32
-//     grows with n: at n>=1024 the BF16-R residual is ~0.5-0.7x the gate (passes);
-//     at n=512 it is ~2.9x (fails) so the n=512 big-batch case must stay FP32. A final fill kernel
-//     converts the above-panel R (rows < the column's panel start) from Hb (BF16);
-//     the panel-written FP32 lower/diag is left untouched.
-// Gated to the well-conditioned (prec==1) benchmark route; cond=0 stress cases keep
-// the exact-FP32 path. Factor-residual headroom (4.9x s3, 11x s4, 17x s5)
-// is the budget the BF16 above-panel R spends.
+//   * Orthogonality (uses ONLY V=strict-lower + tau) needs FP32 reflectors. The panel
+//     computes V in FP32 smem and writes the strict-lower (V) + R diag block to the
+//     FP32 output H directly -> orth is FP32-exact regardless of the BF16 trailing GEMMs.
+//   * Factor residual (uses R=triu(H)) tolerates BF16 in the ABOVE-panel R rows since
+//     20*n*eps32 grows with n: at n>=1024 the BF16-R residual passes (~0.5-0.7x gate),
+//     but at n=512 it fails (~2.9x), so the n=512 big-batch case stays FP32. A final
+//     fill kernel converts the above-panel R from Hb (BF16); the panel-written FP32
+//     lower/diag is left untouched.
+// Gated to the well-conditioned (prec==1) route; cond=0 stress keeps exact FP32. The
+// factor-residual headroom (4.9x s3, 11x s4, 17x s5) is the budget BF16-R spends.
 // ===========================================================================
 // [`bf16` alias = __half declared at top of _CUDA_SRC, ahead of the apply driver.]
 
@@ -3427,34 +3410,23 @@ __global__ void fill_R_n512_ob64_ib16_indexed_kernel(float* __restrict__ Hout,
 
 
 // ===========================================================================
-// WARP-SPECIALIZED PIVOT (1-sync) BF16 panel: targets the the n=512 big-batch case panel's
-// per-column CTA-barrier stall (30.2% of warp cycles are barrier-wait caused by
-// divergence-before-barrier, panel ~40% of the n=512 big-batch case, latency-bound at B=640).
+// WARP-SPECIALIZED PIVOT (1-sync) BF16 panel: targets the n=512 big-batch panel's
+// per-column CTA-barrier stall (panel ~40% of n=512, latency-bound at B=640).
 //
-// The fnorm panel (defer==3, the the n=512 big-batch case incumbent) pays a SERIAL TAIL each column:
-// warp0,lane0 alone computes the next pivot's tau/inv/beta (sqrtf + 2 divides) between
-// two barriers while 255 threads idle. The pipe panel (defer==4) hides that broadcast
-// by computing the next column's scalars one step ahead -- BUT in pipe warp 0 ALSO
-// strides over the extra trailing columns (c=j+1, j+1+NWARPS, ...) AND THEN reduces the
-// norm + computes the scalar, so warp 0 is the LONGEST chain into the barrier
-// (pivot-column + extra-columns + norm-reduce + scalar). The barrier waits on warp 0.
+// The incumbent fnorm (defer==3) / pipe (defer==4) panels make warp 0 the LONGEST chain
+// into the per-column barrier (it strides the extra trailing columns AND reduces the norm
+// AND computes the scalar), so the barrier waits on warp 0. THIS kernel instead DEDICATES
+// warp 0 to the NEXT pivot column (c=j+1) ONLY -- its trailing apply + fused norm +
+// tau/inv/beta scalar -- and splits the bulk columns (c>=j+2) over the other NWARPS-1
+// warps. The single per-column barrier then waits on max(warp0_short_chain, bulk/(NWARPS-1))
+// instead of bulk-then-warp0-serial. Column j+1 reads the scalars warp 0 already stashed ->
+// still ONE __syncthreads/column (column 0's scalars computed up front). Numerically
+// IDENTICAL to fnorm/pipe (same betas/taus/V -- only WHICH warp runs WHICH column changes).
 //
-// THIS kernel DEDICATES warp 0 to the NEXT pivot column (c=j+1) ONLY: its trailing
-// apply + fused norm + the tau/inv/beta scalar. The OTHER NWARPS-1 warps split the
-// remaining bulk trailing columns (c>=j+2) among themselves. The single per-column
-// barrier then waits on max(warp0_pivot_chain, bulk_of_(NWARPS-1)_warps) instead of
-// bulk-then-warp0-serial: warp 0's chain is SHORT (1 column + a 32-lane reduce + a few
-// scalar FLOPs) and the bulk is spread over NWARPS-1 warps, so the per-column critical
-// path drops to roughly the longer of the two. Column (j+1) reads the scalars warp 0
-// already stashed -> still ONE __syncthreads/column (j>=0; column 0's scalars computed
-// up front like pipe). Numerically IDENTICAL to fnorm/pipe (same betas/taus/V -- only
-// WHICH warp runs WHICH column changes, and WHEN the same scalar arithmetic runs).
-// MINB (launch_bounds min-blocks/SM) is a template param. the n=512 big-batch case (W=8, 256
-// threads, m=512=38KB smem, B=640 occupancy-rich) wants MINB=6 (the compiler caps
-// registers so up to 6 small CTAs co-reside -> hides barrier latency). the n=1024 case/5 (W=32,
-// 1024 threads, m=1024/2048 = 127-216KB smem) are smem-capped to 1 CTA/SM regardless,
-// so MINB=6 only needlessly throttles registers (forcing recompute/spill on the serial
-// column chain). MINB=1 there lets the compiler use more registers per thread.
+// MINB (launch_bounds min-blocks/SM) is a template param: n=512 (W=8, m=512=38KB, B=640
+// occupancy-rich) wants MINB=6 (the register cap lets up to 6 small CTAs co-reside, hiding
+// barrier latency); n=1024/2048 (W=32, m=1024/2048=127-216KB) are smem-capped to 1 CTA/SM
+// regardless, so MINB=1 there lets the compiler use more registers per thread.
 // Shared ROW-MAJOR warp-specialized-pivot Householder factor (load + col-0 scalars +
 // the per-column j-loop). Operates on extern __shared__ float s[] (row-major s[r*LDS+c],
 // invs[] at s+m*LDS); leaves the factored panel + deferred inverses in smem. The plain
@@ -4449,20 +4421,15 @@ static void mmb_S(cublasHandle_t h, const bf16* V, int b, int m, float* S, int b
 // ===========================================================================
 // FUSED SINGLE-READ INNER-APPLY (WMMA tensor cores).
 //
-// The two-level bf16 driver applies, for each NARROW inner sub-panel (width
-// w=IB, m rows, rest=inner_rest <= OB-IB cols), the compact-WY reflector via
-// FIVE cuBLAS/kernel launches that touch the m x rest C-tile TWICE from HBM
-// (W = V^T C reads C; C -= V Y reads+writes C).  Unlike the WIDE OUTER tile
-// (458KB, cannot be smem-resident; self-evicts L2), the INNER C-tile is small
-// (m=512, rest<=48 -> 48KB FP16) and FITS in opt-in smem.  So this kernel reads
-// the inner C-tile ONCE into smem, computes W = V^T C and C -= V*(M*(V^T C)) on
-// the 16x16x16 FP16->FP32 tensor cores entirely on-chip, and writes C back ONCE.
-// Fusing the un-fusable OUTER tile instead (128KB/1-CTA) is ~2.6x slower, and
-// scalar smem math loses to cuBLAS tensor cores.
-//
-// S = V^T V and M = L^{-1} still run BEFORE this on cuBLAS/build_Minv (tiny w x w
-// over B; cheap, and M is a serial triangular solve that does not fuse cleanly);
-// the caller passes M as FP16 (Mb16, emitted by build_Minv's fused FP16 write).
+// For each NARROW inner sub-panel (w=IB, m rows, rest<=OB-IB cols), the compact-WY apply
+// would touch the m x rest C-tile TWICE from HBM (W=V^T C reads C; C-=V Y reads+writes C).
+// Unlike the WIDE OUTER tile (458KB, cannot be smem-resident), the INNER C-tile is small
+// (m=512, rest<=48 -> 48KB FP16) and FITS in opt-in smem, so this kernel reads it ONCE into
+// smem, computes W=V^T C and C-=V*(M*(V^T C)) on the 16x16x16 FP16->FP32 tensor cores
+// on-chip, and writes C back ONCE. (Fusing the un-fusable OUTER tile is slower, and scalar
+// smem math loses to cuBLAS tensor cores.) S=V^T V and M=L^{-1} still run BEFORE this on
+// cuBLAS/build_Minv (tiny w x w; M is a serial triangular solve that doesn't fuse cleanly);
+// the caller passes M as FP16 (Mb16).
 //
 // Layouts (match the cuBLAS path):
 //   V : BF16, packed (B, m, w) ROW-MAJOR: V[mat*m*w + i*w + p] = V[i,p].
@@ -4479,16 +4446,13 @@ static void mmb_S(cublasHandle_t h, const bf16* V, int b, int m, float* S, int b
 // ---------------------------------------------------------------------------
 
 // ===========================================================================
-// FULL-FUSION INNER APPLY (WMMA).  Extends the single-read
-// fused apply by ALSO computing S=V^T V and M=L^{-1} (the WY T-inverse) ON-CHIP,
-// eliminating the separate cuBLAS S=V^T V GEMM (~164us/24 inner launches on the n=512 big-batch case)
-// AND the build_Minv kernel launch + the f32->FP16 M-convert for the inner applies.
-// One CTA/matrix does: load V,C,tau -> S=V^T V (WMMA) -> M=Minv(S,tau) in-smem
-// forward-sub -> W=V^T C (WMMA) -> Y=M W (WMMA) -> C-=V Y (WMMA, single C write).
-// tau is FP32 (B,n).  Numerically: S/M FP32 (matches build_Minv); W/Y FP16 (matches
-// the wf16 path).  Requires w%16==0, m%16==0, rest%16==0, w<=WMAX, rest<=NTMAX.
-// smem adds Ssh(w*w FP32) + Lsh(w*LDw FP32) + Msh(w*LDw FP32) + Mb(w*w FP16) + tau_s(w);
-// at w=16 these are tiny (~1-2KB) vs the m*rest C-tile.
+// FULL-FUSION INNER APPLY (WMMA). Extends the single-read fused apply by ALSO computing
+// S=V^T V and M=L^{-1} (the WY T-inverse) ON-CHIP, eliminating the separate cuBLAS S=V^T V
+// GEMM AND the build_Minv launch + f32->FP16 M-convert for the inner applies. One CTA/matrix:
+// load V,C,tau -> S=V^T V (WMMA) -> M=Minv(S,tau) in-smem forward-sub -> W=V^T C -> Y=M W ->
+// C-=V Y (WMMA, single C write). tau is FP32 (B,n). Numerically S/M FP32 (matches build_Minv),
+// W/Y FP16 (matches wf16). Requires w%16==0, m%16==0, rest%16==0, w<=WMAX, rest<=NTMAX. smem
+// adds Ssh+Lsh+Msh(w*LDw FP32) + Mb(w*w FP16) + tau_s(w); at w=16 tiny vs the m*rest C-tile.
 // ---------------------------------------------------------------------------
 __global__ void __launch_bounds__(256) qr_inner_apply_wmma_full_kernel(
         bf16* __restrict__ Hb, const bf16* __restrict__ Vp, const float* __restrict__ taup,
@@ -4636,44 +4600,30 @@ __global__ void __launch_bounds__(256) qr_inner_apply_wmma_full_kernel(
 //
 // Extends the mode-2 full-fusion inner apply UP to also absorb the PANEL FACTOR
 // that precedes it.  One CTA/matrix does, for ONE inner sub-panel [kc, kc+w):
-//   (P) factor the m x w sub-panel IN SMEM (column-major warp-specialized, the
-//       wsp_cm_ov logic), producing the unit-diag strict-lower V + tau + the
-//       beta/R-diag, and writing V back to Hb (BF16) / Hout (FP32) / the OB-wide
-//       outer-V fold OVm -- AND staging a BF16 row-major Vsh[m*w] that PERSISTS
-//       into the apply phase;
-//   (A) load the m x rest within-OB trailing C-tile ONCE into smem, compute
-//       S=V^T V, M=L^{-1} (in-smem forward-sub), W=V^T C, Y=M W, C-=V Y on the
-//       WMMA tensor cores entirely on-chip, write C back ONCE.
+//   (P) factor the m x w sub-panel IN SMEM (column-major warp-specialized), producing
+//       the unit-diag strict-lower V + tau + beta/R-diag, writing V back to Hb (BF16) /
+//       Hout (FP32) / the OB-wide outer-V fold OVm, AND staging a BF16 row-major Vsh[m*w]
+//       that PERSISTS into the apply phase;
+//   (A) load the m x rest within-OB trailing C-tile ONCE into smem, compute S=V^T V,
+//       M=L^{-1}, W=V^T C, Y=M W, C-=V Y on the WMMA tensor cores on-chip, write C once.
+// This folds {panel launch + inner-apply launch} into ONE launch and ELIMINATES the
+// inner-V HBM round-trip (the apply reads V from smem, never via the cVb buffer).
 //
-// This folds the per-sub-panel {panel launch + inner-apply launch} into ONE
-// launch and ELIMINATES the inner-V HBM round-trip (the panel's V is read from
-// smem by the apply, never written-to / re-read-from the cVb buffer).  The key
-// to preserving occupancy (a whole-OB megakernel instead collapses to
-// 1 CTA/SM at 128KB): the panel's FP32 column-major scratch (w*(m|1) floats =
-// 32KB at m=512,w=16) is OVERLAID on the apply's C-tile region (m*rest bf16 =
-// 48KB) -- they live in DISJOINT phases (panel finishes, syncs, then C loads),
-// so the fused kernel's PEAK smem == the apply kernel's footprint (~70KB), the
-// same ~6-CTA-theoretical / 48%-achieved occupancy the mode-2 apply already has.
-// Only Vsh (m*w bf16, 16KB) is genuinely additional and persistent.
+// SMEM-OVERLAY (load-bearing for occupancy): the panel's FP32 column-major scratch
+// (w*(m|1) floats, 32KB at m=512/w=16) is OVERLAID on the apply's C-tile region (m*rest
+// bf16, 48KB) -- DISJOINT phases (panel syncs, then C loads) -- so PEAK smem == the apply
+// kernel's footprint (~70KB, ~48% occupancy), not the sum. Only Vsh (m*w bf16, 16KB) is
+// additional and persistent. Numerically the fused kernel produces the SAME (H,tau,V) as
+// the unfused panel+apply pair (panel math == wsp_cm_ov, apply math == inner_apply_wmma_full);
+// the only change is WHERE the intermediate V lives. Block shape dim3(32,NWARPS=8) is shared
+// by both phases; LDM = m|1 (odd, conflict-free column stride).
 //
-// Numerically: the panel math (Householder norm/sign/scale) is bit-identical to
-// panel_factor_smem_wsp_cm_ov_bf16_kernel (same FP32 column-major reductions);
-// the apply math is bit-identical to qr_inner_apply_wmma_full_kernel (S/M FP32,
-// W/Y FP16).  So the fused kernel produces the SAME (H,tau,V) as the unfused
-// panel+apply pair -- the only change is WHERE the intermediate V lives.
-//
-// Layout note: the panel needs warp 0 (pivot) + bulk warps; the apply needs all
-// warps for WMMA tiles.  Both run at dim3(32, NWARPS=8) (256 threads), so the
-// block shape is shared.  LDM = m|1 (odd, conflict-free column stride).
-//
-// ---------------------------------------------------------------------------
 // HELP = compile-time pivot-coop warp count in PHASE P. HELP==1 -> the original
-// warp-specialized panel (the cooperative branch is dead-code-eliminated, so the n=512
-// instance is byte-identical to the pre-coop kernel and keeps its occupancy / register
-// count). HELP>1 -> warps 0..HELP-1 cooperatively run the next-pivot m-pass (the
-// barrier-bound serial latency the n=1024 underfilled regime is bound by). Making HELP a
-// template param (not a runtime arg) is REQUIRED: a runtime branch left the cooperative
-// code + its pdot/pnrm smem in the n=512 instance and cut its occupancy ~20%.
+// warp-specialized panel (cooperative branch dead-code-eliminated -> the n=512 instance
+// is byte-identical to pre-coop, same occupancy). HELP>1 -> warps 0..HELP-1 cooperatively
+// run the next-pivot m-pass (the barrier-bound serial latency the n=1024 underfilled regime
+// hits). HELP MUST be a template param: a runtime branch leaves the coop code + pdot/pnrm
+// smem in the n=512 instance and cuts its occupancy ~20%.
 template <int NWARPS, int HELP>
 __global__ void __launch_bounds__(NWARPS * 32) qr_panel_apply_fused_kernel(
         bf16* __restrict__ Hb, float* __restrict__ Hout, float* __restrict__ taup,
