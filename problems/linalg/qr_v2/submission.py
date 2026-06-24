@@ -5716,8 +5716,8 @@ __global__ void diag_lu_reg_kernel(float* __restrict__ Mg, float* __restrict__ D
 // WARP-LEVEL 64x64 diag-LU: the register-blocked diag_lu_reg above pays
 // TWO __syncthreads() PER COLUMN (128 block barriers / panel) to exchange the pivot row/col
 // across its 8 warps -- and at the 2 CTAs the B=2 recon launches there is NO occupancy to
-// hide those barriers, so diag_lu_reg is 1894us (29.6us/panel), the LONGEST per-panel op and
-// the recon's bottleneck. This version uses 64 lanes (2 WARPS, <<<batch,64>>>) -- lane t owns
+// hide those barriers, so diag_lu_reg is the LONGEST per-panel op and the recon's
+// bottleneck. This version uses 64 lanes (2 WARPS, <<<batch,64>>>) -- lane t owns
 // COLUMN t as a 64-row REGISTER array col[64] (64 floats/lane -> NO register spill, unlike a
 // single-warp 2-columns/lane version which spilled at REG:255/STACK:464). The pivot ROW element
 // for a lane's column c is col[kk] (thread-local). The pivot COLUMN's sub-diagonal (col_kk[r],
@@ -6526,11 +6526,10 @@ __global__ void panel_solve_fused_kernel(float* __restrict__ Mg, int n,
 }
 
 // ===========================================================================
-// FULL orhr_col reconstruction LU loop, in ONE C++ call. Issuing the ~190 ops/call
-// from Python pays ~20-30us dispatch overhead each (~3.5ms above the GPU-kernel
-// floor), and CUDA graphs can't capture our default-queue custom kernels, so the
-// whole loop runs in C++: the SAME cuBLAS trsm/gemm fire back-to-back with ~5us
-// driver latency between them.
+// FULL orhr_col reconstruction LU loop, in ONE C++ call. Issuing the ~190 ops/call from
+// Python pays per-op dispatch overhead, and CUDA graphs can't capture our default-queue
+// custom kernels, so the whole loop runs in C++: the SAME cuBLAS trsm/gemm fire back-to-
+// back with only driver latency between them.
 //
 // Single-level right-looking blocked LU, ob-wide panels (ob<=64). Per panel: no-pivot
 // diagonal LU (custom diag_lu_static), then for the trailing (joe<n): L21 = M21 @
