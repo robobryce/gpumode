@@ -6802,50 +6802,12 @@ __device__ __forceinline__ void oz_peel_one(float a, float cj, int NS, signed ch
 // the load requests, full 128B line/warp), and each plane's 4 int8 results are
 // PACKED into one 4B store (char4 reinterpreted as int) -- so a warp writes 128
 // contiguous bytes = a FULL 128B line per plane in one transaction, instead of
-// 32 threads each emitting a 1-byte (1-sector) store.  ncu on shape 6 showed the
-// scalar kernel at 20% HBM / 4.19M store-requests = LSU-issue-bound, not DRAM:
-// quartering the warp count (4 cols/thread) and coalescing each plane store to a
-// full line is the fix.  Requires n%4==0 (true for every shape that reaches the
-// n>=4096 CholeskyQR path -- n=4096); oz_slice routes other n to the scalar
-// kernel.  Math is identical to the scalar path (oz_peel_one per element).
-__global__ void oz_peel_v4_kernel(const float* __restrict__ Ag, int n, int batch, int NS,
-                                  const float* __restrict__ cjf, signed char* __restrict__ slN) {
-    int j0 = (blockIdx.x * blockDim.x + threadIdx.x) * 4;   // 4-aligned base column
-    int i = blockIdx.y * blockDim.y + threadIdx.y;
-    int b = blockIdx.z;
-    if (j0 >= n || i >= n || b >= batch) return;
-    long nn = (long)n * n;
-    long base = (long)b * nn + (long)i * n + j0;             // div by 4 (n,j0 div 4)
-    float4 a4 = *reinterpret_cast<const float4*>(Ag + base);
-    float4 c4 = *reinterpret_cast<const float4*>(cjf + (long)b * n + j0);
-    long batch_nn = (long)batch * nn;
-    // Peel each of the 4 lanes into its NS-length local plane buffer, then emit
-    // one packed 4B (char4) store per plane.
-    signed char o0[8], o1[8], o2[8], o3[8];
-    oz_peel_one(a4.x, c4.x, NS, o0);
-    oz_peel_one(a4.y, c4.y, NS, o1);
-    oz_peel_one(a4.z, c4.z, NS, o2);
-    oz_peel_one(a4.w, c4.w, NS, o3);
-    #pragma unroll
-    for (int p = 0; p < 8; ++p) {
-        if (p >= NS) break;
-        char4 packed = make_char4(o0[p], o1[p], o2[p], o3[p]);
-        *reinterpret_cast<char4*>(slN + (long)p * batch_nn + base) = packed;
-    }
-}
-
-// COMPILE-TIME-NS vectorized peel: identical math/bytes to oz_peel_v4_kernel but
-// NS is a template constant (the n>=4096 CholeskyQR path always uses NS=_OZ_NS=4),
-// which lets the compiler (a) size everything to exactly NS planes (no NS=8
-// over-allocation + runtime `if(p>=NS)break`), and (b) carry only FOUR running
-// residuals (one per lane) instead of four NS-wide signed-char plane buffers,
-// emitting each plane's char4 the instant it is computed. The scalar kernel was
-// register-limited (42 reg/thread -> 5 blocks/SM, 62.5% theoretical occupancy);
-// dropping the 32-char plane arrays cuts register pressure so more blocks co-reside.
-// Bit-exact: each lane runs the SAME r=a/max(cj,1e-30); per-plane
-// sp=clamp(rint(r*127),-127,127); r=127*(r-sp/127) recurrence in the SAME order;
-// only the store interleaving (per-plane-across-lanes vs per-lane-across-planes)
-// changes, which does not affect any emitted byte.
+// COMPILE-TIME-NS vectorized peel (float4, 4 columns/thread): NS is a template
+// constant (the n>=4096 CholeskyQR path always uses NS=_OZ_NS=4), so the compiler
+// sizes everything to exactly NS planes and carries only FOUR running residuals (one
+// per lane), emitting each plane's char4 the instant it is computed. Bit-exact: each
+// lane runs r=a/max(cj,1e-30); per-plane sp=clamp(rint(r*127),-127,127);
+// r=127*(r-sp/127) in order, and the store interleaving does not affect any byte.
 template <int NS_C>
 __global__ void oz_peel_v4t_kernel(const float* __restrict__ Ag, int n, int batch,
                                    const float* __restrict__ cjf, signed char* __restrict__ slN) {
@@ -7044,18 +7006,12 @@ std::vector<torch::Tensor> oz_slice(torch::Tensor A, int64_t NS) {
     }
     dim3 pblk(32, 8);
     if ((n & 3) == 0) {
-        // float4 fast path: blockDim.x threads cover 4*blockDim.x columns.
+        // float4 fast path: blockDim.x threads cover 4*blockDim.x columns. NS is the
+        // module constant _OZ_NS=4 (the only value oz_slice is ever called with), so the
+        // compile-time-NS templated peel is always taken. Bit-identical output bytes.
         dim3 pgrid((n / 4 + 31) / 32, (n + 7) / 8, batch);
-        // NS is a compile-time constant for the actual benchmark path (NS=4) ->
-        // the templated peel drops the 32-char plane buffers (register-limited
-        // occupancy) and runs only 4 residuals. Bit-identical output bytes.
-        if (NS == 4) {
-            oz_peel_v4t_kernel<4><<<pgrid, pblk>>>(A.data_ptr<float>(), n, batch,
-                cjf.data_ptr<float>(), slN.data_ptr<signed char>());
-        } else {
-            oz_peel_v4_kernel<<<pgrid, pblk>>>(A.data_ptr<float>(), n, batch, (int)NS,
-                cjf.data_ptr<float>(), slN.data_ptr<signed char>());
-        }
+        oz_peel_v4t_kernel<4><<<pgrid, pblk>>>(A.data_ptr<float>(), n, batch,
+            cjf.data_ptr<float>(), slN.data_ptr<signed char>());
     } else {
         dim3 pgrid((n + 31) / 32, (n + 7) / 8, batch);
         oz_peel_kernel<<<pgrid, pblk>>>(A.data_ptr<float>(), n, batch, (int)NS,
