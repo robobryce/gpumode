@@ -5714,7 +5714,7 @@ __global__ void diag_lu_reg_kernel(float* __restrict__ Mg, float* __restrict__ D
         } }
 }
 
-// WARP-LEVEL 64x64 diag-LU (worker-3 brief-5): the register-blocked diag_lu_reg above pays
+// WARP-LEVEL 64x64 diag-LU: the register-blocked diag_lu_reg above pays
 // TWO __syncthreads() PER COLUMN (128 block barriers / panel) to exchange the pivot row/col
 // across its 8 warps -- and at the 2 CTAs the B=2 recon launches there is NO occupancy to
 // hide those barriers, so diag_lu_reg is 1894us (29.6us/panel), the LONGEST per-panel op and
@@ -5932,7 +5932,7 @@ static void gemm3_strided(cublasHandle_t h, int M, int N, int K, float alpha,
         Bh, ldB, sB, Al, ldA, sA, &one, C, ldC, sC, batch));
 }
 
-// worker-0 brief-9: 3xFP16 strided-batched GEMM (FP16 in, FP32 accumulate, FP32 out).
+// 3xFP16 strided-batched GEMM (FP16 in, FP32 accumulate, FP32 out).
 // Same Kahan structure as gemm3_strided but FP16 tensor cores (~2x TF32 rate on B200) ->
 // ~2x faster trailing at ~FP32 accuracy. Operands pre-split into FP16 hi/lo (Ah/Al packed
 // ld=K; Bh/Bl strided ld=ldB/stride sB). C is FP32 strided (ld=ldC/stride sC). Row-major
@@ -5955,31 +5955,19 @@ static void gemm3_fp16_strided(cublasHandle_t h, int M, int N, int K, float alph
 }
 
 static cublasHandle_t g_trsm_handle = nullptr;
-// Recon-LU Schur-GEMM precision (worker-3 brief-0): 1 = FP16 (FP32-accum) Schur
-// update C -= L21 @ U12 in recon_lu_cpp; 0 = TF32 (default). The recon produces
-// (H,tau) whose Q via householder_product is orthogonal REGARDLESS of V precision
-// (only the loose factor residual is touched) -- so a low-precision Schur is the
-// brief's safe low-prec-TC lever IF the FP16 error doesn't accumulate over the 63
-// right-looking panels past the factor gate. Tested end-to-end.
+// Recon-LU Schur-GEMM precision: 1 = FP16 (FP32-accum) Schur update C -= L21 @ U12 in
+// recon_lu_cpp; 0 = TF32. The (H,tau)->Q via householder_product is orthogonal regardless
+// of V precision (only the loose factor residual is touched), so a low-precision Schur is safe.
 static int g_recon_lowp = 0;
-// Recon panel-solve accumulation precision (worker-3 brief-2 lever B): 1 = FP32 (faster),
-// 0 = FP64 (default, orth-margin). Only the loose factor residual is touched (orth is
-// recon-precision-independent). Tested end-to-end on s6.
+// Recon panel-solve accumulation precision: 1 = FP32 (faster), 0 = FP64 (orth-margin).
 static int g_recon_solve_fp32 = 0;
-// Recon low-precision panel BOUNDARY (worker-3 brief-4): the panel index (in COLUMNS, a
-// multiple of ob) from which the Schur GEMM goes FP16 and the panel-solve goes FP32. The
-// pre-brief-4 default was 3*ob (first 3 panels TF32/FP64 to protect the orth gate). The
-// tau-override (e235cc8b5) now makes householder_product orthonormal REGARDLESS of recon
-// precision, so the early-panel high-precision guard is no longer needed for orth -- only
-// the loose FACTOR residual (gate 32 @ n4096) limits how early we can drop. -1 = use the
-// legacy 3*ob default; >=0 = explicit column boundary (0 = low-prec from the very first
-// panel). Tested end-to-end on s6 against both gates.
+// Recon low-precision panel BOUNDARY: the panel index (in COLUMNS, a multiple of ob) from
+// which the Schur GEMM goes FP16 and the panel-solve goes FP32. -1 = legacy 3*ob default;
+// >=0 = explicit column boundary (0 = low-prec from the first panel).
 static int g_recon_lowp_from = -1;
-// Recon WARP-LEVEL diag-LU (worker-3 brief-5): 1 = factor the 64x64 diag block in a SINGLE
-// warp (diag_lu_warp_kernel, __shfl pivot broadcast, ZERO __syncthreads), 0 = the legacy
-// register-blocked diag_lu_reg (256 threads, 128 block barriers/panel). diag_lu_reg is the
-// recon's bottleneck (1894us, 2-CTA latency-bound where barriers can't be hidden). Only the
-// w==64 path uses it; w<64 tail keeps diag_lu_static_fused. Bit-for-bit-equivalent orhr_col LU.
+// Recon WARP-LEVEL diag-LU: 1 = factor the 64x64 diag block in a SINGLE warp
+// (diag_lu_warp_kernel, __shfl pivot broadcast, no __syncthreads); 0 = the register-blocked
+// diag_lu_reg (256 threads). Only the w==64 path uses it; w<64 tail keeps diag_lu_static_fused.
 static int g_recon_warplu = 0;
 
 // Combined gather + identity-fill for the blocked right-TRSM (X * R = A, R upper).
@@ -6050,7 +6038,7 @@ __global__ void split_flat_kernel(const float* __restrict__ x, float* __restrict
     }
 }
 
-// worker-0 brief-9: hi/lo split of the STRIDED X-panel X[mat][:, j:j+w] (n rows, w cols,
+// hi/lo split of the STRIDED X-panel X[mat][:, j:j+w] (n rows, w cols,
 // ld=n) into PACKED hi/lo buffers (batch, n, w) with row-stride w. Reads the input panel
 // for the 3xTF32 tensor-core DIAGONAL solve (g_trsm_diag_prec==2). float4 over the w cols
 // (w=nb=384 or tail 256, both %4==0; j%4==0 -> the X read base is 16B-aligned; the packed
@@ -6077,7 +6065,7 @@ __global__ void split_panel_strided_kernel(const float* __restrict__ Xg,
     *reinterpret_cast<float4*>(L + pidx) = lv;
 }
 
-// worker-0 brief-9: FP16 hi/lo split of FP32 x -> (hi = half(x), lo = half(x - float(hi))).
+// FP16 hi/lo split of FP32 x -> (hi = half(x), lo = half(x - float(hi))).
 // 3 accumulating FP16 GEMMs (hi.hi + hi.lo + lo.hi) in FP32 accumulation recover ~21
 // mantissa bits (~FP32). FP16 tensor cores run at ~2x the TF32 rate on B200, so a 3xFP16
 // trailing GEMM is ~2x faster than the 3xTF32 it replaces at the same accuracy structure.
@@ -6149,7 +6137,7 @@ __global__ void split_panel_strided_fp16_kernel(const float* __restrict__ Xg,
 // version ran at ~12% DRAM / 36% SM (latency-bound on tiny per-thread work across
 // 13 small launches); the 4-wide pass cuts memory instructions 4x for the same byte
 // traffic -> better MLP / coalescing, lower per-launch latency.
-// worker-0 brief-9: hi16/lo16 (optional) add a FUSED FP16 hi/lo split of the solved panel in
+// hi16/lo16 (optional) add a FUSED FP16 hi/lo split of the solved panel in
 // the SAME pass as the scatter -> the 3xFP16 trailing needs no separate split kernel (saves
 // ~8us/block). Pass hi/lo (FP32 TF32-split) for the 3xTF32 trailing, hi16/lo16 (FP16-split)
 // for the 3xFP16 trailing, or all-null (last block) to just scatter.
@@ -6210,7 +6198,7 @@ __global__ void scatter_split_panel_kernel(float* __restrict__ Xg,
 // at b2). The diagonal pre-invert is ONE cublasStrsmBatched (RHS=I) over all nblk
 // blocks at once -- the tail block is identity-padded so the single batched call
 // covers it -- then the per-block diagonal solve is a wide GEMM X[:,blk] @ Rblk^{-1}.
-// worker-0 brief-9 precision map (s6 path, gated): pre-invert EXACT FP32 (triangular-block
+// precision map (s6 path, gated): pre-invert EXACT FP32 (triangular-block
 // inverse is conditioning-sensitive -- TF32 fails the factor gate); the diagonal SOLVE is
 // 3xTF32 (g_trsm_diag_prec==2, ~FP32 via Kahan hi/lo, faster than FP32-SIMT at nb=512); the
 // trailing rank-w update is 3xFP16 (g_trsm_trail_fp16; FP16 tensor cores ~2x TF32 on B200,
@@ -6244,11 +6232,11 @@ torch::Tensor tri_solve_right_inv(torch::Tensor A, torch::Tensor Rin, int nb) {
     // X) and avoids the per-call torch::empty dispatch overhead at tiny batch. Keyed
     // by (batch,n): nb is fixed (_TRSM_NB_CPP) so every buffer shape follows from it.
     static torch::Tensor cRop, cRinv, cRh, cRl, cXpan, cXph, cXpl;
-    // worker-0 brief-9: hi/lo splits for the 3xTF32 tensor-core DIAGONAL solve (g_trsm_diag_prec==2).
+    // hi/lo splits for the 3xTF32 tensor-core DIAGONAL solve (g_trsm_diag_prec==2).
     // cRinvh/cRinvl = hi/lo of the pre-inverted diagonal blocks (split ONCE after pre-invert);
     // cXbh/cXbl = hi/lo of the CURRENT X[:,j:je] panel (split each block, n x nb per matrix).
     static torch::Tensor cRinvh, cRinvl, cXbh, cXbl;
-    // worker-0 brief-9: FP16 hi/lo for the 3xFP16 trailing (g_trsm_trail_fp16==1). cRh16/cRl16
+    // FP16 hi/lo for the 3xFP16 trailing (g_trsm_trail_fp16==1). cRh16/cRl16
     // = FP16 hi/lo of R (split ONCE); cXph16/cXpl16 = FP16 hi/lo of the solved panel (per block).
     static torch::Tensor cRh16, cRl16, cXph16, cXpl16;
     // FP16 hi/lo for the 3xFP16 DIAGONAL solve (g_trsm_diag_prec==3): cRinvh16/cRinvl16 = FP16
@@ -6329,7 +6317,7 @@ torch::Tensor tri_solve_right_inv(torch::Tensor A, torch::Tensor Rin, int nb) {
     cublasSetMathMode(h, CUBLAS_TF32_TENSOR_OP_MATH);
 
     // --- Pre-split R once into hi/lo for the 3xTF32 trailing. R is contiguous, so a
-    // single FLAT vectorized split runs it in ~38us. worker-0 brief-9: SKIP this FP32 split
+    // single FLAT vectorized split runs it in ~38us. SKIP this FP32 split
     // when the trailing is 3xFP16 (g_trsm_trail_fp16) -- the FP16 path uses Rh16/Rl16 only,
     // so the FP32 Rh/Rl split was ~58us of pure WASTE (ncu). Rh/Rl are static scratch.
     // split_flat_kernel is float4-vectorized: one thread per 4 contiguous elements.
@@ -6340,7 +6328,7 @@ torch::Tensor tri_solve_right_inv(torch::Tensor A, torch::Tensor Rin, int nb) {
         split_flat_kernel<<<cdiv((int)rvec, 256), 256>>>(
             R.data_ptr<float>(), Rh.data_ptr<float>(), Rl.data_ptr<float>(), rcount);
     }
-    // worker-0 brief-9: for the 3xTF32 tensor-core DIAGONAL solve (g_trsm_diag_prec==2),
+    // for the 3xTF32 tensor-core DIAGONAL solve (g_trsm_diag_prec==2),
     // pre-split the pre-inverted diagonal blocks Rinv (contiguous, nmat x nb x nb) into
     // hi/lo ONCE here (the X-panel hi/lo is split per block in the loop).
     if (g_trsm_diag_prec == 2) {
@@ -6355,7 +6343,7 @@ torch::Tensor tri_solve_right_inv(torch::Tensor A, torch::Tensor Rin, int nb) {
         split_flat_fp16_kernel<<<cdiv((int)ivec, 256), 256>>>(
             Rinv.data_ptr<float>(), (__half*)Rinvh16.data_ptr(), (__half*)Rinvl16.data_ptr(), icount);
     }
-    // worker-0 brief-9: for the 3xFP16 trailing (g_trsm_trail_fp16==1), pre-split R into
+    // for the 3xFP16 trailing (g_trsm_trail_fp16==1), pre-split R into
     // FP16 hi/lo ONCE here (the solved panel's FP16 hi/lo is split per block in the loop).
     if (g_trsm_trail_fp16) {
         long rcount = (long)batch * nn;
@@ -6479,7 +6467,7 @@ torch::Tensor tri_solve_right_inv(torch::Tensor A, torch::Tensor Rin, int nb) {
         }
         int rest = n - je;
         if (g_trsm_trail_fp16) {
-            // worker-0 brief-9: 3xFP16 trailing. FUSED scatter-back + FP16 hi/lo split of the
+            // 3xFP16 trailing. FUSED scatter-back + FP16 hi/lo split of the
             // solved panel in ONE pass (hi16/lo16 args), then 3xFP16 GEMM (no separate split).
             scatter_split_panel_kernel<<<pgrid, blk>>>(Xp, xpan, nullptr, nullptr, n, j, w,
                                                        xph16p, xpl16p);
@@ -6525,7 +6513,7 @@ torch::Tensor tri_solve_right_inv(torch::Tensor A, torch::Tensor Rin, int nb) {
 // Work items 0..mrows-1 are L21 rows; mrows..mrows+rest-1 are U12w columns. Each
 // thread owns one work item (one full w-step solve). The diag block is staged in smem
 // once per CTA (Usm/Lsm), shared by every solve in the CTA.
-// L21h/U12h (worker-3 brief-0 iter4): optional contiguous FP16 mirrors of the solved
+// L21h/U12h: optional contiguous FP16 mirrors of the solved
 // panels, written FROM REGISTERS in the same pass (no extra read/launch) so the FP16
 // recon Schur GEMM needs no separate cast. L21h packs (batch x mrows x w) ld=w; U12h
 // packs (batch x w x rest) ld=rest. nullptr -> skip (TF32-Schur path).
@@ -6568,7 +6556,7 @@ __global__ void panel_solve_fused_kernel(float* __restrict__ Mg, int n,
         // back-sub over columns c=0..w-1: y[c] = (b[c] - sum_{k<c} y[k] U[k][c]) / U[c][c]
         float* b = M + (long)(joe + item) * n + jo;      // mrows x w region, ld=n
         float y[W];
-        // fp32_solve (worker-3 brief-2 lever B): FP32 accumulation (faster) vs the default
+        // fp32_solve: FP32 accumulation (faster) vs the default
         // FP64 (orth-margin). The recon's Q via householder_product is orth-exact regardless
         // of V precision -> only the loose factor residual (gate 32 @ n4096) is touched;
         // tested whether FP32 holds it. Passed from the host (reads g_recon_solve_fp32).
@@ -6648,7 +6636,7 @@ torch::Tensor recon_lu_cpp(torch::Tensor M, torch::Tensor R, torch::Tensor D, in
     const float negone = -1.f, one = 1.f;
     int nt = kLuNt;
     bool rlowp_on = (g_recon_lowp != 0);
-    // HYBRID PRECISION (worker-3 brief-0 iter3): the first few right-looking panels'
+    // HYBRID PRECISION: the first few right-looking panels'
     // Schur updates propagate FP16 error through ALL subsequent panels, so keep them
     // TF32 (exact-class) and only drop to FP16 once jo >= RECON_LOWP_FROM. iter2's
     // pure-FP16 Schur was 1.19x over the orth gate on 1/8 s6 draws; the early-panel
@@ -6737,7 +6725,7 @@ torch::Tensor recon_lu_cpp(torch::Tensor M, torch::Tensor R, torch::Tensor D, in
                     rest, rest, w, &negone,
                     U12w, n, nn, L21, n, nn, &one, tr, n, nn, batch));
             } else {
-                // FP16 Schur (worker-3 brief-0 iter4): the contiguous FP16 mirrors were
+                // FP16 Schur: the contiguous FP16 mirrors were
                 // written FROM REGISTERS by panel_solve_fused (no cast pass). U12h ld=n
                 // (buffer (batch,W,n)), L21h ld=W (buffer (batch,n,W)). ONE FP16 GEMM.
                 BKL(cublasGemmStridedBatchedEx(h, CUBLAS_OP_N, CUBLAS_OP_N,
@@ -7245,9 +7233,9 @@ void oz_gram_gemm_grouped(torch::Tensor slN, torch::Tensor P,
         Carr, CUDA_R_32I, n, G, CUBLAS_COMPUTE_32I, CUBLAS_GEMM_DEFAULT));
 }
 
-// Python knob (worker-3 brief-0): 0 = TF32 recon Schur (default); 1 = FP16 (FP32-accum)
-// recon Schur update in recon_lu_cpp. The recon's (H,tau)->Q is orth-exact regardless of
-// V precision, so only the loose factor residual is at risk; tested end-to-end on s6.
+// Python knobs: recon Schur/solve precision + low-prec panel boundary + warp-LU toggle.
+// The recon's (H,tau)->Q is orth-exact regardless of V precision, so only the loose factor
+// residual is at risk.
 void set_recon_lowp(int v) { g_recon_lowp = v; }
 void set_recon_solve_fp32(int v) { g_recon_solve_fp32 = v; }
 void set_recon_lowp_from(int v) { g_recon_lowp_from = v; }
