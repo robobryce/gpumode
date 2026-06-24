@@ -1647,14 +1647,6 @@ void set_cmf_warps(int v) { g_cmf_warps = v; }
 static int g_cmf_mrfine = 0;
 void set_cmf_mrfine(int v) { g_cmf_mrfine = v; }
 
-// brief-51 (worker-1): when set, the n=352 cmf BF16 panel reads its BLOCK-0 input columns
-// from the FP32 ORIGINAL matrix (full-precision reflectors for columns [0,b)) instead of
-// from the bf16 working matrix, while still storing bf16 V to H + the FP32 V/R to Hout.
-// Only block 0 is eligible (blocks k>0 read trailing-updated columns that exist only in
-// bf16 after the bf16 tensor-core trailing apply). 0 = the historical all-bf16 panel.
-static int g_cmf_f32in0 = 0;
-void set_cmf_f32in0(int v) { g_cmf_f32in0 = v; }
-
 // When set, route the two-level FP32 inner panel to the warp-specialized column-major
 // cmf kernel (panel_factor_smem_wsp_cmf_tmpl_kernel<32,16,float>) instead of the
 // pipe<32> deep-pipeline panel. cmf overlaps warp-0's next-pivot look-ahead with the
@@ -5662,12 +5654,9 @@ std::tuple<torch::Tensor, torch::Tensor> blocked_qr_2level_bf16_indexed(torch::T
                 // larger MROWS only adds r>=m loop trips, each guarded to contribute exactly
                 // 0). Net: 6 live BF16 cmf instances instead of 14 -> 8 fewer ptxas compiles.
                 int mr = (m + 31) >> 5;   // ceil(m/32), the EXACT per-lane register cache
-                // FP32-INPUT BLOCK-0 (brief-51): only k==0, dense non-indexed path, gated.
-                // Hf is the contiguous FP32 original (== A for the dense n=352 caller); its
-                // leading [0,b) panel columns have not yet been bf16-rounded, so the panel can
-                // build full-precision block-0 reflectors. k>0 -> nullptr (bf16-input path).
-                const float* Af32 = (g_cmf_f32in0 && k == 0 && !indexed_out)
-                                    ? Hf.data_ptr<float>() : nullptr;
+                // The cmf panel always reads bf16-rounded input (the FP32-input block-0 path
+                // was a measured no-win and never enabled).
+                const float* Af32 = nullptr;
                 // NWARPS sweep (brief-51): the n=352 cmf panel is 1-CTA/SM, 40 CTAs, sync-
                 // bound on warp-0's serial per-column look-ahead chain -> the per-column
                 // __syncthreads waits on min(WV warps). g_cmf_warps picks WV (default 24, the
@@ -6290,7 +6279,6 @@ void set_panel_cm(int v);
 void set_panel_cm2(int v);
 void set_cmf_warps(int v);
 void set_cmf_mrfine(int v);
-void set_cmf_f32in0(int v);
 void set_ov_fold(int v);
 void set_inner_wmma(int v);
 void set_inner_wmma_wmax(int v);
@@ -6327,7 +6315,7 @@ def _compile_qr(name, cpp, cuda, functions, ldflags):
 
 
 def _compile_ext():
-    functions = ["blocked_qr", "illcond_mask", "n352_illcond_mask_cuda", "blocked_qr_2level", "blocked_qr_2level_bf16", "qr_n512_mixed_driver", "blocked_qr_tiny", "qr_mega_small", "set_mega_warps", "set_bf16_nt", "set_bf16_wf16", "set_fp16_pure", "set_prec", "set_warps", "set_minv_nt", "set_minv_blk4", "set_minv_blk4_minw", "set_minv_nt_sl", "set_panel_defer", "set_panel_raw", "set_wsp_pad", "set_wsp_cm_coop", "set_panel_cm", "set_panel_cm2", "set_cmf_warps", "set_cmf_mrfine", "set_cmf_f32in0", "set_ov_fold", "set_inner_wmma", "set_inner_wmma_wmax", "set_panel_apply_fused", "set_paf_warps", "set_n2048_h", "set_paf_help", "set_yfold", "set_yfold_maxrest", "set_ov_coop"]
+    functions = ["blocked_qr", "illcond_mask", "n352_illcond_mask_cuda", "blocked_qr_2level", "blocked_qr_2level_bf16", "qr_n512_mixed_driver", "blocked_qr_tiny", "qr_mega_small", "set_mega_warps", "set_bf16_nt", "set_bf16_wf16", "set_fp16_pure", "set_prec", "set_warps", "set_minv_nt", "set_minv_blk4", "set_minv_blk4_minw", "set_minv_nt_sl", "set_panel_defer", "set_panel_raw", "set_wsp_pad", "set_wsp_cm_coop", "set_panel_cm", "set_panel_cm2", "set_cmf_warps", "set_cmf_mrfine", "set_ov_fold", "set_inner_wmma", "set_inner_wmma_wmax", "set_panel_apply_fused", "set_paf_warps", "set_n2048_h", "set_paf_help", "set_yfold", "set_yfold_maxrest", "set_ov_coop"]
     return _compile_qr("qr_blocked_v7k_wf16", _CPP_SRC, _CUDA_SRC, functions, ["-lcublas"])
 
 _CUDA_LU_SRC = r"""
@@ -8283,7 +8271,7 @@ _RDEF = {
     "set_prec": 3, "set_warps": 32, "set_minv_nt": _MINV_NT, "set_bf16_nt": _BF16_NT,
     "set_fp16_pure": _FP16_PURE, "set_panel_defer": 0, "set_panel_raw": 0, "set_wsp_pad": 2,
     "set_minv_blk4": 0, "set_minv_blk4_minw": 0, "set_panel_cm": 0, "set_panel_cm2": 0,
-    "set_cmf_warps": 0, "set_cmf_mrfine": 0, "set_cmf_f32in0": 0,
+    "set_cmf_warps": 0, "set_cmf_mrfine": 0,
     "set_ov_fold": 0, "set_inner_wmma": 0, "set_inner_wmma_wmax": 0, "set_panel_apply_fused": 0, "set_paf_warps": 8,
     "set_bf16_wf16": 0, "set_wsp_cm_coop": 0, "set_n2048_h": 0, "set_paf_help": 1,
     "set_yfold": 0, "set_yfold_maxrest": 64, "set_ov_coop": 0,
@@ -8436,11 +8424,6 @@ def _qr_small_bf16(Ac: torch.Tensor, n: int):
     # 16->550us (BEST), 24->557us (the old default), 32->581us. 16 wins -- the prior note that
     # "16 starves: 758us" was on the OLD toolchain; the matched toolchain moved the optimum
     # from 24 to 16 (~1.2% faster s2). cmf_mrfine still picks the precise per-block MROWS.
-    # brief-51 (worker-1) MEASURED NO-WIN: set_cmf_f32in0(1) (FP32-input block-0 reflectors)
-    # left s2 at 559.8us vs the all-bf16 556.8us (+0.5%, within noise) and geomean 1659 vs
-    # 1641 -- the n=352 panel is underfill/sync-bound, NOT load-bound, so full-precision
-    # block-0 input buys no speed (and the orth gate had ample margin at bf16 already). Kept
-    # OFF; the FP32-input plumbing stays gated for the record.
     # _run_blocked restores every set knob to its _RDEF default (warps->32, fp16_pure->
     # _FP16_PURE, rest->0); only set_prec deliberately leaks (re-set by the next n=512/1024/
     # 2048/4096 shape), so it is the lone skip -- byte-identical to the prior mirror list.
