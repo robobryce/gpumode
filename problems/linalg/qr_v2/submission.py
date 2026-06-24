@@ -1103,6 +1103,10 @@ _N352_PNW = int(_os.environ.get("QR_N352_PNW", "4"))   # 4 beats the height-defa
 # trailing updates compound tf32x2 error -> n=512 irreducibly tf32x3). Default
 # route OFF (perf-neutral until measured).
 _N512_2L = int(_os.environ.get("QR_N512_2L", "1")) != 0
+# brief-45: route n=1024 through the two-level BLOCKED-PANEL path (IB=16/NB=32) to
+# shorten the serial reflector chain + add tensor-core trailing, exploiting the
+# n=1024 grid-starvation (idle SMs absorb the n=512-killing spill). Default OFF.
+_N1024_2L = int(_os.environ.get("QR_N1024_2L", "0")) != 0
 _N512_2L_IB = int(_os.environ.get("QR_N512_2L_IB", "16"))   # sub-panel width
 _N512_2L_NB = int(_os.environ.get("QR_N512_2L_NB", "32"))   # outer block / wide-trailing width
 # Saturated-grid tiles for the n=512 (B=640, grid-saturated) two-level path. The
@@ -3410,6 +3414,16 @@ def custom_kernel(data: input_t) -> output_t:
     # stays at the BLK=32 pass count. Gated by _N512_2L (default OFF -> perf-
     # neutral) and n==512 (a SHAPE param -> invariance-guard-safe). Exact geqrf.
     if n == 512 and _N512_2L:
+        return _w2_qr_2level_n512(data)
+    # brief-45 (W0): n=1024 BLOCKED-PANEL route. The single-level BLK=32 panel is a
+    # SERIAL scalar reflector chain on grid=60 (88/148 SMs IDLE = grid-starved). The
+    # two-level IB=16/NB=32 path replaces the monolithic 32-reflector loop with 2x16
+    # narrower sub-panels coupled by a tensor-core cross_T + wide trailing GEMM --
+    # SHORTER serial chains + more tensor-core work. Crucially the spill that capped
+    # this at n=512 (B=640 grid-SATURATED) may be FREE at n=1024 (grid-starved -> idle
+    # SMs absorb the lower occupancy). Gated _N1024_2L (default OFF), n==1024 (shape
+    # param -> invariance-safe). Exact geqrf.
+    if n == 1024 and _N1024_2L:
         return _w2_qr_2level_n512(data)
     return _w2_qr(data)
 
