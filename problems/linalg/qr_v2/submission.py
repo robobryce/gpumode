@@ -1348,6 +1348,174 @@ def _tiny_qr(A):
 # imported intact from the in-run batch-major line.
 # =============================================================================
 @triton.jit
+def _tsqr_leaf_R_kernel(
+    A_ptr, R_ptr,
+    B, N, j, jb, pheight, ncols, G, rpb,
+    stride_ab, stride_an,
+    stride_rb, stride_rg, stride_ri, stride_rj,
+    BLK: tl.constexpr, RPB: tl.constexpr,
+):
+    # brief-48 TRUE TSQR -- LEAF stage. grid=(G, B). Each program g factors the
+    # COMPLETE local Householder QR of its row-block A[bid, rows g*rpb..g*rpb+rpb,
+    # cols jb..jb+ncols] INDEPENDENTLY (no cross-CTA sync), emitting only the local
+    # R-factor (ncols x ncols upper-tri) into Rstack[bid, g]. The reductions are
+    # over RPB rows (not the full pheight) -> G-times shorter + G CTAs in parallel
+    # fill the idle SMs. (The R-factors feed the O(log G) merge tree; this kernel
+    # is the GATE-1 parallel-fill probe -- measure whether it beats the 1-CTA panel
+    # reduction before building the full reflector/reconstruction path.)
+    g = tl.program_id(0)
+    bid = tl.program_id(1)
+    if bid >= B or g >= G:
+        return
+    r0 = g * rpb
+    rows = tl.arange(0, RPB)
+    cols = tl.arange(0, BLK)
+    grow = r0 + rows
+    row_valid = (rows < rpb) & (grow < pheight)
+    col_valid = cols < ncols
+    a_base = A_ptr + bid * stride_ab + j * stride_an + jb
+    aptr = a_base + grow[:, None] * stride_an + cols[None, :]
+    panel = tl.load(aptr, mask=row_valid[:, None] & col_valid[None, :], other=0.0)  # (RPB,BLK)
+    for k in range(0, BLK):
+        col_is_k = cols == k
+        xk = tl.sum(tl.where(col_is_k[None, :], panel, 0.0), axis=1)   # (RPB,)
+        is_k = (rows == k).to(tl.float32)
+        gt_k = (rows > k).to(tl.float32)
+        stacked = tl.where(tl.arange(0, 2)[None, :] == 0,
+                           (xk * is_k)[:, None], (xk * xk * gt_k)[:, None])
+        red = tl.sum(stacked, axis=0)
+        alpha = tl.sum(tl.where(tl.arange(0, 2) == 0, red, 0.0))
+        tail_n2 = tl.sum(tl.where(tl.arange(0, 2) == 1, red, 0.0))
+        normx = tl.sqrt(alpha * alpha + tail_n2)
+        sgn = tl.where(alpha >= 0.0, 1.0, -1.0)
+        beta = -sgn * normx
+        has_refl = tail_n2 > 0.0
+        tau_k = tl.where(has_refl, (beta - alpha) / beta, 0.0)
+        denom = alpha - beta
+        denom = tl.where(denom == 0.0, 1.0, denom)
+        v = tl.where(rows > k, xk / denom, 0.0)
+        v = tl.where(rows == k, 1.0, v)
+        w = tl.sum(v[:, None] * panel, axis=0)            # (BLK,)
+        upd = tau_k * v[:, None] * w[None, :]
+        diagval = tl.where(has_refl, beta, alpha)
+        new_colk = tl.where(rows == k, diagval, v)
+        col_gt_k = cols > k
+        colk_write = col_is_k[None, :] & (rows[:, None] >= k)
+        panel = tl.where(colk_write, new_colk[:, None],
+                         tl.where(col_gt_k[None, :], panel - upd, panel))
+    # emit the local R = upper-triangle of the factored panel (rows 0..ncols-1).
+    rmask = (rows[:, None] < ncols) & (rows[:, None] <= cols[None, :]) & col_valid[None, :]
+    Rblk = tl.where(rows[:, None] <= cols[None, :], panel, 0.0)
+    rbase = R_ptr + bid * stride_rb + g * stride_rg
+    rptr = rbase + rows[:, None] * stride_ri + cols[None, :] * stride_rj
+    tl.store(rptr, Rblk, mask=rmask)
+
+
+@triton.jit
+def _tsqr_merge_R_kernel(
+    Nin_ptr, Nout_ptr, B, npairs, nin, ncols,
+    sb_in, sg_in, si_in, sj_in,
+    sb_out, sg_out, si_out, sj_out,
+    BLK: tl.constexpr,
+):
+    # brief-48 TRUE TSQR -- MERGE stage. grid=(npairs, B). One program merges the
+    # stacked 2*ncols x ncols [R_2p ; R_2p+1] into one ncols x ncols R via a local
+    # Householder QR (O(log G) levels total, NO per-column cross-CTA sync). Pairwise
+    # tree: level halves the R count until one final R remains.
+    p = tl.program_id(0)
+    bid = tl.program_id(1)
+    if bid >= B or p >= npairs:
+        return
+    cols = tl.arange(0, BLK)
+    rows = tl.arange(0, 2 * BLK)          # stacked 2*ncols rows (padded to 2*BLK)
+    col_valid = cols < ncols
+    a = 2 * p
+    bb = 2 * p + 1
+    # load R[a] into rows 0..ncols-1, R[b] into rows ncols..2ncols-1
+    in_base = Nin_ptr + bid * sb_in
+    top_valid = rows[:, None] < ncols
+    bot_valid = (rows[:, None] >= ncols) & (rows[:, None] < 2 * ncols) & (bb < nin)
+    rtop = rows
+    rbot = rows - ncols
+    ptop = in_base + a * sg_in + rtop[:, None] * si_in + cols[None, :] * sj_in
+    pbot = in_base + bb * sg_in + rbot[:, None] * si_in + cols[None, :] * sj_in
+    panel = tl.where(top_valid, tl.load(ptop, mask=top_valid & col_valid[None, :], other=0.0),
+                     tl.load(pbot, mask=bot_valid & col_valid[None, :], other=0.0))
+    panel = tl.where(col_valid[None, :], panel, 0.0)
+    for k in range(0, BLK):
+        col_is_k = cols == k
+        xk = tl.sum(tl.where(col_is_k[None, :], panel, 0.0), axis=1)
+        is_k = (rows == k).to(tl.float32)
+        gt_k = (rows > k).to(tl.float32)
+        stacked = tl.where(tl.arange(0, 2)[None, :] == 0,
+                           (xk * is_k)[:, None], (xk * xk * gt_k)[:, None])
+        red = tl.sum(stacked, axis=0)
+        alpha = tl.sum(tl.where(tl.arange(0, 2) == 0, red, 0.0))
+        tail_n2 = tl.sum(tl.where(tl.arange(0, 2) == 1, red, 0.0))
+        normx = tl.sqrt(alpha * alpha + tail_n2)
+        sgn = tl.where(alpha >= 0.0, 1.0, -1.0)
+        beta = -sgn * normx
+        has_refl = tail_n2 > 0.0
+        denom = alpha - beta
+        denom = tl.where(denom == 0.0, 1.0, denom)
+        v = tl.where(rows > k, xk / denom, 0.0)
+        v = tl.where(rows == k, 1.0, v)
+        tau_k = tl.where(has_refl, (beta - alpha) / beta, 0.0)
+        w = tl.sum(v[:, None] * panel, axis=0)
+        upd = tau_k * v[:, None] * w[None, :]
+        diagval = tl.where(has_refl, beta, alpha)
+        new_colk = tl.where(rows == k, diagval, v)
+        col_gt_k = cols > k
+        colk_write = col_is_k[None, :] & (rows[:, None] >= k)
+        panel = tl.where(colk_write, new_colk[:, None],
+                         tl.where(col_gt_k[None, :], panel - upd, panel))
+    out_base = Nout_ptr + bid * sb_out + p * sg_out
+    rmask = (rows[:, None] < ncols) & (rows[:, None] <= cols[None, :]) & col_valid[None, :]
+    Rblk = tl.where(rows[:, None] <= cols[None, :], panel, 0.0)
+    optr = out_base + rows[:, None] * si_out + cols[None, :] * sj_out
+    tl.store(optr, Rblk, mask=rmask)
+
+
+def _tsqr_panel_R(A, j, jb, pheight, ncols, G):
+    # brief-48 TRUE TSQR -- compute the panel R-factor of A[:, j:j+pheight rows,
+    # jb:jb+ncols cols] via G independent leaf QRs (grid=(G,B)) + an O(log G) merge
+    # tree. Returns R (B, ncols, ncols). NO A^T A (-> avoids CholeskyQR's cond^2
+    # blow-up), NO per-column cross-CTA sync (-> avoids the dead row-split barrier
+    # wall). GATE-1 probe: does row-block-parallel local-QR fill the idle SMs and
+    # beat the 1-CTA panel reduction at large-n B=2/8?
+    B = A.shape[0]
+    N = A.shape[2]
+    BLK = triton.next_power_of_2(ncols)
+    rpb = (pheight + G - 1) // G
+    RPB = triton.next_power_of_2(rpb)
+    sab, san = A.stride(0), A.stride(1)   # row stride (cols use implicit stride 1, A contiguous)
+    # leaf R-stack: (B, G, BLK, BLK)
+    Rstack = torch.zeros((B, G, BLK, BLK), device=A.device, dtype=torch.float32)
+    srb, srg, sri, srj = Rstack.stride()
+    _tsqr_leaf_R_kernel[(G, B)](
+        A, Rstack, B, N, j, jb, pheight, ncols, G, rpb,
+        sab, san, srb, srg, sri, srj,
+        BLK=BLK, RPB=RPB, num_warps=4,
+    )
+    # O(log G) pairwise merge tree.
+    nin = G
+    cur = Rstack
+    while nin > 1:
+        npairs = (nin + 1) // 2
+        nxt = torch.zeros((B, npairs, BLK, BLK), device=A.device, dtype=torch.float32)
+        ci = cur.stride()
+        no = nxt.stride()
+        _tsqr_merge_R_kernel[(npairs, B)](
+            cur, nxt, B, npairs, nin, ncols,
+            ci[0], ci[1], ci[2], ci[3], no[0], no[1], no[2], no[3],
+            BLK=BLK, num_warps=4,
+        )
+        cur = nxt
+        nin = npairs
+    return cur[:, 0, :ncols, :ncols]
+
+
+@triton.jit
 def _panel_factor_kernel(
     A_ptr, tau_ptr, Vbuf_ptr, Tbuf_ptr,
     B, N, j, pheight, b,
