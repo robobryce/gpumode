@@ -4625,6 +4625,11 @@ static inline void set_n512_good_flags() {
     // 49->33KB at m=512.) See the Vsm staging in qr_panel_apply_fused_kernel's Phase A. This
     // is orthogonal to and stacks with the sh_tau WAR race-fix (disjoint buffer/phase).
     g_paf_no_vsh = 1;
+    // build_Minv variant for the OB=64 trailing apply's T-inverse. brief-8 audit: the
+    // T-inverse is LATENCY-bound (ncu: waves 0.72, SM 50%, L2 5%), but the shorter-chain
+    // nlev=3 (build_Minv_rblk_gen, depth b/8) measured SLIGHTLY SLOWER (geomean 1727->1734):
+    // at b=64 the extra parallel merges' sync cost exceeds the serial-chain saving. blk4
+    // (4-block-merge, depth b/4) is the optimum here -- T-inverse is at its structural wall.
     g_minv_blk4 = 1; g_minv_blk4_minw = 48;
     g_paf_warps = 8;   // n512 mixed-driver PAF: 8-warp/256-thread block
     // PHASE-P pivot cooperation OFF at n512: the m_i<=512 panel m-pass is SHORT and the path
