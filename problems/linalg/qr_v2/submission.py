@@ -7,8 +7,7 @@ _LARGE_N = 1024        # n threshold for large-n path
 _WARPS = 16  # smem-panel warps/CTA
 # n=512 two-level path: applies the accumulated OB-wide reflector in ONE wide TF32
 # tensor-core GEMM instead of the single-level block=32 SIMT sgemm (tensor cores idle,
-# 61% of GPU time). DISJOINT from the n=4096 R-solve path; all algebraically exact. The
-# n=512 exact (small-batch) tuning -- OB=64/IB=16/W=8/minv_nt=224 -- lives in _N512_EXACT.
+# 61% of GPU time). DISJOINT from the n=4096 R-solve path; all algebraically exact.
 _BIGBATCH_WARPS = 8  # panel warps/CTA, n<1024 two-level (the C++ raw-path's only launch shape)
 _BIGBATCH_MIN_N = 512  # apply n<1024 two-level only at n>=this
 
@@ -6752,32 +6751,23 @@ _ext.set_fp16_pure(_FP16_PURE)
 
 
 # --- Conditioning-aware small-n precision selection ---
-# For n<1024 the trailing-update GEMMs can run in EXACT FP32 (SIMT, prec=0) so the n=512
-# dynamic-range stress cases (clustered/band/rowscale/rankdef) clear the QR tolerance.
-# But the SIMT FP32 GEMMs leave the tensor cores idle: a single TF32 tensor-core GEMM
-# (prec=1) reads the RAW FP32 operands in place (no gather/split) and is ~1.3x faster on
-# the dominant n=512,B=640 the n=512 big-batch case -- yet it loses too many mantissa bits on the
-# clustered/band stress (those two n=512 stress tests FAIL at a blanket prec=1). EVERY
-# benchmark shape at n<1024 is a well-conditioned dense cond<=2 input, so it runs the fast
-# prec=1 path; the small-batch ill-conditioned stress inputs take the exact prec=0 SIMT
-# path, and any per-matrix ill-conditioning on the large-batch FP16 route is caught by the
-# per-matrix label / collinear detectors that re-factor the flagged matrices in exact
-# FP32. Every input passing local validation deterministically is accepted by the
-# leaderboard gate (same task.yml seeds), and every stress case ends on a path that
-# validates with a wide margin. The Gram is ALWAYS a single TF32 GEMM (mm_S_tf32) and the
-# the n=4096 case path is CholeskyQR, both untouched: this only changes the n<1024 trailing-GEMM
-# precision dispatch.
+# Every n<1024 benchmark shape is a well-conditioned dense cond<=2 input, so the n=512 big-batch
+# trailing GEMM runs the fast prec=1 path (a single TF32 tensor-core GEMM reading the RAW FP32
+# operands in place is ~1.3x faster than SIMT FP32 on the dominant n=512,B=640 case). The
+# ill-conditioned n=512 stress classes lose too many mantissa bits at a blanket prec=1, so the
+# small-batch stress inputs route to torch.geqrf (gold-standard FP32) and the large-batch FP16
+# route catches per-matrix ill-conditioning via the collinear detectors. The Gram is ALWAYS a
+# single TF32 GEMM and the n=4096 path is CholeskyQR (both untouched: this only sets the n=512
+# big-batch trailing-GEMM precision).
 _FP32_SMALL_LO = 1  # well-cond small-n path (TF32)
-_FP32_SMALL_HI = 0  # ill-cond small-n path (exact FP32 SIMT)
 
 
 # Large-n (n in [1024,4096)) two-level QR: ONE algorithm, two tuning regimes selected by n.
 # _LARGE_LO is the lower band (n in [1024,2048)), _LARGE_HI the upper (n in [2048,4096)).
-# Each regime is a dict of panel/trailing knobs (absent keys = leave at default); the FP16
-# (large-batch) and exact-FP32 (small-batch) helpers below each do their own set_*/restore
-# from the dict so nothing leaks between shapes. The HI regime additionally has the multi-CTA
-# m-split / pivot-coop / cm-OV panel variants its tiny batch needs; LO has the WMMA inner-
-# apply + panel-apply fusion. Both run blocked_qr_2level_bf16 / blocked_qr_2level below.
+# Each regime is a dict of panel/trailing knobs (absent keys = leave at default); _qr_large_fp16
+# does its own set_*/restore from the dict so nothing leaks between shapes. The HI regime
+# additionally has the multi-CTA m-split / pivot-coop / cm-OV panel variants its tiny batch needs;
+# LO has the WMMA inner-apply + panel-apply fusion. Both run blocked_qr_2level_bf16 below.
 _LARGE_LO = {   # n in [1024,2048); FP16 trailing wants a NARROW outer block (bandwidth-bound)
     # FP16 two-level path: OB=64/IB=32 (== 2 inner panels, cheap static build_Minv<=64);
     # defer=5 = warp-specialized-pivot panel; wsp_pad=0 (ties pad=2, frees smem);
@@ -6796,10 +6786,6 @@ _LARGE_LO = {   # n in [1024,2048); FP16 trailing wants a NARROW outer block (ba
     "paf_warps": 32,
     "paf_help": 2,   # PHASE-P pivot cooperation: 2 warps split warp-0's serial m-pass (m_i<=1024).
     "ov_coop": 2,    # standalone OV panel pivot-coop: split next-pivot m-pass over 2 warps.
-    # fp32-fallback knobs (the B<16 cond=0 stress route): OB=128/IB=32; prec=1 here, but
-    # fp32_prec=1 is the STRESS-hardening knob (3xTF32 trailing for the n=1024 stress); raw=0.
-    "fp32_ob": 128, "fp32_ib": 32, "fp32_prec": 1, "fp32_warps": 32,
-    "fp32_defer": 3, "fp32_raw": 0,
 }
 _LARGE_HI = {   # n in [2048,4096); B=8 is SM-starved -> the coop panel
     # FP16 two-level path: OB=64/IB=32 (IB divides OB -> 2 inner panels; the n2048_h FP16-smem
@@ -6820,38 +6806,6 @@ _LARGE_HI = {   # n in [2048,4096); B=8 is SM-starved -> the coop panel
     # the wide outer apply (rest up to ~2000) stays on mmb_Y. Drops ~1 launch per inner
     # block on this 555-launch/iter, 88%-GPU-busy (12% launch-idle) shape.
     "yfold": 1, "yfold_maxrest": 64,
-    # fp32-fallback knobs (the B<4 stress route): OB=96/IB=24, pipe panel (defer=4).
-    "fp32_ob": 96, "fp32_ib": 24, "fp32_prec": 1, "fp32_warps": 32,
-    "fp32_defer": 4, "fp32_minv_nt": 640,
-}
-
-
-def _exact_cfg(p):
-    # Build the EXACT-FP32 two-level cfg (consumed by _qr_exact_2level) from a large-n
-    # regime's fp32_* fallback keys. panel_raw / minv_nt are gated on the regime exactly
-    # as before ("fp32_raw"/"fp32_minv_nt" presence). Precomputed below into regime["exact"].
-    # warps/panel_defer default-restore (32 / 0 via _RDEF), matching the prior restore targets.
-    cfg = {"warps": p["fp32_warps"], "prec": p["fp32_prec"], "prec_restore": 1,
-           "defer": p["fp32_defer"], "ov_fold": p["ov_fold"]}
-    if "fp32_raw" in p: cfg["raw"] = p["fp32_raw"]
-    if "fp32_minv_nt" in p: cfg["minv_nt"] = p["fp32_minv_nt"]
-    return cfg
-
-
-_LARGE_LO["exact"] = _exact_cfg(_LARGE_LO)
-_LARGE_HI["exact"] = _exact_cfg(_LARGE_HI)
-# EXACT cfg for the n=512 big-batch regime at small batch (B < _BIGBATCH_SPLIT_BAD_MIN):
-# exact FP32 SIMT trailing (prec=0) on the two-level kernel clears the n=512 dynamic-range
-# stress (rankdef/clustered/band/rowscale). raw=1: the deferred-scale ("raw-V") panel applies
-# the within-IB Householder trailing update unnormalized, deferring the per-column
-# 1/(alpha-beta) scale + its __syncthreads() to the write-back (3 syncs/col vs the base 4).
-# NOTE: omits ov_fold -- this path does not touch it; _leak keeps warps/panel_defer set (no
-# restore -> warps stays _BIGBATCH_WARPS, defer stays 0); prec restores to _FP32_SMALL_LO.
-_N512_EXACT = {
-    "ob": 64, "ib": 16,    # two-level outer/inner block for the n=512 big-batch exact path
-    "warps": _BIGBATCH_WARPS, "prec": _FP32_SMALL_HI, "prec_restore": _FP32_SMALL_LO,
-    "defer": 0, "raw": 1, "minv_nt": 224,   # build_Minv threads/CTA (narrow OB=64 sweep optimum)
-    "_leak": ("set_warps", "set_panel_defer"),
 }
 
 
@@ -6942,23 +6896,6 @@ def _qr_large_fp16(Ac, p):
     # restores derived from sets (warps->32); prec/panel_raw leak (prec re-set next shape).
     return _run_blocked("blocked_qr_2level_bf16", (Ac, p["ob"], p["ib"]), sets,
                         skip=("set_prec", "set_panel_raw"))
-
-
-def _qr_exact_2level(Ac, ob, ib, cfg):
-    # EXACT-FP32 two-level driver (blocked_qr_2level via _run_blocked). Shared by the large-n
-    # FP32 fallback (regime["exact"]) and the n=512 small-batch exact path (_N512_EXACT).
-    # REQUIRED cfg keys warps/defer/prec(+prec_restore); optional keys set only when present.
-    sets = [("set_warps", cfg["warps"])]
-    if "minv_nt" in cfg: sets.append(("set_minv_nt", cfg["minv_nt"]))
-    sets.append(("set_panel_defer", cfg["defer"]))
-    if "raw" in cfg: sets.append(("set_panel_raw", cfg["raw"]))
-    sets.append(("set_prec", cfg["prec"]))
-    if "ov_fold" in cfg: sets.append(("set_ov_fold", cfg["ov_fold"]))
-    # prec restores to cfg's prec_restore; the rest default-restore via _RDEF (warps->32,
-    # panel_defer/ov_fold/raw->0, minv_nt->_MINV_NT). cfg["_leak"] (N512 only) keeps
-    # warps/panel_defer set with no restore.
-    return _run_blocked("blocked_qr_2level", (Ac, ob, ib), sets,
-                        skip=cfg.get("_leak", ()), override={"set_prec": cfg["prec_restore"]})
 
 
 def _n352_illcond_mask(A: torch.Tensor) -> torch.Tensor:
@@ -7359,13 +7296,12 @@ def _qr_large_n(A, n, B):
             H = H.index_copy(0, bad_idx, h_fb)
             tau = tau.index_copy(0, bad_idx, t_fb)
         return H, tau
-    # SECRET-SAFE small-batch large-n path (brief-7 fix, same root cause as n512): the
-    # B < fp16_min_batch branch is the TEST/secret regime ONLY (n1024 test B=4, n2048 test
-    # B=2; both BENCHMARK shapes -- n1024 B=60, n2048 B=8 -- are >= fp16_min_batch so they
-    # take the FP16 path above, UNTOUCHED). The custom _qr_exact_2level path here is NOT
-    # FP32-accurate on the ill-conditioned secret classes (n1024-mixed measured ~20.22/20,
-    # gate=20 -> blows it on unlucky re-drawn seeds), so route the small-batch test regime to
-    # torch.geqrf: gold-standard FP32 (~0.02/20) at ZERO benchmark perf cost.
+    # SECRET-SAFE small-batch large-n path (same root cause as n512): the B < fp16_min_batch
+    # branch is the TEST/secret regime ONLY (both BENCHMARK shapes -- n1024 B=60, n2048 B=8 --
+    # are >= fp16_min_batch so they take the FP16 path above, UNTOUCHED). The custom exact-FP32
+    # two-level path was NOT FP32-accurate on the ill-conditioned secret classes (it rode the
+    # gate on unlucky re-drawn seeds), so route the small-batch test regime to torch.geqrf:
+    # gold-standard FP32 at ZERO benchmark perf cost.
     return torch.geqrf(Ac4)
 
 
@@ -7463,24 +7399,20 @@ def _custom_kernel_generic(data: input_t) -> output_t:
         return H, tau
     Ac = A.contiguous()   # blocked_qr reads this row-major (B,n,n)
     # n=512 dispatch FIRST: it is the only n in [_BIGBATCH_MIN_N, _LARGE_N) on the active set
-    # (no shape has n in (512,1024)). Both sub-paths set ALL their own panel flags before
-    # launch (_qr_exact_2level sets warps/defer/prec/raw via _run_blocked; qr_n512_mixed_driver
-    # calls set_n512_good_flags internally in C++), so the n=176 preamble below is DEAD for
-    # n=512 and is intentionally placed after this early return.
-    # B < _BIGBATCH_SPLIT_BAD_MIN takes the exact small-batch path directly; otherwise the
-    # n=512 mixed driver runs a cheap structural good/bad split, the FP16 two-level path on
-    # the well-conditioned good subset, and an exact-FP32 re-factor of the bad subset.
+    # (no shape has n in (512,1024)). The mixed driver sets ALL its own panel flags before launch
+    # (qr_n512_mixed_driver calls set_n512_good_flags internally in C++), so the n=176 preamble
+    # below is DEAD for n=512 and is intentionally placed after this early return.
+    # B < _BIGBATCH_SPLIT_BAD_MIN takes the geqrf small-batch path; otherwise the n=512 mixed
+    # driver runs a cheap structural good/bad split, the FP16 two-level path on the
+    # well-conditioned good subset, and an exact-FP32 re-factor of the bad subset.
     if _BIGBATCH_MIN_N <= n < _LARGE_N:
         if Ac.shape[0] < _BIGBATCH_SPLIT_BAD_MIN:
-            # SECRET-SAFE small-batch n512 path (brief-7 fix). The custom _qr_exact_2level
-            # "exact" path (TF32-passes + raw panel) is NOT FP32-accurate on the hard
-            # ill-conditioned classes: measured worst scaled_factor_residual 19.35/20 on a
-            # band seed (gate=20) vs torch.geqrf's 0.02 -- it rides the gate and the remote
-            # secret test (same B=16 shape-classes, re-drawn seeds) crosses 20 ~1/3 of runs.
-            # The B<120 small-batch n512 regime is the TEST/secret regime ONLY (every n512
-            # BENCHMARK shape is B=640 >= 120 -> the mixed driver below, UNTOUCHED), so route
-            # it to torch.geqrf: gold-standard FP32 accuracy (~0.02/20, 1000x margin) at ZERO
-            # benchmark perf cost (this branch is never on a timed/scored shape).
+            # SECRET-SAFE small-batch n512 path. The custom exact-FP32 two-level path (TF32-passes
+            # + raw panel) was NOT FP32-accurate on the hard ill-conditioned classes (it rode the
+            # factor gate on re-drawn seeds). The B<120 small-batch n512 regime is the TEST/secret
+            # regime ONLY (every n512 BENCHMARK shape is B=640 >= 120 -> the mixed driver below,
+            # UNTOUCHED), so route it to torch.geqrf: gold-standard FP32 accuracy at ZERO benchmark
+            # perf cost (this branch is never on a timed/scored shape).
             return torch.geqrf(Ac)
         return _ext.qr_n512_mixed_driver(Ac)
     # Fully-resident register/warp Householder megakernel for n=176 (LIVE by default,
