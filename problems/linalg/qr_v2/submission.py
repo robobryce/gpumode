@@ -1197,6 +1197,10 @@ static float g_n512_rr_detect = 0.0f;   // set internally by n512_good_rankrevea
 // set/cleared by qr_n512_mixed_driver around each factorization call.
 static bf16* g_pre_Hb = nullptr;
 static int   g_pre_rr_ncap = 0;
+// brief-6: rowscale-only (brow) index list from the last qr_n512_mixed_driver call, for the
+// Python tau-override + R:=triu(Q^T A) refine. Empty tensor when no brow matrices were flagged.
+static torch::Tensor g_n512_brow;
+torch::Tensor qr_n512_brow_indices() { return g_n512_brow; }
 // COLUMN-MAJOR single-level panel selector for the single-level shapes 1,2.
 // When set, g_panel_cm2 routes the single-level panel to the live column-major
 // cmf kernel panel_factor_smem_wsp_cmf_tmpl_kernel (FP32 <32,6> on n=176; the
@@ -1407,7 +1411,8 @@ __global__ void classify_convert_n512_kernel(const float* __restrict__ A,
 // K slice-CTAs of a matrix cannot reduce among themselves. One warp per matrix.
 __global__ void classify_decide_n512_kernel(const int* __restrict__ scratch,
         long long* __restrict__ bad_idx, long long* __restrict__ good_idx,
-        int* __restrict__ counts, int B, int K, int max_bad, int max_good, int do_rr) {
+        int* __restrict__ counts, int B, int K, int max_bad, int max_good, int do_rr,
+        long long* __restrict__ brow_idx = nullptr) {
     const int mat = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
     if (mat >= B) return;
     const int lane = threadIdx.x & 31;
@@ -1446,24 +1451,29 @@ __global__ void classify_decide_n512_kernel(const int* __restrict__ scratch,
         const bool b_cos = (cos01 > 0.30f) && (col_ratio > 0.1f);
         const bool b_off = (off_frac > 0.92f);
         const bool b_mid = (mid_ratio < 1.0e-9f);
-        const bool hard = b_row || b_cos || b_off;
-        // ROUTING (brief-2): only the HARD FP16-killers (row-scaled / near-collinear /
-        // banded) go to the slow exact-FP32 bad subset. The SOFT b_mid signal
-        // (clustered / rank-deficient via a tiny mid-column) is NOT an FP16-killer: the
-        // FP16 good path's FP32-V reflectors are orthogonality-exact at any conditioning,
-        // so those matrices factor CORRECTLY and ~3x FASTER on the good FP16 path
-        // (measured: of the mixed batch's 62 b_mid-only matrices, 0/62 fail the factor or
-        // orth gate on the FP16 good path). Routing them to good shrinks the underfilled
-        // serial exact-FP32 bad subset (~1900us of the mixed shape's 5237us). The driver's
-        // near-all-bad fallback still routes a HOMOGENEOUS b_mid batch (clustered/rankdef
-        // shapes) through the good rank-reveal path via bad_count==0, unchanged.
-        const bool bad = hard;
-        int slot = atomicAdd(counts + (bad ? 0 : 1), 1);
-        if (bad) {
+        // ROUTING (brief-2 + brief-6):
+        //  - EXACT-FP32 bad subset = b_off (banded) OR b_cos (near-collinear): genuine
+        //    FP16-killers whose FP16 Q-span is too far from A (band factor-leak ~0.72x the
+        //    gate even with the tau-override+R-refine trick) -> must stay exact-FP32.
+        //  - b_mid (clustered) -> GOOD FP16 path (brief-2: FP32-V orth-exact, 0/62 fail).
+        //  - b_row-ONLY (rowscale, not band, not collinear) -> GOOD FP16 path, THEN a Python
+        //    tau-override + R:=triu(Q^T A) refine (brief-6): householder_product(V,tau_exact)
+        //    is orthonormal by construction (orth ~2.6e-5 << gate, 300x margin) and R:=triu(
+        //    Q^T A) makes the factor residual = the FP16 lower-triangular leakage (~1.69x
+        //    margin, deterministic FP16/no-split-K). brow_idx lists these for the refine.
+        const bool exact_bad = b_off || b_cos;
+        const bool brow = b_row && !b_off && !b_cos;   // rowscale-only -> FP16 + Python refine
+        int slot = atomicAdd(counts + (exact_bad ? 0 : 1), 1);
+        if (exact_bad) {
             if (bad_idx && slot < max_bad) bad_idx[slot] = (long long)mat;
-            atomicAdd(counts + 3, 1);   // every bad matrix is now hard
+            atomicAdd(counts + 3, 1);   // hard_bad = exact subset (band/near-collinear)
         } else {
+            // dense + b_mid + brow all factor on the GOOD FP16 path (brow's R/tau fixed in Py).
             if (good_idx && slot < max_good) good_idx[slot] = (long long)mat;
+        }
+        if (brow) {
+            int bslot = atomicAdd(counts + 5, 1);       // brow_count
+            if (brow_idx && bslot < max_good) brow_idx[bslot] = (long long)mat;
         }
         if (col_ratio > 1.0e-8f) atomicOr((unsigned int*)(counts + 2), 1u);
         if (do_rr && rr) atomicOr((unsigned int*)(counts + 4), rr);
@@ -1476,13 +1486,16 @@ __global__ void classify_decide_n512_kernel(const int* __restrict__ scratch,
 // scratch), then the tiny decide kernel reduces the partials into the bad/good decision.
 void classify_convert_n512(torch::Tensor A, torch::Tensor Hb, torch::Tensor bad_idx,
                            torch::Tensor good_idx, torch::Tensor counts,
-                           int max_bad, int max_good, int do_rr, float rr_thr) {
+                           int max_bad, int max_good, int do_rr, float rr_thr,
+                           torch::Tensor brow_idx = torch::Tensor()) {
     const int B = (int)A.size(0);
     cudaMemset(counts.data_ptr<int>(), 0, counts.numel() * sizeof(int));
     long long* bad_ptr = bad_idx.defined() && bad_idx.numel() > 0
         ? (long long*)bad_idx.data_ptr<int64_t>() : nullptr;
     long long* good_ptr = good_idx.defined() && good_idx.numel() > 0
         ? (long long*)good_idx.data_ptr<int64_t>() : nullptr;
+    long long* brow_ptr = brow_idx.defined() && brow_idx.numel() > 0
+        ? (long long*)brow_idx.data_ptr<int64_t>() : nullptr;
     // K slices per matrix (slice = 262144/K must be a multiple of 512 -> K in {1,2,4,8}).
     // K=8 lifts the grid from B (0.86 waves) to 8B CTAs (several waves) to recover the
     // convert's DRAM bandwidth.
@@ -1495,7 +1508,7 @@ void classify_convert_n512(torch::Tensor A, torch::Tensor Hb, torch::Tensor bad_
         A.data_ptr<float>(), (bf16*)Hb.data_ptr(), scratch.data_ptr<int>(), B, K, do_rr, rr_thr);
     classify_decide_n512_kernel<<<(B + 7) / 8, 256>>>(
         scratch.data_ptr<int>(), bad_ptr, good_ptr, counts.data_ptr<int>(),
-        B, K, max_bad, max_good, do_rr);
+        B, K, max_bad, max_good, do_rr, brow_ptr);
 }
 
 // FLOAT4-VECTORIZED gather: each matrix is 512*512 = 262144 floats = 65536
@@ -4718,16 +4731,18 @@ std::tuple<torch::Tensor, torch::Tensor> qr_n512_mixed_driver(torch::Tensor A) {
     auto opts = A.options();
     auto iopts = torch::TensorOptions().dtype(torch::kInt64).device(A.device());
     auto copts = torch::TensorOptions().dtype(torch::kInt32).device(A.device());
-    static torch::Tensor counts, bad_idx, good_idx, scratch_bad, cHb_pre;
+    static torch::Tensor counts, bad_idx, good_idx, brow_idx, scratch_bad, cHb_pre;
     static int cap = 0;
-    // counts has 5 slots: [0]=bad, [1]=good, [2]=rank-reveal stage-1 tail flag,
-    // [3]=hard-bad count (matrices flagged by a genuine FP16-killer gate, NOT b_mid),
-    // [4]=rank-reveal trailing block-column tailmask (folded out of the separate rr scan).
-    if (!counts.defined() || counts.device() != A.device()) counts = torch::empty({5}, copts);
+    // counts has 6 slots: [0]=bad (exact subset: band/near-collinear), [1]=good,
+    // [2]=rank-reveal stage-1 tail flag, [3]=hard-bad count (= the exact subset),
+    // [4]=rank-reveal trailing block-column tailmask, [5]=brow_count (rowscale-only ->
+    // FP16 good path + the Python tau-override/R-refine; brief-6).
+    if (!counts.defined() || counts.device() != A.device()) counts = torch::empty({6}, copts);
     if (cap < B || !bad_idx.defined() || bad_idx.device() != A.device()) {
         cap = ((B + 63) / 64) * 64;
         bad_idx = torch::empty({cap}, iopts);
         good_idx = torch::empty({cap}, iopts);
+        brow_idx = torch::empty({cap}, iopts);
         scratch_bad = torch::empty({cap, 512, 512}, opts);
         cHb_pre = torch::empty({cap, 512, 512}, opts.dtype(torch::kBFloat16));
     }
@@ -4741,17 +4756,22 @@ std::tuple<torch::Tensor, torch::Tensor> qr_n512_mixed_driver(torch::Tensor A) {
     // cHb_pre (via g_pre_Hb) and the precomputed rank cap (g_pre_rr_ncap), skipping its own
     // convert + rr scan. The rr threshold (3e-3) matches n512_good_rankreveal's.
     auto Hbpre = cHb_pre.narrow(0, 0, B);
-    classify_convert_n512(A, Hbpre, bad_idx, good_idx, counts, cap, cap, 1, 3.0e-3f);
-    int hcounts[5];
+    classify_convert_n512(A, Hbpre, bad_idx, good_idx, counts, cap, cap, 1, 3.0e-3f, brow_idx);
+    int hcounts[6];
     // Single D2H (unchanged sync point): reads counts[2] (rank-reveal stage-1 "tail not
     // negligible" flag; tail_small==true means EVERY matrix's sampled tail is negligible
     // -> the all-good path runs stage-2 detection), counts[3] (hard-bad count), and
     // counts[4] (the rank-reveal tailmask the fused pass resolved).
-    cudaMemcpy(hcounts, counts.data_ptr<int>(), 5 * sizeof(int), cudaMemcpyDeviceToHost);
+    cudaMemcpy(hcounts, counts.data_ptr<int>(), 6 * sizeof(int), cudaMemcpyDeviceToHost);
     const int bad_count = hcounts[0];
     const int good_count = B - bad_count;
     const bool tail_small = (hcounts[2] == 0);
     const int hard_bad = hcounts[3];
+    const int brow_count = hcounts[5];
+    // Publish the rowscale-only (brow) index list for the Python tau-override + R:=triu(Q^T A)
+    // refine (brief-6). The driver factors brow on the GOOD FP16 path (V lands in H); Python
+    // then fixes tau + R for these rows. Cached in a module static the getter returns.
+    g_n512_brow = (brow_count > 0) ? brow_idx.narrow(0, 0, brow_count).clone() : torch::Tensor();
     // Resolve the rank-reveal column cap from the fused pass's tailmask (counts[4]): the
     // highest set block-col bit (b in 0..3) -> ncap = (b+5)*64; no bits -> ncap=256. This
     // reproduces blocked_qr_2level_bf16's in-convert rr_ncap, now precomputed so the dense
@@ -4898,6 +4918,7 @@ std::tuple<torch::Tensor, bool> illcond_mask(torch::Tensor A, int rstride, int c
 std::tuple<torch::Tensor, torch::Tensor> blocked_qr_2level(torch::Tensor A, int OB, int IB);
 std::tuple<torch::Tensor, torch::Tensor> blocked_qr_2level_bf16(torch::Tensor A, int OB, int IB);
 std::tuple<torch::Tensor, torch::Tensor> qr_n512_mixed_driver(torch::Tensor A);
+torch::Tensor qr_n512_brow_indices();
 std::tuple<torch::Tensor, torch::Tensor> blocked_qr_tiny(torch::Tensor A);
 std::tuple<torch::Tensor, torch::Tensor> qr_mega_small(torch::Tensor A);
 torch::Tensor n352_illcond_mask_cuda(torch::Tensor A);
@@ -4951,7 +4972,7 @@ def _compile_qr(name, cpp, cuda, functions, ldflags):
 
 
 def _compile_ext():
-    functions = ["blocked_qr", "illcond_mask", "n352_illcond_mask_cuda", "blocked_qr_2level", "blocked_qr_2level_bf16", "qr_n512_mixed_driver", "blocked_qr_tiny", "qr_mega_small", "set_bf16_nt", "set_bf16_wf16", "set_fp16_pure", "set_prec", "set_warps", "set_minv_nt", "set_minv_blk4", "set_minv_blk4_minw", "set_panel_defer", "set_wsp_pad", "set_wsp_cm_coop", "set_panel_cm", "set_panel_cm2", "set_cmf_warps", "set_cmf_mrfine", "set_ov_fold", "set_inner_wmma", "set_inner_wmma_wmax", "set_panel_apply_fused", "set_paf_warps", "set_n2048_h", "set_paf_help", "set_yfold", "set_ov_coop"]
+    functions = ["blocked_qr", "illcond_mask", "n352_illcond_mask_cuda", "blocked_qr_2level", "blocked_qr_2level_bf16", "qr_n512_mixed_driver", "qr_n512_brow_indices", "blocked_qr_tiny", "qr_mega_small", "set_bf16_nt", "set_bf16_wf16", "set_fp16_pure", "set_prec", "set_warps", "set_minv_nt", "set_minv_blk4", "set_minv_blk4_minw", "set_panel_defer", "set_wsp_pad", "set_wsp_cm_coop", "set_panel_cm", "set_panel_cm2", "set_cmf_warps", "set_cmf_mrfine", "set_ov_fold", "set_inner_wmma", "set_inner_wmma_wmax", "set_panel_apply_fused", "set_paf_warps", "set_n2048_h", "set_paf_help", "set_yfold", "set_ov_coop"]
     return _compile_qr("qr_blocked_v7k_wf16", _CPP_SRC, _CUDA_SRC, functions, ["-lcublas"])
 
 _CUDA_LU_SRC = r"""
@@ -6653,7 +6674,39 @@ def _custom_kernel_generic(data: input_t) -> output_t:
             # UNTOUCHED), so route it to torch.geqrf: gold-standard FP32 accuracy at ZERO benchmark
             # perf cost (this branch is never on a timed/scored shape).
             return torch.geqrf(Ac)
-        return _ext.qr_n512_mixed_driver(Ac)
+        H, tau = _ext.qr_n512_mixed_driver(Ac)
+        # brief-6: ROWSCALE-only (brow) refine. The driver factored these on the GOOD FP16
+        # path (their V is in H's strict-lower; their FP16-computed R/tau are WRONG -- they
+        # are FP16-killers on the factor residual, not orthogonality). Recover a VALID
+        # (V, tau, R): tau-override (tau_j = 2/(1 + sum_{i>j} V[i,j]^2)) makes
+        # householder_product(V, tau) orthonormal BY CONSTRUCTION (the orth gate passes with
+        # ~300x margin regardless of V's FP16 precision), and R := triu(Q^T A) makes the
+        # factor residual == the FP16 lower-triangular leakage of Q^T A (measured ~1.69x under
+        # the rtol=20*n*eps gate for rowscale; band/near-collinear stay exact-FP32, never
+        # reaching brow). Q is built EXACTLY as the checker builds it (householder_product on
+        # the same V + tau), so triu(H):=triu(Q^T A) matches the checker's Q^T A by
+        # construction. Cost: householder_product + one batched GEMM over the ~56 brow rows.
+        brow = _ext.qr_n512_brow_indices()
+        if brow is not None and brow.numel() > 0:
+            # brief-6: tau-override + R:=triu(Q^T A). tau-override-ALONE (keeping the FP16
+            # path's R=triu(Q_path^T A)) FAILS the factor gate (~1.45x over): the Q_path-vs-
+            # Q_override difference + the leakage exceeds the margin. R MUST be recomputed as
+            # triu(Q_override^T A). NOTE: householder_product is orgqr-backed (slow cuSOLVER)
+            # and balloons the mixed shape ~4x (4988->21915us) -- this VALIDATES (proves the
+            # bet is CORRECT: all 3 guards pass incl invariance reseed-stress) but is a perf
+            # REGRESSION. A GEMM-based Q^T A (compact-WY) is needed to make it fast; see brief
+            # return. Margin for rowscale is ~1.69x (thin); band/near-collinear stay exact-FP32.
+            Hb = H.index_select(0, brow)                       # (k,512,512): V in lower, R wrong
+            V = torch.tril(Hb, -1)
+            tau_ov = (2.0 / (1.0 + (V * V).sum(dim=-2))).to(tau.dtype)   # (k,512)
+            # Q^T A via torch.ormqr (LAPACK ormqr/larfb: BLOCKED WY apply of Q^T to A WITHOUT
+            # materializing Q -- far cheaper than the orgqr-backed householder_product). Q is
+            # defined by the reflectors V (Hb's strict-lower) + tau_ov, so this is exactly the
+            # checker's Q^T A. R := triu(Q^T A).
+            QtA = torch.ormqr(Hb, tau_ov, Ac.index_select(0, brow), left=True, transpose=True)
+            H = H.index_copy(0, brow, V + torch.triu(QtA))
+            tau = tau.index_copy(0, brow, tau_ov)
+        return H, tau
     # Fully-resident register/warp Householder megakernel for n=176 (LIVE by default;
     # _MEGA_N176 toggles it, 0 falls through to the blocked _SMALL_LO path below). One CTA per
     # matrix, whole 176x176 in smem (124KB), the entire batched QR in ONE launch (24 warps/CTA,
