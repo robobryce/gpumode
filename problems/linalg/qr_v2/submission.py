@@ -5585,18 +5585,13 @@ _CUDA_LU_SRC = r"""
 
 #define BKSOL(expr) do { cusolverStatus_t _s = (expr); TORCH_CHECK(_s == CUSOLVER_STATUS_SUCCESS, "cuSOLVER failed"); } while(0)
 
-// ONE-barrier fused no-pivot diagonal-block LU for the latency-bound recon (n=4096,
-// batch=2 -> 2 CTAs on 148 SMs; diag_lu is ~33% of the recon, pure __syncthreads-chain
-// latency not FLOP). The base kernel pays TWO barriers/column: (A) after tid-0 writes
-// the pivot so all threads read 1/pivot, and (B) after the trailing Schur update. This
-// REMOVES (A): every thread reads the column's diagonal (finalized by the prior
-// column's trailing update, visible across the one per-column barrier) and computes
-// d/piv/inv LOCALLY -- no pivot handoff. The diagonal slot is never written in the loop
-// (no read-after-write race); the pivot is stashed in smem pivs[] and applied at the
-// end (diagonal := piv, strict-lower /= column piv -- the base kernel's deferred scale).
-// Numerically IDENTICAL: the trailing update reads only the final U-row kk, the RAW
-// sub-diagonal column kk (scaled at the end), and the prior column's finalized diagonal
-// -- so V (strict-lower) and the recon's (H,tau) are bit-for-bit the same.
+// ONE-barrier fused no-pivot diagonal-block LU for the latency-bound recon. The base kernel
+// pays TWO barriers/column; this REMOVES the pivot-handoff barrier: every thread reads the
+// column's diagonal (finalized by the prior column's trailing update, race-free since the
+// diagonal slot is not written in the loop) and computes d/piv/inv LOCALLY. The pivot is
+// stashed in smem pivs[] and applied at write-back (diagonal:=piv, strict-lower/=col piv).
+// Numerically IDENTICAL: the trailing update reads only the final U-row kk + the raw
+// sub-diagonal col kk (scaled at the end), so V and the recon's (H,tau) are bit-for-bit same.
 __global__ void diag_lu_static_fused_kernel(float* __restrict__ Mg,
                                             float* __restrict__ Dg,
                                             int n, int batch, int j0, int w) {
@@ -5642,19 +5637,13 @@ __global__ void diag_lu_static_fused_kernel(float* __restrict__ Mg,
     }
 }
 
-// REGISTER-BLOCKED 64x64 variant of the diag_lu (used when the panel is exactly 64
-// wide -- the n=4096 recon's every panel). The static-smem kernel above moves the
-// whole trailing block through __shared__ EVERY column (read sblk[r,c], FMA, write back),
-// so its 64-column chain is smem-bandwidth bound at the 2 CTAs the b2 recon launches.
-// This version keeps each thread's slice of the block in REGISTERS across the whole
-// column loop: a 16x16 thread grid (256 threads), each owning a 4x4 register tile of the
-// 64x64 block. Only the pivot row kk (srow) and pivot column kk (scol) cross __shared__
-// per column; the trailing FMA reads them from smem and updates the thread's registers
-// in place -- no per-column smem round-trip of the whole block. The math is
-// IDENTICAL (bit-for-bit verified): same on-the-fly multiplier (scol[r]*inv)*srow[c],
-// same deferred-scale write-back (diag:=piv, strict-lower:=raw/pivs[c]), same D signs --
-// so V (strict-lower) and the recon's (H,tau) are unchanged. TX*TY==256 threads; the
-// 64x64 tile is 16(TX) x 16(TY) threads x 4(RX) x 4(RY) registers.
+// REGISTER-BLOCKED 64x64 variant of the diag_lu (used when the panel is exactly 64 wide --
+// the n=4096 recon's every panel). Unlike the static-smem kernel above (smem-bandwidth bound
+// at 2 CTAs), each thread keeps its 4x4 register tile of the 64x64 block in REGISTERS across
+// the whole column loop (16x16 thread grid, 256 threads); only the pivot row kk (srow) and
+// column kk (scol) cross __shared__ per column. The math is IDENTICAL (bit-for-bit verified):
+// same on-the-fly multiplier (scol[r]*inv)*srow[c], same deferred-scale write-back, same D
+// signs -- so V and the recon's (H,tau) are unchanged.
 template<int W, int TX, int TY>
 __global__ void diag_lu_reg_kernel(float* __restrict__ Mg, float* __restrict__ Dg,
                                    int n, int j0) {
@@ -5713,19 +5702,13 @@ __global__ void diag_lu_reg_kernel(float* __restrict__ Mg, float* __restrict__ D
         } }
 }
 
-// WARP-LEVEL 64x64 diag-LU: the register-blocked diag_lu_reg above pays
-// TWO __syncthreads() PER COLUMN (128 block barriers / panel) to exchange the pivot row/col
-// across its 8 warps -- and at the 2 CTAs the B=2 recon launches there is NO occupancy to
-// hide those barriers, so diag_lu_reg is the LONGEST per-panel op and the recon's
-// bottleneck. This version uses 64 lanes (2 WARPS, <<<batch,64>>>) -- lane t owns
-// COLUMN t as a 64-row REGISTER array col[64] (64 floats/lane -> NO register spill, unlike a
-// single-warp 2-columns/lane version which spilled at REG:255/STACK:464). The pivot ROW element
-// for a lane's column c is col[kk] (thread-local). The pivot COLUMN's sub-diagonal (col_kk[r],
-// r>kk) is published by the owner lane (lane kk) to a tiny smem pcol[64] and read by all lanes.
-// Barriers run over only 2 WARPS (vs diag_lu_reg's 8) -- a 2-warp __syncthreads is far cheaper
-// than an 8-warp one, which is what the latency-bound 2-CTA recon pays. SAME orhr_col math: d=(diag>0?-1:1),
-// piv=diag-d, on-the-fly (col_kk[r]*inv)*col_c[kk], deferred-scale write-back. No multi-queue, no
-// grid-wide sync (kernelguard-safe). col[64] indices are static under the unrolled kk loop.
+// WARP-LEVEL 64x64 diag-LU: cuts diag_lu_reg's barrier cost (the recon's bottleneck at 2
+// CTAs). 64 lanes (2 WARPS, <<<batch,64>>>); lane t owns COLUMN t as a 64-row REGISTER array
+// col[64] (no spill). The pivot ROW element is thread-local col[kk]; the pivot COLUMN's
+// sub-diagonal is published by the owner lane to a tiny smem pcol[64] read by all lanes.
+// Barriers run over only 2 warps (vs diag_lu_reg's 8). SAME orhr_col math: d=(diag>0?-1:1),
+// piv=diag-d, on-the-fly (col_kk[r]*inv)*col_c[kk], deferred-scale write-back. No grid-wide
+// sync (kernelguard-safe); col[64] indices are static under the unrolled kk loop.
 __global__ void diag_lu_warp_kernel(float* __restrict__ Mg, float* __restrict__ Dg,
                                     int n, int j0) {
     const int mat = blockIdx.x;
@@ -5785,15 +5768,12 @@ __global__ void diag_lu_warp_kernel(float* __restrict__ Mg, float* __restrict__ 
 static constexpr int kLuNt = 768;
 static constexpr int kLuRegNt = 256;   // 16x16 threads for diag_lu_reg_kernel<64,16,16>
 
-// Fused IN-PLACE assembly of the compact-Householder factor H + tau extraction from
-// the LU result M, the R-factor, and the diagonal signs D, in ONE pass (replaces
-// H = tril(M,-1) + triu(R*D[...,None]), 4 elementwise kernels + temps):
-//   H[i,j] = M[i,j] (i>j, =V, untouched) ;  = R[i,j]*D[i] (i<=j, overwritten in M)
-// so M itself becomes H -- NO 256MB H alloc. R is the row-major UPPER QR factor
-// (= L^T from the LOWER chol factor), read directly for i<=j. tau_i = -diag(M)_i*D_i
-// is captured from the pivot BEFORE that diagonal slot is overwritten. The V the
-// checker's householder_product reads is bit-identical to a separate build_H, so the
-// residuals are UNCHANGED. M,R,H are (batch,n,n) row-major; D,Tau are (batch,n) FP32.
+// Fused IN-PLACE assembly of the compact-Householder factor H + tau extraction from the LU
+// result M, the R-factor, and the diagonal signs D, in ONE pass (replaces H = tril(M,-1) +
+// triu(R*D[...,None])): H[i,j] = M[i,j] for i>j (=V, untouched), = R[i,j]*D[i] for i<=j
+// (overwritten in M, so M itself becomes H -- no 256MB H alloc). R is the row-major UPPER QR
+// factor; tau_i = -diag(M)_i*D_i is captured BEFORE that diagonal slot is overwritten. The V
+// is bit-identical to a separate build_H. M,R,H are (batch,n,n) row-major; D,Tau (batch,n) FP32.
 __global__ void build_H_inplace_kernel(float* __restrict__ M, const float* __restrict__ R,
                                        const float* __restrict__ D, float* __restrict__ Tau,
                                        int n) {
@@ -5887,20 +5867,14 @@ std::vector<torch::Tensor> chol_b2_lower_R_solve(torch::Tensor A, torch::Tensor 
 
 // ===========================================================================
 // Custom tiled batched right-TRSM:  X * R = A  (R is n x n UPPER, A/X are n x n).
-//
-// Why custom: at batch=2, n=4096 the cuSOLVER/cuBLAS trsm_right kernel is a SIMT
-// kernel that badly underfills the 148 SMs (only 2 matrices' worth of tiles).
-// The fix is a BLOCKED right-TRSM whose dominant cost -- the trailing rank-nb
-// update X[:,je:] -= X[:,J] @ R[J,je:] -- is a WIDE (n x rest) tensor-core GEMM
-// that saturates the device even at batch 2 (it parallelizes across the n=4096
-// rows AND the `rest` trailing columns). Precision: a plain-TF32 trailing GEMM
-// blows orthogonality to ~3.5 through cond(R)~1.8e4; the 3xTF32 split
-// (Khan-style hi/lo, 3 accumulating tensor-core GEMMs) holds ||Q^TQ-I|| ~ 5e-3,
-// far under the 4.9e-2 orth gate. The diagonal blocks are pre-inverted ONCE in one
-// batched FP32 trsm (RHS=I); each block's solve is then a wide exact-FP32 GEMM.
-//
-// R never changes, so it is split into Rhi/Rlo ONCE up front. Only the freshly
-// solved nb-wide panel X[:,J] is re-split each block step (it is small).
+// Why custom: at batch=2/n=4096 the cuBLAS trsm_right SIMT kernel underfills the 148 SMs.
+// The fix is a BLOCKED right-TRSM whose dominant cost -- the trailing rank-nb update
+// X[:,je:] -= X[:,J] @ R[J,je:] -- is a WIDE (n x rest) tensor-core GEMM that saturates the
+// device even at batch 2. Precision: 3xTF32 Kahan-split trailing (3 accumulating tensor-core
+// GEMMs) holds ||Q^TQ-I|| far under the orth gate where a plain-TF32 trailing would not. The
+// diagonal blocks are pre-inverted ONCE (one batched FP32 trsm, RHS=I) -> each block's solve
+// is a wide GEMM. R never changes (split into Rhi/Rlo once up front); only the freshly solved
+// nb-wide panel X[:,J] is re-split each block step.
 // ===========================================================================
 
 #define BKL(x) do { cublasStatus_t s=(x); if(s!=CUBLAS_STATUS_SUCCESS){ printf("cublasL err %s:%d %d\n",__FILE__,__LINE__,(int)s); } } while(0)
@@ -6092,24 +6066,14 @@ __global__ void split_flat_fp16_kernel(const float* __restrict__ x,
             fp16_split_store(x[jj], hi + jj, lo + jj);
     }
 }
-// Fused scatter-back + (optional) hi/lo split of the solved diagonal panel: reads
-// the packed (batch, n, w) Tmp, writes (a) the strided X panel X[:, :, j:j+w] (the
-// final Q columns) AND, when hi != nullptr, (b) the packed hi/lo buffers for the
-// 3xTF32 trailing -- one pass over the panel instead of a plain scatter +
-// split_flat_kernel back to back.  The last block (no trailing GEMM follows) passes
-// nullptr for hi/lo to skip the split, so this single kernel serves both call sites.
-//
-// VECTORIZED (float4): one thread owns 4 CONTIGUOUS columns [c,c+4) of row r. The Tmp
-// read Tmp[r*w+c..], the X-panel write X[r*n+j+c..] (j+c..j+c+3 contiguous WITHIN the
-// row), and the hi/lo writes are each one 16B transaction. The TRSM block width w is
-// _TRSM_NB_CPP=384 (or the n4096 tail 256) -- both %4==0 -- and j=bi*nb is %4==0, so
-// every float4 base (j+c and r*w+c and pbase+r*w+c) is 16B-aligned. A scalar tail
-// covers any (currently unreachable) w%4!=0. BYTE-IDENTICAL: tf32_split_store applied
-// per lane exactly as the scalar path.
-// hi16/lo16 (optional) add a FUSED FP16 hi/lo split of the solved panel in
-// the SAME pass as the scatter -> the 3xFP16 trailing needs no separate split kernel.
-// Pass hi/lo (FP32 TF32-split) for the 3xTF32 trailing, hi16/lo16 (FP16-split)
-// for the 3xFP16 trailing, or all-null (last block) to just scatter.
+// Fused scatter-back + (optional) hi/lo split of the solved diagonal panel: reads the
+// packed (batch, n, w) Tmp, writes the strided X panel X[:, :, j:j+w] (the final Q columns)
+// AND, when hi != nullptr, the packed hi/lo buffers -- one pass instead of a scatter +
+// split_flat back to back. VECTORIZED (float4): one thread owns 4 contiguous columns [c,c+4)
+// of row r (all bases 16B-aligned since w and j=bi*nb are %4==0); a scalar tail covers any
+// unreachable w%4!=0. BYTE-IDENTICAL: tf32_split_store per lane. Pass hi/lo (FP32 TF32-split)
+// for the 3xTF32 trailing, hi16/lo16 (FP16-split) for the 3xFP16 trailing, or all-null (last
+// block) to just scatter.
 __global__ void scatter_split_panel_kernel(float* __restrict__ Xg,
                                            const float* __restrict__ Tmpg,
                                            float* __restrict__ hi, float* __restrict__ lo,
@@ -6161,18 +6125,13 @@ __global__ void scatter_split_panel_kernel(float* __restrict__ Xg,
     }
 }
 
-// ===========================================================================
-// MAIN-SOLVE (Q = A R^{-1}): the blocked right-TRSM above, whole loop in ONE C++
-// call so the cuBLAS FP32/TF32 GEMMs fire back-to-back (no per-block Python dispatch
-// at b2). The diagonal pre-invert is ONE cublasStrsmBatched (RHS=I) over all nblk
-// blocks at once -- the tail block is identity-padded so the single batched call
-// covers it -- then the per-block diagonal solve is a wide GEMM X[:,blk] @ Rblk^{-1}.
-// precision map (s6 path, gated): pre-invert EXACT FP32 (triangular-block
-// inverse is conditioning-sensitive -- TF32 fails the factor gate); the diagonal SOLVE is
-// 3xTF32 (g_trsm_diag_prec==2, ~FP32 via Kahan hi/lo, faster than FP32-SIMT at nb=512); the
-// trailing rank-w update is 3xFP16 (g_trsm_trail_fp16; FP16 tensor cores ~2x TF32 on B200,
-// same accuracy). BOTH the diag-solve and trailing need all 3 Kahan passes (2 fails the
-// factor gate). nb=512 is the s6 optimum. Returns X (= Q), A left untouched.
+// MAIN-SOLVE (Q = A R^{-1}): the blocked right-TRSM above, whole loop in ONE C++ call so the
+// cuBLAS GEMMs fire back-to-back at b2. The diagonal pre-invert is ONE cublasStrsmBatched
+// (RHS=I) over all nblk blocks (tail identity-padded), then each per-block diagonal solve is
+// a wide GEMM X[:,blk] @ Rblk^{-1}. Precision map (s6 path, gated): pre-invert EXACT FP32
+// (the triangular-block inverse is conditioning-sensitive); diagonal SOLVE is 3xTF32 Kahan
+// (g_trsm_diag_prec==2, ~FP32, faster than FP32-SIMT at nb=512); trailing rank-w update is
+// 3xFP16 (g_trsm_trail_fp16). Returns X (= Q), A left untouched.
 torch::Tensor tri_solve_right_inv(torch::Tensor A, torch::Tensor Rin, int nb) {
     int batch = A.size(0), n = A.size(1);
     auto opts = A.options();
@@ -6408,32 +6367,18 @@ torch::Tensor tri_solve_right_inv(torch::Tensor A, torch::Tensor Rin, int nb) {
     return X;
 }
 
-// ===========================================================================
-// CUSTOM FUSED PANEL SOLVE for the orhr_col recon LU (launch-overhead elimination).
-// At n=4096/ob=64/B=2 the recon issues, PER PANEL, three sequential launch-bound
-// kernels: the 64x64 diag LU (only B=2 CTAs -> device-underfilled) plus TWO triangular
-// solves (cublasStrsm L21=M21*U^-1 and U12w=L^-1*M12, pure launch latency at this size).
-// Across 63 trailing panels that is the recon's wall.
-// This kernel collapses the TWO per-panel triangular solves into ONE launch covering
-// BOTH the L21 back-solve and the U12w forward-solve for ALL B matrices: identical
-// FP32 arithmetic (each independent row/column solve is a w-step substitution against
-// the in-place LU diagonal block held once in smem), but the work tiles across many
-// CTAs (it fills the device, unlike the 2-CTA cuBLAS-batched path) and it removes
-// 1 launch + the heavier cublasStrsmBatched dispatch per panel.
-//
-// Layout (row-major M, ld=n; diagonal block at (jo,jo)). The LU block packs unit-lower
-// L (strict-lower, implicit 1 diag) and upper U (diag+upper):
-//   L21 (mrows x w) at (joe,jo):  row r solves  y @ U = M21[r]  (back-sub over cols)
-//   U12w (w x rest) at (jo,joe):  col c solves  L @ x = M12[:,c] (fwd-sub, unit L)
-// Work items 0..mrows-1 are L21 rows; mrows..mrows+rest-1 are U12w columns. Each
-// thread owns one work item (one full w-step solve). The diag block is staged in smem
-// once per CTA (Usm/Lsm), shared by every solve in the CTA.
-// L21h/U12h: optional contiguous FP16 mirrors of the solved
-// panels, written FROM REGISTERS in the same pass (no extra read/launch) so the FP16
-// recon Schur GEMM needs no separate cast. L21h packs (batch x mrows x w) ld=w; U12h
-// packs (batch x w x rest) ld=rest. nullptr -> skip (TF32-Schur path).
-// L21h buffer is (batch x n x W) row-major: per-mat stride matStrideL=n*W, row stride W.
-// U12h buffer is (batch x W x n) row-major: per-mat stride matStrideU=W*n, row stride n.
+// CUSTOM FUSED PANEL SOLVE for the orhr_col recon LU: collapses the TWO per-panel
+// triangular solves (L21 = M21 U^{-1} back-solve, U12w = L^{-1} M12 forward-solve) into
+// ONE launch over ALL B matrices, replacing two launch-bound cublasStrsmBatched calls that
+// underfill the device at B=2. Identical FP32 arithmetic (each row/column solve is a w-step
+// substitution against the in-place LU diagonal block, staged once per CTA in smem Usm/Lsm),
+// but the work tiles across many CTAs to fill the device.
+//   M row-major, ld=n; LU block at (jo,jo) packs unit-lower L (implicit 1 diag) + upper U.
+//   L21 (mrows x w) at (joe,jo): row r solves y @ U = M21[r]; U12w (w x rest) at (jo,joe):
+//   col c solves L @ x = M12[:,c]. Work items 0..mrows-1 are L21 rows; the rest are U12w cols.
+// L21h/U12h: optional contiguous FP16 mirrors written FROM REGISTERS in the same pass (no
+// extra cast/launch) for the FP16 recon Schur GEMM; nullptr -> skip (TF32-Schur path). L21h
+// is (batch x n x W) row-major (stride n*W, row W); U12h is (batch x W x n) (stride W*n, row n).
 template<int W>
 __global__ void panel_solve_fused_kernel(float* __restrict__ Mg, int n,
                                          int jo, int joe, int mrows, int rest,
@@ -6525,19 +6470,14 @@ __global__ void panel_solve_fused_kernel(float* __restrict__ Mg, int n,
     }
 }
 
-// ===========================================================================
-// FULL orhr_col reconstruction LU loop, in ONE C++ call. Issuing the ~190 ops/call from
-// Python pays per-op dispatch overhead, and CUDA graphs can't capture our default-queue
-// custom kernels, so the whole loop runs in C++: the SAME cuBLAS trsm/gemm fire back-to-
-// back with only driver latency between them.
-//
+// FULL orhr_col reconstruction LU loop, in ONE C++ call (per-op Python dispatch overhead
+// and no CUDA-graph capture of our default-queue kernels make the in-C++ loop a win).
 // Single-level right-looking blocked LU, ob-wide panels (ob<=64). Per panel: no-pivot
-// diagonal LU (custom diag_lu_static), then for the trailing (joe<n): L21 = M21 @
-// U^{-1} (trsm_left), wide U12w = L^{-1} @ M12w (trsm_right, unit), wide Schur GEMM.
-// All trsm run DEFAULT (true FP32) math (the LU is sequential -> exact inputs); the
-// Schur GEMM runs TF32 (loose factor residual). Layout convention: a row-major (RxC)
-// sub-block with row-stride n is a col-major (CxR) matrix ld=n to cuBLAS, and a
-// row-major-upper triangle reads as col-major-lower (and vice versa).
+// diagonal LU (custom diag_lu_static), then for the trailing (joe<n): L21 = M21 @ U^{-1}
+// (trsm_left), wide U12w = L^{-1} @ M12w (trsm_right, unit), wide Schur GEMM. All trsm run
+// DEFAULT FP32 (the LU is sequential -> exact inputs); the Schur GEMM runs TF32 (loose
+// factor residual). Layout: a row-major (RxC) sub-block with row-stride n is a col-major
+// (CxR) matrix ld=n to cuBLAS, and row-major-upper reads as col-major-lower (and vice versa).
 torch::Tensor recon_lu_cpp(torch::Tensor M, torch::Tensor R, torch::Tensor D, int ob) {
     int batch = M.size(0), n = M.size(1);
     if (g_trsm_handle == nullptr) {
@@ -6652,32 +6592,21 @@ torch::Tensor recon_lu_cpp(torch::Tensor M, torch::Tensor R, torch::Tensor D, in
 
 // ===========================================================================
 // INTEGER-OZAKI FP64-EMULATED GRAM (kernels; the Python header explains why int8).
-//
-// G = A^T A for FP32 A (B,n,n), EXACTLY-to-FP64 via INT8 tensor-core GEMMs that
-// accumulate in INT32 (no FP32 1e-5 relerr -> the cond(G)~3e8 Gram stays PD):
-//   G[i,j] = ci*cj * sum_{p,q} 127^-(p+q+2) (s_p[:,i] . s_q[:,j]),
-// each column of A normalized by its max-abs (cj) into [-1,1] and peeled into NS
-// signed-INT8 slices (7 bits each).  Each s_p^T s_q is one exact INT8->INT32 GEMM
-// (sum of 4096 terms, max |sum| < 2^31 -- fits INT32).  NS=4 is required: orth
-// holds ~0.25x of the gate at NS=4 but ~1.3x (FAILS) at NS=3.  The GEMMs are issued
-// from Python via torch._int_mm; this file provides the two kernels that otherwise
-// dominate in PyTorch:
-//   oz_slice:      A f32 -> NS int8 slices slN (NORMAL [b,i,j] layout; the GEMM's
-//                  transposed operand is the cublasLt view slN[p].t()) + cj (B,n) f64.
-//   oz_recombine:  fused INT32-product -> FP64 accumulate with weight w + ci*cj scales.
-//                  Off-diagonal pairs (p!=q, tg=1) fold the (q,p) term; `lower` picks
-//                  which triangle of the symmetric G is written.
+// G = A^T A for FP32 A, EXACTLY-to-FP64 via INT8 tensor-core GEMMs accumulating in INT32
+// (no FP32 relerr -> the cond(G)~3e8 Gram stays PD): G[i,j] = ci*cj * sum_{p,q}
+// 127^-(p+q+2) (s_p[:,i] . s_q[:,j]), each column normalized by its max-abs (cj) and peeled
+// into NS signed-INT8 slices. The s_p^T s_q GEMMs are issued from Python; this file provides
+// the two kernels that otherwise dominate in PyTorch:
+//   oz_slice:     A f32 -> NS int8 slices slN (NORMAL [b,i,j] layout, GEMM operand = the
+//                 cublasLt view slN[p].t()) + cj (B,n) f64.
+//   oz_recombine: fused INT32-product -> FP64 accumulate with weight w + ci*cj scales;
+//                 `lower` picks which triangle of the symmetric G is written.
 
-// Per-column max-abs of A (B,n,n) -> cj (B,n) f64. 2D-tiled, COALESCED row-major
-// reads; each block owns a tile of columns [c0, c0+TILE) and a ROW-BLOCK
-// [r0, r0+rows_per_blk) so the grid is (n/TILE, RB, batch) -- RB row-blocks per
-// column-tile saturate the device (the original (n/TILE, 1, batch)=256-block launch
-// ran at ~16% of HBM BW because each of the few blocks serially walked all n rows).
-// Each block reduces its row-slab in registers + smem across blockDim.y, then
-// atomicMax's its per-column partial into cjf (reinterpret-as-int atomicMax is exact
-// for non-negative floats: the IEEE-754 bit pattern is monotone for x>=0). cjf must
-// be zero-initialized by the caller; the 1e-30 floor is applied by oz_finalize_cj /
-// in the peel division so an all-zero column does not divide by zero.
+// Per-column max-abs of A (B,n,n) -> cj (B,n) f64. 2D-tiled, COALESCED row-major reads; the
+// grid is (n/TILE, RB, batch) -- RB row-blocks per column-tile saturate the device. Each
+// block reduces its row-slab across blockDim.y, then atomicMax's its per-column partial into
+// cjf (reinterpret-as-int atomicMax is exact for non-negative floats). cjf must be zero-
+// initialized by the caller; the 1e-30 floor is applied in the peel division.
 constexpr int OZ_CM_TILE = 32;             // threads/row-partition for oz_colmax_v4 (== blockDim.x)
 __device__ __forceinline__ void oz_atomic_max_pos(float* addr, float val) {
     // atomicMax on the int reinterpretation; valid because val>=0 (max-abs) and the
@@ -6732,19 +6661,13 @@ __global__ void oz_colmax_v4_kernel(const float* __restrict__ Ag, int n, int bat
     }
 }
 
-// Peel A (B,n,n) into NS signed-int8 slices slN[p] (NS,B,n,n) in NORMAL [b,i,j] layout
-// (the GEMM's transposed operand is taken as slN[p].t() -- a cublasLt view, so no separate
-// slT tensor / transpose copy). thread (i,j) reads A[b,i,j], writes slN[p][b,i,j] row-major;
-// cjf (B,n) f32 read broadcast. Per element: r = a/max(cj,1e-30); each plane p takes
-// sp=clamp(rint(r*127),-127,127); r=127*(r-sp/127).
-//
-// VECTORIZED, COMPILE-TIME-NS peel (float4, 4 contiguous columns/thread): the Ag read is
-// one 16B float4 (1/4 the load requests, full 128B line/warp) and each plane's 4 int8
-// results are PACKED into one 4B char4 store. NS is a template constant (the n>=4096 path
-// always uses NS=_OZ_NS=4), so the compiler sizes everything to exactly NS planes and
-// carries only FOUR running residuals (one per lane), emitting each plane's char4 the
-// instant it is computed. Bit-exact: each lane runs the per-element recurrence in order;
-// the store interleaving does not affect any emitted byte.
+// Peel A (B,n,n) into NS signed-int8 slices slN[p] (NS,B,n,n) in NORMAL [b,i,j] layout (the
+// GEMM operand is the cublasLt view slN[p].t(), no transpose copy). Per element:
+// r=a/max(cj,1e-30); each plane p takes sp=clamp(rint(r*127),-127,127); r=127*(r-sp/127).
+// VECTORIZED, COMPILE-TIME-NS (float4, 4 contiguous columns/thread): one 16B float4 read,
+// each plane's 4 int8 results PACKED into one char4 store. NS is a template constant (the
+// n>=4096 path always uses NS=_OZ_NS=4) so the compiler sizes to exactly NS planes and
+// carries 4 running residuals. Bit-exact: the per-element recurrence runs in order.
 template <int NS_C>
 __global__ void oz_peel_v4t_kernel(const float* __restrict__ Ag, int n, int batch,
                                    const float* __restrict__ cjf, signed char* __restrict__ slN) {
@@ -6918,15 +6841,11 @@ void oz_recombine_2pass(torch::Tensor P, torch::Tensor wg, torch::Tensor cj,
         cj.data_ptr<double>(), G.data_ptr<double>(), (int)lower);
 }
 
-// ===========================================================================
-// GROUPED int8 Gram GEMM: ALL npairs*b int8 GEMMs in ONE cublasGemmBatchedEx
-// (pointer-array batch) -> a SINGLE launch covers all 16 GEMMs, closing the
-// inter-pair launch gaps. Column-major view of the row-major int8 buffers gives
-// A=s_q (op_N), B=s_p (op_T), m=n=k=N, ld=N, so P[k,bi]=s_p[bi]^T @ s_q[bi]
-// (bit-identical to a torch._int_mm(s_p^T, s_q) loop -- same IMMA INT8 kernel +
-// INT32 accumulation). The 3 device pointer arrays (A,B,C bases for each
-// g=(k,bi)) are constant for a given (slN,P,pairs); built on host and cached in a
-// persistent device buffer, refreshed only if a base pointer changes.
+// GROUPED int8 Gram GEMM: ALL npairs*b int8 GEMMs in ONE cublasGemmBatchedEx (pointer-array
+// batch) -> a SINGLE launch covers all GEMMs. Column-major view of the row-major int8 buffers
+// gives A=s_q (op_N), B=s_p (op_T), m=n=k=N, ld=N, so P[k,bi]=s_p[bi]^T @ s_q[bi] (bit-
+// identical to a torch._int_mm loop). The 3 device pointer arrays are constant for a given
+// (slN,P,pairs); built on host and cached in a persistent device buffer, refreshed on change.
 static cublasHandle_t g_oz_grp = nullptr;
 static torch::Tensor g_oz_ptrbuf;       // [3*G] int64 device: A ptrs | B ptrs | C ptrs
 static std::vector<int64_t> g_oz_ptrhost;
