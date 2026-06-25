@@ -83,10 +83,9 @@ autocuda run exclusive --data-dir "$DATA_DIR" -- \
 
 ## Profiling
 
-`eval.py` runs `custom_kernel` in a **spawned subprocess** (`multiprocessing.get_context("spawn")`), so a profiler attached only to the parent process captures **zero kernels** — it finishes in a couple of seconds and writes a `.nsys-rep` with no kernel data. That empty trace is a failed capture, not a result; never base a decision on one. Two ways to get a real capture:
+`eval.py` runs `custom_kernel` in a spawned subprocess and only runs at all when `POPCORN_FD` is set (it exits immediately otherwise). `nsys` follows the subprocess by default, so the usual reason a capture comes back with **zero kernels** is that the benchmark never ran — a missing `POPCORN_FD`, or a setup step that aborted the command (a relative `source harness/env.sh` fails unless the working dir is the repo root). An empty trace is a failed capture, not a result; confirm kernels with `nsys stats --report cuda_gpu_kern_sum <file>.nsys-rep` before trusting it, and use the verified invocation in `autocuda/environment.md`'s **Profiling** section (written per-machine by `/autocuda:discover`) rather than improvising one.
 
-- **`ncu` works directly** — it attaches to each kernel launch, so it sees the subprocess kernels. Use `harness/profile_ncu.sh <set>/<problem> [<shape-spec>]` (wrapped in `autocuda run exclusive`); it already handles the subprocess plus the `sudo`/closed-fd-3/`PYTHONPATH` issues `ncu` hits on this harness. Because the leaderboard kernel is reached via the subprocess and only `ncu` reliably profiles through it, `ncu` is the primary signal here — don't settle for `nsys` alone once you know which kernel to attack.
-- **`nsys`** needs the exact subprocess-tracing invocation recorded in `autocuda/environment.md`'s **Profiling** section (written per-machine by `/autocuda:discover`) — use it verbatim and confirm the result with `nsys stats --report cuda_gpu_kern_sum <file>.nsys-rep` before trusting it.
+`ncu` needs root: drive it through `harness/profile_ncu.sh <set>/<problem> [<shape-spec>]` (wrapped in `autocuda run exclusive`), which handles the `sudo`/closed-fd-3/`PYTHONPATH` issues for you. Reach for it once you know which kernel to attack — it reports the memory-vs-compute/occupancy/stall detail `nsys` can't.
 
 Profile `custom_kernel` on **one representative shape in isolation**, never the whole benchmark: a whole-benchmark profile interleaves the reference checker's own kernels (cuSOLVER/cuBLAS/cutlass) with yours and mis-attributes time.
 
