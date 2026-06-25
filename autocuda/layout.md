@@ -83,7 +83,7 @@ autocuda run exclusive --data-dir "$DATA_DIR" -- \
 
 ## Profiling
 
-Profile through the harness scripts — they exist so the capture is correct and reproducible, not improvised per run. Both wrap a small driver (`harness/profile_driver.py`) that imports the live `submission.custom_kernel` and times it on one shape inside a CUDA profiler range, so the capture holds **only your kernels** — not eval.py's `spawn`-Pool indirection and not the cuSOLVER/cuBLAS reference checker that `eval.py benchmark` interleaves with every timed call.
+Profile through the harness scripts — they exist so the capture is correct and reproducible, not improvised per run. `eval.py` wraps its timed `custom_kernel` launches in a `torch.cuda.profiler` range, and the scripts run `eval.py benchmark` on one shape under that range (`nsys --capture-range=cudaProfilerApi`, `ncu --profile-from-start off`), so the capture holds **only your kernels** — not the warmup, the L2 flush, or the cuSOLVER/cuBLAS reference checker `eval.py` runs between timed calls. The range is a no-op when no profiler is attached, so normal validate/benchmark runs are unaffected.
 
 ```bash
 autocuda run exclusive --data-dir "$DATA_DIR" -- \
@@ -121,6 +121,8 @@ Every iteration row carries `--metric <set>/<problem>=<value>` (geomean µs). Th
 Leaderboard submissions are **mandatory evidence**, not optional reporting. A run without a baseline leaderboard submission is **invalid from the start**. A run that finds improvements but does not submit them regularly is also **invalid**: local geomean timings alone cannot tell whether a kernel is accepted by GPU MODE, whether it is considered cheating/reward-hacking by the remote harness, or what its real leaderboard performance is.
 
 Automatic submission is authorized for this workspace. Do not ask the operator before submitting, and do not continue optimizing until the required submission for the current phase has either succeeded or failed with an explicit, logged infrastructure/authentication error.
+
+Submission can be flaky. A run that comes back **failed** is a real failure — treat it as one. A run that **times out** is not conclusive: retry it, up to 3 times. If all 3 time out, treat that as a real failure.
 
 - **At baseline setup:** after the baseline passes local validation, is benchmarked, profiled, and logged with `autocuda log optimize-tree baseline`, immediately submit that exact baseline `submission.py` with `popcorn-cli submit --no-tui --leaderboard <name> --gpu <gpu> --mode leaderboard submission.py`. If this submission is missing, the entire optimize run is invalid and workers must not be launched.
 - **As the run improves:** each time the best safe committed kernel meaningfully improves over the last submitted kernel, submit that exact committed `submission.py` with `--mode leaderboard` before treating the improvement as real. Do not compare local candidates as final apples-to-apples results without corresponding leaderboard submissions.
