@@ -1151,13 +1151,6 @@ void set_warps(int w) { g_warps = w; }
 // occupancy-rich shapes (the n=1024 case B=60) keep the base kernel unchanged.
 static int g_panel_defer = 0;
 void set_panel_defer(int v) { g_panel_defer = v; }
-// Use the deferred-scale ("raw-V") panel kernel in the two-level driver (set from
-// Python). It applies the within-panel trailing update in unnormalized Householder
-// form, deferring the per-column 1/(alpha-beta) scale to the write-back. Distinct
-// from g_panel_defer (a different variant); the the n=512 big-batch case two-level path flips this on (and
-// g_panel_defer off). Default OFF.
-static int g_panel_raw = 0;
-void set_panel_raw(int v) { g_panel_raw = v; }
 // extra smem leading-dim pad (added to b|1) for the warp-specialized-pivot BF16 panel
 // (defer==5). The 2D-flattened panel load s[r*LDS+c] (c fast) aliases shared-memory banks
 // when LDS+(b-1) == 0 mod 32 (e.g. b=16 -> b|1=17, 17+15==32). An extra even pad keeps LDS
@@ -2075,17 +2068,11 @@ std::tuple<torch::Tensor, torch::Tensor> blocked_qr_2level(torch::Tensor A, int 
     // blocked_qr's cache (different shapes use different entry points + the two-level
     // path's OB-wide buffers differ from the single-level block-wide ones), so the two
     // never share storage. Reallocate only when the signature changes.
-    // cVo2 is the DEDICATED FP32 outer-V buffer for the outer-V-fold path (g_ov_fold):
-    // the n=1024 case (fnorm) / the n=2048 case (pipe) inner panels write the OB-wide outer V into it (via
-    // panel_factor_smem_{fnorm,pipe}_ov_kernel) so the standalone build_V_kernel pass is
-    // dropped. Kept separate from the inner V (cV2) because the two coexist within an
-    // outer block (different row strides: b vs OB). Allocated only when the fold is on.
-    static torch::Tensor cV2, cT2, cS2, cW2, cY2, cVo2;
-    static int s2_B = -1, s2_n = -1, s2_OB = -1, s2_ov = -1;
-    if (s2_B != B || s2_n != n || s2_OB != OB || s2_ov != (int)g_ov_fold) {
+    static torch::Tensor cV2, cT2, cS2, cW2, cY2;
+    static int s2_B = -1, s2_n = -1, s2_OB = -1;
+    if (s2_B != B || s2_n != n || s2_OB != OB) {
         alloc_vtswy<float>(cV2, cT2, cS2, cW2, cY2, B, n, OB, opts);
-        cVo2 = g_ov_fold ? torch::empty({B, n, OB}, opts) : torch::empty({0}, opts);
-        s2_B = B; s2_n = n; s2_OB = OB; s2_ov = (int)g_ov_fold;
+        s2_B = B; s2_n = n; s2_OB = OB;
     }
     torch::Tensor& V = cV2; torch::Tensor& T = cT2; torch::Tensor& S = cS2;
     torch::Tensor& Wbuf = cW2; torch::Tensor& Ybuf = cY2;
@@ -2145,19 +2132,14 @@ std::tuple<torch::Tensor, torch::Tensor> blocked_qr_2level(torch::Tensor A, int 
         TORCH_CHECK(false, "run_panel: only the g_panel_cmf path is reachable");
     };
 
-    // The outer-V fold is wired for the fnorm (defer=3, the n=1024 case) and pipe (defer=4,
-    // the n=2048 case) panels via their *_ov variants; enabled when g_ov_fold is set AND one of
-    // those panels is active. cVo2 holds the OB-wide outer FP32 V the inner panels emit.
-    float* Vop = (g_ov_fold && (g_panel_defer == 3 || g_panel_defer == 4) && !g_panel_raw)
-                 ? cVo2.data_ptr<float>() : nullptr;
-    // Exact-FP32 regime through the shared two-level loop. Vop already bakes in the
-    // *_ov panel condition; ncap=n (no rank-reveal), indexed_out=false, no fusion
-    // (try_fuse always false). The apply is the STORE=float (SIMT/TF32) arm of the
-    // unified apply_block_reflector_t driver -- it does the same GEMM sequence the old
-    // apply_block_reflector did (Wst/Mst null, Yst=Yp, minv_nt=g_minv_nt), so the loop
-    // body for both the inner and the outer trailing update is byte-identical.
+    // The only reachable FP32 two-level panel is the cmf panel (g_panel_cmf), which emits its
+    // inner V directly into Vfold and never uses an outer-V fold -- so the outer-V buffer is
+    // always null here (the *_ov panels that consumed it were removed). ncap=n (no rank-reveal),
+    // indexed_out=false, no fusion (try_fuse always false). The apply is the STORE=float
+    // (SIMT/TF32) arm of the unified apply_block_reflector_t driver (Wst/Mst null, Yst=Yp,
+    // minv_nt=g_minv_nt), so the inner and outer trailing updates are byte-identical.
     run_two_level_loop<float>(
-        n, OB, IB, /*ncap=*/n, /*indexed_out=*/false, Vop, Vp, Hp, B,
+        n, OB, IB, /*ncap=*/n, /*indexed_out=*/false, /*Vop=*/(float*)nullptr, Vp, Hp, B,
         run_panel,
         [&](float* V, int kc, int w, int m, int jc, int rest) {
             apply_block_reflector_t<float>(handle, Hp, taup, V, Sp, Tp, Wp,
@@ -4751,7 +4733,7 @@ static inline void apply_n512_rr_overrides() {
 }
 
 static inline void set_n512_good_flags() {
-    g_prec = 1; g_warps = 8; g_minv_nt = 224; g_panel_defer = 5; g_panel_raw = 0;
+    g_prec = 1; g_warps = 8; g_minv_nt = 224; g_panel_defer = 5;
     g_wsp_pad = 2; g_ov_fold = 1; g_panel_cm = 1; g_fp16_pure = 0;
     g_bf16_wf16 = 1; g_inner_wmma = 2; g_panel_apply_fused = 1; g_paf_no_csh = 1;
     g_inner_wmma_wmax = 32;   // OB-wide (w=64) last apply -> cuBLAS, not single-CTA WMMA
@@ -4775,7 +4757,7 @@ static inline void set_n512_good_flags() {
 static inline void restore_after_n512_good() {
     g_minv_blk4 = 0; g_minv_blk4_minw = 0; g_inner_wmma = 0; g_inner_wmma_wmax = 0; g_panel_apply_fused = 0;
     g_paf_no_csh = 0; g_paf_no_vsh = 0; g_bf16_wf16 = 0; g_fp16_pure = 1; g_panel_defer = 0;
-    g_panel_raw = 0; g_panel_cm = 0; g_wsp_pad = 2; g_ov_fold = 0; g_minv_nt = 512;
+    g_panel_cm = 0; g_wsp_pad = 2; g_ov_fold = 0; g_minv_nt = 512;
     g_paf_warps = 8;   // restore PAF block to the 8-warp default
     g_paf_help = 1;    // restore PAF pivot-coop to off (warp 0 alone)
 }
@@ -4795,7 +4777,7 @@ static inline void restore_after_n512_good() {
 // that flickers a near-rank-deficient residual past the invariance gate. All numerically
 // deterministic (same betas/taus/V; FP32 inverse).
 static inline void set_n512_bad_flags() {
-    g_prec = 0; g_prec_w = 0; g_prec_s = 1; g_warps = 32; g_panel_defer = 4; g_panel_raw = 0; g_fp16_pure = 0;
+    g_prec = 0; g_prec_w = 0; g_prec_s = 1; g_warps = 32; g_panel_defer = 4; g_fp16_pure = 0;
     g_minv_nt = 512; g_minv_2lev_nlev = 2; g_no_splitk = 1; g_qr2_no_clone = 1;
     g_panel_cmf = 1;   // warp-spec FP32 cmf inner panel (overlaps pivot look-ahead w/ bulk
                        // trailing); measured ~1% faster than pipe<32> on the s7 bad subset.
@@ -4805,7 +4787,7 @@ static inline void set_n512_bad_flags() {
 }
 static inline void restore_after_n512_bad() {
     g_no_splitk = 0; g_minv_2lev_nlev = 1; g_qr2_no_clone = 0; g_prec_s = 0;
-    g_prec = 1; g_prec_w = 0; g_panel_defer = 0; g_panel_raw = 0; g_minv_nt = 512; g_fp16_pure = 1;
+    g_prec = 1; g_prec_w = 0; g_panel_defer = 0; g_minv_nt = 512; g_fp16_pure = 1;
     g_panel_cmf = 0; g_cmf_mrfine = 0;
 }
 
@@ -5050,7 +5032,6 @@ void set_minv_blk4(int v);
 void set_minv_blk4_minw(int v);
 void set_minv_nt_sl(int v);
 void set_panel_defer(int v);
-void set_panel_raw(int v);
 void set_wsp_pad(int v);
 void set_wsp_cm_coop(int v);
 void set_panel_cm(int v);
@@ -5093,7 +5074,7 @@ def _compile_qr(name, cpp, cuda, functions, ldflags):
 
 
 def _compile_ext():
-    functions = ["blocked_qr", "illcond_mask", "n352_illcond_mask_cuda", "blocked_qr_2level", "blocked_qr_2level_bf16", "qr_n512_mixed_driver", "blocked_qr_tiny", "qr_mega_small", "set_mega_warps", "set_bf16_nt", "set_bf16_wf16", "set_fp16_pure", "set_prec", "set_warps", "set_minv_nt", "set_minv_blk4", "set_minv_blk4_minw", "set_minv_nt_sl", "set_panel_defer", "set_panel_raw", "set_wsp_pad", "set_wsp_cm_coop", "set_panel_cm", "set_panel_cm2", "set_cmf_warps", "set_cmf_mrfine", "set_ov_fold", "set_inner_wmma", "set_inner_wmma_wmax", "set_panel_apply_fused", "set_paf_warps", "set_n2048_h", "set_paf_help", "set_yfold", "set_yfold_maxrest", "set_ov_coop"]
+    functions = ["blocked_qr", "illcond_mask", "n352_illcond_mask_cuda", "blocked_qr_2level", "blocked_qr_2level_bf16", "qr_n512_mixed_driver", "blocked_qr_tiny", "qr_mega_small", "set_mega_warps", "set_bf16_nt", "set_bf16_wf16", "set_fp16_pure", "set_prec", "set_warps", "set_minv_nt", "set_minv_blk4", "set_minv_blk4_minw", "set_minv_nt_sl", "set_panel_defer", "set_wsp_pad", "set_wsp_cm_coop", "set_panel_cm", "set_panel_cm2", "set_cmf_warps", "set_cmf_mrfine", "set_ov_fold", "set_inner_wmma", "set_inner_wmma_wmax", "set_panel_apply_fused", "set_paf_warps", "set_n2048_h", "set_paf_help", "set_yfold", "set_yfold_maxrest", "set_ov_coop"]
     return _compile_qr("qr_blocked_v7k_wf16", _CPP_SRC, _CUDA_SRC, functions, ["-lcublas"])
 
 _CUDA_LU_SRC = r"""
@@ -6135,7 +6116,6 @@ _ext.set_minv_blk4(0)        # default OFF; the FP16 the n=1024 case/5 dispatch 
 _ext.set_minv_blk4_minw(0)
 # (the n=512 big-batch blk4 build_Minv is now set inline at its driver -- blk4(1)/minw=48.)
 _ext.set_minv_nt_sl(512)   # threads/CTA for the single-level blk2 build_Minv (shapes 1,2)
-_ext.set_panel_raw(0)   # default OFF; the the n=512 big-batch case two-level dispatch flips it on
 _ext.set_panel_cm2(0)   # default OFF; shapes 1,2 flip it on, restored after
 _ext.set_ov_fold(0)     # default OFF; the per-shape dispatch flips it on (outer-V fold)
 
@@ -6244,7 +6224,7 @@ _LARGE_HI = {   # n in [2048,4096); B=8 is SM-starved -> the coop panel
 # except set_warps->32, the large-n preamble value all callers restore to, not import 16).
 _RDEF = {
     "set_prec": 3, "set_warps": 32, "set_minv_nt": _MINV_NT, "set_bf16_nt": _BF16_NT,
-    "set_fp16_pure": _FP16_PURE, "set_panel_defer": 0, "set_panel_raw": 0, "set_wsp_pad": 2,
+    "set_fp16_pure": _FP16_PURE, "set_panel_defer": 0, "set_wsp_pad": 2,
     "set_minv_blk4": 0, "set_minv_blk4_minw": 0, "set_panel_cm": 0, "set_panel_cm2": 0,
     "set_cmf_warps": 0, "set_cmf_mrfine": 0,
     "set_ov_fold": 0, "set_inner_wmma": 0, "set_inner_wmma_wmax": 0, "set_panel_apply_fused": 0, "set_paf_warps": 8,
@@ -6284,8 +6264,7 @@ def _qr_large_fp16(Ac, p):
     sets = [("set_prec", 1)]
     if "minv_nt" in p: sets.append(("set_minv_nt", p["minv_nt"]))
     sets += [("set_warps", p["warps"]), ("set_panel_defer", p["defer"]),
-             ("set_panel_raw", p.get("panel_raw", 0)), ("set_fp16_pure", 0),
-             ("set_bf16_nt", p["bf16_nt"])]
+             ("set_fp16_pure", 0), ("set_bf16_nt", p["bf16_nt"])]
     # defer==5 panels read g_wsp_pad; the HI regime also offers the within-CTA pivot-coop
     # (gated by the cm_coop flag -- wsp_help>1 in the regime dict just records that the
     # coop kernel splits the pivot across the idle warps; its count is implicit, MHELP=2).
@@ -6324,9 +6303,9 @@ def _qr_large_fp16(Ac, p):
     # (the n=1024 standalone OV panel was warp-0-serial). Only set when requested.
     if p.get("ov_coop", 0):
         sets.append(("set_ov_coop", p["ov_coop"]))
-    # restores derived from sets (warps->32); prec/panel_raw leak (prec re-set next shape).
+    # restores derived from sets (warps->32); prec leaks (re-set by the next shape).
     return _run_blocked("blocked_qr_2level_bf16", (Ac, p["ob"], p["ib"]), sets,
-                        skip=("set_prec", "set_panel_raw"))
+                        skip=("set_prec",))
 
 
 def _n352_illcond_mask(A: torch.Tensor) -> torch.Tensor:
@@ -6354,7 +6333,7 @@ def _qr_small_bf16(Ac: torch.Tensor, n: int):
     # the trailing W=VtC / C-=VY GEMMs run BF16 (half bandwidth -- the lever here).
     # Collapsed to the SOLE live config (n=352 _SMALL_HI: ob=64, ib=0->single-level,
     # defer=5 wsp-bf16, warps=32, wf16=1, minv_blk4=3 rblk4, cmf=1). ib==ob so
-    # _two_level is False (no ov_fold); panel_raw=0 (defer!=0); set_panel_cm2 selects
+    # _two_level is False (no ov_fold); set_panel_cm2 selects
     # the cmf column-major fused panel. set_wsp_pad(2) is a no-op here (g_wsp_pad is
     # always 2 on entry -- only _qr_large_fp16 perturbs it + restores), so it is not set.
     # bf16_nt=512: at B=40 the single 64x64 outer build_Minv_rblk nlev=3 merge phases are
@@ -6365,7 +6344,7 @@ def _qr_small_bf16(Ac: torch.Tensor, n: int):
     # MROWS in {2,4,6,8,10,11} covering ceil(m/32) for each shrinking outer block (instead of
     # the coarse 6/11 split), shortening the per-column serial fold trip count.
     sets = [("set_prec", 1), ("set_fp16_pure", 0), ("set_warps", 32),
-            ("set_panel_defer", 5), ("set_panel_raw", 0), ("set_panel_cm2", 1),
+            ("set_panel_defer", 5), ("set_panel_cm2", 1),
             ("set_bf16_wf16", 1), ("set_minv_blk4", 3), ("set_minv_blk4_minw", 0),
             ("set_bf16_nt", 512), ("set_cmf_warps", 16), ("set_cmf_mrfine", 1)]
     # _run_blocked restores every set knob to its _RDEF default (warps->32, fp16_pure->
