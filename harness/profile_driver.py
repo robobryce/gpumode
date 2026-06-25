@@ -67,13 +67,14 @@ def main() -> int:
         custom_kernel(clone(data))
     torch.cuda.synchronize()
 
-    # Only the work between start() and stop() is recorded under
-    # `nsys -c cudaProfilerApi` / `ncu --profile-from-start off`.
-    profiler.start()
-    for _ in range(iters):
-        custom_kernel(clone(data))
-    torch.cuda.synchronize()
-    profiler.stop()
+    # torch.cuda.profiler.profile() wraps cudaProfilerStart/Stop (the PyTorch
+    # equivalent of cupyx.profile.profile), so only the work inside this block
+    # is recorded under `nsys --capture-range=cudaProfilerApi` /
+    # `ncu --profile-from-start off`.
+    with profiler.profile():
+        for _ in range(iters):
+            custom_kernel(clone(data))
+        torch.cuda.synchronize()
     return 0
 
 

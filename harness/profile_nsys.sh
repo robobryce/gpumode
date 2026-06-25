@@ -18,8 +18,8 @@
 # interleaves the cuSOLVER/cuBLAS reference checker with every timed call, so a
 # whole-benchmark trace mixes reference kernels with yours. profile_driver.py
 # imports the live submission + reference and wraps ONLY the timed custom_kernel
-# calls in a cudaProfiler range, so `-c cudaProfilerApi` records just your
-# kernels. Correctness stays eval.py's job (validate.sh / benchmark.sh).
+# calls in a cudaProfiler range, so `--capture-range=cudaProfilerApi` records
+# just your kernels. Correctness stays eval.py's job (validate.sh / benchmark.sh).
 set -uo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/env.sh" "$@"
 
@@ -38,7 +38,7 @@ NSYS="$(command -v nsys || echo "$CUDA_HOME/bin/nsys")"
 
 cd "$PROBLEM_DIR" || exit 1
 "$NSYS" profile --force-overwrite true -o "${REP%.nsys-rep}" \
-    -c cudaProfilerApi --trace=cuda,nvtx \
+    --capture-range=cudaProfilerApi --capture-range-end=stop --trace=cuda,nvtx \
     "$PYTHON" "$HARNESS_DIR/profile_driver.py" "$SPEC" 3 5 >&2
 
 echo "===== nsys cuda_gpu_kern_sum ($SPEC) ====="
