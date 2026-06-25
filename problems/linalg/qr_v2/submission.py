@@ -5292,19 +5292,6 @@ static void gemm3_fp16_strided(cublasHandle_t h, int M, int N, int K, float alph
 }
 
 static cublasHandle_t g_trsm_handle = nullptr;
-// Recon-LU Schur-GEMM precision: 1 = FP16 (FP32-accum) Schur update C -= L21 @ U12 in
-// recon_lu_cpp; 0 = TF32. The (H,tau)->Q via householder_product is orthogonal regardless
-// of V precision (only the loose factor residual is touched), so a low-precision Schur is safe.
-static int g_recon_lowp = 0;
-// Recon panel-solve accumulation precision: 1 = FP32 (faster), 0 = FP64 (orth-margin).
-static int g_recon_solve_fp32 = 0;
-// Recon low-precision panel BOUNDARY: the panel index (in COLUMNS, a multiple of ob) from
-// which the Schur GEMM goes FP16 and the panel-solve goes FP32. -1 = legacy 3*ob default;
-// >=0 = explicit column boundary (0 = low-prec from the first panel).
-static int g_recon_lowp_from = -1;
-// Recon diag-LU knob (retained for the Python interface; the diag-LU is now always the
-// warp-level diag_lu_warp_kernel, the only variant the n=4096 scored path uses).
-static int g_recon_warplu = 0;
 
 // Combined gather + identity-fill for the blocked right-TRSM. In ONE grid pass, per diagonal
 // block (bi of matrix mb at grid.z = bi*batch + mb), writes (a) the gathered R[j:j+w, j:j+w]
@@ -5679,15 +5666,14 @@ torch::Tensor tri_solve_right_inv(torch::Tensor A, torch::Tensor Rin, int nb) {
 //   M row-major, ld=n; LU block at (jo,jo) packs unit-lower L (implicit 1 diag) + upper U.
 //   L21 (mrows x w) at (joe,jo): row r solves y @ U = M21[r]; U12w (w x rest) at (jo,joe):
 //   col c solves L @ x = M12[:,c]. Work items 0..mrows-1 are L21 rows; the rest are U12w cols.
-// L21h/U12h: optional contiguous FP16 mirrors written FROM REGISTERS in the same pass (no
-// extra cast/launch) for the FP16 recon Schur GEMM; nullptr -> skip (TF32-Schur path). L21h
-// is (batch x n x W) row-major (stride n*W, row W); U12h is (batch x W x n) (stride W*n, row n).
+// L21h/U12h: contiguous FP16 mirrors of the solved panels written FROM REGISTERS in the same
+// pass (no extra cast/launch) for the FP16 recon Schur GEMM. L21h is (batch x n x W) row-major
+// (stride n*W, row W); U12h is (batch x W x n) (stride W*n, row n).
 template<int W>
 __global__ void panel_solve_fused_kernel(float* __restrict__ Mg, int n,
                                          int jo, int joe, int mrows, int rest,
-                                         __half* __restrict__ L21h = nullptr,
-                                         __half* __restrict__ U12h = nullptr,
-                                         int fp32_solve = 0) {
+                                         __half* __restrict__ L21h,
+                                         __half* __restrict__ U12h) {
     int mat = blockIdx.z;
     float* M = Mg + (long)mat * n * n;
     long matStrideL = (long)n * W;   // L21h per-matrix stride (buffer (batch,n,W))
@@ -5707,41 +5693,26 @@ __global__ void panel_solve_fused_kernel(float* __restrict__ Mg, int n,
     int total = mrows + rest;
     int item = blockIdx.x * blockDim.x + threadIdx.x;
     if (item >= total) return;
-    // FP64 accumulation of the substitution dot products (each a <=63-term inner product):
-    // strictly more accurate than FP32 (the solution rounds to FP32 only at write-back),
-    // restoring orth margin near the n=4096 gate. Stored back in FP32, so the later Schur
-    // GEMM and build_H are unchanged.
+    // FP32 accumulation of the substitution dot products (Q via householder_product is
+    // orth-exact regardless of V precision, so only the loose factor residual is touched).
+    // Each solved panel also writes its contiguous FP16 mirror for the FP16 Schur GEMM.
     if (item < mrows) {
         // L21 row solve: y @ U = b, b = M21[item][0..w-1] at row (joe+item).
         // back-sub over columns c=0..w-1: y[c] = (b[c] - sum_{k<c} y[k] U[k][c]) / U[c][c]
         float* b = M + (long)(joe + item) * n + jo;      // mrows x w region, ld=n
         float y[W];
-        // fp32_solve (host knob g_recon_solve_fp32): FP32 accumulation (faster) vs the FP64
-        // default; Q via householder_product is orth-exact regardless, only the factor residual.
-        if (fp32_solve) {
-            #pragma unroll
-            for (int c = 0; c < W; ++c) {
-                float acc = b[c];
-                #pragma unroll
-                for (int k = 0; k < W; ++k) if (k < c) acc -= y[k] * Usm[k * W + c];
-                y[c] = acc / Usm[c * W + c];
-            }
-        } else {
         #pragma unroll
         for (int c = 0; c < W; ++c) {
-            double acc = (double)b[c];
+            float acc = b[c];
             #pragma unroll
-            for (int k = 0; k < W; ++k) if (k < c) acc -= (double)y[k] * (double)Usm[k * W + c];
-            y[c] = (float)(acc / (double)Usm[c * W + c]);
-        }
+            for (int k = 0; k < W; ++k) if (k < c) acc -= y[k] * Usm[k * W + c];
+            y[c] = acc / Usm[c * W + c];
         }
         #pragma unroll
         for (int c = 0; c < W; ++c) b[c] = y[c];
-        if (L21h != nullptr) {
-            __half* lh = L21h + (long)mat * matStrideL + (long)item * W;
-            #pragma unroll
-            for (int c = 0; c < W; ++c) lh[c] = __float2half(y[c]);
-        }
+        __half* lh = L21h + (long)mat * matStrideL + (long)item * W;
+        #pragma unroll
+        for (int c = 0; c < W; ++c) lh[c] = __float2half(y[c]);
     } else {
         // U12w column solve: L x = b at column (joe+col). fwd-sub (UNIT L, no division) over
         // rows r: x[r] = b[r] - sum_{k<r} L[r][k] x[k]. FP32 suffices (the orth-margin-sensitive
@@ -5758,11 +5729,9 @@ __global__ void panel_solve_fused_kernel(float* __restrict__ Mg, int n,
         }
         #pragma unroll
         for (int r = 0; r < W; ++r) b[(long)r * n] = x[r];
-        if (U12h != nullptr) {
-            __half* uh = U12h + (long)mat * matStrideU + (long)col;
-            #pragma unroll
-            for (int r = 0; r < W; ++r) uh[(long)r * n] = __float2half(x[r]);
-        }
+        __half* uh = U12h + (long)mat * matStrideU + (long)col;
+        #pragma unroll
+        for (int r = 0; r < W; ++r) uh[(long)r * n] = __float2half(x[r]);
     }
 }
 
@@ -5784,24 +5753,13 @@ torch::Tensor recon_lu_cpp(torch::Tensor M, torch::Tensor R, torch::Tensor D, in
     float* Mp = M.data_ptr<float>();
     long nn = (long)n * n;
     const float negone = -1.f, one = 1.f;
-    bool rlowp_on = (g_recon_lowp != 0);
-    // HYBRID PRECISION: the first few right-looking panels' Schur updates propagate FP16
-    // error through ALL subsequent panels, so keep them TF32 (exact-class) and only drop to
-    // FP16 once jo >= RECON_LOWP_FROM. g_recon_lowp_from sets the boundary: -1 = legacy 3*ob
-    // (first 3 panels high-prec); >=0 = explicit column (tau-override owns orthogonality, so
-    // 0 = low-prec from panel 0 is admissible if the factor residual holds).
-    const int RECON_LOWP_FROM = (g_recon_lowp_from >= 0) ? g_recon_lowp_from : (3 * ob);
-    // FP16 Schur scratch (rlowp): full M cast to half once per panel into the trailing
-    // region is wasteful; instead cast the two operand panels (L21 mrows x w, U12 w x rest)
-    // each panel. Allocate the max-size buffers once.
-    bool rlowp = rlowp_on;
-    torch::Tensor L21h, U12h;
-    __half *L21hp = nullptr, *U12hp = nullptr;
-    if (rlowp) {
-        L21h = torch::empty({(long)batch, n, ob}, M.options().dtype(torch::kHalf));
-        U12h = torch::empty({(long)batch, ob, n}, M.options().dtype(torch::kHalf));
-        L21hp = (__half*)L21h.data_ptr(); U12hp = (__half*)U12h.data_ptr();
-    }
+    // The recon runs LOW-PRECISION from the first panel (FP16 Schur + FP32 panel-solve): the
+    // tau-override owns orthogonality, so only the loose factor residual is touched.
+    // FP16 Schur scratch: cast the two operand panels (L21 mrows x w, U12 w x rest) each panel
+    // (max-size buffers allocated once) instead of the whole trailing block.
+    torch::Tensor L21h = torch::empty({(long)batch, n, ob}, M.options().dtype(torch::kHalf));
+    torch::Tensor U12h = torch::empty({(long)batch, ob, n}, M.options().dtype(torch::kHalf));
+    __half *L21hp = (__half*)L21h.data_ptr(), *U12hp = (__half*)U12h.data_ptr();
     for (int jo = 0; jo < n; jo += ob) {
         int joe = (jo + ob < n) ? (jo + ob) : n;
         int w = joe - jo;                                // panel width (<=ob<=64)
@@ -5814,61 +5772,24 @@ torch::Tensor recon_lu_cpp(torch::Tensor M, torch::Tensor R, torch::Tensor D, in
             float* L21  = Mp + (long)joe * n + jo;        // (mrows x w), ld=n
             float* U12w = Mp + (long)jo * n + joe;        // (w x rest)
             float* tr   = Mp + (long)joe * n + joe;       // (rest x rest)
-            // --- CUSTOM FUSED SOLVE: both triangular solves (L21 = M21 U^{-1} and
-            // U12w = L^{-1} M12) for ALL B matrices in ONE launch (replaces TWO
-            // per-matrix/per-panel cublasStrsm launches each ~pure-latency at B=2).
-            // EXACT FP32: each row/column is an independent w-step substitution against
-            // the in-place LU diagonal block; tiles across many CTAs so it fills the
-            // device instead of running on the 2-CTA cuBLAS-batched path.
-            bool panel_fp16 = rlowp_on && (jo >= RECON_LOWP_FROM);
-            if (w == 64) {
-                int total = mrows + rest;                 // L21 rows ++ U12w cols
-                const int SOLVE_NT = 128;
-                dim3 grid(cdiv(total, SOLVE_NT), 1, batch);
-                // When this panel's Schur is FP16, write the contiguous FP16 mirrors
-                // from the solve registers (no separate cast pass).
-                // Hybrid: keep FP64 panel-solve on the first few right-looking panels
-                // (their V error propagates + the orth gate is borderline on rare seeds),
-                // FP32 after. RECON_LOWP_FROM reused as the FP64->FP32 boundary.
-                int solve_fp32 = (g_recon_solve_fp32 && jo >= RECON_LOWP_FROM) ? 1 : 0;
-                panel_solve_fused_kernel<64><<<grid, SOLVE_NT>>>(
-                    Mp, n, jo, joe, mrows, rest,
-                    panel_fp16 ? L21hp : nullptr, panel_fp16 ? U12hp : nullptr,
-                    solve_fp32);
-            } else {
-                // w<64 tail (not hit by the n=4096 recon) -> cuBLAS per-matrix trsm.
-                cublasSetMathMode(h, CUBLAS_DEFAULT_MATH);
-                for (int mb = 0; mb < batch; ++mb)
-                    BKL(cublasStrsm(h, CUBLAS_SIDE_LEFT, CUBLAS_FILL_MODE_LOWER,
-                        CUBLAS_OP_N, CUBLAS_DIAG_NON_UNIT, w, mrows, &one,
-                        Mp + (long)jo * n + jo + (long)mb * nn, n,
-                        L21 + (long)mb * nn, n));
-                for (int mb = 0; mb < batch; ++mb)
-                    BKL(cublasStrsm(h, CUBLAS_SIDE_RIGHT, CUBLAS_FILL_MODE_UPPER,
-                        CUBLAS_OP_N, CUBLAS_DIAG_UNIT, rest, w, &one,
-                        Mp + (long)jo * n + jo + (long)mb * nn, n,
-                        U12w + (long)mb * nn, n));
-            }
-            // wide Schur: M[joe:n, joe:n] -= M[joe:n, jo:joe] @ M[jo:joe, joe:n]
-            // row-major C(rest x rest) -= L21(rest x w) @ U12w(w x rest) ->
-            // cublas gemm(N,N, rest, rest, w, U12w, L21, C) alpha=-1 beta=1 (TF32).
-            // Hybrid: TF32 for the early panels (jo < RECON_LOWP_FROM), FP16 after.
-            // panel_fp16 was computed above (gates both the FP16-mirror write + this GEMM).
-            if (!panel_fp16) {
-                cublasSetMathMode(h, CUBLAS_TF32_TENSOR_OP_MATH);
-                BKL(cublasSgemmStridedBatched(h, CUBLAS_OP_N, CUBLAS_OP_N,
-                    rest, rest, w, &negone,
-                    U12w, n, nn, L21, n, nn, &one, tr, n, nn, batch));
-            } else {
-                // FP16 Schur: the contiguous FP16 mirrors were
-                // written FROM REGISTERS by panel_solve_fused (no cast pass). U12h ld=n
-                // (buffer (batch,W,n)), L21h ld=W (buffer (batch,n,W)). ONE FP16 GEMM.
-                BKL(cublasGemmStridedBatchedEx(h, CUBLAS_OP_N, CUBLAS_OP_N,
-                    rest, rest, w, &negone,
-                    U12hp, CUDA_R_16F, n, (long)ob * n,
-                    L21hp, CUDA_R_16F, ob, (long)n * ob, &one,
-                    tr, CUDA_R_32F, n, nn, batch, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
-            }
+            // --- CUSTOM FUSED SOLVE: both triangular solves (L21 = M21 U^{-1} and U12w =
+            // L^{-1} M12) for ALL B matrices in ONE launch (replaces TWO per-matrix/per-panel
+            // cublasStrsm launches each ~pure-latency at B=2). FP32 panel-solve; writes the
+            // contiguous FP16 mirrors of the solved panels from registers for the FP16 Schur.
+            // (n=4096 -> every trailing panel is w==64; the w<64 tail is off-grid only.)
+            int total = mrows + rest;                 // L21 rows ++ U12w cols
+            const int SOLVE_NT = 128;
+            dim3 grid(cdiv(total, SOLVE_NT), 1, batch);
+            panel_solve_fused_kernel<64><<<grid, SOLVE_NT>>>(
+                Mp, n, jo, joe, mrows, rest, L21hp, U12hp);
+            // wide Schur: M[joe:n, joe:n] -= L21(rest x w) @ U12w(w x rest), as ONE FP16 GEMM
+            // from the contiguous FP16 mirrors written by panel_solve_fused (no cast pass).
+            // U12h ld=n (buffer (batch,W,n)), L21h ld=W (buffer (batch,n,W)). alpha=-1 beta=1.
+            BKL(cublasGemmStridedBatchedEx(h, CUBLAS_OP_N, CUBLAS_OP_N,
+                rest, rest, w, &negone,
+                U12hp, CUDA_R_16F, n, (long)ob * n,
+                L21hp, CUDA_R_16F, ob, (long)n * ob, &one,
+                tr, CUDA_R_32F, n, nn, batch, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
         }
     }
     return M;   // caller does in-place build_H + tau
@@ -6174,13 +6095,6 @@ void oz_gram_gemm_grouped(torch::Tensor slN, torch::Tensor P,
         Carr, CUDA_R_32I, n, G, CUBLAS_COMPUTE_32I, CUBLAS_GEMM_DEFAULT));
 }
 
-// Python knobs: recon Schur/solve precision + low-prec panel boundary + warp-LU toggle.
-// The recon's (H,tau)->Q is orth-exact regardless of V precision, so only the loose factor
-// residual is at risk.
-void set_recon_lowp(int v) { g_recon_lowp = v; }
-void set_recon_solve_fp32(int v) { g_recon_solve_fp32 = v; }
-void set_recon_lowp_from(int v) { g_recon_lowp_from = v; }
-void set_recon_warplu(int v) { g_recon_warplu = v; }
 """
 
 _CPP_LU_SRC = r"""
@@ -6191,18 +6105,13 @@ torch::Tensor recon_lu_cpp(torch::Tensor M, torch::Tensor R, torch::Tensor D, in
 std::vector<torch::Tensor> oz_slice(torch::Tensor A, int64_t NS);
 void oz_recombine_2pass(torch::Tensor P, torch::Tensor wg, torch::Tensor cj, torch::Tensor S, torch::Tensor G, int64_t ndiag, int64_t lower);
 void oz_gram_gemm_grouped(torch::Tensor slN, torch::Tensor P, std::vector<int64_t> pp, std::vector<int64_t> qq);
-void set_recon_lowp(int v);
-void set_recon_solve_fp32(int v);
-void set_recon_lowp_from(int v);
-void set_recon_warplu(int v);
 """
 def _compile_lu():
     return _compile_qr(
         "qr_orhr_lu_w6m", _CPP_LU_SRC, _CUDA_LU_SRC,
         ["chol_b2_lower_R_solve", "build_H_inplace", "tri_solve_right_inv",
          "recon_lu_cpp", "oz_slice", "oz_recombine_2pass",
-         "oz_gram_gemm_grouped", "set_recon_lowp", "set_recon_solve_fp32",
-         "set_recon_lowp_from", "set_recon_warplu"],
+         "oz_gram_gemm_grouped"],
         ["-lcublas", "-lcublasLt", "-lcusolver"])
 
 
@@ -6489,23 +6398,6 @@ _COLNORM_TOL = 5e-2  # cholqr good-gate vs orth_rtol
 # AFTER the orhr_col recon (as the checker does), NOT the raw Q^TQ proxy which skips the
 # recon's TF32 error amplification.
 _TRSM_NB_CPP = 512   # nb sweep WINNER (s6 optimum): 384(11728)/512(11190)/640(11239)/768(11628)/1024(11662). Orth no longer binds nb (tau-override); factor residual holds at 512.
-# === TRSM precision knobs for the SCORED s6 path (B=2, n=4096) ===
-# Recon Schur-GEMM precision for the s6 n4096 B=2 path: 1 = FP16 (FP32-accum) Schur update
-# (orth is recon-precision-independent), 0 = TF32.
-_RECON_LOWP = 1
-# FP32 recon panel-solve accumulation for s6: 1 = FP32 substitution (faster than the FP64
-# default) in panel_solve_fused on the FP16-Schur panels (jo>=RECON_LOWP_FROM). Only the
-# loose factor residual is touched.
-_RECON_SOLVE_FP32 = 1
-# RECON LOW-PREC PANEL BOUNDARY: the column index from which the recon Schur GEMM goes FP16
-# and the panel-solve goes FP32 (panels before it stay TF32/FP64). The tau-override makes
-# householder_product orthonormal regardless of recon precision, so only the loose factor
-# residual limits how early we drop. 0 = low-prec from the first panel; -1 = legacy 3*ob.
-_RECON_LOWP_FROM = 0
-# RECON WARP-LEVEL diag-LU: 1 = factor the 64x64 diag block in a SINGLE warp
-# (diag_lu_warp_kernel: __shfl pivot broadcast, no __syncthreads); 0 = the register-blocked
-# diag_lu_reg (256 threads). Gated to s6.
-_RECON_WARPLU = 1
 # SECRET-SAFETY TAU-OVERRIDE (n4096 B=2 scored-shape fix). The 3xTF32 TRSM solve + orhr_col
 # recon lose ORTHOGONALITY at high cond(A) (orhr_col tau drifts). FIX: recompute each
 # reflector's tau EXACTLY from the reconstructed Householder vectors V (strict-lower of H,
@@ -6632,59 +6524,37 @@ def _reconstruct_householder(Q, R, lu):
     # caller's good-gate already consumed it, so factor in place (no 256MB clone).
     M = Q.contiguous()
     D = Q.new_empty(b, n)
-    # LOW-PREC RECON SCHUR (worker-3 brief-0): the recon's (H,tau)->Q is orth-exact
-    # regardless of V precision (householder_product re-orthogonalizes), so the Schur
-    # GEMM only touches the loose factor residual. FP16 Schur is the brief's low-prec-TC
-    # lever, gated to the s6 dense bench shape (b==2,n==4096); the B=1/B=3 cond=0 stress
-    # tests keep TF32 (their factor residual is more sensitive). Reset after the call.
-    lu.set_recon_lowp(_RECON_LOWP if (b == 2 and n == 4096) else 0)
-    # FP32 panel-solve accumulation (worker-3 brief-2 lever B): faster than the FP64
-    # default; gated to s6 (the B=1/B=3 cond=0 stress keep FP64). Tested vs factor gate.
-    lu.set_recon_solve_fp32(_RECON_SOLVE_FP32 if (b == 2 and n == 4096) else 0)
-    # LOW-PREC PANEL BOUNDARY (worker-3 brief-4): drop the low-precision Schur/solve from
-    # an earlier panel now that the tau-override owns orthogonality. Gated to s6.
-    lu.set_recon_lowp_from(_RECON_LOWP_FROM if (b == 2 and n == 4096) else -1)
-    # WARP-LEVEL diag-LU (worker-3 brief-5): factor the 64x64 diag block in one warp with
-    # __shfl pivot broadcast (no __syncthreads) -- attacks the recon's 1894us diag-LU. Gated s6.
-    lu.set_recon_warplu(_RECON_WARPLU if (b == 2 and n == 4096) else 0)
-    # ob=64 single-level right-looking blocked LU in C++ (recon_lu_cpp) + in-place
-    # build_H/tau. (ob=64 beat the wider 2-level ob=256 scheme, 7299 vs 7926us.)
+    # ob=64 single-level right-looking blocked LU in C++ (recon_lu_cpp) + in-place build_H/tau.
+    # The recon runs low-precision (FP16 Schur + FP32 panel-solve) -- the (H,tau)->Q is orth-
+    # exact regardless of V precision, so only the loose factor residual is touched.
     Mf = lu.recon_lu_cpp(M, R, D, 64)
-    lu.set_recon_lowp(0)
-    lu.set_recon_solve_fp32(0)
-    lu.set_recon_lowp_from(-1)
-    lu.set_recon_warplu(0)
     return lu.build_H_inplace(Mf, R, D)
 
 
 def _cholqr_path(A, dense_noinfo=False, gate=True):
-    # Single 1-pass-CholeskyQR -> orhr_col entry for both n>=4096 dispatch arms; the
-    # B==2 (bench shape 6) arm is just this with gate=False + dense_noinfo=True (its
-    # dense well-conditioned 1pass takes the fused chol_b2_lower_R_solve and needs no
-    # fallback). gate=True (B!=2) keeps the geqrf fallback for the B=1/B=3 n4096 tests,
-    # whose cond=0 stress CholeskyQR cannot orthogonalize. _lu is the compiled-once
-    # module singleton, threaded through both callees (so they don't each re-reference it).
+    # 1-pass-CholeskyQR -> orhr_col for the n>=4096 dispatch arm (only B==2 reaches here; the
+    # dispatch routes B!=2 to geqrf). _lu is the compiled-once module singleton, threaded
+    # through both callees. (dense_noinfo/gate are kept in the signature for the dispatch call
+    # but are always True here, so their branches are unconditional.)
     lu = _lu
     Q, R, info = _choleskyqr_1pass(A, lu=lu)
-    if gate:
-        # "good" = Gram was PD (info==0) AND Q columns near-unit-norm (a cheap orth proxy
-        # for the rank-deficient cond=0 stress); bad matrices fall back to geqrf. Computed
-        # BEFORE _reconstruct_householder, which factors Q in place (donated) and clobbers it.
-        colnorm_dev = ((Q * Q).sum(dim=-2) - 1.0).abs().amax(dim=-1)
-        good = (info == 0) & (colnorm_dev <= _COLNORM_TOL) \
-            & torch.isfinite(Q).all(dim=-1).all(dim=-1)
+    # "good" = Gram was PD (info==0) AND Q columns near-unit-norm (a cheap orth proxy for the
+    # rank-deficient cond=0 stress); bad matrices fall back to geqrf. Computed BEFORE
+    # _reconstruct_householder, which factors Q in place (donated) and clobbers it.
+    colnorm_dev = ((Q * Q).sum(dim=-2) - 1.0).abs().amax(dim=-1)
+    good = (info == 0) & (colnorm_dev <= _COLNORM_TOL) \
+        & torch.isfinite(Q).all(dim=-1).all(dim=-1)
     H, tau = _reconstruct_householder(Q, R, lu=lu)
-    if _TAU_OVERRIDE and dense_noinfo and A.shape[1] == 4096:
-        # SECRET-SAFETY TAU-OVERRIDE (worker-3 brief-2, B=2): recompute each reflector's tau
-        # EXACTLY from the reconstructed Householder vectors V (strict-lower of H, implicit
-        # v[j]=1): tau_j = 2 / (1 + sum_{i>j} H[i,j]^2). The orhr_col recon's tau drifts at high
-        # cond (the orth-too-large "mode 1" -- ~14/18 of the scored B=2 secret fails); the
-        # exact-from-V tau makes householder_product orthonormal regardless of recon precision
-        # (orth ~0.16, far under the gate). Cheap (one n^2 reduction); applied for the B=2 path.
+    if _TAU_OVERRIDE and A.shape[1] == 4096:
+        # SECRET-SAFETY TAU-OVERRIDE (B=2): recompute each reflector's tau EXACTLY from the
+        # reconstructed Householder vectors V (strict-lower of H, implicit v[j]=1):
+        # tau_j = 2 / (1 + sum_{i>j} H[i,j]^2). The orhr_col recon's tau drifts at high cond;
+        # the exact-from-V tau makes householder_product orthonormal regardless of recon
+        # precision. Cheap (one n^2 reduction).
         V2 = torch.tril(H, diagonal=-1)
         vsq = (V2 * V2).sum(dim=-2)                    # (b,n) sum_{i>j} H[i,j]^2 per column j
         tau = (2.0 / (1.0 + vsq)).to(tau.dtype)
-    if gate and not bool(good.all()):
+    if not bool(good.all()):
         bad_idx = torch.nonzero(~good, as_tuple=False).flatten()
         h_fb, t_fb = torch.geqrf(A[bad_idx].contiguous())
         H = H.index_copy(0, bad_idx, h_fb)
