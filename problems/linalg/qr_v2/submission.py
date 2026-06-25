@@ -3044,114 +3044,6 @@ panel_factor_smem_wsp_ov_coop_bf16_kernel(bf16* __restrict__ H, float* __restric
     }
 }
 
-// float4-vectorized column-major smem helpers for the cmv panel below. Each
-// lane processes a head (rows [lo, a4) scalar, strided by 32), a float4 body (rows
-// [a4, m4) in 4-row chunks, lanes strided by 128), and a tail (rows [m4, m) scalar).
-// The column bases passed in MUST be 16-byte aligned (LDM a multiple of 4) so the body
-// float4 loads at colX + r (r % 4 == 0) are aligned. Returns the per-lane partial; the
-// caller shfl-reduces across the warp.
-__device__ __forceinline__ float cmv_dot(const float* __restrict__ colj,
-                                         const float* __restrict__ colc,
-                                         int lo, int m, int lane) {
-    int a4 = (lo + 3) & ~3;
-    int m4 = m & ~3;
-    float p = 0.f;
-    for (int r = lo + lane; r < a4 && r < m; r += 32) p += colj[r] * colc[r];
-    for (int r = a4 + lane * 4; r < m4; r += 128) {
-        float4 vj = *reinterpret_cast<const float4*>(colj + r);
-        float4 vc = *reinterpret_cast<const float4*>(colc + r);
-        p += vj.x * vc.x + vj.y * vc.y + vj.z * vc.z + vj.w * vc.w;
-    }
-    for (int r = m4 + lane; r < m; r += 32) p += colj[r] * colc[r];
-    return p;
-}
-// Fused update colc[r] -= tw_inv * colj[r] for r in [lo,m); returns the per-lane sum of
-// squares of the UPDATED entries (for the next-pivot norm) when want_norm. The caller
-// reads colc[lo] from smem afterwards for next_alpha (one scalar read, no race: the
-// owning lane wrote it). Vectorized float4 body like cmv_dot.
-__device__ __forceinline__ float cmv_update(const float* __restrict__ colj,
-                                            float* __restrict__ colc,
-                                            int lo, int m, int lane,
-                                            float tw_inv, bool want_norm) {
-    int a4 = (lo + 3) & ~3;
-    int m4 = m & ~3;
-    float ns = 0.f;
-    for (int r = lo + lane; r < a4 && r < m; r += 32) {
-        float nv = colc[r] - tw_inv * colj[r];
-        colc[r] = nv;
-        if (want_norm) ns += nv * nv;
-    }
-    for (int r = a4 + lane * 4; r < m4; r += 128) {
-        float4 vj = *reinterpret_cast<const float4*>(colj + r);
-        float4 vc = *reinterpret_cast<float4*>(colc + r);
-        vc.x -= tw_inv * vj.x; vc.y -= tw_inv * vj.y;
-        vc.z -= tw_inv * vj.z; vc.w -= tw_inv * vj.w;
-        *reinterpret_cast<float4*>(colc + r) = vc;
-        if (want_norm) ns += vc.x*vc.x + vc.y*vc.y + vc.z*vc.z + vc.w*vc.w;
-    }
-    for (int r = m4 + lane; r < m; r += 32) {
-        float nv = colc[r] - tw_inv * colj[r];
-        colc[r] = nv;
-        if (want_norm) ns += nv * nv;
-    }
-    return ns;
-}
-
-// HELP-aware float4 column-major dot/update for the pivot-COOP cm panel.
-// HELP warps (w = 0..HELP-1) split the m-rows of one column disjointly: the float4 body
-// rows [a4,m4) are partitioned so warp w covers r = a4 + w*128 + lane*4, stepping by
-// HELP*128; the scalar head [lo,a4) and tail [m4,m) by r = lo|m4 + w*32 + lane stepping
-// HELP*32. Every row is touched by exactly one (warp,lane), so the partials reduced
-// across the HELP warps reproduce the single-warp cmv_dot/cmv_update sum (reassociated
-// by stripe -- a VALID QR, identical betas/taus/V). Returns this warp's partial; the
-// caller shfl-reduces within the warp, writes to pdot[w]/pnrm[w], then named-barrier sums.
-__device__ __forceinline__ float cmv_dot_help(const float* __restrict__ colj,
-                                              const float* __restrict__ colc,
-                                              int lo, int m, int lane, int w, int HELP) {
-    int a4 = (lo + 3) & ~3;
-    int m4 = m & ~3;
-    float p = 0.f;
-    for (int r = lo + w * 32 + lane; r < a4 && r < m; r += HELP * 32) p += colj[r] * colc[r];
-    for (int r = a4 + w * 128 + lane * 4; r < m4; r += HELP * 128) {
-        float4 vj = *reinterpret_cast<const float4*>(colj + r);
-        float4 vc = *reinterpret_cast<const float4*>(colc + r);
-        p += vj.x * vc.x + vj.y * vc.y + vj.z * vc.z + vj.w * vc.w;
-    }
-    for (int r = m4 + w * 32 + lane; r < m; r += HELP * 32) p += colj[r] * colc[r];
-    return p;
-}
-// HELP-aware fused update (mirrors cmv_update). want_norm returns sum-of-squares of the
-// UPDATED entries over this warp's stripe; the caller reduces across HELP warps for the
-// next-pivot norm. The single owner-lane write of colc[lo] (row j+1's next_alpha) is read
-// AFTER the per-column __syncthreads, no race.
-__device__ __forceinline__ float cmv_update_help(const float* __restrict__ colj,
-                                                 float* __restrict__ colc,
-                                                 int lo, int m, int lane, int w, int HELP,
-                                                 float tw_inv, bool want_norm) {
-    int a4 = (lo + 3) & ~3;
-    int m4 = m & ~3;
-    float ns = 0.f;
-    for (int r = lo + w * 32 + lane; r < a4 && r < m; r += HELP * 32) {
-        float nv = colc[r] - tw_inv * colj[r];
-        colc[r] = nv;
-        if (want_norm) ns += nv * nv;
-    }
-    for (int r = a4 + w * 128 + lane * 4; r < m4; r += HELP * 128) {
-        float4 vj = *reinterpret_cast<const float4*>(colj + r);
-        float4 vc = *reinterpret_cast<float4*>(colc + r);
-        vc.x -= tw_inv * vj.x; vc.y -= tw_inv * vj.y;
-        vc.z -= tw_inv * vj.z; vc.w -= tw_inv * vj.w;
-        *reinterpret_cast<float4*>(colc + r) = vc;
-        if (want_norm) ns += vc.x*vc.x + vc.y*vc.y + vc.z*vc.z + vc.w*vc.w;
-    }
-    for (int r = m4 + w * 32 + lane; r < m; r += HELP * 32) {
-        float nv = colc[r] - tw_inv * colj[r];
-        colc[r] = nv;
-        if (want_norm) ns += nv * nv;
-    }
-    return ns;
-}
-
 // COLUMN-MAJOR-SMEM warp-specialized-pivot OV BF16 panel. Identical math and
 // warp-specialization to panel_factor_smem_wsp_ov_bf16_kernel, but the panel lives in
 // smem COLUMN-MAJOR: s[c*LDM + r] (row r fast). The per-column m-passes (dot v_j^T col_c,
@@ -3370,128 +3262,6 @@ panel_factor_smem_wsp_cm_ov_bf16_indexed_kernel(bf16* __restrict__ H, float* __r
     panel_cm_ov_bf16_body<NWARPS>(H + (size_t)mat * n * n, Hout + (size_t)omat * n * n,
                                   tau + (size_t)mat * n, n, k, b, m, mat,
                                   Vout, OVbase, ovmo, ovld, ovroff, LDM, labels);
-}
-
-// ===================================================================================
-// COLUMN-MAJOR float4-VECTORIZED PIVOT-COOPERATIVE BF16 panel (non-OV).
-// Combines THREE ideas for the SM-starved n=2048 panel (8 CTAs / 148 SMs, latency-bound):
-//   (1) PIVOT-COOP (race-free): HELP warps split the next-pivot column's two m-passes so
-//       warp-0's serial pivot chain leaves the per-column critical path.
-//   (2) COLUMN-MAJOR smem s[c*LDM+r]: the per-column m-pass strides r by 32 -> 32 lanes read
-//       32 CONSECUTIVE words, coalesced/conflict-free (no row-major gather).
-//   (3) float4 m-passes (cmv_dot/update + HELP-aware *_help variants): 4 contiguous rows/lane
-//       -> a warp covers 128 rows/iter, 4x fewer iterations on the dominant bulk columns.
-// RACE FIX preserved: Ajc=colc[j] read BEFORE the pass-1 named barrier (register-cached per
-// helper), so warp0's later in-place write colc[j]=Ajc-tw cannot poison a slower helper.
-// Helper reductions use __barrier_sync_count(1, HELP*32) (intra-CTA, NO device-wide fence).
-// LDM is a MULTIPLE OF 4 (every column base s+c*LDM is 16-byte aligned for float4).
-// Numerically a VALID QR: same betas/taus/V as the plain panel (FP32 reduction reassociated
-// by row-stripe; orth FP32-exact via FP32-V). HELP must divide NWARPS, >=1.
-template <int NWARPS, int HELP, int MINB = 6>
-__global__ void __launch_bounds__(NWARPS * 32, MINB)
-panel_factor_smem_wsp_cm_coop_bf16_kernel(bf16* __restrict__ H, float* __restrict__ tau,
-                                                  int n, int k, int b, int m,
-                                                  bf16* __restrict__ Vout,
-                                                  float* __restrict__ Hout, int LDM) {
-    const int mat = blockIdx.x;
-    bf16* A = H + (size_t)mat * n * n;
-    float* Aout = Hout + (size_t)mat * n * n;
-    float* TAU = tau + (size_t)mat * n;
-    const int lane = threadIdx.x, warp = threadIdx.y;
-    const int tid = warp * 32 + lane, nthreads = NWARPS * 32;
-    extern __shared__ float s[];           // column-major: s[c*LDM + r], LDM % 4 == 0
-    __shared__ float sh_tau, sh_inv;
-    __shared__ float pdot[HELP], pnrm[HELP], palp[HELP];
-    float* invs = s + (size_t)b * LDM;     // [b] deferred 1/(alpha-beta) per column
-
-    for (int idx = tid; idx < m * b; idx += nthreads) {
-        int r = idx / b, c = idx % b;      // row-major iter -> coalesced global read
-        s[(size_t)c * LDM + r] = __half2float(A[(size_t)(k + r) * n + (k + c)]);
-    }
-    __syncthreads();
-
-    // Column 0: HELP warps cooperatively reduce its norm (float4, split m by HELP).
-    if (warp < HELP) {
-        float part = cmv_dot_help(s, s, 0, m, lane, warp, HELP);
-        part = warp_reduce_sum(part);
-        if (lane == 0) pnrm[warp] = part;
-        __barrier_sync_count(1, HELP * 32);
-        if (warp == 0 && lane == 0) {
-            float partsum = 0.f;
-            #pragma unroll
-            for (int w = 0; w < HELP; ++w) partsum += pnrm[w];
-            float xnorm = sqrtf(partsum);
-            float alpha = s[0];
-            float tau_j, inv, beta;
-            hh_reflector(alpha, xnorm, tau_j, inv, beta);
-            sh_tau = tau_j; sh_inv = inv;
-            TAU[k] = tau_j; s[0] = beta; invs[0] = inv;
-        }
-    }
-    __syncthreads();
-
-    for (int j = 0; j < b; ++j) {
-        const float tau_j = sh_tau, inv = sh_inv;
-        const bool do_next = (j + 1 < b);
-        float* colj = s + (size_t)j * LDM;             // reflector column j (raw)
-        if (warp < HELP) {
-            if (do_next) {
-                const int c = j + 1;
-                float* colc = s + (size_t)c * LDM;
-                // RACE FIX: read Ajc (row j) BEFORE the pass-1 barrier / warp0's write.
-                float Ajc = colc[j];
-                float ssum = cmv_dot_help(colj, colc, j + 1, m, lane, warp, HELP);
-                ssum = warp_reduce_sum(ssum);
-                if (lane == 0) pdot[warp] = ssum;
-                __barrier_sync_count(1, HELP * 32);
-                float dsum = 0.f;
-                #pragma unroll
-                for (int w = 0; w < HELP; ++w) dsum += pdot[w];
-                float tw = tau_j * (Ajc + inv * dsum);
-                if (warp == 0 && lane == 0) colc[j] = Ajc - tw;
-                float twinv = tw * inv;
-                float my_norm2 = cmv_update_help(colj, colc, j + 1, m, lane, warp, HELP, twinv, true);
-                my_norm2 = warp_reduce_sum(my_norm2);
-                if (lane == 0) pnrm[warp] = my_norm2;
-                __barrier_sync_count(1, HELP * 32);
-                if (warp == 0 && lane == 0) {
-                    float nsum = 0.f;
-                    #pragma unroll
-                    for (int w = 0; w < HELP; ++w) nsum += pnrm[w];
-                    float next_alpha = colc[j + 1];    // updated row j+1 (written by some helper)
-                    float xnorm = sqrtf(nsum);
-                    float tau_n, inv_n, beta_n;
-                    hh_reflector(next_alpha, xnorm, tau_n, inv_n, beta_n);
-                    sh_tau = tau_n; sh_inv = inv_n;
-                    TAU[k + j + 1] = tau_n; colc[j + 1] = beta_n; invs[j + 1] = inv_n;
-                }
-            }
-        } else {
-            // Bulk warps HELP..NWARPS-1: remaining trailing columns c>=j+2 (float4, 1 warp/col).
-            for (int c = j + 2 + (warp - HELP); c < b; c += (NWARPS - HELP)) {
-                float* colc = s + (size_t)c * LDM;
-                float Ajc = colc[j];
-                float ssum = cmv_dot(colj, colc, j + 1, m, lane);
-                ssum = warp_reduce_bcast(ssum);
-                float tw = tau_j * (Ajc + inv * ssum);
-                if (lane == 0) colc[j] = Ajc - tw;
-                cmv_update(colj, colc, j + 1, m, lane, tw * inv, false);
-            }
-        }
-        __syncthreads();   // publishes trailing block + col (j+1)'s scalars
-    }
-    bf16* Vm = (Vout != nullptr) ? Vout + (size_t)mat * m * b : nullptr;
-    for (int idx = tid; idx < m * b; idx += nthreads) {
-        int r = idx / b, c = idx % b;       // row-major iter -> coalesced global stores
-        float v = s[(size_t)c * LDM + r];
-        if (r > c) v *= invs[c];
-        A[(size_t)(k + r) * n + (k + c)] = __float2half(v);
-        if (Aout != nullptr) Aout[(size_t)(k + r) * n + (k + c)] = v;
-        if (Vm != nullptr) {
-            float vv = (r == c) ? 1.f : (r > c ? v : 0.f);
-            Vm[(size_t)r * b + c] = __float2half(vv);
-        }
-    }
 }
 
 // ===================================================================================
@@ -4745,15 +4515,9 @@ std::tuple<torch::Tensor, torch::Tensor> blocked_qr_2level_bf16_indexed(torch::T
             // PLAIN wsp_bf16 <8,6> (the n=512 big-batch case) + <32,6> (the n=1024 final
             // block); OV wsp_bf16 <32,1> (the n=1024 case, smem-capped to MINB=1); cm-OV
             // plain <8,6> below -- are opted in via the `optin` && chain in the return.
-            // COLUMN-MAJOR float4 pivot-COOP (cm_coop). Column-major panel
-            // = b*LDM floats (LDM=((m+3)&~3)+4); for the n=2048 case (m=2048,b=24) ~197KB > 48KB
-            // default -> the high-smem opt-in is REQUIRED or the <<<...,sm_cc>>> launch
-            // silently fails with cudaErrorInvalidValue. Only MHELP=2 launches (the live
-            // n=2048 caller sets wsp_help=2).
-            cudaFuncSetAttribute(panel_factor_smem_wsp_cm_coop_bf16_kernel<32,2,6>,
-                    cudaFuncAttributeMaxDynamicSharedMemorySize, want);
-            // FP16-SMEM precision variant of the coop panel (half8 m-pass). At m=2048,b=24
-            // its smem = b*ldmh*2 + b*4 ~= 99KB > 48KB default -> opt-in required.
+            // COLUMN-MAJOR float4 pivot-COOP, FP16-SMEM variant (half8 m-pass): the only live
+            // cm_coop kernel (_LARGE_HI always co-sets n2048_h, so the FP32-smem cm_coop_bf16
+            // was deleted). At m=2048,b=24 its smem ~99KB > 48KB default -> opt-in required.
             cudaFuncSetAttribute(panel_factor_smem_wsp_cm_coop_h_kernel<32,4,6>,
                     cudaFuncAttributeMaxDynamicSharedMemorySize, want);
             // Opt the BF16 cmf panel (the n=352 case) into large smem. At b<=64 its
@@ -4986,26 +4750,17 @@ std::tuple<torch::Tensor, torch::Tensor> blocked_qr_2level_bf16_indexed(torch::T
             // the default per-shape config (the live row-major path is the plain panel
             // taken below; zero trace launches of the m-split arm) -- deleted with its kernel.
             } else if (g_warps >= 32 && g_wsp_cm_coop) {
-                // COLUMN-MAJOR float4 PIVOT-COOP. Column-major panel
-                // s[c*LDM+r], LDM = m rounded to a multiple of 4 + 4 (16-byte-aligned
-                // column bases for float4); smem = (b*LDM + b)*4 (panel + invs[b]).
-                // g_wsp_cm_coop is the gate: it is set (==1) only on the n=2048 _LARGE_HI
-                // path, in lockstep with the now-removed g_wsp_help>1 (the kernel hardcodes
-                // MHELP=2, so the help count never reached it -- g_wsp_help was dead).
-                int ldm = ((m + 3) & ~3) + 4;
-                size_t sm_cc = ((size_t)b * ldm + b) * 4;
-                // FP16-SMEM PRECISION variant: half8 m-pass (8 rows/lane/iter), V emitted
-                // FP16. smem = b*ldmh halves + b FP32 invs; ldmh padded to a multiple of 8
-                // (16-byte half8 column-base alignment). Gated on g_n2048_h (n=2048 cond=1
-                // bench only); the FP32-smem coop kernel is the default fallback.
-                if (g_n2048_h) {
-                    int ldmh = ((m + 7) & ~7) + 8;
-                    size_t sm_h = (size_t)b * ldmh * sizeof(__half) + (size_t)b * sizeof(float);
-                    panel_factor_smem_wsp_cm_coop_h_kernel<32,4,6><<<B, dim3(32, 32), sm_h>>>(Hb, taup, n, k, b, m, Vfold, Hpanel, ldmh);
-                } else
-                // Only MHELP=2 launches (the live n=2048 caller); the MHELP=4/8 instances
-                // were build-light pruned (zero trace launches).
-                panel_factor_smem_wsp_cm_coop_bf16_kernel<32,2,6><<<B, dim3(32, 32), sm_cc>>>(Hb, taup, n, k, b, m, Vfold, Hpanel, ldm);
+                // COLUMN-MAJOR float4 PIVOT-COOP, FP16-SMEM variant: half8 m-pass (8 rows/
+                // lane/iter), V emitted FP16; smem = b*ldmh halves + b FP32 invs, ldmh padded
+                // to a multiple of 8 (16-byte half8 column-base alignment). g_wsp_cm_coop is set
+                // ONLY by _LARGE_HI (n=2048), which ALWAYS co-sets n2048_h=1 (the Python sets-
+                // builder emits set_wsp_cm_coop(1) and set_n2048_h(1) together), so the FP32-smem
+                // cm_coop_bf16 kernel was never the selected else-branch -- it + its float4 cmv_*
+                // helpers were DELETED. Only cm_coop_h fires; the guard fails loudly otherwise.
+                TORCH_CHECK(g_n2048_h, "wsp_cm_coop path: only the n2048_h FP16-smem cm_coop_h kernel is live");
+                int ldmh = ((m + 7) & ~7) + 8;
+                size_t sm_h = (size_t)b * ldmh * sizeof(__half) + (size_t)b * sizeof(float);
+                panel_factor_smem_wsp_cm_coop_h_kernel<32,4,6><<<B, dim3(32, 32), sm_h>>>(Hb, taup, n, k, b, m, Vfold, Hpanel, ldmh);
             // build-light prune: the non-column-major pivot-coop (coop) panel arm never
             // fires under the default per-shape config (the live coop path is cm_coop,
             // taken above; zero trace launches of the plain coop kernel) -- deleted with
