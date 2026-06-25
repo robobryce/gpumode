@@ -3478,183 +3478,6 @@ static void mmb_S(cublasHandle_t h, const bf16* V, int b, int m, float* S, int b
 }
 
 // ===========================================================================
-// FUSED SINGLE-READ INNER-APPLY (WMMA tensor cores).
-//
-// For each NARROW inner sub-panel (w=IB, m rows, rest<=OB-IB cols), the compact-WY apply
-// would touch the m x rest C-tile TWICE from HBM (W=V^T C reads C; C-=V Y reads+writes C).
-// Unlike the WIDE OUTER tile (458KB, cannot be smem-resident), the INNER C-tile is small
-// (m=512, rest<=48 -> 48KB FP16) and FITS in opt-in smem, so this kernel reads it ONCE into
-// smem, computes W=V^T C and C-=V*(M*(V^T C)) on the 16x16x16 FP16->FP32 tensor cores
-// on-chip, and writes C back ONCE. (Fusing the un-fusable OUTER tile is slower, and scalar
-// smem math loses to cuBLAS tensor cores.) S=V^T V and M=L^{-1} still run BEFORE this on
-// cuBLAS/build_Minv (tiny w x w; M is a serial triangular solve that doesn't fuse cleanly);
-// the caller passes M as FP16 (Mb16).
-//
-// Layouts (match the cuBLAS path):
-//   V : BF16, packed (B, m, w) ROW-MAJOR: V[mat*m*w + i*w + p] = V[i,p].
-//   M : FP16, packed (B, w, w) ROW-MAJOR: M[mat*w*w + p*q]    = M[p,q] (= T^T).
-//   C : Hb's trailing block, BF16, ld=n, at Hb + mat*n*n + kc*n + jc.
-//   W = V^T C  (w x rest, K=m).   Y = M W (w x rest, K=w).   C -= V Y (m x rest).
-// One CTA per matrix (grid=B), NWARP warps.  rest <= NTMAX <= 64 (one col-block).
-// w is a multiple of 16 (IB=16/32/48/64) and m is a multiple of 16 (m=n-ki, ki
-// multiple of IB, n=512 -> m always %16).  rest is a multiple of 16 within the OB
-// block (OB,IB both multiples of 16).
-//   smem: Vsh[m*w] FP16 (V resident) + Csh[m*rest] FP16 (single C read, resident)
-//         + Msh[w*w] FP16 + Wsh[w*rest] FP16 (W then Y, FP16 staging)
-//         + Wacc[w*rest] FP32 (W/Y accumulator scratch, also C-=VY tile scratch).
-// ---------------------------------------------------------------------------
-
-// ===========================================================================
-// FULL-FUSION INNER APPLY (WMMA). Extends the single-read fused apply by ALSO computing
-// S=V^T V and M=L^{-1} (the WY T-inverse) ON-CHIP, eliminating the separate cuBLAS S=V^T V
-// GEMM AND the build_Minv launch + f32->FP16 M-convert for the inner applies. One CTA/matrix:
-// load V,C,tau -> S=V^T V (WMMA) -> M=Minv(S,tau) in-smem forward-sub -> W=V^T C -> Y=M W ->
-// C-=V Y (WMMA, single C write). tau is FP32 (B,n). Numerically S/M FP32 (matches build_Minv),
-// W/Y FP16 (matches wf16). Requires w%16==0, m%16==0, rest%16==0, w<=WMAX, rest<=NTMAX. smem
-// adds Ssh+Lsh+Msh(w*LDw FP32) + Mb(w*w FP16) + tau_s(w); at w=16 tiny vs the m*rest C-tile.
-// ---------------------------------------------------------------------------
-__global__ void __launch_bounds__(256) qr_inner_apply_wmma_full_kernel(
-        bf16* __restrict__ Hb, const bf16* __restrict__ Vp, const float* __restrict__ taup,
-        int n, int kc, int w, int m, int jc, int rest) {
-    using namespace nvcuda::wmma;
-    const int mat = blockIdx.x;
-    const bf16* V = Vp + (size_t)mat * m * w;
-    const float* TAU = taup + (size_t)mat * n;
-    bf16* C = Hb + (size_t)mat * n * n + (size_t)kc * n + jc;
-
-    const int tid    = threadIdx.y * 32 + threadIdx.x;
-    const int warp   = tid >> 5;
-    const int nthr   = blockDim.x * blockDim.y;   // 256
-    const int nwarps = nthr >> 5;                 // 8
-    const int LDw = w | 1;                         // padded row stride for L/M smem (actual w)
-
-    extern __shared__ char smem_raw_f[];
-    bf16*  Vsh = reinterpret_cast<bf16*>(smem_raw_f);             // m*w
-    bf16*  Csh = Vsh + (size_t)m * w;                            // m*rest
-    bf16*  Mb  = Csh + (size_t)m * rest;                         // w*w  (FP16 M, fed to phase B)
-    bf16*  Wsh = Mb + (size_t)w * w;                            // w*rest (W then Y)
-    float* Wacc = reinterpret_cast<float*>(Wsh + (size_t)w * rest); // max(w*rest, nwarps*256) FP32
-    float* waccend = Wacc + (((size_t)w * rest > (size_t)nwarps * 256) ? (size_t)w * rest
-                                                                        : (size_t)nwarps * 256);
-    float* Ssh = waccend;                                        // w*w  (Gram, FP32)
-    float* Lsh = Ssh + (size_t)w * w;                           // w*LDw (strict-lower L)
-    float* Msh = Lsh + (size_t)w * LDw;                        // w*LDw (M = L^{-1})
-    float* tau_s = Msh + (size_t)w * LDw;                      // w
-
-    const int wt  = w / 16;
-    const int ntl = rest / 16;
-    const int mt  = m / 16;
-
-    // (1) Load V (m*w), C (m*rest, single read), tau (w).
-    for (int idx = tid; idx < m * w; idx += nthr) Vsh[idx] = V[idx];
-    for (int idx = tid; idx < m * rest; idx += nthr) {
-        int i = idx / rest, j = idx - i * rest;
-        Csh[idx] = C[(size_t)i * n + j];
-    }
-    for (int j = tid; j < w; j += nthr) tau_s[j] = TAU[kc + j];
-    __syncthreads();
-
-    // (2) S = V^T V (w x w, K=m).  A = V^T (col_major), B = V (row_major).
-    for (int t = warp; t < wt * wt; t += nwarps) {
-        int pi = t / wt, qj = t % wt;
-        fragment<accumulator, 16, 16, 16, float> acc;
-        fill_fragment(acc, 0.0f);
-        for (int mk = 0; mk < mt; ++mk) {
-            fragment<matrix_a, 16, 16, 16, half, col_major> a;   // V^T tile
-            fragment<matrix_b, 16, 16, 16, half, row_major> b;   // V tile
-            load_matrix_sync(a, Vsh + (size_t)(mk * 16) * w + pi * 16, w);
-            load_matrix_sync(b, Vsh + (size_t)(mk * 16) * w + qj * 16, w);
-            mma_sync(acc, a, b, acc);
-        }
-        store_matrix_sync(Ssh + (size_t)(pi * 16) * w + qj * 16, acc, w, mem_row_major);
-    }
-    __syncthreads();
-
-    // (3) M = L^{-1} = T^T (FP32 in-smem forward-sub; mirrors build_Minv_kernel).
-    //     L = tril(S,-1) masked by tau!=0; M diag = tau_j (1 if identity); then
-    //     M[i,j] = -tau_i * sum_{p in [j,i)} L[i,p] M[p,j].  One thread per column.
-    for (int idx = tid; idx < w * w; idx += nthr) {
-        int r = idx / w, c = idx % w;
-        Lsh[r * LDw + c] = (r > c && tau_s[r] != 0.f) ? Ssh[c * w + r] : 0.f;
-        Msh[r * LDw + c] = 0.f;
-    }
-    __syncthreads();
-    for (int j = tid; j < w; j += nthr) {
-        float tj = tau_s[j];
-        Msh[j * LDw + j] = (tj != 0.f) ? tj : 1.f;
-        for (int i = j + 1; i < w; ++i) {
-            float ti = tau_s[i];
-            if (ti == 0.f) { Msh[i * LDw + j] = 0.f; continue; }
-            float acc = 0.f;
-            const float* Lrow = Lsh + i * LDw;
-            for (int p = j; p < i; ++p) acc += Lrow[p] * Msh[p * LDw + j];
-            Msh[i * LDw + j] = -ti * acc;
-        }
-    }
-    __syncthreads();
-    for (int idx = tid; idx < w * w; idx += nthr) Mb[idx] = __float2half(Msh[(idx / w) * LDw + (idx % w)]);
-    __syncthreads();
-
-    // (4) W = V^T C (w x rest, K=m).  Warp-per-tile.
-    for (int t = warp; t < wt * ntl; t += nwarps) {
-        int pi = t / ntl, nj = t % ntl;
-        fragment<accumulator, 16, 16, 16, float> acc;
-        fill_fragment(acc, 0.0f);
-        for (int mk = 0; mk < mt; ++mk) {
-            fragment<matrix_a, 16, 16, 16, half, col_major> a;
-            fragment<matrix_b, 16, 16, 16, half, row_major> b;
-            load_matrix_sync(a, Vsh + (size_t)(mk * 16) * w + pi * 16, w);
-            load_matrix_sync(b, Csh + (size_t)(mk * 16) * rest + nj * 16, rest);
-            mma_sync(acc, a, b, acc);
-        }
-        store_matrix_sync(Wacc + (size_t)(pi * 16) * rest + nj * 16, acc, rest, mem_row_major);
-    }
-    __syncthreads();
-    for (int idx = tid; idx < w * rest; idx += nthr) Wsh[idx] = __float2half(Wacc[idx]);
-    __syncthreads();
-
-    // (5) Y = M W (w x rest, K=w).  M=Mb (FP16, just built), W=Wsh.
-    for (int t = warp; t < wt * ntl; t += nwarps) {
-        int pi = t / ntl, nj = t % ntl;
-        fragment<accumulator, 16, 16, 16, float> acc;
-        fill_fragment(acc, 0.0f);
-        for (int qk = 0; qk < wt; ++qk) {
-            fragment<matrix_a, 16, 16, 16, half, row_major> a;
-            fragment<matrix_b, 16, 16, 16, half, row_major> b;
-            load_matrix_sync(a, Mb + (size_t)(pi * 16) * w + qk * 16, w);
-            load_matrix_sync(b, Wsh + (size_t)(qk * 16) * rest + nj * 16, rest);
-            mma_sync(acc, a, b, acc);
-        }
-        store_matrix_sync(Wacc + (size_t)(pi * 16) * rest + nj * 16, acc, rest, mem_row_major);
-    }
-    __syncthreads();
-    for (int idx = tid; idx < w * rest; idx += nthr) Wsh[idx] = __float2half(Wacc[idx]);  // FP16 Y
-    __syncthreads();
-
-    // (6) C -= V Y (m x rest, K=w), single write.
-    for (int t = warp; t < mt * ntl; t += nwarps) {
-        int mi = t / ntl, nj = t % ntl;
-        fragment<accumulator, 16, 16, 16, float> acc;
-        fill_fragment(acc, 0.0f);
-        for (int pk = 0; pk < wt; ++pk) {
-            fragment<matrix_a, 16, 16, 16, half, row_major> a;
-            fragment<matrix_b, 16, 16, 16, half, row_major> b;
-            load_matrix_sync(a, Vsh + (size_t)(mi * 16) * w + pk * 16, w);
-            load_matrix_sync(b, Wsh + (size_t)(pk * 16) * rest + nj * 16, rest);
-            mma_sync(acc, a, b, acc);
-        }
-        float* tile = Wacc + (size_t)warp * 256;
-        store_matrix_sync(tile, acc, 16, mem_row_major);
-        for (int e = (tid & 31); e < 256; e += 32) {
-            int rr = e >> 4, cc = e & 15;
-            int gi = mi * 16 + rr, gj = nj * 16 + cc;
-            float cv = __half2float(Csh[(size_t)gi * rest + gj]) - tile[e];
-            C[(size_t)gi * n + gj] = __float2half(cv);
-        }
-    }
-}
-
-// ===========================================================================
 // PANEL+APPLY FUSED MEGAKERNEL (WMMA).
 //
 // Extends the mode-2 full-fusion inner apply UP to also absorb the PANEL FACTOR
@@ -4378,31 +4201,21 @@ static void apply_block_reflector_t(cublasHandle_t handle, STORE* Hp, float* tau
         // fusion's saved C round-trip does not pay off when the tile is OB-wide. Capping
         // at 32 keeps the genuinely-narrow inner applies (w<=32) fused while routing the
         // w=64 OB-wide apply to the cuBLAS S/W/Y/C-=VY GEMM path. 0 = no width cap (= WMAX).
+        // The STANDALONE single-CTA WMMA inner apply (qr_inner_apply_wmma_full_kernel) is
+        // DEAD: it only fired when an inner sub-panel reached here UNFUSED, but whenever
+        // g_inner_wmma==2 the PAF megakernel g_panel_apply_fused is also on (Python forces them
+        // together via paf = ... if iwmma==2) and PAF's fuse_ok consumes EVERY inner sub-panel
+        // that calls apply_trailing (n=512 ib=16, inner_rest in {16,32,48}; n=1024 ib=32,
+        // inner_rest=32 -- all %16 <= NTMAX). The OB-wide outer apply (w=64) is routed to cuBLAS
+        // by g_inner_wmma_wmax=32 (fails w<=wmax). So fused_ok is never true for a scored shape;
+        // the kernel + its launch were removed and this guard fails loudly instead of silently
+        // diverging if a future apply ever becomes fused-eligible.
         int wmax = (g_inner_wmma_wmax > 0) ? g_inner_wmma_wmax : INNER_WMMA_WMAX;
         bool fused_ok = g_inner_wmma && (w % 16 == 0) && (m % 16 == 0) && (rest % 16 == 0) &&
                         rest <= INNER_WMMA_NTMAX && w <= wmax;
-        // FUSED SINGLE-READ INNER APPLY (mode 2, the only reachable mode): when enabled and
-        // the dims qualify (w,m,rest all %16; rest fits one col-block; C-tile fits opt-in
-        // smem), replace the W=V^T C / Y=M W / C-=V Y trio (which reads the C-tile TWICE)
-        // with ONE WMMA kernel that reads the inner C-tile ONCE into smem -- and also
-        // recomputes S=V^T V + M=Minv on-chip (no cuBLAS S, no build_Minv launch). fused_ok
-        // already requires g_inner_wmma!=0, and the only nonzero value any shape sets is 2
-        // (the mode-1 WMMA path -- g_inner_wmma==1 -- was build-light pruned, trace-proven
-        // never set), so fused_ok IMPLIES mode 2: no inner g_inner_wmma==2 test is needed.
-        // S=V^T V is SKIPPED on the fused path (recomputed in-kernel); the cuBLAS S is
-        // exactly the thing the fusion eliminates.
-        if (!fused_ok) mmb_S(handle, Vp, w, m, Sp, B);
-        if (fused_ok) {
-            int LDw = w | 1;     // L/M smem row stride uses ACTUAL w (was WMAX|1 -> wasted smem at w=16)
-            size_t waccf = (size_t)w * rest; if (waccf < (size_t)8 * 256) waccf = (size_t)8 * 256;
-            size_t smem = ((size_t)m * w + (size_t)m * rest + (size_t)w * w + (size_t)w * rest) * sizeof(bf16)
-                        + (waccf + (size_t)w * w + (size_t)2 * w * LDw + (size_t)w) * sizeof(float);
-            cudaFuncSetAttribute(qr_inner_apply_wmma_full_kernel,
-                    cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
-            qr_inner_apply_wmma_full_kernel<<<B, dim3(32, 8), smem>>>(
-                    Hp, Vp, taup, n, kc, w, m, jc, rest);
-            return;
-        }
+        TORCH_CHECK(!fused_ok, "apply_block_reflector_t: standalone WMMA inner apply is "
+                               "unreachable (PAF megakernel consumes every fused sub-panel)");
+        mmb_S(handle, Vp, w, m, Sp, B);
         // W = V^T C : bandwidth-bound wide read of C in BF16, now also a FP16 WRITE (Wst).
         mmb(handle, /*tA=*/true, Vp, w, m, Cin, rest, /*ldB=*/n, (long)n * n,
             Wst, /*ldR=*/rest, (long)w * rest, 1.f, 0.f, B, CUDA_R_16F);
