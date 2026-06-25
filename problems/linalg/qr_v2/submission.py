@@ -6542,11 +6542,6 @@ std::vector<torch::Tensor> chol_b2_lower_R_solve(torch::Tensor A, torch::Tensor 
 #define BKL(x) do { cublasStatus_t s=(x); if(s!=CUBLAS_STATUS_SUCCESS){ printf("cublasL err %s:%d %d\n",__FILE__,__LINE__,(int)s); } } while(0)
 static inline int cdiv(int a, int b){ return (a + b - 1) / b; }
 
-// TRSM precision globals (set per call from Python). g_trsm_diag_prec: diagonal-solve
-// precision; g_trsm_trail_fp16: 3xFP16 trailing toggle.
-static int g_trsm_diag_prec = 0;
-static int g_trsm_trail_fp16 = 0;
-
 // 3xFP16 strided-batched GEMM (FP16 in, FP32 accumulate, FP32 out). 3xTF32-style Kahan
 // structure on FP16 tensor cores (~2x TF32 rate on B200). Operands pre-split into FP16 hi/lo
 // (Ah/Al packed ld=K; Bh/Bl strided ld=ldB/stride sB). C is FP32 strided (ld=ldC/stride sC).
@@ -6643,9 +6638,9 @@ __global__ void split_flat_kernel(const float* __restrict__ x, float* __restrict
 }
 
 // hi/lo split of the STRIDED X-panel X[mat][:, j:j+w] (n rows, w cols, ld=n) into PACKED
-// hi/lo buffers (batch, n, w), row-stride w, for the 3xTF32 diagonal solve (g_trsm_diag_prec
-// ==2). float4 over the w cols (w and j are %4==0 -> all bases 16B-aligned); one thread owns
-// 4 contiguous columns of one row.
+// hi/lo buffers (batch, n, w), row-stride w, for the 3xTF32 diagonal solve. float4 over the w
+// cols (w and j are %4==0 -> all bases 16B-aligned); one thread owns 4 contiguous columns of
+// one row.
 __global__ void split_panel_strided_kernel(const float* __restrict__ Xg,
                                             float* __restrict__ hi, float* __restrict__ lo,
                                             int n, int j, int w) {
@@ -6761,10 +6756,9 @@ __global__ void scatter_split_panel_kernel(float* __restrict__ Xg,
 // MAIN-SOLVE (Q = A R^{-1}): the blocked right-TRSM above, whole loop in ONE C++ call so the
 // cuBLAS GEMMs fire back-to-back at b2. The diagonal pre-invert is ONE cublasStrsmBatched
 // (RHS=I) over all nblk blocks (tail identity-padded), then each per-block diagonal solve is
-// a wide GEMM X[:,blk] @ Rblk^{-1}. Precision map (s6 path, gated): pre-invert EXACT FP32
-// (the triangular-block inverse is conditioning-sensitive); diagonal SOLVE is 3xTF32 Kahan
-// (g_trsm_diag_prec==2, ~FP32, faster than FP32-SIMT at nb=512); trailing rank-w update is
-// 3xFP16 (g_trsm_trail_fp16). Returns X (= Q), A left untouched.
+// a wide GEMM X[:,blk] @ Rblk^{-1}. Precision: pre-invert EXACT FP32 (the triangular-block
+// inverse is conditioning-sensitive); diagonal SOLVE is 3xTF32 Kahan (~FP32); trailing rank-w
+// update is 3xFP16. Returns X (= Q), A left untouched.
 torch::Tensor tri_solve_right_inv(torch::Tensor A, torch::Tensor Rin, int nb) {
     int batch = A.size(0), n = A.size(1);
     auto opts = A.options();
@@ -7459,9 +7453,6 @@ void set_recon_lowp(int v) { g_recon_lowp = v; }
 void set_recon_solve_fp32(int v) { g_recon_solve_fp32 = v; }
 void set_recon_lowp_from(int v) { g_recon_lowp_from = v; }
 void set_recon_warplu(int v) { g_recon_warplu = v; }
-// TRSM (tri_solve_right_inv) diagonal-solve precision + FP16 trailing knobs (s6 vs test path).
-void set_trsm_diag_prec(int v) { g_trsm_diag_prec = v; }
-void set_trsm_trail_fp16(int v) { g_trsm_trail_fp16 = v; }
 """
 
 _CPP_LU_SRC = r"""
@@ -7476,8 +7467,6 @@ void set_recon_lowp(int v);
 void set_recon_solve_fp32(int v);
 void set_recon_lowp_from(int v);
 void set_recon_warplu(int v);
-void set_trsm_diag_prec(int v);
-void set_trsm_trail_fp16(int v);
 """
 def _compile_lu():
     return _compile_qr(
@@ -7485,8 +7474,7 @@ def _compile_lu():
         ["chol_b2_lower_R_solve", "build_H_inplace", "tri_solve_right_inv",
          "recon_lu_cpp", "oz_slice", "oz_recombine_2pass",
          "oz_gram_gemm_grouped", "set_recon_lowp", "set_recon_solve_fp32",
-         "set_recon_lowp_from", "set_recon_warplu",
-         "set_trsm_diag_prec", "set_trsm_trail_fp16"],
+         "set_recon_lowp_from", "set_recon_warplu"],
         ["-lcublas", "-lcublasLt", "-lcusolver"])
 
 
@@ -7872,11 +7860,6 @@ _COLNORM_TOL = 5e-2  # cholqr good-gate vs orth_rtol
 # recon's TF32 error amplification.
 _TRSM_NB_CPP = 512   # nb sweep WINNER (s6 optimum): 384(11728)/512(11190)/640(11239)/768(11628)/1024(11662). Orth no longer binds nb (tau-override); factor residual holds at 512.
 # === TRSM precision knobs for the SCORED s6 path (B=2, n=4096) ===
-# The Q = A R^{-1} blocked right-TRSM runs in low precision for s6 (the tau-override owns
-# orthogonality; only the loose factor residual binds). Gated to s6; the ill-conditioned
-# B=1/B!=2 fallback arm keeps exact FP32 (its factor residual is sensitive).
-_TRSM_DIAG_PREC = 2       # 3xTF32 Kahan diagonal solve (beats FP32-SIMT at nb=512).
-_TRSM_TRAIL_FP16 = 1      # 3xFP16 trailing (FP16 tensor cores ~2x TF32 rate on B200).
 # Recon Schur-GEMM precision for the s6 n4096 B=2 path: 1 = FP16 (FP32-accum) Schur update
 # (orth is recon-precision-independent), 0 = TF32.
 _RECON_LOWP = 1
@@ -8006,12 +7989,7 @@ def _choleskyqr_1pass(A, lu):
     _gram_int_ozaki(A, G, lu=lu)
     # Persistent FP32 R (= the QR R-factor), fully overwritten by the chol L^T->R cast.
     R = _scratch_like_dtype3(b, n, 1, "Rfp32", torch.float32, G.device)[0]
-    lu.set_trsm_diag_prec(_TRSM_DIAG_PREC)
-    lu.set_trsm_trail_fp16(_TRSM_TRAIL_FP16)
-    out = lu.chol_b2_lower_R_solve(A, G, R, _TRSM_NB_CPP)
-    lu.set_trsm_diag_prec(0)
-    lu.set_trsm_trail_fp16(0)
-    return out
+    return lu.chol_b2_lower_R_solve(A, G, R, _TRSM_NB_CPP)
 
 
 def _reconstruct_householder(Q, R, lu):
