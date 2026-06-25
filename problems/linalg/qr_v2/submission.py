@@ -2964,46 +2964,6 @@ panel_factor_smem_wsp_bf16_kernel(bf16* __restrict__ H, float* __restrict__ tau,
     }
 }
 
-// OUTER-V-FOLD warp-specialized-pivot BF16 panel: wsp_bf16 + emit the OB-wide outer
-// BF16 V slice in the write-back (drops the standalone build_V_bf16_kernel pass).
-// MINB template param (see panel_factor_smem_wsp_bf16_kernel). the n=1024 case (the
-// only shape using the *_ov variant at W=32) is smem-capped to 1 CTA/SM -> MINB=1.
-template <int NWARPS, int MINB = 6>
-__global__ void __launch_bounds__(NWARPS * 32, MINB)
-panel_factor_smem_wsp_ov_bf16_kernel(bf16* __restrict__ H, float* __restrict__ tau,
-                                                     int n, int k, int b, int m,
-                                                     bf16* __restrict__ Vout,
-                                                     float* __restrict__ Hout,
-                                                     bf16* __restrict__ OVbase,
-                                                     int ovmo, int ovld, int ovroff, int LDS) {
-    const int mat = blockIdx.x;
-    bf16* A = H + (size_t)mat * n * n;
-    float* Aout = Hout + (size_t)mat * n * n;
-    panel_wsp_rm_factor<NWARPS>(A, tau + (size_t)mat * n, n, k, b, m, LDS);
-    const int lane = threadIdx.x, warp = threadIdx.y;
-    const int tid = warp * 32 + lane, nthreads = NWARPS * 32;
-    extern __shared__ float s[];
-    float* invs = s + (size_t)m * LDS;
-    bf16* OVm = OVbase + (size_t)mat * ovmo * ovld;
-    bf16* Vm = (Vout != nullptr) ? Vout + (size_t)mat * m * b : nullptr;
-    for (int idx = tid; idx < m * b; idx += nthreads) {
-        int r = idx / b, c = idx % b;
-        float v = s[r * LDS + c];
-        if (r > c) v *= invs[c];
-        A[(size_t)(k + r) * n + (k + c)] = __float2half(v);
-        if (Aout != nullptr) Aout[(size_t)(k + r) * n + (k + c)] = v;
-        float vfold = (r == c) ? 1.f : (r > c ? v : 0.f);
-        bf16 vh = __float2half(vfold);
-        OVm[(size_t)(ovroff + r) * ovld + (ovroff + c)] = vh;
-        if (Vm != nullptr) Vm[(size_t)r * b + c] = vh;
-    }
-    bf16 zero = __float2half(0.f);
-    for (int idx = tid; idx < ovroff * b; idx += nthreads) {
-        int rr = idx / b, cc = idx % b;
-        OVm[(size_t)rr * ovld + (ovroff + cc)] = zero;
-    }
-}
-
 // PIVOT-COOP variant of panel_factor_smem_wsp_ov_bf16_kernel: identical OV write-back, but
 // the factor uses panel_wsp_rm_factor_coop<NWARPS,HELP> (HELP warps split the next-pivot
 // m-pass). For the n=1024 standalone OV panel (warps=32). Same FP32 reductions reassociated
@@ -4550,9 +4510,7 @@ std::tuple<torch::Tensor, torch::Tensor> blocked_qr_2level_bf16_indexed(torch::T
             // default cap, so it needs no opt-in.
             return optin(want, panel_factor_smem_wsp_bf16_kernel<8,6>)
                 && optin(want, panel_factor_smem_wsp_bf16_kernel<32,6>)
-                && optin(want, panel_factor_smem_wsp_ov_bf16_kernel<32,1>)
                 && optin(want, panel_factor_smem_wsp_ov_coop_bf16_kernel<32,2,1>)
-                && optin(want, panel_factor_smem_wsp_ov_coop_bf16_kernel<32,4,1>)
                 && optin(want, panel_factor_smem_wsp_cm_ov_bf16_kernel<8,6>);
         });
 
@@ -4736,16 +4694,15 @@ std::tuple<torch::Tensor, torch::Tensor> blocked_qr_2level_bf16_indexed(torch::T
                 else
                     panel_factor_smem_wsp_cm_ov_bf16_kernel<8,6><<<B, dim3(32, 8), sm_c>>>(Hb, taup, n, k, b, m, Vfold, Hpanel, OVbase, ovmo, ovld, ovroff, ldm, labelp);
             } else if (OVbase != nullptr) {
-                // Only the 32-warp instance launches (the sole non-cm OV caller is the
-                // n=1024 case, warps=32). The 16/8-warp ov arms were build-light pruned.
-                // PIVOT-COOP: when g_ov_coop>0, split the next-pivot m-pass over g_ov_coop
-                // warps (only the wired counts 2/4 are instantiated); else warp-0 serial.
-                if (g_ov_coop == 4)
-                    panel_factor_smem_wsp_ov_coop_bf16_kernel<32,4,1><<<B, dim3(32, 32), sm>>>(Hb, taup, n, k, b, m, Vfold, Hpanel, OVbase, ovmo, ovld, ovroff, lds);
-                else if (g_ov_coop == 2)
-                    panel_factor_smem_wsp_ov_coop_bf16_kernel<32,2,1><<<B, dim3(32, 32), sm>>>(Hb, taup, n, k, b, m, Vfold, Hpanel, OVbase, ovmo, ovld, ovroff, lds);
-                else
-                    panel_factor_smem_wsp_ov_bf16_kernel<32,1><<<B, dim3(32, 32), sm>>>(Hb, taup, n, k, b, m, Vfold, Hpanel, OVbase, ovmo, ovld, ovroff, lds);
+                // Only the 32-warp instance launches (the sole non-cm OV caller is n=1024,
+                // which ALWAYS sets _LARGE_LO's ov_coop=2 -> the PIVOT-COOP kernel). The base
+                // non-coop ov_bf16<32,1> and the ov_coop<32,4,1> arms were never reached
+                // (g_ov_coop is only ever 0 or 2, and the OV path is n=1024-only -> always 2):
+                // both are dropped, and ov_bf16's kernel body was deleted. The guard fails
+                // loudly if a future config sends a non-2 ov_coop down this path.
+                // PIVOT-COOP: HELP=2 warps split the next-pivot m-pass.
+                TORCH_CHECK(g_ov_coop == 2, "OV panel: only the ov_coop<32,2,1> kernel is live (ov_coop=2)");
+                panel_factor_smem_wsp_ov_coop_bf16_kernel<32,2,1><<<B, dim3(32, 32), sm>>>(Hb, taup, n, k, b, m, Vfold, Hpanel, OVbase, ovmo, ovld, ovroff, lds);
             // build-light prune: the plain row-major m-split panel arm never fires under
             // the default per-shape config (the live row-major path is the plain panel
             // taken below; zero trace launches of the m-split arm) -- deleted with its kernel.
