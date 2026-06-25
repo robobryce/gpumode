@@ -5683,13 +5683,11 @@ std::vector<torch::Tensor> build_H_inplace(torch::Tensor M, torch::Tensor R, tor
 }
 
 // FP64 cholesky factor -> FP32 R (the row-major-UPPER QR factor) in ONE pass: upper triangle
-// (r<=c) cast to float, strict-lower zeroed. ONE kernel serves both chol paths via `transpose`:
-// =1 reads a LOWER factor L (R=L^T) for the per-matrix cholesky_ex path; =0 reads a source
-// already in row-major-upper for the B=2 fused potrf path. transpose=1 replaces a cast +
-// transposed materialize-copy with one strided FP64 read + contiguous FP32 write. Every
-// element is written each call, so a persistent reused R buffer is safe.
+// (r<=c) cast to float, strict-lower zeroed. Reads the cuSOLVER LOWER-potrf output, which is
+// already row-major-upper (= R) for the B=2 fused path. Every element is written each call,
+// so a persistent reused R buffer is safe.
 __global__ void chol_tri_to_R_kernel(const double* __restrict__ Sg, float* __restrict__ Rg,
-                                     int n, int transpose) {
+                                     int n) {
     int mat = blockIdx.z;
     const double* S = Sg + (long)mat * n * n;
     float* R = Rg + (long)mat * n * n;
@@ -5697,16 +5695,8 @@ __global__ void chol_tri_to_R_kernel(const double* __restrict__ Sg, float* __res
     int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (r < n && c < n) {
         long ridx = (long)r * n + c;
-        R[ridx] = (r <= c) ? (float)S[transpose ? ((long)c * n + r) : ridx] : 0.f;
+        R[ridx] = (r <= c) ? (float)S[ridx] : 0.f;
     }
-}
-// Out-variant: cast the LOWER factor L into a caller-provided (persistent) FP32 R
-// buffer (R = L^T). Avoids the per-call 256MB FP32 alloc of an alloc-variant.
-void chol_L_to_R_out(torch::Tensor L, torch::Tensor R) {
-    int batch = L.size(0), n = L.size(1);
-    dim3 blk(32, 8);
-    dim3 grid((n + 31) / 32, (n + 7) / 8, batch);
-    chol_tri_to_R_kernel<<<grid, blk>>>(L.data_ptr<double>(), R.data_ptr<float>(), n, 1);
 }
 
 torch::Tensor tri_solve_right_inv(torch::Tensor A, torch::Tensor Rin, int nb);
@@ -5731,14 +5721,14 @@ std::vector<torch::Tensor> chol_b2_lower_R_solve(torch::Tensor A, torch::Tensor 
     long nn = (long)n * n;
     double* Gp = G.data_ptr<double>();
     // cuSOLVER LOWER potrf on the symmetric row-major G leaves the factor as
-    // row-major-UPPER (= R directly, transpose=0).
+    // row-major-UPPER (= R directly).
     for (int b = 0; b < batch; ++b) {
         BKSOL(cusolverDnDpotrf(h, CUBLAS_FILL_MODE_LOWER, n,
             Gp + (long)b * nn, n, work, lwork, infop + b));
     }
     dim3 blk(32, 8);
     dim3 grid((n + 31) / 32, (n + 7) / 8, batch);
-    chol_tri_to_R_kernel<<<grid, blk>>>(G.data_ptr<double>(), R.data_ptr<float>(), n, 0);
+    chol_tri_to_R_kernel<<<grid, blk>>>(G.data_ptr<double>(), R.data_ptr<float>(), n);
     auto Q = tri_solve_right_inv(A, R, nb);
     return {Q, R, info};
 }
@@ -6747,7 +6737,6 @@ void set_trsm_trail_fp16(int v) { g_trsm_trail_fp16 = v; }
 """
 
 _CPP_LU_SRC = r"""
-void chol_L_to_R_out(torch::Tensor L, torch::Tensor R);
 std::vector<torch::Tensor> chol_b2_lower_R_solve(torch::Tensor A, torch::Tensor G, torch::Tensor R, int nb);
 std::vector<torch::Tensor> build_H_inplace(torch::Tensor M, torch::Tensor R, torch::Tensor D);
 torch::Tensor tri_solve_right_inv(torch::Tensor A, torch::Tensor R, int nb);
@@ -6765,7 +6754,7 @@ void set_trsm_trail_fp16(int v);
 def _compile_lu():
     return _compile_qr(
         "qr_orhr_lu_w6m", _CPP_LU_SRC, _CUDA_LU_SRC,
-        ["chol_L_to_R_out", "chol_b2_lower_R_solve", "build_H_inplace", "tri_solve_right_inv",
+        ["chol_b2_lower_R_solve", "build_H_inplace", "tri_solve_right_inv",
          "recon_lu_cpp", "oz_slice", "oz_recombine_2pass",
          "oz_gram_gemm_grouped", "set_recon_lowp", "set_recon_solve_fp32",
          "set_recon_lowp_from", "set_recon_warplu",
