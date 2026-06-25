@@ -1546,25 +1546,17 @@ void set_minv_blk4_minw(int v) { g_minv_blk4_minw = v; }
 // Y-FOLD: fold the FP16 Y = M @ W GEMM (mmb_Y) INTO the build_Minv_rblk_gen kernel,
 // eliminating one cuBLAS launch per compact-WY apply. The kernel computes Y on-chip
 // from the just-built M (already in smem) and the FP16 W. ON only when the trailing
-// width `rest` is at/below g_yfold_maxrest (a single CTA per matrix computing the
-// (b x rest) Y, K=b: cheap for narrow rest; a WIDE rest would serialize the Y GEMM
-// into one CTA and lose). 0 = off (separate mmb_Y). Set per shape by Python. (Declared
-// here, ahead of apply_block_reflector_t / build_Minv, which both reference it.)
+// width `rest` is at/below 64 (a single CTA per matrix computing the (b x rest) Y, K=b:
+// cheap for narrow rest; a WIDE rest would serialize the Y GEMM into one CTA and lose).
+// 0 = off (separate mmb_Y). Set per shape by Python. (Declared here, ahead of
+// apply_block_reflector_t / build_Minv, which both reference it.)
 static int g_yfold = 0;
 void set_yfold(int v) { g_yfold = v; }
-static int g_yfold_maxrest = 64;   // fold only applies with rest <= this
-void set_yfold_maxrest(int v) { g_yfold_maxrest = v; }
 // The single-level blocked_qr's blk2/blk4 build_Minv is capped to n<=400: it trims
 // the occupancy-bound shapes 1,2 (n=176/352) build_Minv fraction by ~4-5%, but at the
 // OCCUPANCY-RICH n=512 big-batch case (n=512,B=640: 640 CTAs overfill the 148 SMs, so
 // build_Minv's serial chain is fully hidden) it is a slight (~1%) regression -- so the
 // n<=400 cap keeps the n=512 big-batch case on the static<64> kernel.
-// Threads/CTA for the SINGLE-level blk2 build_Minv (shapes 1,2). Separate from
-// g_minv_nt (which the two-level the n=1024 case/5 path tunes for its OB=128 wide reflectors)
-// so the narrow b=32/60 reflectors here can use a thread count tuned for their
-// shorter forward-subs + tiny h x h matmuls without disturbing shapes 4,5.
-static int g_minv_nt_sl = 256;
-void set_minv_nt_sl(int v) { g_minv_nt_sl = v; }
 // Recursion depth (nlev) for the TWO-LEVEL apply_block_reflector's blk2 build_Minv
 // (build_Minv_rblk_gen_kernel). Default 1 (depth-b/2 forward-sub + 1 merge); N runs nlev=N
 // (depth-b/(2^N) base inverses + N merge phases), SHORTENING the serial diagonal forward-sub
@@ -1969,14 +1961,14 @@ std::tuple<torch::Tensor, torch::Tensor> blocked_qr(torch::Tensor A, int block) 
         panel_factor_smem_wsp_cmf_tmpl_kernel<32,6,float><<<B, dim3(32, 32), wsp_cm_smem>>>(Hp, taup, n, k, b, m, Vfold, nullptr, wsp_cm_ldm);
         // within-block trailing update: the STORE=float arm of the unified
         // apply_block_reflector_t driver (S=V^T V, W=V^T C, M=L^{-1}, Y=M W, C-=V Y, in
-        // place on H), the SAME template the two-level path uses. minv_nt=g_minv_nt_sl is
-        // the single-level build_Minv threads/CTA, and the driver's unified use_blk4
-        // predicate fires the n=176 blk4 family (g_minv_blk4=2, n<=400) while staying false
-        // for n>=512 -- so (H,tau) stay byte-identical. Wst/Mst null, Yst=Yp.
+        // place on H), the SAME template the two-level path uses. minv_nt=512 is the
+        // single-level build_Minv threads/CTA, and the driver's unified use_blk4 predicate
+        // fires the n=176 blk4 family (g_minv_blk4=2, n<=400) while staying false for n>=512
+        // -- so (H,tau) stay byte-identical. Wst/Mst null, Yst=Yp.
         if (inner_rest > 0)
             apply_block_reflector_t<float>(handle, Hp, taup, Vp, Sp, Tp, Wp,
                                   /*Wst=*/nullptr, /*Mst=*/nullptr, /*Yst=*/Yp,
-                                  n, k, b, m, k + b, inner_rest, B, g_minv_nt_sl);
+                                  n, k, b, m, k + b, inner_rest, B, /*minv_nt=*/512);
     }
     return std::make_tuple(H, tau);  // handle is persistent (static), not destroyed
 }
@@ -4050,8 +4042,9 @@ static void apply_block_reflector_t(cublasHandle_t handle, STORE* Hp, float* tau
         // build_Minv's dead W-zeroing arg (rankdef never reaches the bf16 path).
         // Y-FOLD: for narrow trailing widths, also fold Y=M@W into build_Minv (it has M
         // in smem + the FP16 W in HBM), dropping the separate mmb_Y launch. Gated to the
-        // rblk_gen build_Minv path (the only one used here) and rest<=g_yfold_maxrest.
-        const bool yfold = g_yfold && rest <= g_yfold_maxrest;
+        // rblk_gen build_Minv path (the only one used here) and rest<=64 (the only value
+        // every yfold regime sets for the former g_yfold_maxrest knob).
+        const bool yfold = g_yfold && rest <= 64;
         launch_build_Minv(Sp, taup, Tp, Wp_f32, n, kc, w, rest, B, minv_nt,
                           /*use_blk4=*/(g_minv_blk4 && (w & 3) == 0 && w >= g_minv_blk4_minw),
                           /*blk2_nlev=*/1, /*Mb16=*/Mst,
@@ -4863,7 +4856,6 @@ void set_warps(int w);
 void set_minv_nt(int v);
 void set_minv_blk4(int v);
 void set_minv_blk4_minw(int v);
-void set_minv_nt_sl(int v);
 void set_panel_defer(int v);
 void set_wsp_pad(int v);
 void set_wsp_cm_coop(int v);
@@ -4880,7 +4872,6 @@ void set_n2048_h(int v);
 void set_paf_help(int v);
 void set_ov_coop(int v);
 void set_yfold(int v);
-void set_yfold_maxrest(int v);
 """
 
 # --- Build of the two CUDA extensions --------------------------------------
@@ -4907,7 +4898,7 @@ def _compile_qr(name, cpp, cuda, functions, ldflags):
 
 
 def _compile_ext():
-    functions = ["blocked_qr", "illcond_mask", "n352_illcond_mask_cuda", "blocked_qr_2level", "blocked_qr_2level_bf16", "qr_n512_mixed_driver", "blocked_qr_tiny", "qr_mega_small", "set_bf16_nt", "set_bf16_wf16", "set_fp16_pure", "set_prec", "set_warps", "set_minv_nt", "set_minv_blk4", "set_minv_blk4_minw", "set_minv_nt_sl", "set_panel_defer", "set_wsp_pad", "set_wsp_cm_coop", "set_panel_cm", "set_panel_cm2", "set_cmf_warps", "set_cmf_mrfine", "set_ov_fold", "set_inner_wmma", "set_inner_wmma_wmax", "set_panel_apply_fused", "set_paf_warps", "set_n2048_h", "set_paf_help", "set_yfold", "set_yfold_maxrest", "set_ov_coop"]
+    functions = ["blocked_qr", "illcond_mask", "n352_illcond_mask_cuda", "blocked_qr_2level", "blocked_qr_2level_bf16", "qr_n512_mixed_driver", "blocked_qr_tiny", "qr_mega_small", "set_bf16_nt", "set_bf16_wf16", "set_fp16_pure", "set_prec", "set_warps", "set_minv_nt", "set_minv_blk4", "set_minv_blk4_minw", "set_panel_defer", "set_wsp_pad", "set_wsp_cm_coop", "set_panel_cm", "set_panel_cm2", "set_cmf_warps", "set_cmf_mrfine", "set_ov_fold", "set_inner_wmma", "set_inner_wmma_wmax", "set_panel_apply_fused", "set_paf_warps", "set_n2048_h", "set_paf_help", "set_yfold", "set_ov_coop"]
     return _compile_qr("qr_blocked_v7k_wf16", _CPP_SRC, _CUDA_SRC, functions, ["-lcublas"])
 
 _CUDA_LU_SRC = r"""
@@ -5948,7 +5939,6 @@ _ext.set_minv_nt(_MINV_NT)
 _ext.set_minv_blk4(0)        # default OFF; the FP16 the n=1024 case/5 dispatch flips it on
 _ext.set_minv_blk4_minw(0)
 # (the n=512 big-batch blk4 build_Minv is now set inline at its driver -- blk4(1)/minw=48.)
-_ext.set_minv_nt_sl(512)   # threads/CTA for the single-level blk2 build_Minv (shapes 1,2)
 _ext.set_panel_cm2(0)   # default OFF; shapes 1,2 flip it on, restored after
 _ext.set_ov_fold(0)     # default OFF; the per-shape dispatch flips it on (outer-V fold)
 
@@ -6049,7 +6039,7 @@ _LARGE_HI = {   # n in [2048,4096); B=8 is SM-starved -> the coop panel
     # Y-FOLD: fold Y=M@W into build_Minv for the NARROW inner applies (rest=OB-IB=24<=64);
     # the wide outer apply (rest up to ~2000) stays on mmb_Y. Drops ~1 launch per inner
     # block on this 555-launch/iter, 88%-GPU-busy (12% launch-idle) shape.
-    "yfold": 1, "yfold_maxrest": 64,
+    "yfold": 1,
 }
 
 
@@ -6062,7 +6052,7 @@ _RDEF = {
     "set_cmf_warps": 0, "set_cmf_mrfine": 0,
     "set_ov_fold": 0, "set_inner_wmma": 0, "set_inner_wmma_wmax": 0, "set_panel_apply_fused": 0, "set_paf_warps": 8,
     "set_bf16_wf16": 0, "set_wsp_cm_coop": 0, "set_n2048_h": 0, "set_paf_help": 1,
-    "set_yfold": 0, "set_yfold_maxrest": 64, "set_ov_coop": 0,
+    "set_yfold": 0, "set_ov_coop": 0,
 }
 
 
@@ -6110,10 +6100,9 @@ def _qr_large_fp16(Ac, p):
                 sets.append(("set_n2048_h", 1))
     sets.append(("set_ov_fold", p["ov_fold"]))
     sets.append(("set_bf16_wf16", 1))    # FP16-W apply always on for the large-n FP16 path
-    # Y-FOLD (fold Y=M@W into build_Minv for narrow applies): opt-in per regime.
+    # Y-FOLD (fold Y=M@W into build_Minv for narrow applies, rest<=64): opt-in per regime.
     if p.get("yfold", 0):
         sets.append(("set_yfold", 1))
-        sets.append(("set_yfold_maxrest", p.get("yfold_maxrest", 64)))
     # build_Minv block variant: rblk selector (HI) takes priority over the plain blk4 flag.
     if minv_sel: sets += [("set_minv_blk4", minv_sel), ("set_minv_blk4_minw", p["blk4_minw"])]
     # WMMA inner-apply + panel-apply fusion (LO regime only; keys absent for HI).
