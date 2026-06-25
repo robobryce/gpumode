@@ -81,6 +81,15 @@ autocuda run exclusive --data-dir "$DATA_DIR" -- \
 - **Axes:** the benchmark shapes from `task.yml`; the geomean reduces across them.
 - **Aggregation:** geomean over the shapes. Because `geomean(baseline_i)/geomean(trial_i) == geomean(baseline_i/trial_i)`, this single geomean-µs scalar with direction=min makes autocuda's baseline/trial speedup the ratio-space per-shape aggregate the worker skill prescribes, and matches the leaderboard's own geomean-of-shapes ranking.
 
+## Profiling
+
+`eval.py` runs `custom_kernel` in a **spawned subprocess** (`multiprocessing.get_context("spawn")`), so a profiler attached only to the parent process captures **zero kernels** — it finishes in a couple of seconds and writes a `.nsys-rep` with no kernel data. That empty trace is a failed capture, not a result; never base a decision on one. Two ways to get a real capture:
+
+- **`ncu` works directly** — it attaches to each kernel launch, so it sees the subprocess kernels. Use `harness/profile_ncu.sh <set>/<problem> [<shape-spec>]` (wrapped in `autocuda run exclusive`); it already handles the subprocess plus the `sudo`/closed-fd-3/`PYTHONPATH` issues `ncu` hits on this harness. Because the leaderboard kernel is reached via the subprocess and only `ncu` reliably profiles through it, `ncu` is the primary signal here — don't settle for `nsys` alone once you know which kernel to attack.
+- **`nsys`** needs the exact subprocess-tracing invocation recorded in `autocuda/environment.md`'s **Profiling** section (written per-machine by `/autocuda:discover`) — use it verbatim and confirm the result with `nsys stats --report cuda_gpu_kern_sum <file>.nsys-rep` before trusting it.
+
+Profile `custom_kernel` on **one representative shape in isolation**, never the whole benchmark: a whole-benchmark profile interleaves the reference checker's own kernels (cuSOLVER/cuBLAS/cutlass) with yours and mis-attributes time.
+
 ## Cross-benchmark aggregation
 
 One problem is optimized per run (one `optimize-tree` run, scoped with `benchmark=<set>/<problem>`), so there is no cross-benchmark combination: a run's per-iteration score is its single benchmark's geomean-µs compared to baseline as `baseline/trial` (direction=min). To optimize a different problem, start a fresh run with a different `benchmark=<set>/<problem>` and `tag-suffix`.
