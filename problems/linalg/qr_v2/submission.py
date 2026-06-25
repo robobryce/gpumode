@@ -799,17 +799,14 @@ qr_mega_resident_kernel(const float* __restrict__ Ain, float* __restrict__ Hout,
             float vj[MR];
             #pragma unroll
             for (int t = 0; t < MR; ++t) { int r = r0 + lane + 32 * t; vj[t] = (r < n) ? colj[r] : 0.f; }
-            // 2-WIDE TRAILING APPLY: the n=176 bulk path -- NOT warp 0's look-ahead -- is the
-            // per-column CRITICAL path (warp 0 finishes its pivot work before the 31 bulk warps
-            // finish their ~6 trailing-column updates each, so the per-column barrier waits on
-            // bulk). Each warp applies H_j to its trailing columns TWO at a time: the two
-            // independent dot-product warp reductions PIPELINE through ONE fused shuffle butterfly
-            // (depth 5 + 1 bcast, carrying both ss0,ss1) instead of two serial back-to-back
-            // reductions, halving the reduction-latency exposure on the bulk spine. The pivot vj[]
-            // stays register-cached across the pair; FLAT reg0[MR]/reg1[MR] (not reg[2][MR]) keeps
-            // the allocator from spilling (the 2D form spills). Reflector
-            // is identical per column -> BIT-IDENTICAL result. An odd trailing count leaves the
-            // last column to the scalar tail below.
+            // 2-WIDE TRAILING APPLY: at n=176 the bulk path (not warp 0's look-ahead) is the
+            // per-column CRITICAL path, so the barrier waits on bulk. Each warp applies H_j to
+            // its trailing columns TWO at a time: the two dot-product reductions PIPELINE through
+            // ONE fused shuffle butterfly (depth 5 + 1 bcast, carrying both ss0,ss1) instead of
+            // two serial reductions, halving the reduction-latency exposure. The pivot vj[] stays
+            // register-cached across the pair; FLAT reg0[MR]/reg1[MR] (not reg[2][MR]) avoids the
+            // 2D-form spill. BIT-IDENTICAL result; an odd trailing count leaves the last column
+            // to the scalar tail below.
             const int step = NWARPS - 1;
             int c = j + 2 + (warp - 1);
             for (; c + step < n; c += 2 * step) {
@@ -870,18 +867,14 @@ qr_mega_resident_kernel(const float* __restrict__ Ain, float* __restrict__ Hout,
 
 // Build M = L^{-1} = T^T  (lower-triangular b x b) directly from S=V^TV and tau,
 // where L = (T^{-1})^T = diag(1/tau) + tril(S,-1) (S symmetric so S[i,j]=S[j,i]).
-// Then the compact-WY trailing update C -= V T^T W = V (M W) uses Y = M W, a
-// single op_N batched GEMM -- so this kernel REPLACES both form_T_from_S (the
-// sequential larft j-recurrence) AND it lets the Y-GEMM drop the transpose.
-// The inverse is built in smem with the COLUMNS of M independent (parallelized
-// across threads, one column each); only the row recurrence within a column is
-// sequential -- strictly more parallel than larft's sequential j-loop, so it
-// fills the GPU better at every batch.
+// The compact-WY trailing update C -= V T^T W = V (M W) then uses Y = M W (a single op_N
+// batched GEMM), so this REPLACES form_T_from_S (the sequential larft j-recurrence) and lets
+// the Y-GEMM drop the transpose. The inverse is built in smem with M's COLUMNS independent
+// (one thread each); only the within-column row recurrence is sequential:
 //   M[j,j] = tau_j ; for i>j:  M[i,j] = -tau_i * sum_{p=j..i-1} L[i,p] M[p,j].
-// Rank-deficient tau_j==0 -> L row j = e_j, so M row/col j collapse and Y_j=0;
-// we also zero W row j (matching larft's zero row & column j in T).
-// Smem row stride padded ODD (b|1) so the strided column reads of M during the
-// forward-sub hit 32 distinct banks (no conflicts) regardless of b.
+// Rank-deficient tau_j==0 -> L row j = e_j, so M row/col j collapse and Y_j=0; we also zero
+// W row j (matching larft's zero row & column j in T). Smem row stride padded ODD (b|1) so
+// the strided column reads of M hit 32 distinct banks regardless of b.
 // FOUR-block-merge build_Minv: invert the b x b lower-triangular L via a 4x4 block scheme
 // (block size q=b/4) instead of blk2's 2x2. The four DIAGONAL q-blocks invert via q-deep
 // forward-subs (HALF blk2's h-deep chain), and the 6 below-diagonal blocks fill by
@@ -1710,32 +1703,22 @@ __global__ void compact_n512_bad_input_kernel(const float* __restrict__ A,
             // on the FP16 good path -- flagging them bad would only waste the costlier exact
             // path. col_ratio is instead reused for the rank-reveal stage-1 flag below.
             const bool b_row = (row_ratio < 1.0e-6f);
-            // cos01 (near-collinear) is gated on col_ratio: a near-collinear batch only
-            // needs the exact FP32 path when its TRAILING columns are FULL-NORM (col_ratio
-            // ~ O(1)). When the trailing columns are scaled down (col_ratio << 1, e.g.
-            // cond>0 column scaling: logspace tail ~1e-2 -> col_ratio ~1e-3), the FP16 good
-            // path factors it correctly (FP32-V reflectors keep orthogonality exact and the
-            // tiny tail carries negligible ill-conditioning). MEASURED: cond=2 nearcollinear
-            // has col_ratio ~9.9e-4 and factors clean on good (worst orth/factor ratio 0.27
-            // over 12 seeds); cond=0 mixed near-collinear has col_ratio 0.6-1.28 and FAILS
-            // good (orth scaled up to 7e3). The 0.1 threshold sits 2 orders of magnitude
-            // above the scaled-tail cases and 6x below the full-norm ones -> it routes only
-            // the genuinely-FP16-killing full-norm near-collinear matrices to exact, freeing
-            // the scaled-tail ones (the bulk of s7's cos hits) onto the fast good path.
+            // cos01 (near-collinear) is gated on col_ratio: a near-collinear batch only needs
+            // the exact FP32 path when its TRAILING columns are FULL-NORM (col_ratio ~ O(1)).
+            // When they are scaled down (col_ratio << 1, e.g. cond>0 logspace tail), the FP16
+            // good path factors it correctly. The 0.1 threshold sits ~2 orders above the
+            // scaled-tail cases (cond=2 nearcollinear col_ratio ~9.9e-4, factors clean) and
+            // below the full-norm ones (cond=0 mixed near-collinear col_ratio 0.6-1.28, FAILS
+            // good), so only the FP16-killing full-norm near-collinear matrices route to exact.
             const bool b_cos = (cos01 > 0.30f) && (col_ratio > 0.1f);
             const bool b_off = (off_frac > 0.92f);
-            // ROBUSTNESS FIX (worker-2 brief-25, ported from board-accepted b3ef4435): also
-            // route the clustered case to the exact FP32 path. Measured over 160+ shape-7
-            // mixed re-seeds, clustered's sqrt(eps)-scaled middle cluster (cols ~254-257)
-            // factors to a scaled factor residual of ~15-16 on the FP16 good path (vs ~0.02
-            // exact), sitting at ~80% of the gate with no headroom for an unlucky remote
-            // re-seed. The clustered signature is UNIQUE and cleanly separable: col 320 sits
-            // in clustered's 4*eps tail -> mid_ratio ~1e-13, vs >=6.7e-6 for EVERY other
-            // profile (dense incl cond4 ~7e-6, rankdef/nearrank ~0.26 -- col 320 is full
-            // there, rank=384). A 1e-9 threshold has ~3 orders of margin below the nearest
-            // non-clustered profile, so it flags clustered ONLY; routing it to exact FP32
-            // drops its worst residual ~15.5 -> ~0.02. (rankdef stays on the good path: col
-            // 320 full there, and its tail is handled by the rank-reveal cap below.)
+            // ROBUSTNESS: also route the clustered case to exact FP32. Clustered's
+            // sqrt(eps)-scaled middle cluster factors to a scaled factor residual ~15-16 on the
+            // FP16 good path (~80% of the gate, no remote-reseed headroom) vs ~0.02 exact. Its
+            // signature is UNIQUE and cleanly separable: col 320 sits in clustered's 4*eps tail
+            // -> mid_ratio ~1e-13, vs >=6.7e-6 for EVERY other profile (col 320 full there), so
+            // a 1e-9 threshold flags clustered ONLY. (rankdef stays on the good path: col 320
+            // full there, its tail handled by the rank-reveal cap below.)
             const bool b_mid = (mid_ratio < 1.0e-9f);
             // HARD bad = a genuine FP16-killer (row-scaled, near-collinear-full-norm,
             // banded). These LOSE orthogonality / blow the factor residual on the FP16
@@ -2112,27 +2095,21 @@ void set_yfold_maxrest(int v) { g_yfold_maxrest = v; }
 static int g_minv_nt_sl = 256;
 void set_minv_nt_sl(int v) { g_minv_nt_sl = v; }
 // Recursion depth (nlev) for the TWO-LEVEL apply_block_reflector's blk2 build_Minv
-// (build_Minv_rblk_gen_kernel). Default 1 (the 2-block-merge: depth-b/2 diagonal
-// forward-sub + 1 merge). Setting it to N runs nlev=N (depth-b/(2^N) base-block
-// inverses + N independent-merge phases), SHORTENING the serial diagonal forward-sub
-// chain at the cost of more parallel merge matmuls. Wins ONLY where the build_Minv
-// CTA grid does NOT fully fill the SMs (so the per-matrix serial chain is exposed on
-// the critical path, NOT hidden by occupancy): the n=512 BAD subset runs ~bad_count
-// CTAs (~1 wave at bad_count~144), so its chain is exposed. The full-640-CTA good
-// batch overfills the SMs and hides the chain -> nlev>1 there is neutral-to-regress.
-// Requires (w % (1<<nlev)) == 0 for the reflector width w; falls back to nlev=1 (and
-// then static<64> / dyn) otherwise. Numerically identical to nlev=1 (same FP32
-// triangular inverse up to tree-reduction reassociation).
+// (build_Minv_rblk_gen_kernel). Default 1 (depth-b/2 forward-sub + 1 merge); N runs nlev=N
+// (depth-b/(2^N) base inverses + N merge phases), SHORTENING the serial diagonal forward-sub
+// chain at the cost of more parallel merge matmuls. Wins ONLY where the build_Minv grid does
+// NOT fill the SMs (chain exposed): the n=512 BAD subset runs ~bad_count CTAs (~1 wave), so
+// its chain is exposed; the full-640-CTA good batch overfills and hides it (nlev>1 neutral).
+// Requires (w % (1<<nlev)) == 0; falls back to nlev=1 otherwise. Numerically identical to
+// nlev=1 (FP32 inverse up to tree-reduction reassociation).
 static int g_minv_2lev_nlev = 1;   // set internally by set_n512_good_flags; no Python setter
 
-// When set, blocked_qr_2level factors its input tensor IN PLACE (no defensive clone).
-// The n512-mixed BAD subset gathers its ~bad_count matrices into a fresh disposable
-// scratch buffer, so the internal `H = A.contiguous().clone()` is a REDUNDANT 174MB
-// copy (B=166 -> 166*512*512*4) + alloc on every call. With this flag the driver's
-// scratch IS the output H: gather -> factor-in-place -> scatter reads the same buffer.
-// Set internally by set_n512_bad_flags; restored after. Off for every other caller
-// (which pass tensors that must stay unmodified). Numerically identical (the clone
-// only protected the caller's input; the bad driver's scratch is write-once-per-call).
+// When set, blocked_qr_2level factors its input tensor IN PLACE (no defensive clone). The
+// n512-mixed BAD subset gathers its matrices into a fresh disposable scratch, so the internal
+// `H = A.contiguous().clone()` is a redundant copy+alloc; with this flag the driver's scratch
+// IS the output H (gather -> factor-in-place -> scatter reads the same buffer). Set internally
+// by set_n512_bad_flags; restored after. Off for every other caller (whose tensors must stay
+// unmodified). Numerically identical (the clone only protected the caller's input).
 static int g_qr2_no_clone = 0;
 
 // Single-pass strided-batched GEMM (no hi/lo split), arbitrary ld/stride so operands
@@ -2266,15 +2243,12 @@ static void launch_build_Minv(const float* Sp, const float* taup, float* Tp, flo
 // OB GEMM. Falls back to the single-level path for n that don't fit smem at IB.
 std::tuple<torch::Tensor, torch::Tensor> blocked_qr_2level(torch::Tensor A, int OB, int IB);
 
-// Lean single-panel QR for the TINY launch/overhead-bound regime (n<=block, so
-// the blocked_qr loop would factor the whole matrix in ONE panel kernel and break
-// before any trailing update). The general blocked_qr unconditionally allocates 9
-// scratch tensors (V,T,S,Wbuf,Ybuf,Ah,Al,Bh,Bl) and touches the static cuBLAS
-// handle even on this single-panel path where none of them are used. This entry
-// does the bare minimum with the separate-IO warp-per-matrix kernel: NO clone of A
-// (the kernel reads A untouched and writes a FRESH empty H), an empty tau (the
-// kernel writes every tau[0..n)), and one launch. Numerically identical to
-// blocked_qr's single-panel deferred-scale case, so it shares all validation.
+// Lean single-panel QR for the TINY launch/overhead-bound regime (n<=block, so blocked_qr
+// would factor the whole matrix in ONE panel kernel and break before any trailing update).
+// The general blocked_qr unconditionally allocates 9 scratch tensors + touches the cuBLAS
+// handle even though none are used here. This entry does the bare minimum with the
+// separate-IO warp-per-matrix kernel: NO clone of A, an empty tau, and one launch.
+// Numerically identical to blocked_qr's single-panel deferred-scale case.
 std::tuple<torch::Tensor, torch::Tensor> blocked_qr_tiny(torch::Tensor A) {
     int B = A.size(0);
     int n = A.size(1);
@@ -3345,11 +3319,10 @@ __global__ void fill_R_n512_ob64_ib16_indexed_kernel(float* __restrict__ Hout,
 // barrier latency); n=1024/2048 (W=32, m=1024/2048=127-216KB) are smem-capped to 1 CTA/SM
 // regardless, so MINB=1 there lets the compiler use more registers per thread.
 // Shared ROW-MAJOR warp-specialized-pivot Householder factor (load + col-0 scalars +
-// the per-column j-loop). Operates on extern __shared__ float s[] (row-major s[r*LDS+c],
-// invs[] at s+m*LDS); leaves the factored panel + deferred inverses in smem. The plain
-// (V-only) and OV (outer-V-fold) bf16 wrappers below call this then run their own
-// write-back epilogue. Factored as __forceinline__ so each wrapper keeps its own
-// signature and the inlined codegen matches the former monolithic kernels.
+// per-column j-loop). Operates on extern __shared__ float s[] (row-major s[r*LDS+c], invs[]
+// at s+m*LDS); leaves the factored panel + deferred inverses in smem. The plain (V-only) and
+// OV (outer-V-fold) bf16 wrappers below call this then run their own write-back epilogue
+// (__forceinline__ so each keeps its own signature).
 template <int NWARPS>
 __device__ __forceinline__ void panel_wsp_rm_factor(
         bf16* __restrict__ A, float* __restrict__ TAU,
