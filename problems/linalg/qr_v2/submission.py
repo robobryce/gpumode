@@ -8067,61 +8067,28 @@ def _gram_int_ozaki(A, G, lu):
 
 
 
-def _choleskyqr_1pass(A, lu, dense_noinfo=False):
-    # ONE CholeskyQR pass with an FP64 Gram + FP64 cholesky (so the squared
-    # condition number cond(G)~cond(A)^2 ~ 3e8 is fully resolved -- an FP32 Gram
-    # would lose the small eigenvalues below its 1e-7 noise floor and need a
-    # second pass). The triangular solve Q = A R^{-1} runs in FP32/TF32: that
-    # alone holds ||Q^TQ-I|| ~ 2e-4 at n=4096, far under the 4.9e-2 orth gate, so
-    # NO reortho / 2nd cholesky is needed for the well-conditioned benchmark
-    # shapes. Rank-deficient (cond=0) stress matrices make G non-PD -> chol info
-    # flags them and they fall back to geqrf in the caller. Returns (Q, R, info).
-    #
-    # The cholesky is the LOWER potrf (~2x faster than the blocked upper potrf at
-    # n=4096), and the main A R^{-1} solve is the custom blocked right-TRSM
-    # (nb=_TRSM_NB_CPP, 3xTF32 wide trailing GEMMs that fill 148 SMs at batch=2).
-    # The lower factor L (G = L L^T) gives R = L^T (upper QR factor); both
-    # the custom TRSM and the fused build_H index R as row-major UPPER, so L^T is
-    # materialized contiguous ONCE (a cheap ~0.13ms n^2 transpose-copy, negligible
-    # next to the ~3.6ms/call the lower potrf saves).
+def _choleskyqr_1pass(A, lu):
+    # ONE CholeskyQR pass with an FP64 int-Ozaki Gram + FP64 cholesky (so the squared
+    # condition number cond(G)~cond(A)^2 ~ 3e8 is fully resolved). The triangular solve
+    # Q = A R^{-1} runs in FP32/TF32: that alone holds ||Q^TQ-I|| ~ 2e-4 at n=4096, far
+    # under the orth gate, so no reortho / 2nd cholesky is needed. Reached only for the
+    # scored shape 6 (B=2, n=4096) -- the fused cuSOLVER lower-potrf + custom blocked
+    # right-TRSM in one C++ call (chol_b2_lower_R_solve; the L^T->R cast happens inside).
+    # The tau-override owns orthogonality, so the TRSM drops to 3xTF32 diag / 3xFP16
+    # trailing (only the loose factor residual binds). Returns (Q, R, info).
     b, n, _ = A.shape
-    # G = A^T A in FP64. G reuses a persistent FP64 buffer (the Gram fully overwrites
-    # its used triangle). The int-Ozaki Gram slices A directly (FP32) and fills
-    # ROW-MAJOR-LOWER for the LOWER cholesky.
+    # G = A^T A in FP64 (persistent buffer, fully overwritten). The int-Ozaki Gram slices
+    # A directly (FP32) and fills ROW-MAJOR-LOWER for the LOWER cholesky.
     G = _scratch_like_dtype3(b, n, 1, "gramG", torch.float64, A.device)[0]
     _gram_int_ozaki(A, G, lu=lu)
-    # Persistent FP32 R (= the QR R-factor), fully overwritten by the chol L^T->R cast
-    # each call. Same (b,n,n) buffer as G's shape.
+    # Persistent FP32 R (= the QR R-factor), fully overwritten by the chol L^T->R cast.
     R = _scratch_like_dtype3(b, n, 1, "Rfp32", torch.float32, G.device)[0]
-    if dense_noinfo and b == 2 and n == 4096:
-        # Benchmark shape 6 (B=2, n=4096): fused cuSOLVER lower-potrf + custom
-        # blocked right-TRSM in one C++ call (the L^T->R cast happens inside).
-        # worker-0 brief-9: drop the diagonal-solve / trailing precision for the SCORED
-        # s6 path (tau-override owns orthogonality; only the loose factor residual binds).
-        lu.set_trsm_diag_prec(_TRSM_DIAG_PREC)
-        lu.set_trsm_trail_fp16(_TRSM_TRAIL_FP16)
-        out = lu.chol_b2_lower_R_solve(A, G, R, _TRSM_NB_CPP)
-        lu.set_trsm_diag_prec(0)
-        lu.set_trsm_trail_fp16(0)
-        return out
-    # The other arm (dense_noinfo unset): the B=1/B!=2 n>=4096 tiny-batch test inputs.
-    # A per-matrix LOWER cholesky_ex is ~2.8x faster than the batched routine at large-n/
-    # tiny-batch; each writes its L[i] into a persistent FP64 buffer (no torch.stack ->
-    # no n^2 copy) and info is collected without a per-matrix .item() sync (one at the
-    # gate). R = L^T, then the custom blocked right-TRSM Q = A R^{-1}.
-    L64 = _scratch_like_dtype3(b, n, 1, "chol_L", torch.float64, G.device)[0]
-    info = torch.empty(b, dtype=torch.int32, device=G.device)
-    for i in range(b):
-        torch.linalg.cholesky_ex(G[i], upper=False, out=(L64[i], info[i:i + 1].view(())))
-    lu.chol_L_to_R_out(L64, R)
-    # Q = A R^{-1} via the custom blocked right-TRSM (tri_solve_right_inv, as above).
-    # Force exact-FP32 matmul (no TF32) for this arm's solve.
-    torch.backends.cuda.matmul.allow_tf32 = False
-    torch.backends.cudnn.allow_tf32 = False
-    Q = lu.tri_solve_right_inv(A, R, _TRSM_NB_CPP)
-    # Return R (= the FP64-accurate chol factor = the QR R-factor; see the section
-    # header) instead of recomputing Q^T A -- saves an n^3 GEMM and is more accurate.
-    return Q, R, info
+    lu.set_trsm_diag_prec(_TRSM_DIAG_PREC)
+    lu.set_trsm_trail_fp16(_TRSM_TRAIL_FP16)
+    out = lu.chol_b2_lower_R_solve(A, G, R, _TRSM_NB_CPP)
+    lu.set_trsm_diag_prec(0)
+    lu.set_trsm_trail_fp16(0)
+    return out
 
 
 def _reconstruct_householder(Q, R, lu):
@@ -8167,7 +8134,7 @@ def _cholqr_path(A, dense_noinfo=False, gate=True):
     # whose cond=0 stress CholeskyQR cannot orthogonalize. _lu is the compiled-once
     # module singleton, threaded through both callees (so they don't each re-reference it).
     lu = _lu
-    Q, R, info = _choleskyqr_1pass(A, dense_noinfo=dense_noinfo, lu=lu)
+    Q, R, info = _choleskyqr_1pass(A, lu=lu)
     if gate:
         # "good" = Gram was PD (info==0) AND Q columns near-unit-norm (a cheap orth proxy
         # for the rank-deficient cond=0 stress); bad matrices fall back to geqrf. Computed
