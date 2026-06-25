@@ -1304,19 +1304,16 @@ panel_factor_smem_wsp_cmf_tmpl_kernel(ST* __restrict__ H, float* __restrict__ ta
             }
         } else if constexpr (!std::is_same<ST, float>::value) {
             // Bulk (__half-storage instantiation == the n=352 s2 path ONLY): REGISTER-CACHE
-            // each trailing column AND reuse the per-lane reflector cache vj_s2[] hoisted at
-            // the top of this column-j iteration (SHARED with the warp-0 look-ahead). colj is
-            // INVARIANT across this warp's trailing columns (depends on (j,lane,t), not c) yet
-            // is read twice per (c,t) (reduce + update); profiling s2 showed the cmf panel is
-            // ~26% short-scoreboard-stalled on exactly these smem re-reads (n=352 B=40, 1
-            // CTA/SM, latency-bound). Reusing vj_s2 collapses colj's smem traffic from
-            // 2*(#cols)*MROWS to MROWS. The compiler cannot lift it: the colc[r] store below
-            // may alias colj (no c!=j proof through smem), so it reloads every iteration. Gated
-            // to __half so the FP32 cmf instantiations (n=176 FP32 panel, the n=512-bad <32,16>
-            // FP32 cmf at B=640 where +MROWS regs cost occupancy and REGRESS) keep their
-            // original byte-identical SASS. The reduce accumulate drops its r<m guard: vj_s2[t]
-            // and reg[t] are both 0 for r>=m so the added term is exactly 0 -- bit-identical.
-            // The store keeps its r<m bound check.
+            // each trailing column AND reuse the per-lane reflector cache vj_s2[] hoisted at the
+            // top of this column-j iteration (SHARED with the warp-0 look-ahead). colj is
+            // INVARIANT across this warp's trailing columns yet is read twice per (c,t) (reduce
+            // + update) and the compiler cannot lift it (the colc[r] store may alias colj through
+            // smem), so reusing vj_s2 collapses colj's smem traffic from 2*(#cols)*MROWS to MROWS
+            // on this latency-bound 1-CTA/SM panel. Gated to __half so the FP32 cmf
+            // instantiations (n=176, n=512-bad <32,16> at B=640 where +MROWS regs REGRESS
+            // occupancy) keep their byte-identical SASS. The reduce drops its r<m guard (vj_s2[t]
+            // and reg[t] are both 0 for r>=m -> the added term is exactly 0, bit-identical); the
+            // store keeps its r<m bound check.
             const int r0 = j + 1;
             for (int c = j + 2 + (warp - 1); c < b; c += (NWARPS - 1)) {  // bulk: cols >= j+2
                 float* colc = s + (size_t)c * LDM;
@@ -1453,20 +1450,15 @@ static int g_prec_w = 0;   // set internally by set_n512_good_flags; no Python s
 // ~0.02). ROBUSTNESS: the remote secret s7 run amplifies a latent orth instability the
 // local toolchain cannot reproduce, so exact-S is required to hold the wide margin.
 static int g_prec_s = 0;
-// DETERMINISM: forbid split-K in the blocked_qr_2level trailing GEMMs.
-// On the n512-mixed BAD subset (qr_n512_mixed_driver), the exact SIMT-FP32 trailing
-// GEMMs (W=V^T@C and final C-=V@Y + Y=T@W, all via mm3g) run cublasSgemmStridedBatched
-// with the handle's DEFAULT workspace. At LARGE batch (B>=~500, e.g. the B=1280
-// invariance perturbation) the cuBLAS heuristic picks a SPLIT-K algorithm
-// (cublasLt::splitKreduce_kernel) whose K-split partial-sum reduction varies the
-// floating-point result run-to-run -> a near-rank-deficient matrix's factor residual
-// flickers around the gate (~1/5 runs FAIL the invariance guard = LEADERBOARD-REJECTION
-// risk). Split-K reduction REQUIRES a workspace to hold the K-split partials; setting the
-// handle workspace to 0 bytes forces the heuristic to a SINGLE-WAVE non-split-K algorithm
-// -> bit-reproducible across runs (cuBLAS guarantees same-arch/same-SM/default-queue
-// reproducibility for non-split-K). 1 = disable split-K (workspace 0) for the duration of
-// the blocked_qr_2level call, restoring a persistent default workspace at exit so the other
-// (smaller-B) two-level callers keep their split-K fast path.
+// DETERMINISM: forbid split-K in the blocked_qr_2level trailing GEMMs. On the n512-mixed
+// BAD subset, at LARGE batch (B>=~500, e.g. the B=1280 invariance perturbation) the cuBLAS
+// heuristic picks a SPLIT-K algorithm whose K-split partial-sum reduction varies the result
+// run-to-run -> a near-rank-deficient matrix's factor residual flickers around the gate
+// (~1/5 runs FAIL the invariance guard = LEADERBOARD-REJECTION risk). Split-K REQUIRES a
+// workspace for the partials, so setting the handle workspace to 0 bytes forces a non-split-K
+// algorithm -> bit-reproducible (cuBLAS guarantees same-arch/default-queue reproducibility
+// for non-split-K). 1 = disable split-K (workspace 0) for the blocked_qr_2level call,
+// restoring the persistent default workspace at exit so smaller-B callers keep their fast path.
 static int g_no_splitk = 0;  // C++-managed (RAII-toggled around the n512 bad-subset exact GEMMs); no Python setter
 static int g_warps = 8;  // smem-panel warps/CTA (set from Python)
 void set_warps(int w) { g_warps = w; }
