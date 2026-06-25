@@ -6658,15 +6658,16 @@ def _custom_kernel_generic(data: input_t) -> output_t:
         bad = _n352_illcond_mask(Ac)           # (B,) bool: structurally ill-conditioned matrices
         if not bool(bad.any()):
             return _qr_small_bf16(Ac, n)        # fast path (the scored cond1-dense lands here)
-        # CRITICAL: blocked_qr_2level_bf16 factors Ac IN PLACE (mutates the input). The eval
-        # benchmark RE-CHECK runs custom_kernel on the SAME input tensor across timed reps and
-        # compares R against the ORIGINAL A, so the geqrf fallback MUST read the bad rows from a
-        # COPY taken BEFORE the bf16 path mutates them (else geqrf factors corrupted rows on rep
-        # 2+ -> spurious factor-residual fail). Snapshot the bad rows first.
+        # ILL-COND FALLBACK: factor everything on the bf16 path, then overwrite the structurally
+        # ill-conditioned matrices with gold-standard geqrf. _qr_small_bf16 does NOT mutate its
+        # input (the FP32->BF16 convert reads Ac into a SEPARATE bf16 working buffer; verified
+        # max|Ac-Ac_before|==0, brief-9/10) -- so the geqrf fallback reads the ORIGINAL Ac[bad_idx]
+        # directly. (The old code took a pre-snapshot `bad_rows = Ac[bad_idx].contiguous()` before
+        # the bf16 call on the now-disproven assumption that it factored Ac IN PLACE; that copy was
+        # dead and is removed -- byte-identical, and drops a redundant copy on this fallback path.)
+        H, tau = _qr_small_bf16(Ac, n)          # bf16 for all (input unchanged); overwrite bad w/ geqrf
         bad_idx = torch.nonzero(bad, as_tuple=False).flatten()
-        bad_rows = Ac[bad_idx].contiguous()     # copy of the original ill-cond matrices (pre-bf16)
-        H, tau = _qr_small_bf16(Ac, n)          # bf16 for all (mutates Ac); overwrite bad w/ geqrf
-        h_fb, t_fb = torch.geqrf(bad_rows)
+        h_fb, t_fb = torch.geqrf(Ac[bad_idx].contiguous())
         H = H.index_copy(0, bad_idx, h_fb)
         tau = tau.index_copy(0, bad_idx, t_fb)
         return H, tau
