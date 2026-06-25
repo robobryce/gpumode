@@ -1151,13 +1151,6 @@ void set_warps(int w) { g_warps = w; }
 // occupancy-rich shapes (the n=1024 case B=60) keep the base kernel unchanged.
 static int g_panel_defer = 0;
 void set_panel_defer(int v) { g_panel_defer = v; }
-// Use the deferred-scale ("raw-V") panel kernel in the two-level driver (set from
-// Python). It applies the within-panel trailing update in unnormalized Householder
-// form, deferring the per-column 1/(alpha-beta) scale to the write-back. Distinct
-// from g_panel_defer (a different variant); the the n=512 big-batch case two-level path flips this on (and
-// g_panel_defer off). Default OFF.
-static int g_panel_raw = 0;
-void set_panel_raw(int v) { g_panel_raw = v; }
 // extra smem leading-dim pad (added to b|1) for the warp-specialized-pivot BF16 panel
 // (defer==5). The 2D-flattened panel load s[r*LDS+c] (c fast) aliases shared-memory banks
 // when LDS+(b-1) == 0 mod 32 (e.g. b=16 -> b|1=17, 17+15==32). An extra even pad keeps LDS
@@ -1267,8 +1260,8 @@ static int g_panel_cmf = 0;
 //
 // counts layout (extends the classifier's 4 slots): [0]=bad, [1]=good, [2]=rank-reveal
 // stage-1 "tail not negligible" flag, [3]=hard-bad count, [4]=rank-reveal trailing
-// block-column tailmask (the bits f32_to_bf16_rr_kernel would set; only meaningful when
-// do_rr!=0).
+// block-column tailmask (this kernel ORs in the collapsible trailing OB-block-column bits;
+// only meaningful when do_rr!=0).
 // scratch layout: per (mat, k) slice slot, 11 int32 words (the 8 float sums bit-cast via
 // __float_as_int): [0..7]=head_col,tail_col,head_row,tail_row,mid_col,dot0,norm0,norm1;
 // [8]=off_cnt, [9]=off_zero, [10]=rrmask. classify_decide_n512_kernel reduces over K.
@@ -2075,17 +2068,11 @@ std::tuple<torch::Tensor, torch::Tensor> blocked_qr_2level(torch::Tensor A, int 
     // blocked_qr's cache (different shapes use different entry points + the two-level
     // path's OB-wide buffers differ from the single-level block-wide ones), so the two
     // never share storage. Reallocate only when the signature changes.
-    // cVo2 is the DEDICATED FP32 outer-V buffer for the outer-V-fold path (g_ov_fold):
-    // the n=1024 case (fnorm) / the n=2048 case (pipe) inner panels write the OB-wide outer V into it (via
-    // panel_factor_smem_{fnorm,pipe}_ov_kernel) so the standalone build_V_kernel pass is
-    // dropped. Kept separate from the inner V (cV2) because the two coexist within an
-    // outer block (different row strides: b vs OB). Allocated only when the fold is on.
-    static torch::Tensor cV2, cT2, cS2, cW2, cY2, cVo2;
-    static int s2_B = -1, s2_n = -1, s2_OB = -1, s2_ov = -1;
-    if (s2_B != B || s2_n != n || s2_OB != OB || s2_ov != (int)g_ov_fold) {
+    static torch::Tensor cV2, cT2, cS2, cW2, cY2;
+    static int s2_B = -1, s2_n = -1, s2_OB = -1;
+    if (s2_B != B || s2_n != n || s2_OB != OB) {
         alloc_vtswy<float>(cV2, cT2, cS2, cW2, cY2, B, n, OB, opts);
-        cVo2 = g_ov_fold ? torch::empty({B, n, OB}, opts) : torch::empty({0}, opts);
-        s2_B = B; s2_n = n; s2_OB = OB; s2_ov = (int)g_ov_fold;
+        s2_B = B; s2_n = n; s2_OB = OB;
     }
     torch::Tensor& V = cV2; torch::Tensor& T = cT2; torch::Tensor& S = cS2;
     torch::Tensor& Wbuf = cW2; torch::Tensor& Ybuf = cY2;
@@ -2145,19 +2132,14 @@ std::tuple<torch::Tensor, torch::Tensor> blocked_qr_2level(torch::Tensor A, int 
         TORCH_CHECK(false, "run_panel: only the g_panel_cmf path is reachable");
     };
 
-    // The outer-V fold is wired for the fnorm (defer=3, the n=1024 case) and pipe (defer=4,
-    // the n=2048 case) panels via their *_ov variants; enabled when g_ov_fold is set AND one of
-    // those panels is active. cVo2 holds the OB-wide outer FP32 V the inner panels emit.
-    float* Vop = (g_ov_fold && (g_panel_defer == 3 || g_panel_defer == 4) && !g_panel_raw)
-                 ? cVo2.data_ptr<float>() : nullptr;
-    // Exact-FP32 regime through the shared two-level loop. Vop already bakes in the
-    // *_ov panel condition; ncap=n (no rank-reveal), indexed_out=false, no fusion
-    // (try_fuse always false). The apply is the STORE=float (SIMT/TF32) arm of the
-    // unified apply_block_reflector_t driver -- it does the same GEMM sequence the old
-    // apply_block_reflector did (Wst/Mst null, Yst=Yp, minv_nt=g_minv_nt), so the loop
-    // body for both the inner and the outer trailing update is byte-identical.
+    // The only reachable FP32 two-level panel is the cmf panel (g_panel_cmf), which emits its
+    // inner V directly into Vfold and never uses an outer-V fold -- so the outer-V buffer is
+    // always null here (the *_ov panels that consumed it were removed). ncap=n (no rank-reveal),
+    // indexed_out=false, no fusion (try_fuse always false). The apply is the STORE=float
+    // (SIMT/TF32) arm of the unified apply_block_reflector_t driver (Wst/Mst null, Yst=Yp,
+    // minv_nt=g_minv_nt), so the inner and outer trailing updates are byte-identical.
     run_two_level_loop<float>(
-        n, OB, IB, /*ncap=*/n, /*indexed_out=*/false, Vop, Vp, Hp, B,
+        n, OB, IB, /*ncap=*/n, /*indexed_out=*/false, /*Vop=*/(float*)nullptr, Vp, Hp, B,
         run_panel,
         [&](float* V, int kc, int w, int m, int jc, int rest) {
             apply_block_reflector_t<float>(handle, Hp, taup, V, Sp, Tp, Wp,
@@ -2231,88 +2213,6 @@ __global__ void f32_to_bf16_kernel(const float* __restrict__ x, bf16* __restrict
     }
 }
 
-// FP32 -> BF16 convert that ALSO folds the rank-reveal tail detection into the same
-// full-matrix read (n == 512). For each element it converts to BF16 and, when the
-// element is in a trailing OB-block-column (col >= 256) with |value| > thr, ORs the
-// block-column bit into `tailmask`. This makes the rank detection essentially FREE
-// (it piggybacks on the convert pass that runs anyway) instead of a separate
-// ~335 MB read. After this kernel a single D2H of tailmask drives the column cap.
-__global__ void f32_to_bf16_rr_kernel(const float* __restrict__ x, bf16* __restrict__ y,
-                                      long count, float thr, unsigned int* __restrict__ tailmask) {
-    unsigned int local = 0u;
-    // 8-elem/thread grid-strided (2x float4 load -> one int4 = 8x bf16 store), matching the
-    // plain convert: halves CTA count + store traffic, raises MLP on this full-matrix pass.
-    const long stride = (long)gridDim.x * blockDim.x * 8;
-    for (long base = ((long)blockIdx.x * blockDim.x + threadIdx.x) * 8; base < count; base += stride) {
-        if (base + 7 < count) {
-            float4 a = *reinterpret_cast<const float4*>(x + base);
-            float4 b = *reinterpret_cast<const float4*>(x + base + 4);
-            __half2 h[4];
-            h[0] = __floats2half2_rn(a.x, a.y); h[1] = __floats2half2_rn(a.z, a.w);
-            h[2] = __floats2half2_rn(b.x, b.y); h[3] = __floats2half2_rn(b.z, b.w);
-            *reinterpret_cast<int4*>(y + base) = *reinterpret_cast<int4*>(h);
-            // column of element (base + i) is (base + i) % 512; block-col = col >> 6.
-            const float av[8] = {fabsf(a.x), fabsf(a.y), fabsf(a.z), fabsf(a.w),
-                                 fabsf(b.x), fabsf(b.y), fabsf(b.z), fabsf(b.w)};
-            #pragma unroll
-            for (int i = 0; i < 8; ++i) {
-                int col = (int)((base + i) & 511);     // n == 512
-                if (col >= 256 && av[i] > thr) local |= (1u << ((col >> 6) - 4));
-            }
-        } else {
-            for (long i = base; i < count && i < base + 8; ++i) {
-                y[i] = __float2half(x[i]);
-                int col = (int)(i & 511);
-                if (col >= 256 && fabsf(x[i]) > thr) local |= (1u << ((col >> 6) - 4));
-            }
-        }
-    }
-    // warp-OR, then one atomicOr per warp -- but SKIP bits already globally set. The
-    // global mask is monotonic (bits only turn on, from cudaMemset 0), so a plain read of
-    // the current mask and masking it off (local & ~seen) can only ever drop a REDUNDANT
-    // atomic (a bit that is already set): it can never lose a bit (a stale "0" read just
-    // does the atomic). This collapses the rankdef atomic storm -- its O(1) cols 256..383
-    // make ~every warp want to set bits 0/1, but once the first wave sets them globally
-    // every later warp reads them as set and issues no atomic (410us -> ~read-bound).
-    for (int o = 16; o > 0; o >>= 1) local |= __shfl_down_sync(0xffffffff, local, o);
-    if ((threadIdx.x & 31) == 0 && local) {
-        unsigned int seen = *((volatile unsigned int*)tailmask);
-        unsigned int add = local & ~seen;
-        if (add) atomicOr(tailmask, add);
-    }
-}
-
-// Indexed FP32->BF16 convert of the n512-mixed GOOD subset. 8 elems/thread,
-// grid-strided (matches the plain f32_to_bf16_kernel: the 4/thread version it
-// replaced was SM-issue-bound at ~70% SM / too many tiny CTAs). 262144 = 512*512
-// is divisible by 8 and matrices are >=16B aligned, so an 8-aligned base never
-// straddles a matrix boundary -> one idx[src] lookup, two float4 loads, one int4
-// (8x bf16) store per step. Output y[base] is contiguous; input gathered via
-// idx[src]. Bit-identical to the per-4 version (same __floats2half2_rn convert of
-// the same source floats; cvt4 already used __floats2half2_rn).
-__global__ void f32_to_bf16_indexed_n512_kernel(const float* __restrict__ x,
-                                                bf16* __restrict__ y,
-                                                const long long* __restrict__ idx,
-                                                int B) {
-    const long total = (long)B * 512 * 512;
-    const long stride = (long)gridDim.x * blockDim.x * 8;
-    for (long base = ((long)blockIdx.x * blockDim.x + threadIdx.x) * 8; base < total; base += stride) {
-        const int src = (int)(base / (512 * 512));
-        const long rem = base - (long)src * 512 * 512;
-        const long in_base = (long)idx[src] * 512 * 512 + rem;
-        if (base + 7 < total) {                              // rem+7 < 262144 holds (262144%8==0)
-            float4 a = *reinterpret_cast<const float4*>(x + in_base);
-            float4 b = *reinterpret_cast<const float4*>(x + in_base + 4);
-            __half2 h[4];
-            h[0] = __floats2half2_rn(a.x, a.y); h[1] = __floats2half2_rn(a.z, a.w);
-            h[2] = __floats2half2_rn(b.x, b.y); h[3] = __floats2half2_rn(b.z, b.w);
-            *reinterpret_cast<int4*>(y + base) = *reinterpret_cast<int4*>(h);
-        } else {
-            for (long i = 0; i < 8 && base + i < total; ++i) y[base + i] = __float2half(x[in_base + i]);
-        }
-    }
-}
-
 // Indexed BF16->BF16 GATHER of the n512-mixed GOOD subset from the dense pre-converted
 // buffer cHb_pre (the fused classify+convert pass already converted EVERY matrix to BF16
 // at its original row). Packs good matrix src's BF16 (at row idx[src]) into the compact
@@ -2340,36 +2240,6 @@ __global__ void bf16_gather_indexed_n512_kernel(const bf16* __restrict__ x,
         int4* yp = reinterpret_cast<int4*>(ys + off);
         yp[0] = xp[0];
         yp[1] = xp[1];
-    }
-}
-
-// Zero the trailing rank-deficient region of the FP32 output after a capped factor:
-// H[:, :, nfac:] (all rows, columns >= nfac -> both the would-be-R upper triangle and
-// the would-be-V strict-lower) and tau[:, nfac:] (identity reflectors). The fill kernel
-// does NOT write the trailing block-cols' R, so the full rectangle must be zeroed here
-// (zeroing only the strict-lower V would leave garbage in the would-be-R upper triangle).
-// Each row's trailing slice [nfac, n) IS contiguous in row-major storage, so one warp
-// zeros one row's tail with float4 stores. Flat 1D grid of warps over all B*n rows
-// (nfac a multiple of 64 -> the slice base is 16-byte aligned for float4). This fills
-// the device with many CTAs (vs the prior 1-CTA-per-matrix) to saturate write bandwidth.
-__global__ void n512_zero_tail_kernel(float* __restrict__ Hout, float* __restrict__ tau,
-                                      int B, int n, int nfac) {
-    const int warps_per_blk = blockDim.x >> 5;
-    const long warp_id = (long)blockIdx.x * warps_per_blk + (threadIdx.x >> 5);
-    const int lane = threadIdx.x & 31;
-    const long total_rows = (long)B * n;
-    const int tcols = n - nfac;
-    const int tcols4 = tcols >> 2;                 // float4 count (tcols % 4 == 0 here)
-    for (long row = warp_id; row < total_rows; row += (long)gridDim.x * warps_per_blk) {
-        float4* base = reinterpret_cast<float4*>(Hout + row * n + nfac);
-        for (int j = lane; j < tcols4; j += 32) base[j] = make_float4(0.f, 0.f, 0.f, 0.f);
-    }
-    // Zero tau[:, nfac:] -- block 0 handles the whole tau tail.
-    if (blockIdx.x == 0) {
-        for (long e = (long)threadIdx.x; e < (long)B * tcols; e += blockDim.x) {
-            int b = (int)(e / tcols), c = nfac + (int)(e % tcols);
-            tau[(size_t)b * n + c] = 0.f;
-        }
     }
 }
 
@@ -2645,7 +2515,7 @@ __global__ void fill_R_zero_tail_n512_kernel(float* __restrict__ Hout,
             }
         }
     } else {
-        // ---- rank-reveal zero-tail (identical math to n512_zero_tail_kernel) ----
+        // ---- rank-reveal zero-tail (folds the standalone tail-zero into this fused pass) ----
         // Tail CTAs span the FULL 2D grid (blockIdx.x in [36,36+ztb), blockIdx.y in
         // [0,B)); the matrix index blockIdx.y is folded into the global warp id so the
         // tail rectangle is zeroed ONCE (not B times). With ztb=64 and 8 warps/CTA the
@@ -4391,27 +4261,19 @@ std::tuple<torch::Tensor, torch::Tensor> blocked_qr_2level_bf16_indexed(torch::T
         // The fused kernel also resolved the rank-reveal tailmask, so when this is the
         // rr path use the cap it computed (g_pre_rr_ncap); otherwise stay dense (n).
         if (rr_detect && g_pre_rr_ncap > 0) rr_ncap = g_pre_rr_ncap;
-    } else if (rr_detect) {
-        static torch::Tensor rr_mask;
-        if (!rr_mask.defined() || rr_mask.device() != A.device())
-            rr_mask = torch::empty({1}, opts.dtype(torch::kInt32));
-        cudaMemset(rr_mask.data_ptr<int>(), 0, sizeof(int));
-        f32_to_bf16_rr_kernel<<<nblk8, 256>>>(Hf.data_ptr<float>(), Hb, total,
-                                             g_n512_rr_detect, (unsigned int*)rr_mask.data_ptr<int>());
-        unsigned int hmask = 0u;
-        cudaMemcpy(&hmask, rr_mask.data_ptr<int>(), sizeof(int), cudaMemcpyDeviceToHost);
-        int hi = -1;
-        for (int b = 3; b >= 0; --b) { if (hmask & (1u << b)) { hi = b; break; } }
-        // hi in {-1,0,1,2,3} (4 tail block-cols) -> rr_ncap in {256,320,384,448,512},
-        // already within [64, n=512] and a multiple of OB=64, so no clamp is needed.
-        rr_ncap = (hi < 0) ? 256 : (hi + 5) * 64;
     } else if (pre_gather) {
         // BF16->BF16 gather of the good subset out of the dense pre-converted buffer.
         bf16_gather_indexed_n512_kernel<<<dim3(8, B), 256>>>(g_pre_Hb, Hb, idxp, B, 8);
-    } else if (indexed_out) {
-        // 8 elems/thread, grid-strided (nblk8, capped) -- matches the plain convert.
-        f32_to_bf16_indexed_n512_kernel<<<nblk8, 256>>>(Hf.data_ptr<float>(), Hb, idxp, B);
     } else {
+        // Plain dense FP32->BF16 convert (the only reachable non-pre_conv/pre_gather case:
+        // n != 512, or n==512 without the mixed driver's pre-converted buffer). The
+        // standalone rank-reveal convert (rr_detect) and the indexed convert (indexed_out)
+        // are unreachable: every n==512 caller comes through qr_n512_mixed_driver, which
+        // pre-sets g_pre_Hb (=> pre_conv on the non-indexed arm, pre_gather on the indexed
+        // arm), so rr_detect/indexed_out never co-occur with g_pre_Hb==nullptr here.
+        TORCH_CHECK(!rr_detect && !indexed_out,
+                    "blocked_qr_2level_bf16_indexed: standalone rr/indexed convert is "
+                    "unreachable (pruned -- the n=512 mixed driver always pre-converts)");
         f32_to_bf16_kernel<<<nblk8, 256>>>(Hf.data_ptr<float>(), Hb, total);
     }
 
@@ -4708,14 +4570,12 @@ std::tuple<torch::Tensor, torch::Tensor> blocked_qr_2level_bf16_indexed(torch::T
             int T = nbc * (nbc + 1) / 2;     // block-upper-triangle tile count per matrix
             fill_above_panel_R_tiled_kernel<<<dim3(T, B), dim3(32, 8)>>>(
                 Hop, Hb, n, OB, IB, nbc);
-            // RANK-REVEAL tail for the non-n512 path: zero columns [ncap, n). (n512 folds
-            // this into the fused kernel above.) Only on the dense (non-indexed) output.
-            if (ncap < n && !indexed_out) {
-                int zrows = B * n;
-                int zblocks = (zrows + (256 >> 5) - 1) / (256 >> 5);   // one warp per row
-                if (zblocks > 65535) zblocks = 65535;                  // grid-stride caps
-                n512_zero_tail_kernel<<<zblocks, 256>>>(Hop, taup, B, n, ncap);
-            }
+            // The rank-reveal column cap (ncap < n) is set ONLY on the n=512 path (it derives
+            // from g_pre_rr_ncap / the in-convert rr scan, both n==512-gated), which takes the
+            // fused fill+zero-tail branch above. So on this non-n512 path ncap==n always and the
+            // standalone tail-zero is unreachable (pruned).
+            TORCH_CHECK(ncap == n, "blocked_qr_2level_bf16_indexed: non-n512 rank-reveal "
+                                   "tail-zero is unreachable (pruned)");
         }
     }
     if (indexed_out) {
@@ -4751,7 +4611,7 @@ static inline void apply_n512_rr_overrides() {
 }
 
 static inline void set_n512_good_flags() {
-    g_prec = 1; g_warps = 8; g_minv_nt = 224; g_panel_defer = 5; g_panel_raw = 0;
+    g_prec = 1; g_warps = 8; g_minv_nt = 224; g_panel_defer = 5;
     g_wsp_pad = 2; g_ov_fold = 1; g_panel_cm = 1; g_fp16_pure = 0;
     g_bf16_wf16 = 1; g_inner_wmma = 2; g_panel_apply_fused = 1; g_paf_no_csh = 1;
     g_inner_wmma_wmax = 32;   // OB-wide (w=64) last apply -> cuBLAS, not single-CTA WMMA
@@ -4775,7 +4635,7 @@ static inline void set_n512_good_flags() {
 static inline void restore_after_n512_good() {
     g_minv_blk4 = 0; g_minv_blk4_minw = 0; g_inner_wmma = 0; g_inner_wmma_wmax = 0; g_panel_apply_fused = 0;
     g_paf_no_csh = 0; g_paf_no_vsh = 0; g_bf16_wf16 = 0; g_fp16_pure = 1; g_panel_defer = 0;
-    g_panel_raw = 0; g_panel_cm = 0; g_wsp_pad = 2; g_ov_fold = 0; g_minv_nt = 512;
+    g_panel_cm = 0; g_wsp_pad = 2; g_ov_fold = 0; g_minv_nt = 512;
     g_paf_warps = 8;   // restore PAF block to the 8-warp default
     g_paf_help = 1;    // restore PAF pivot-coop to off (warp 0 alone)
 }
@@ -4795,7 +4655,7 @@ static inline void restore_after_n512_good() {
 // that flickers a near-rank-deficient residual past the invariance gate. All numerically
 // deterministic (same betas/taus/V; FP32 inverse).
 static inline void set_n512_bad_flags() {
-    g_prec = 0; g_prec_w = 0; g_prec_s = 1; g_warps = 32; g_panel_defer = 4; g_panel_raw = 0; g_fp16_pure = 0;
+    g_prec = 0; g_prec_w = 0; g_prec_s = 1; g_warps = 32; g_panel_defer = 4; g_fp16_pure = 0;
     g_minv_nt = 512; g_minv_2lev_nlev = 2; g_no_splitk = 1; g_qr2_no_clone = 1;
     g_panel_cmf = 1;   // warp-spec FP32 cmf inner panel (overlaps pivot look-ahead w/ bulk
                        // trailing); measured ~1% faster than pipe<32> on the s7 bad subset.
@@ -4805,7 +4665,7 @@ static inline void set_n512_bad_flags() {
 }
 static inline void restore_after_n512_bad() {
     g_no_splitk = 0; g_minv_2lev_nlev = 1; g_qr2_no_clone = 0; g_prec_s = 0;
-    g_prec = 1; g_prec_w = 0; g_panel_defer = 0; g_panel_raw = 0; g_minv_nt = 512; g_fp16_pure = 1;
+    g_prec = 1; g_prec_w = 0; g_panel_defer = 0; g_minv_nt = 512; g_fp16_pure = 1;
     g_panel_cmf = 0; g_cmf_mrfine = 0;
 }
 
@@ -5050,7 +4910,6 @@ void set_minv_blk4(int v);
 void set_minv_blk4_minw(int v);
 void set_minv_nt_sl(int v);
 void set_panel_defer(int v);
-void set_panel_raw(int v);
 void set_wsp_pad(int v);
 void set_wsp_cm_coop(int v);
 void set_panel_cm(int v);
@@ -5093,7 +4952,7 @@ def _compile_qr(name, cpp, cuda, functions, ldflags):
 
 
 def _compile_ext():
-    functions = ["blocked_qr", "illcond_mask", "n352_illcond_mask_cuda", "blocked_qr_2level", "blocked_qr_2level_bf16", "qr_n512_mixed_driver", "blocked_qr_tiny", "qr_mega_small", "set_mega_warps", "set_bf16_nt", "set_bf16_wf16", "set_fp16_pure", "set_prec", "set_warps", "set_minv_nt", "set_minv_blk4", "set_minv_blk4_minw", "set_minv_nt_sl", "set_panel_defer", "set_panel_raw", "set_wsp_pad", "set_wsp_cm_coop", "set_panel_cm", "set_panel_cm2", "set_cmf_warps", "set_cmf_mrfine", "set_ov_fold", "set_inner_wmma", "set_inner_wmma_wmax", "set_panel_apply_fused", "set_paf_warps", "set_n2048_h", "set_paf_help", "set_yfold", "set_yfold_maxrest", "set_ov_coop"]
+    functions = ["blocked_qr", "illcond_mask", "n352_illcond_mask_cuda", "blocked_qr_2level", "blocked_qr_2level_bf16", "qr_n512_mixed_driver", "blocked_qr_tiny", "qr_mega_small", "set_mega_warps", "set_bf16_nt", "set_bf16_wf16", "set_fp16_pure", "set_prec", "set_warps", "set_minv_nt", "set_minv_blk4", "set_minv_blk4_minw", "set_minv_nt_sl", "set_panel_defer", "set_wsp_pad", "set_wsp_cm_coop", "set_panel_cm", "set_panel_cm2", "set_cmf_warps", "set_cmf_mrfine", "set_ov_fold", "set_inner_wmma", "set_inner_wmma_wmax", "set_panel_apply_fused", "set_paf_warps", "set_n2048_h", "set_paf_help", "set_yfold", "set_yfold_maxrest", "set_ov_coop"]
     return _compile_qr("qr_blocked_v7k_wf16", _CPP_SRC, _CUDA_SRC, functions, ["-lcublas"])
 
 _CUDA_LU_SRC = r"""
@@ -6135,7 +5994,6 @@ _ext.set_minv_blk4(0)        # default OFF; the FP16 the n=1024 case/5 dispatch 
 _ext.set_minv_blk4_minw(0)
 # (the n=512 big-batch blk4 build_Minv is now set inline at its driver -- blk4(1)/minw=48.)
 _ext.set_minv_nt_sl(512)   # threads/CTA for the single-level blk2 build_Minv (shapes 1,2)
-_ext.set_panel_raw(0)   # default OFF; the the n=512 big-batch case two-level dispatch flips it on
 _ext.set_panel_cm2(0)   # default OFF; shapes 1,2 flip it on, restored after
 _ext.set_ov_fold(0)     # default OFF; the per-shape dispatch flips it on (outer-V fold)
 
@@ -6244,7 +6102,7 @@ _LARGE_HI = {   # n in [2048,4096); B=8 is SM-starved -> the coop panel
 # except set_warps->32, the large-n preamble value all callers restore to, not import 16).
 _RDEF = {
     "set_prec": 3, "set_warps": 32, "set_minv_nt": _MINV_NT, "set_bf16_nt": _BF16_NT,
-    "set_fp16_pure": _FP16_PURE, "set_panel_defer": 0, "set_panel_raw": 0, "set_wsp_pad": 2,
+    "set_fp16_pure": _FP16_PURE, "set_panel_defer": 0, "set_wsp_pad": 2,
     "set_minv_blk4": 0, "set_minv_blk4_minw": 0, "set_panel_cm": 0, "set_panel_cm2": 0,
     "set_cmf_warps": 0, "set_cmf_mrfine": 0,
     "set_ov_fold": 0, "set_inner_wmma": 0, "set_inner_wmma_wmax": 0, "set_panel_apply_fused": 0, "set_paf_warps": 8,
@@ -6284,8 +6142,7 @@ def _qr_large_fp16(Ac, p):
     sets = [("set_prec", 1)]
     if "minv_nt" in p: sets.append(("set_minv_nt", p["minv_nt"]))
     sets += [("set_warps", p["warps"]), ("set_panel_defer", p["defer"]),
-             ("set_panel_raw", p.get("panel_raw", 0)), ("set_fp16_pure", 0),
-             ("set_bf16_nt", p["bf16_nt"])]
+             ("set_fp16_pure", 0), ("set_bf16_nt", p["bf16_nt"])]
     # defer==5 panels read g_wsp_pad; the HI regime also offers the within-CTA pivot-coop
     # (gated by the cm_coop flag -- wsp_help>1 in the regime dict just records that the
     # coop kernel splits the pivot across the idle warps; its count is implicit, MHELP=2).
@@ -6324,9 +6181,9 @@ def _qr_large_fp16(Ac, p):
     # (the n=1024 standalone OV panel was warp-0-serial). Only set when requested.
     if p.get("ov_coop", 0):
         sets.append(("set_ov_coop", p["ov_coop"]))
-    # restores derived from sets (warps->32); prec/panel_raw leak (prec re-set next shape).
+    # restores derived from sets (warps->32); prec leaks (re-set by the next shape).
     return _run_blocked("blocked_qr_2level_bf16", (Ac, p["ob"], p["ib"]), sets,
-                        skip=("set_prec", "set_panel_raw"))
+                        skip=("set_prec",))
 
 
 def _n352_illcond_mask(A: torch.Tensor) -> torch.Tensor:
@@ -6354,7 +6211,7 @@ def _qr_small_bf16(Ac: torch.Tensor, n: int):
     # the trailing W=VtC / C-=VY GEMMs run BF16 (half bandwidth -- the lever here).
     # Collapsed to the SOLE live config (n=352 _SMALL_HI: ob=64, ib=0->single-level,
     # defer=5 wsp-bf16, warps=32, wf16=1, minv_blk4=3 rblk4, cmf=1). ib==ob so
-    # _two_level is False (no ov_fold); panel_raw=0 (defer!=0); set_panel_cm2 selects
+    # _two_level is False (no ov_fold); set_panel_cm2 selects
     # the cmf column-major fused panel. set_wsp_pad(2) is a no-op here (g_wsp_pad is
     # always 2 on entry -- only _qr_large_fp16 perturbs it + restores), so it is not set.
     # bf16_nt=512: at B=40 the single 64x64 outer build_Minv_rblk nlev=3 merge phases are
@@ -6365,7 +6222,7 @@ def _qr_small_bf16(Ac: torch.Tensor, n: int):
     # MROWS in {2,4,6,8,10,11} covering ceil(m/32) for each shrinking outer block (instead of
     # the coarse 6/11 split), shortening the per-column serial fold trip count.
     sets = [("set_prec", 1), ("set_fp16_pure", 0), ("set_warps", 32),
-            ("set_panel_defer", 5), ("set_panel_raw", 0), ("set_panel_cm2", 1),
+            ("set_panel_defer", 5), ("set_panel_cm2", 1),
             ("set_bf16_wf16", 1), ("set_minv_blk4", 3), ("set_minv_blk4_minw", 0),
             ("set_bf16_nt", 512), ("set_cmf_warps", 16), ("set_cmf_mrfine", 1)]
     # _run_blocked restores every set knob to its _RDEF default (warps->32, fp16_pure->
