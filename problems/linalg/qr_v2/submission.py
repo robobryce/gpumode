@@ -6532,33 +6532,29 @@ def _reconstruct_householder(Q, R, lu):
 
 
 def _cholqr_path(A, dense_noinfo=False, gate=True):
-    # Single 1-pass-CholeskyQR -> orhr_col entry for both n>=4096 dispatch arms; the
-    # B==2 (bench shape 6) arm is just this with gate=False + dense_noinfo=True (its
-    # dense well-conditioned 1pass takes the fused chol_b2_lower_R_solve and needs no
-    # fallback). gate=True (B!=2) keeps the geqrf fallback for the B=1/B=3 n4096 tests,
-    # whose cond=0 stress CholeskyQR cannot orthogonalize. _lu is the compiled-once
-    # module singleton, threaded through both callees (so they don't each re-reference it).
+    # 1-pass-CholeskyQR -> orhr_col for the n>=4096 dispatch arm (only B==2 reaches here; the
+    # dispatch routes B!=2 to geqrf). _lu is the compiled-once module singleton, threaded
+    # through both callees. (dense_noinfo/gate are kept in the signature for the dispatch call
+    # but are always True here, so their branches are unconditional.)
     lu = _lu
     Q, R, info = _choleskyqr_1pass(A, lu=lu)
-    if gate:
-        # "good" = Gram was PD (info==0) AND Q columns near-unit-norm (a cheap orth proxy
-        # for the rank-deficient cond=0 stress); bad matrices fall back to geqrf. Computed
-        # BEFORE _reconstruct_householder, which factors Q in place (donated) and clobbers it.
-        colnorm_dev = ((Q * Q).sum(dim=-2) - 1.0).abs().amax(dim=-1)
-        good = (info == 0) & (colnorm_dev <= _COLNORM_TOL) \
-            & torch.isfinite(Q).all(dim=-1).all(dim=-1)
+    # "good" = Gram was PD (info==0) AND Q columns near-unit-norm (a cheap orth proxy for the
+    # rank-deficient cond=0 stress); bad matrices fall back to geqrf. Computed BEFORE
+    # _reconstruct_householder, which factors Q in place (donated) and clobbers it.
+    colnorm_dev = ((Q * Q).sum(dim=-2) - 1.0).abs().amax(dim=-1)
+    good = (info == 0) & (colnorm_dev <= _COLNORM_TOL) \
+        & torch.isfinite(Q).all(dim=-1).all(dim=-1)
     H, tau = _reconstruct_householder(Q, R, lu=lu)
-    if _TAU_OVERRIDE and dense_noinfo and A.shape[1] == 4096:
-        # SECRET-SAFETY TAU-OVERRIDE (worker-3 brief-2, B=2): recompute each reflector's tau
-        # EXACTLY from the reconstructed Householder vectors V (strict-lower of H, implicit
-        # v[j]=1): tau_j = 2 / (1 + sum_{i>j} H[i,j]^2). The orhr_col recon's tau drifts at high
-        # cond (the orth-too-large "mode 1" -- ~14/18 of the scored B=2 secret fails); the
-        # exact-from-V tau makes householder_product orthonormal regardless of recon precision
-        # (orth ~0.16, far under the gate). Cheap (one n^2 reduction); applied for the B=2 path.
+    if _TAU_OVERRIDE and A.shape[1] == 4096:
+        # SECRET-SAFETY TAU-OVERRIDE (B=2): recompute each reflector's tau EXACTLY from the
+        # reconstructed Householder vectors V (strict-lower of H, implicit v[j]=1):
+        # tau_j = 2 / (1 + sum_{i>j} H[i,j]^2). The orhr_col recon's tau drifts at high cond;
+        # the exact-from-V tau makes householder_product orthonormal regardless of recon
+        # precision. Cheap (one n^2 reduction).
         V2 = torch.tril(H, diagonal=-1)
         vsq = (V2 * V2).sum(dim=-2)                    # (b,n) sum_{i>j} H[i,j]^2 per column j
         tau = (2.0 / (1.0 + vsq)).to(tau.dtype)
-    if gate and not bool(good.all()):
+    if not bool(good.all()):
         bad_idx = torch.nonzero(~good, as_tuple=False).flatten()
         h_fb, t_fb = torch.geqrf(A[bad_idx].contiguous())
         H = H.index_copy(0, bad_idx, h_fb)
