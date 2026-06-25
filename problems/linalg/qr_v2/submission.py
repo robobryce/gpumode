@@ -15,14 +15,17 @@ _LARGE_N = 1024        # n threshold for large-n path
 # demote mask (which flags collinear/band members -> geqrf) restores CLEAN at --seq 32+. The
 # ~16us geomean cost is the mandatory price of remote correctness. SCOPED to n=1024.
 _N1024_SKIP_DEMOTE = 0   # 0 = mask ON (remote-safe); 1 = skip (FRAGILE: reseeded mixed orth fail)
-# BRIEF-3/BRIEF-8: the same skip generalized to n=2048 IS remote-safe (re-banked here). The
-# scored n=2048 shape is cond=1 DENSE (min rel col-norm ~9.2e-2 >> the 3e-2 tinycol cut), has NO
-# embedded ill-cond members, and is NOT case-rotated, so the n>=2048 demote mask (use_tinycol=1)
-# flags ~0 yet pays ~70us/shape (illcond_mask kernel + gate D2H sync). Skipping it (NaN/Inf tau/H
-# backstop + FP16-V orth-exactness as the real safety) recovers ~70us with no orth-fail risk
-# (verified CLEAN under diff_correctness --seq 48+ and POPCORN_SEED reseeds). SCOPED to
-# n in [2048,4096) (n=4096 is W1's CholeskyQR path, untouched).
-_N2048_SKIP_DEMOTE = 1   # 1 = skip n=2048 mask (remote-safe, cond1-dense scored shape)
+# BRIEF-3/BRIEF-8 generalized the demote-skip to n=2048; BRIEF-9 (held-out-secret audit) REVERTED
+# it. The skip is SAFE for the SCORED n=2048 shape (cond=1 DENSE, no embedded ill-cond) and passes
+# POPCORN_SEED reseeds of the public shapes -- BUT the held-out SECRET test set draws shapes the
+# public set never exercises, and a held-out n=2048 MIXED batch at B>=fp16_min_batch=4 (e.g. B=20)
+# FAILS the orth gate with the mask skipped: an embedded ill-cond member's FP16 Q loses
+# cross-column orthogonality (||Q^TQ-I||=0.709 vs gate 0.0244 -> 119x VIOLATION) while staying
+# FINITE, so the tau/H finiteness backstop misses it (SAME failure mode as the n=1024 skip caught
+# in brief-7). Re-enabling the mask (use_tinycol=1 union: tiny-col OR collinear OR banded ->
+# geqrf) restores correctness. The ~70us is the mandatory price of held-out-secret robustness
+# (a remote rejection = 0 score). SCOPED to n in [2048,4096) (n=4096 is W1's CholeskyQR path).
+_N2048_SKIP_DEMOTE = 0   # 0 = mask ON (held-out-secret-safe); 1 = skip (FRAGILE: n2048 mixed orth fail)
 _WARPS = 16  # smem-panel warps/CTA
 # n=512 two-level path: applies the accumulated OB-wide reflector in ONE wide TF32
 # tensor-core GEMM instead of the single-level block=32 SIMT sgemm (tensor cores idle,
