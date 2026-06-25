@@ -5748,36 +5748,15 @@ std::vector<torch::Tensor> chol_b2_lower_R_solve(torch::Tensor A, torch::Tensor 
 #define BKL(x) do { cublasStatus_t s=(x); if(s!=CUBLAS_STATUS_SUCCESS){ printf("cublasL err %s:%d %d\n",__FILE__,__LINE__,(int)s); } } while(0)
 static inline int cdiv(int a, int b){ return (a + b - 1) / b; }
 
-// 3xTF32 strided-batched GEMM, row-major, accumulating into a STRIDED output:
-//   Cstride[:, :] += alpha * Ahi@Bsub  (A pre-split into packed Ah/Al, ldA=K;
-//   B is a strided sub-block ldB=n at (rb,cb) of a (batch,n,n) tensor, pre-split
-//   into Bhi/Blo with the SAME ld=n/stride; C is a strided sub-block ldC=n at
-//   (rc,cc) of (batch,n,n)). M x N output, inner dim K.
-//   Row-major C(MxN)=A(MxK)@B(KxN) -> col-major: gemm(N,N, N,M,K, B,ldB, A,ldA, C,ldC).
-// g_trsm_diag_prec: diagonal-solve precision (0 = exact FP32 SIMT; 2 = 3xTF32 Kahan
-// tensor-core). g_trsm_trail_fp16: 1 = 3xFP16 trailing (FP16 tensor cores, ~2x TF32 on
-// B200, same Kahan accuracy); 0 = 3xTF32. Both are set per call (s6 vs the test path).
+// TRSM precision globals (set per call from Python). g_trsm_diag_prec: diagonal-solve
+// precision; g_trsm_trail_fp16: 3xFP16 trailing toggle.
 static int g_trsm_diag_prec = 0;
 static int g_trsm_trail_fp16 = 0;
-static void gemm3_strided(cublasHandle_t h, int M, int N, int K, float alpha,
-                          const float* Ah, const float* Al, int ldA, long sA,
-                          const float* Bh, const float* Bl, int ldB, long sB,
-                          float* C, int ldC, long sC, int batch) {
-    const float one = 1.f;
-    // 3xTF32 Kahan trailing: C += a*(Ah@Bh + Ah@Bl + Al@Bh).
-    BKL(cublasSgemmStridedBatched(h, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha,
-        Bh, ldB, sB, Ah, ldA, sA, &one, C, ldC, sC, batch));
-    BKL(cublasSgemmStridedBatched(h, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha,
-        Bl, ldB, sB, Ah, ldA, sA, &one, C, ldC, sC, batch));
-    BKL(cublasSgemmStridedBatched(h, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha,
-        Bh, ldB, sB, Al, ldA, sA, &one, C, ldC, sC, batch));
-}
 
-// 3xFP16 strided-batched GEMM (FP16 in, FP32 accumulate, FP32 out).
-// Same Kahan structure as gemm3_strided but FP16 tensor cores (~2x TF32 rate on B200) ->
-// ~2x faster trailing at ~FP32 accuracy. Operands pre-split into FP16 hi/lo (Ah/Al packed
-// ld=K; Bh/Bl strided ld=ldB/stride sB). C is FP32 strided (ld=ldC/stride sC). Row-major
-// C(MxN)=A(MxK)@B(KxN) -> GemmEx(N,N, N,M,K, B,A,C).
+// 3xFP16 strided-batched GEMM (FP16 in, FP32 accumulate, FP32 out). 3xTF32-style Kahan
+// structure on FP16 tensor cores (~2x TF32 rate on B200). Operands pre-split into FP16 hi/lo
+// (Ah/Al packed ld=K; Bh/Bl strided ld=ldB/stride sB). C is FP32 strided (ld=ldC/stride sC).
+// Row-major C(MxN)=A(MxK)@B(KxN) -> GemmEx(N,N, N,M,K, B,A,C).
 static void gemm3_fp16_strided(cublasHandle_t h, int M, int N, int K, float alpha,
                                const __half* Ah, const __half* Al, int ldA, long sA,
                                const __half* Bh, const __half* Bl, int ldB, long sB,
@@ -6014,18 +5993,16 @@ torch::Tensor tri_solve_right_inv(torch::Tensor A, torch::Tensor Rin, int nb) {
     // op(Rop_cm) Xcm = alpha*Rinv_cm -> Rop^T Xcm = I -> Xcm = Rop^{-T} ->
     // row-major Rinv = Rop^{-1}. Exact FP32 (R-solve precision floor).
     //
-    // STATIC-SCRATCH-REUSE: Rop/Rinv/Rh/Rl/Xpan/Xph/Xpl are INTERNAL-only -- each is
-    // FULLY OVERWRITTEN every call and NONE is returned (only X, a fresh clone,
-    // escapes), so persisting them via static handles is safe (no aliasing with A or
-    // X) and avoids the per-call torch::empty dispatch overhead at tiny batch. Keyed
-    // by (batch,n): nb is fixed (_TRSM_NB_CPP) so every buffer shape follows from it.
-    static torch::Tensor cRop, cRinv, cRh, cRl, cXpan, cXph, cXpl;
-    // hi/lo splits for the 3xTF32 tensor-core DIAGONAL solve (g_trsm_diag_prec==2).
-    // cRinvh/cRinvl = hi/lo of the pre-inverted diagonal blocks (split ONCE after pre-invert);
-    // cXbh/cXbl = hi/lo of the CURRENT X[:,j:je] panel (split each block, n x nb per matrix).
+    // STATIC-SCRATCH-REUSE: Rop/Rinv/Xpan are INTERNAL-only -- each is FULLY OVERWRITTEN every
+    // call and NONE is returned (only X, a fresh clone, escapes), so persisting them via static
+    // handles is safe and avoids the per-call torch::empty dispatch overhead at tiny batch.
+    static torch::Tensor cRop, cRinv, cXpan;
+    // hi/lo splits for the 3xTF32 tensor-core DIAGONAL solve. cRinvh/cRinvl = hi/lo of the
+    // pre-inverted diagonal blocks (split ONCE after pre-invert); cXbh/cXbl = hi/lo of the
+    // CURRENT X[:,j:je] panel (split each block, n x nb per matrix).
     static torch::Tensor cRinvh, cRinvl, cXbh, cXbl;
-    // FP16 hi/lo for the 3xFP16 trailing (g_trsm_trail_fp16==1). cRh16/cRl16
-    // = FP16 hi/lo of R (split ONCE); cXph16/cXpl16 = FP16 hi/lo of the solved panel (per block).
+    // FP16 hi/lo for the 3xFP16 trailing. cRh16/cRl16 = FP16 hi/lo of R (split ONCE);
+    // cXph16/cXpl16 = FP16 hi/lo of the solved panel (per block).
     static torch::Tensor cRh16, cRl16, cXph16, cXpl16;
     static int s_B = -1, s_n = -1, s_nb = -1;
     auto opts16 = opts.dtype(torch::kHalf);
@@ -6033,11 +6010,7 @@ torch::Tensor tri_solve_right_inv(torch::Tensor A, torch::Tensor Rin, int nb) {
     if (shape_changed) {
         cRop  = torch::empty({(long)nmat, nb, nb}, opts);
         cRinv = torch::empty({(long)nmat, nb, nb}, opts);
-        cRh   = torch::empty_like(R);
-        cRl   = torch::empty_like(R);
         cXpan = torch::empty({batch, n, nb}, opts);
-        cXph  = torch::empty({batch, n, nb}, opts);
-        cXpl  = torch::empty({batch, n, nb}, opts);
         cRinvh = torch::empty({(long)nmat, nb, nb}, opts);
         cRinvl = torch::empty({(long)nmat, nb, nb}, opts);
         cXbh   = torch::empty({batch, n, nb}, opts);
@@ -6049,8 +6022,7 @@ torch::Tensor tri_solve_right_inv(torch::Tensor A, torch::Tensor Rin, int nb) {
         s_B = batch; s_n = n; s_nb = nb;
     }
     torch::Tensor& Rop  = cRop;  torch::Tensor& Rinv = cRinv;
-    torch::Tensor& Rh   = cRh;   torch::Tensor& Rl   = cRl;
-    torch::Tensor& Xpan = cXpan; torch::Tensor& Xph  = cXph; torch::Tensor& Xpl = cXpl;
+    torch::Tensor& Xpan = cXpan;
     torch::Tensor& Rinvh = cRinvh; torch::Tensor& Rinvl = cRinvl;
     torch::Tensor& Xbh = cXbh; torch::Tensor& Xbl = cXbl;
     torch::Tensor& Rh16 = cRh16; torch::Tensor& Rl16 = cRl16;
@@ -6095,42 +6067,28 @@ torch::Tensor tri_solve_right_inv(torch::Tensor A, torch::Tensor Rin, int nb) {
         (const float* const*)dRop, nb, dRinv, nb, nmat));
     cublasSetMathMode(h, CUBLAS_TF32_TENSOR_OP_MATH);
 
-    // --- Pre-split R once into hi/lo for the 3xTF32 trailing. R is contiguous, so a
-    // single FLAT vectorized split. SKIP this FP32 split when the trailing is 3xFP16
-    // (g_trsm_trail_fp16) -- the FP16 path uses Rh16/Rl16 only. Rh/Rl are static scratch.
-    // split_flat_kernel is float4-vectorized: one thread per 4 contiguous elements.
-    // rcount = batch*n*n with n%4==0 -> rcount%4==0, so the vec4 grid covers it exactly.
-    if (!g_trsm_trail_fp16) {
-        long rcount = (long)batch * nn;
-        long rvec = (rcount + 3) >> 2;                       // float4 work-items
-        split_flat_kernel<<<cdiv((int)rvec, 256), 256>>>(
-            R.data_ptr<float>(), Rh.data_ptr<float>(), Rl.data_ptr<float>(), rcount);
-    }
-    // for the 3xTF32 tensor-core DIAGONAL solve (g_trsm_diag_prec==2),
-    // pre-split the pre-inverted diagonal blocks Rinv (contiguous, nmat x nb x nb) into
-    // hi/lo ONCE here (the X-panel hi/lo is split per block in the loop).
-    if (g_trsm_diag_prec == 2) {
+    // For the 3xTF32 tensor-core DIAGONAL solve, pre-split the pre-inverted diagonal blocks
+    // Rinv (contiguous, nmat x nb x nb) into hi/lo ONCE here (the X-panel hi/lo is split per
+    // block in the loop). split_flat_kernel is float4-vectorized (count%4==0).
+    {
         long icount = (long)nmat * nb * nb;
         long ivec = (icount + 3) >> 2;
         split_flat_kernel<<<cdiv((int)ivec, 256), 256>>>(
             Rinv.data_ptr<float>(), Rinvh.data_ptr<float>(), Rinvl.data_ptr<float>(), icount);
     }
-    // for the 3xFP16 trailing (g_trsm_trail_fp16==1), pre-split R into
-    // FP16 hi/lo ONCE here (the solved panel's FP16 hi/lo is split per block in the loop).
-    if (g_trsm_trail_fp16) {
+    // For the 3xFP16 trailing, pre-split R into FP16 hi/lo ONCE here (the solved panel's FP16
+    // hi/lo is split per block in the loop).
+    {
         long rcount = (long)batch * nn;
         long rvec = (rcount + 3) >> 2;
         split_flat_fp16_kernel<<<cdiv((int)rvec, 256), 256>>>(
             R.data_ptr<float>(), (__half*)Rh16.data_ptr(), (__half*)Rl16.data_ptr(), rcount);
     }
-    // Scratch: the diagonal-solve output panel (packed batch x n x nb, exact-FP32
-    // GEMM target -- the diagonal GEMM can't write in place since its output aliases
-    // its X input), then its hi/lo split for the 3xTF32 trailing update.
-    // Xpan/Xph/Xpl are persisted static scratch (see the shape_changed block above).
+    // Scratch: the diagonal-solve output panel (packed batch x n x nb, GEMM target -- the
+    // diagonal GEMM can't write in place since its output aliases its X input). Xpan is
+    // persisted static scratch (see the shape_changed block above).
     float* Xp = X.data_ptr<float>();
-    float* Rhp = Rh.data_ptr<float>(); float* Rlp = Rl.data_ptr<float>();
     float* xpan = Xpan.data_ptr<float>();
-    float* xph = Xph.data_ptr<float>(); float* xpl = Xpl.data_ptr<float>();
     float* rinvhp = Rinvh.data_ptr<float>(); float* rinvlp = Rinvl.data_ptr<float>();
     float* xbhp = Xbh.data_ptr<float>(); float* xblp = Xbl.data_ptr<float>();
     __half* rh16p = (__half*)Rh16.data_ptr(); __half* rl16p = (__half*)Rl16.data_ptr();
@@ -6144,43 +6102,32 @@ torch::Tensor tri_solve_right_inv(torch::Tensor A, torch::Tensor Rin, int nb) {
         // GEMM over all matrices. For block bi the two Rinv blocks are contiguous (stride
         // nb*nb), the X panels stride nn, the packed output strides n*w. Row-major
         // C(n,w)=Xblk(n,w)@Rij(w,w) <=> gemm(N,N, m=w,n=n,k=w, A=Rij(ld=nb), B=Xblk(ld=n),
-        // C=Xpan(ld=w)). Precision per g_trsm_diag_prec: exact-FP32 SIMT (==0, the test path)
-        // or 3xTF32 Kahan tensor-core (==2, the s6 path).
-        if (g_trsm_diag_prec == 2) {
-            // 3xTF32 tensor-core diagonal solve: split the CURRENT X[:,j:je] panel into packed
-            // hi/lo (Xbh/Xbl, (n,w) row-major -> col-major (w,n) ld=w), then 3 accumulating TF32
-            // GEMMs (Rinvh@Xbh + Rinvh@Xbl + Rinvl@Xbh) -> ~FP32 accuracy, far faster than SIMT.
-            {
-                dim3 sblk(32, 8);
-                int scols = (w + 3) >> 2;                       // float4 cols (w%4==0)
-                dim3 sgrid(cdiv(scols, 32), cdiv(n, 8), batch);
-                split_panel_strided_kernel<<<sgrid, sblk>>>(Xp, xbhp, xblp, n, j, w);
-            }
-            cublasSetMathMode(h, CUBLAS_TF32_TENSOR_OP_MATH);
-            long rinv_off = (long)(bi * batch) * nb * nb;
-            // Xpan = Rinvh @ Xbh  (beta=0)
-            BKL(cublasSgemmStridedBatched(h, CUBLAS_OP_N, CUBLAS_OP_N, w, n, w, &one,
-                rinvhp + rinv_off, nb, (long)nb * nb,
-                xbhp, w, (long)n * w,
-                &zero, xpan, w, (long)n * w, batch));
-            // Xpan += Rinvh @ Xbl
-            BKL(cublasSgemmStridedBatched(h, CUBLAS_OP_N, CUBLAS_OP_N, w, n, w, &one,
-                rinvhp + rinv_off, nb, (long)nb * nb,
-                xblp, w, (long)n * w,
-                &one, xpan, w, (long)n * w, batch));
-            // Xpan += Rinvl @ Xbh
-            BKL(cublasSgemmStridedBatched(h, CUBLAS_OP_N, CUBLAS_OP_N, w, n, w, &one,
-                rinvlp + rinv_off, nb, (long)nb * nb,
-                xbhp, w, (long)n * w,
-                &one, xpan, w, (long)n * w, batch));
-        } else {
-            cublasSetMathMode(h, CUBLAS_DEFAULT_MATH);   // exact FP32 SIMT (the test path)
-            BKL(cublasSgemmStridedBatched(h, CUBLAS_OP_N, CUBLAS_OP_N, w, n, w, &one,
-                Rinvp + (long)(bi * batch) * nb * nb, nb, (long)nb * nb,
-                Xp + j, n, nn,
-                &zero, xpan, w, (long)n * w, batch));
-            cublasSetMathMode(h, CUBLAS_TF32_TENSOR_OP_MATH);
+        // C=Xpan(ld=w)). 3xTF32 Kahan tensor-core: split the CURRENT X[:,j:je] panel into packed
+        // hi/lo (Xbh/Xbl, (n,w) row-major -> col-major (w,n) ld=w), then 3 accumulating TF32
+        // GEMMs (Rinvh@Xbh + Rinvh@Xbl + Rinvl@Xbh) -> ~FP32 accuracy, far faster than SIMT.
+        {
+            dim3 sblk(32, 8);
+            int scols = (w + 3) >> 2;                       // float4 cols (w%4==0)
+            dim3 sgrid(cdiv(scols, 32), cdiv(n, 8), batch);
+            split_panel_strided_kernel<<<sgrid, sblk>>>(Xp, xbhp, xblp, n, j, w);
         }
+        cublasSetMathMode(h, CUBLAS_TF32_TENSOR_OP_MATH);
+        long rinv_off = (long)(bi * batch) * nb * nb;
+        // Xpan = Rinvh @ Xbh  (beta=0)
+        BKL(cublasSgemmStridedBatched(h, CUBLAS_OP_N, CUBLAS_OP_N, w, n, w, &one,
+            rinvhp + rinv_off, nb, (long)nb * nb,
+            xbhp, w, (long)n * w,
+            &zero, xpan, w, (long)n * w, batch));
+        // Xpan += Rinvh @ Xbl
+        BKL(cublasSgemmStridedBatched(h, CUBLAS_OP_N, CUBLAS_OP_N, w, n, w, &one,
+            rinvhp + rinv_off, nb, (long)nb * nb,
+            xblp, w, (long)n * w,
+            &one, xpan, w, (long)n * w, batch));
+        // Xpan += Rinvl @ Xbh
+        BKL(cublasSgemmStridedBatched(h, CUBLAS_OP_N, CUBLAS_OP_N, w, n, w, &one,
+            rinvlp + rinv_off, nb, (long)nb * nb,
+            xbhp, w, (long)n * w,
+            &one, xpan, w, (long)n * w, batch));
         dim3 blk(32, 8);
         // float4-vectorized scatter: 4 columns/thread when w%4==0 (x-grid covers w/4 work-
         // items); the scalar fallback (w%4!=0, unreachable here) wants the full-w grid.
@@ -6193,29 +6140,16 @@ torch::Tensor tri_solve_right_inv(torch::Tensor A, torch::Tensor Rin, int nb) {
             break;
         }
         int rest = n - je;
-        if (g_trsm_trail_fp16) {
-            // 3xFP16 trailing. FUSED scatter-back + FP16 hi/lo split of the
-            // solved panel in ONE pass (hi16/lo16 args), then 3xFP16 GEMM (no separate split).
-            scatter_split_panel_kernel<<<pgrid, blk>>>(Xp, xpan, nullptr, nullptr, n, j, w,
-                                                       xph16p, xpl16p);
-            // A = FP16 solved panel hi/lo (packed n x w, ld=w); B = FP16 R hi/lo strided at
-            // (row j, col je) ld=n; C = FP32 X strided at col je ld=n; M=n,N=rest,K=w; alpha=-1.
-            gemm3_fp16_strided(h, /*M=*/n, /*N=*/rest, /*K=*/w, negone,
-                xph16p, xpl16p, /*ldA=*/w, (long)n * w,
-                rh16p + (long)j * n + je, rl16p + (long)j * n + je, /*ldB=*/n, nn,
-                Xp + je, /*ldC=*/n, nn, batch);
-        } else {
-            // Fused: write the solved panel back to X AND split it to FP32 hi/lo (one pass).
-            scatter_split_panel_kernel<<<pgrid, blk>>>(Xp, xpan, xph, xpl, n, j, w);
-            // --- Trailing 3xTF32: X[:, je:] -= Xpan @ R[j:je, je:]
-            //   A = solved panel hi/lo (packed n x w, ldA=w, sA=n*w)
-            //   B = R hi/lo strided at (row j, col je), ldB=n, sB=n*n
-            //   C = X strided at col je, ldC=n, sC=n*n ; M=n, N=rest, K=w ; alpha=-1
-            gemm3_strided(h, /*M=*/n, /*N=*/rest, /*K=*/w, negone,
-                xph, xpl, /*ldA=*/w, (long)n * w,
-                Rhp + (long)j * n + je, Rlp + (long)j * n + je, /*ldB=*/n, nn,
-                Xp + je, /*ldC=*/n, nn, batch);
-        }
+        // 3xFP16 trailing X[:, je:] -= Xpan @ R[j:je, je:]. FUSED scatter-back + FP16 hi/lo
+        // split of the solved panel in ONE pass (hi16/lo16 args), then 3xFP16 GEMM (no separate
+        // split). A = FP16 solved panel hi/lo (packed n x w, ld=w); B = FP16 R hi/lo strided at
+        // (row j, col je) ld=n; C = FP32 X strided at col je ld=n; M=n,N=rest,K=w; alpha=-1.
+        scatter_split_panel_kernel<<<pgrid, blk>>>(Xp, xpan, nullptr, nullptr, n, j, w,
+                                                   xph16p, xpl16p);
+        gemm3_fp16_strided(h, /*M=*/n, /*N=*/rest, /*K=*/w, negone,
+            xph16p, xpl16p, /*ldA=*/w, (long)n * w,
+            rh16p + (long)j * n + je, rl16p + (long)j * n + je, /*ldB=*/n, nn,
+            Xp + je, /*ldC=*/n, nn, batch);
     }
     return X;
 }
