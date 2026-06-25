@@ -1117,15 +1117,6 @@ __global__ void build_V_kernel(const T* __restrict__ H, T* __restrict__ V,
 // other two use beta=1.
 static int g_prec = 3;   // TF32 accuracy passes: 1, 2, or 3 (set from Python)
 void set_prec(int p) { g_prec = p; }
-// Independent precision for ONLY the first trailing GEMM W = V^T @ C in
-// apply_block_reflector. The full 3xTF32 W path (gather_split_C_kernel that gathers+splits
-// the STRIDED trailing C block in 3 passes, + mm3_bpresplit) was always SLOWER than the
-// SIMT-FP32 path on these narrow batched GEMMs and is pruned. The wide final update
-// C -= V@Y (mm3g) reads C in-place (no gather) and stays at g_prec. g_prec_w selects the
-// in-place W step:
-//   0 (default) -> single-pass, C read in place at g_prec (mm3g)
-//   1 -> single-pass TF32, C read STRIDED in place (mm1_tf32_inplace), tensor cores even at g_prec==0
-static int g_prec_w = 0;   // set internally by set_n512_good_flags; no Python setter
 // Precision of the S=V^T V Gram (mm_S_tf32) on the n512-mixed BAD path. Set only by
 // set_n512_bad_flags; restored after. The Gram feeds the compact-WY T-inverse; on the
 // marginal band/rowscale/clustered bad matrices the single-pass TF32 (~19-bit) Gram
@@ -1600,8 +1591,8 @@ static int g_qr2_no_clone = 0;
 // benchmark and test shape, so it and its hi/lo split scratch are pruned.) Both the
 // W=V^T@C and final C-=V@Y / Y=T@W trailing GEMMs share this single marshaler.
 // mm_fp32_strided is the arg-marshaling core (A stride/ld + op_y from tA, then the
-// one cublasSgemmStridedBatched); mm3g/mm1_tf32_inplace/mm_S_tf32 add ONLY their
-// distinct math-mode bracketing -- the sole axis they differ on.
+// one cublasSgemmStridedBatched); mm3g/mm_S_tf32 add ONLY their distinct math-mode
+// bracketing -- the sole axis they differ on.
 // col-major R^T (r x p) ldR: X=B (r,q) col-major ldB op_x=N ; Y=A op_y.
 static inline void mm_fp32_strided(cublasHandle_t h, bool tA, const float* A, int p, int q,
                                    const float* B, int r, long ldB, long sB,
@@ -1629,8 +1620,8 @@ static void mm3(cublasHandle_t h, bool tA, const float* A, int p, int q,
 
 // TF32-tensor-core single-pass strided GEMM (ALWAYS tensor cores, independent of g_prec):
 // set TF32 math (a prior g_prec==0 GEMM may have left DEFAULT), run the shared marshaler,
-// restore DEFAULT when g_prec==0 so a subsequent SIMT-FP32 update is unaffected. The
-// set/run/restore bracket shared by mm_S_tf32 and mm1_tf32_inplace.
+// restore DEFAULT when g_prec==0 so a subsequent SIMT-FP32 update is unaffected. Used by
+// mm_S_tf32's TF32 Gram path.
 static inline void mm_tf32_strided(cublasHandle_t h, bool tA, const float* A, int p, int q,
                                    const float* B, int r, long ldB, long sB,
                                    float* R, long ldR, long sR, float alpha, float beta0, int batch) {
@@ -1655,13 +1646,6 @@ static void mm_S_tf32(cublasHandle_t h, const float* V, int b, int m, float* S, 
     }
     mm_tf32_strided(h, /*tA=*/true, V, b, m, V, b, b, (long)b * m,
                     S, b, (long)b * b, 1.f, 0.f, batch);
-}
-
-// TF32 in-place GEMM for W=V^T@C when the final update stays SIMT-FP32 (g_prec==0).
-static void mm1_tf32_inplace(cublasHandle_t h, bool tA, const float* A, int p, int q,
-                             const float* B, int r, long ldB, long sB,
-                             float* R, long ldR, long sR, float alpha, float beta0, int batch) {
-    mm_tf32_strided(h, tA, A, p, q, B, r, ldB, sB, R, ldR, sR, alpha, beta0, batch);
 }
 
 
@@ -4011,11 +3995,9 @@ static void apply_block_reflector_t(cublasHandle_t handle, STORE* Hp, float* tau
 
     if constexpr (F32) {
         mm_S_tf32(handle, Vp, w, m, Sp, B);                 // S = V^T V (w x w)
-        // W = V^T @ C via single-pass mm3g (reads C in place). g_prec_w is provably ALWAYS 0
-        // (no Python setter exists; the only C++ writes are =0 in set_n512_bad_flags /
-        // restore_after_n512_bad), so the former gather-free TF32 W-step arm (g_prec_w==1,
-        // mm1_tf32_inplace) and the 3xTF32 split W-steps (g_prec_w>=2) were unreachable on
-        // every scored shape -- the if/else was folded to this unconditional mm3g.
+        // W = V^T @ C via single-pass mm3g (reads C in place at g_prec<=1). The former
+        // gather-free TF32 and 3xTF32-split W-step variants were unreachable on every scored
+        // shape and pruned, so this is unconditional.
         mm3g(handle, /*tA=*/true, Vp, w, m, Cin, rest, /*ldB=*/n, (long)n * n,
              Wp_f32, /*ldR=*/rest, (long)w * rest, 1.f, 0.f, B);
         // M = L^{-1} = T^T (the always-on 2-block-merge blk2, the ~2x-shorter-
@@ -4615,8 +4597,8 @@ static inline void restore_after_n512_good() {
 }
 
 // n=512 mixed-driver BAD-subset trailing config (symmetric with set_n512_good_flags).
-// EXACT SIMT-FP32 wide trailing (g_prec=0) AND exact SIMT-FP32 skinny W=V^T@C
-// (g_prec_w=0 -> mm3g at g_prec==0) AND exact SIMT-FP32 S=V^T V Gram (g_prec_s=1).
+// EXACT SIMT-FP32 wide trailing (g_prec=0) AND exact SIMT-FP32 skinny W=V^T@C (mm3g at
+// g_prec==0) AND exact SIMT-FP32 S=V^T V Gram (g_prec_s=1).
 // ROBUSTNESS: the remote secret s7 run amplifies a latent orth instability the local
 // toolchain cannot reproduce, so the BAD subset must run the W-step and the S=V^T V Gram
 // BOTH exact-FP32 (TF32 on either pushed the worst band/rowscale matrices near/over the
@@ -4629,7 +4611,7 @@ static inline void restore_after_n512_good() {
 // that flickers a near-rank-deficient residual past the invariance gate. All numerically
 // deterministic (same betas/taus/V; FP32 inverse).
 static inline void set_n512_bad_flags() {
-    g_prec = 0; g_prec_w = 0; g_prec_s = 1; g_warps = 32; g_panel_defer = 4; g_fp16_pure = 0;
+    g_prec = 0; g_prec_s = 1; g_warps = 32; g_panel_defer = 4; g_fp16_pure = 0;
     g_minv_nt = 512; g_minv_2lev_nlev = 2; g_no_splitk = 1; g_qr2_no_clone = 1;
     g_panel_cmf = 1;   // warp-spec FP32 cmf inner panel (overlaps pivot look-ahead w/ bulk
                        // trailing); measured ~1% faster than pipe<32> on the s7 bad subset.
@@ -4639,7 +4621,7 @@ static inline void set_n512_bad_flags() {
 }
 static inline void restore_after_n512_bad() {
     g_no_splitk = 0; g_minv_2lev_nlev = 1; g_qr2_no_clone = 0; g_prec_s = 0;
-    g_prec = 1; g_prec_w = 0; g_panel_defer = 0; g_minv_nt = 512; g_fp16_pure = 1;
+    g_prec = 1; g_panel_defer = 0; g_minv_nt = 512; g_fp16_pure = 1;
     g_panel_cmf = 0; g_cmf_mrfine = 0;
 }
 
