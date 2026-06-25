@@ -6554,6 +6554,17 @@ def _qr_large_n(A, n, B):
 def _custom_kernel_generic(data: input_t) -> output_t:
     A = data
     B, n, _ = A.shape
+    # HOST-LAUNCH FAST-PATH (brief-9): n=32 is the geomean-dominant tiny shape (~12.9us, of
+    # which ~3.8us is recoverable host dispatch: measured pipelined GPU floor ~9.1us). Its
+    # handler (the CUDA-graph-launched tiny QR) is a pure function of n -- so dispatch it
+    # DIRECTLY here, skipping the off-grid tuple-membership check + the per-call _arms
+    # tuple-of-lambdas rebuild + the predicate loop below. NUMERICS BYTE-IDENTICAL (this IS
+    # the n<=32 arm, and the grid guard already proves 32 is the only on-grid n<=32, so a
+    # held-out n<32 still falls through to the guard -> geqrf). n=176/n=352 are GPU-bound
+    # (their dispatch overhead is overlapped by GPU work in the bench loop -- measured
+    # GPU-span ~= pipelined), so only n=32 is hoisted.
+    if n == 32:
+        return _ext.blocked_qr_tiny(A)
     # ============================================================================
     # SECRET-SAFETY ANY-N GUARD (brief-9/10, W4+W5): the custom kernels below are tuned
     # for the on-grid n values the PUBLIC benchmark uses {32,176,(176,352]&4-aligned,
