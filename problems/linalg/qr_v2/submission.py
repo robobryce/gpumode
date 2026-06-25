@@ -6048,20 +6048,19 @@ _RDEF = {
 }
 
 
-def _run_blocked(entry, args, sets, *, skip=(), override=None, extra=None):
+def _run_blocked(entry, args, sets, *, skip=(), extra=None):
     # ONE dispatch driver: apply `sets` g_* writes in order, run _ext.<entry>(*args), then
     # restore. The restore set is DERIVED from `sets` (no mirror list): each set knob restores
-    # to override-or-_RDEF, minus `skip` (set-but-deliberately-leaked, re-set by the next
+    # to its _RDEF default, minus `skip` (set-but-deliberately-leaked, re-set by the next
     # shape), plus restore-ONLY `extra` knobs. Restore order is irrelevant (no double-restore;
     # restores only seed the next shape), so each shape's launch state is bit-identical.
-    override = override or {}
     skip = set(skip)
     for _name, _v in sets:
         getattr(_ext, _name)(_v)
     out = getattr(_ext, entry)(*args)
     for _name, _ in sets:
         if _name not in skip:
-            getattr(_ext, _name)(override.get(_name, _RDEF[_name]))
+            getattr(_ext, _name)(_RDEF[_name])
     for _name, _v in (extra or ()):
         getattr(_ext, _name)(_v)
     return out
