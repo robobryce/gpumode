@@ -6596,14 +6596,12 @@ std::vector<torch::Tensor> build_H_inplace(torch::Tensor M, torch::Tensor R, tor
     return {M, Tau};
 }
 
-// FP64 cholesky factor -> FP32 R (the row-major-UPPER QR factor) in ONE pass: upper
-// triangle (r<=c) cast to float, strict-lower zeroed. ONE kernel serves both chol paths
-// via `transpose`: =1 reads a LOWER factor L (R = L^T, so R[r,c]=L[c,r]) for the
-// per-matrix cholesky_ex path; =0 reads a source that already holds the row-major-upper
-// factor in place (R[r,c]=src[r,c]) for the B=2 fused potrf path. The transpose=1 case
-// replaces L64.float().transpose(-1,-2).contiguous() (a cast + transposed materialize-copy)
-// with one strided FP64 read + contiguous FP32 write. Every element is written each call,
-// so a persistent reused R buffer is safe.
+// FP64 cholesky factor -> FP32 R (the row-major-UPPER QR factor) in ONE pass: upper triangle
+// (r<=c) cast to float, strict-lower zeroed. ONE kernel serves both chol paths via `transpose`:
+// =1 reads a LOWER factor L (R=L^T) for the per-matrix cholesky_ex path; =0 reads a source
+// already in row-major-upper for the B=2 fused potrf path. transpose=1 replaces a cast +
+// transposed materialize-copy with one strided FP64 read + contiguous FP32 write. Every
+// element is written each call, so a persistent reused R buffer is safe.
 __global__ void chol_tri_to_R_kernel(const double* __restrict__ Sg, float* __restrict__ Rg,
                                      int n, int transpose) {
     int mat = blockIdx.z;
@@ -6737,13 +6735,11 @@ static int g_recon_lowp_from = -1;
 // diag_lu_reg (256 threads). Only the w==64 path uses it; w<64 tail keeps diag_lu_static_fused.
 static int g_recon_warplu = 0;
 
-// Combined gather + identity-fill for the blocked right-TRSM (X * R = A, R upper).
-// In ONE grid pass, for each of the batch*nblk diagonal blocks (block bi of matrix
-// mb at grid.z = bi*batch + mb), writes BOTH: (a) the gathered R[j:j+w, j:j+w]
-// sub-block into Ropg (identity-padded where r>=w||c>=w so the partial tail block
-// inverts to itself), and (b) a fresh identity block into Rinvg (the batched-trsm
-// RHS). 2D grid.x/y tile the nb x nb output so many CTAs cover each block (a
-// one-CTA-per-block loop was the solve's #1 overhead). R is read row-major (ld=n).
+// Combined gather + identity-fill for the blocked right-TRSM. In ONE grid pass, per diagonal
+// block (bi of matrix mb at grid.z = bi*batch + mb), writes (a) the gathered R[j:j+w, j:j+w]
+// into Ropg (identity-padded where r>=w||c>=w so the tail block inverts to itself) and (b) a
+// fresh identity into Rinvg (the batched-trsm RHS). 2D grid tiles the nb x nb output across
+// many CTAs. R is read row-major (ld=n).
 __global__ void gather_diag_and_eye_kernel(const float* __restrict__ Rg,
                                            float* __restrict__ Ropg,
                                            float* __restrict__ Rinvg,
@@ -6774,14 +6770,10 @@ __device__ __forceinline__ void tf32_split_store(float xv, float* __restrict__ h
     *hi = h; *lo = xv - h;
 }
 
-// Flat FP32 -> (hi, lo) split of a contiguous array (hi exactly TF32-representable,
-// lo = x - hi).  Used to split the packed solved panel for the 3xTF32 trailing GEMM.
-//
-// VECTORIZED (float4): each thread splits 4 CONTIGUOUS elements as one 16B load + two
-// 16B stores. x/hi/lo are contiguous torch buffers (16B-aligned) and `count` is
-// batch*n*n with n a multiple of 4, so count%4==0 and the vec4 grid covers it exactly
-// (no scalar tail on any live caller). BYTE-IDENTICAL math: tf32_split_store is applied
-// per lane exactly as the scalar path. A scalar fallback handles any count%4!=0 caller.
+// Flat FP32 -> (hi, lo) split of a contiguous array (hi exactly TF32-representable, lo=x-hi)
+// for the 3xTF32 trailing GEMM. VECTORIZED (float4): each thread splits 4 contiguous elements
+// (one 16B load + two 16B stores); count=batch*n*n with n%4==0, so the vec4 grid covers it.
+// BYTE-IDENTICAL math (tf32_split_store per lane); a scalar fallback handles any count%4!=0.
 __global__ void split_flat_kernel(const float* __restrict__ x, float* __restrict__ hi,
                                   float* __restrict__ lo, long count) {
     long v = (long)blockIdx.x * blockDim.x + threadIdx.x;   // float4 index
@@ -6802,11 +6794,10 @@ __global__ void split_flat_kernel(const float* __restrict__ x, float* __restrict
     }
 }
 
-// hi/lo split of the STRIDED X-panel X[mat][:, j:j+w] (n rows, w cols,
-// ld=n) into PACKED hi/lo buffers (batch, n, w) with row-stride w. Reads the input panel
-// for the 3xTF32 tensor-core DIAGONAL solve (g_trsm_diag_prec==2). float4 over the w cols
-// (w=nb=384 or tail 256, both %4==0; j%4==0 -> the X read base is 16B-aligned; the packed
-// write base r*w+c with w%4==0 is too). One thread owns 4 contiguous columns of one row.
+// hi/lo split of the STRIDED X-panel X[mat][:, j:j+w] (n rows, w cols, ld=n) into PACKED
+// hi/lo buffers (batch, n, w), row-stride w, for the 3xTF32 diagonal solve (g_trsm_diag_prec
+// ==2). float4 over the w cols (w and j are %4==0 -> all bases 16B-aligned); one thread owns
+// 4 contiguous columns of one row.
 __global__ void split_panel_strided_kernel(const float* __restrict__ Xg,
                                             float* __restrict__ hi, float* __restrict__ lo,
                                             int n, int j, int w) {
@@ -7074,22 +7065,16 @@ torch::Tensor tri_solve_right_inv(torch::Tensor A, torch::Tensor Rin, int nb) {
         int j = bi * nb;
         int je = (j + nb < n) ? (j + nb) : n;
         int w = je - j;
-        // --- Diagonal solve: Xpan := X[:, j:je] @ Rinv_block  (exact FP32), packed.
-        // ONE strided-batched GEMM over all matrices (the Python does a single bmm;
-        // a per-matrix sgemm loop is more launches at batch=2). For fixed block bi the
-        // two matrices' Rinv blocks are contiguous (rows bi*batch+0, +1) with stride
-        // nb*nb; the X panels have stride nn; the packed output has stride n*w.
-        //   C_rm(n,w) = Xblk_rm(n,w) @ Rij_rm(w,w)
-        //   <=> C_cm(w,n) = Rij_cm(w,w) @ Xblk_cm(w,n)
-        //   => gemm(N, N, m=w, n=n, k=w, A=Rij(ld=nb,stride nb*nb), B=Xblk(ld=n,stride
-        //      nn), C=Xpan(ld=w,stride n*w)).  Precision per g_trsm_diag_prec: exact-FP32
-        //      SIMT (==0, the test path) or 3xTF32 Kahan tensor-core (==2, the s6 path).
+        // --- Diagonal solve: Xpan := X[:, j:je] @ Rinv_block, packed, as ONE strided-batched
+        // GEMM over all matrices. For block bi the two Rinv blocks are contiguous (stride
+        // nb*nb), the X panels stride nn, the packed output strides n*w. Row-major
+        // C(n,w)=Xblk(n,w)@Rij(w,w) <=> gemm(N,N, m=w,n=n,k=w, A=Rij(ld=nb), B=Xblk(ld=n),
+        // C=Xpan(ld=w)). Precision per g_trsm_diag_prec: exact-FP32 SIMT (==0, the test path)
+        // or 3xTF32 Kahan tensor-core (==2, the s6 path).
         if (g_trsm_diag_prec == 2) {
-            // 3xTF32 tensor-core diagonal solve: split the CURRENT X[:,j:je] panel into
-            // packed hi/lo, then 3 accumulating TF32 GEMMs (Rinvh@Xbh + Rinvh@Xbl + Rinvl@Xbh)
-            // -> ~FP32 accuracy on tensor cores, far faster than the SIMT FP32 GEMM. The
-            // packed Xbh/Xbl are (n,w) row-major (row-stride w) -> col-major (w,n) ld=w, so the
-            // GEMM is gemm(N,N, w,n,w, A=Rinvh(ld=nb,s=nb*nb), B=Xbh(ld=w,s=n*w), C=xpan(ld=w)).
+            // 3xTF32 tensor-core diagonal solve: split the CURRENT X[:,j:je] panel into packed
+            // hi/lo (Xbh/Xbl, (n,w) row-major -> col-major (w,n) ld=w), then 3 accumulating TF32
+            // GEMMs (Rinvh@Xbh + Rinvh@Xbl + Rinvl@Xbh) -> ~FP32 accuracy, far faster than SIMT.
             {
                 dim3 sblk(32, 8);
                 int scols = (w + 3) >> 2;                       // float4 cols (w%4==0)
@@ -7122,9 +7107,8 @@ torch::Tensor tri_solve_right_inv(torch::Tensor A, torch::Tensor Rin, int nb) {
             cublasSetMathMode(h, CUBLAS_TF32_TENSOR_OP_MATH);
         }
         dim3 blk(32, 8);
-        // float4-vectorized scatter: each thread owns 4 columns when w%4==0, so the
-        // x-grid covers w/4 work-items (matches the kernel's (w&3)==0 fast path); the
-        // scalar fallback (w%4!=0, unreachable here) wants the full-w grid.
+        // float4-vectorized scatter: 4 columns/thread when w%4==0 (x-grid covers w/4 work-
+        // items); the scalar fallback (w%4!=0, unreachable here) wants the full-w grid.
         int wcols = ((w & 3) == 0) ? ((w + 3) >> 2) : w;
         dim3 pgrid(cdiv(wcols, 32), cdiv(n, 8), batch);
         if (je >= n) {
@@ -7198,22 +7182,17 @@ __global__ void panel_solve_fused_kernel(float* __restrict__ Mg, int n,
     int total = mrows + rest;
     int item = blockIdx.x * blockDim.x + threadIdx.x;
     if (item >= total) return;
-    // FP64 accumulation of the substitution dot products: each element is a <=63-term
-    // inner product, and the reconstructed Q's orthogonality at n=4096 sits near the
-    // gate (orth_scaled ~50-90 of 100). cuBLAS's FP32 trsm is at the gate's edge for
-    // some seeds; a double accumulator here is STRICTLY more accurate than FP32 (the
-    // solution rounds to FP32 only at write-back), restoring orth margin while keeping
-    // the operation mathematically identical. The solved values are stored back in FP32
-    // (same storage as before), so the later Schur GEMM and build_H are unchanged.
+    // FP64 accumulation of the substitution dot products (each a <=63-term inner product):
+    // strictly more accurate than FP32 (the solution rounds to FP32 only at write-back),
+    // restoring orth margin near the n=4096 gate. Stored back in FP32, so the later Schur
+    // GEMM and build_H are unchanged.
     if (item < mrows) {
         // L21 row solve: y @ U = b, b = M21[item][0..w-1] at row (joe+item).
         // back-sub over columns c=0..w-1: y[c] = (b[c] - sum_{k<c} y[k] U[k][c]) / U[c][c]
         float* b = M + (long)(joe + item) * n + jo;      // mrows x w region, ld=n
         float y[W];
-        // fp32_solve: FP32 accumulation (faster) vs the default
-        // FP64 (orth-margin). The recon's Q via householder_product is orth-exact regardless
-        // of V precision -> only the loose factor residual (gate 32 @ n4096) is touched;
-        // tested whether FP32 holds it. Passed from the host (reads g_recon_solve_fp32).
+        // fp32_solve (host knob g_recon_solve_fp32): FP32 accumulation (faster) vs the FP64
+        // default; Q via householder_product is orth-exact regardless, only the factor residual.
         if (fp32_solve) {
             #pragma unroll
             for (int c = 0; c < W; ++c) {
@@ -7239,11 +7218,9 @@ __global__ void panel_solve_fused_kernel(float* __restrict__ Mg, int n,
             for (int c = 0; c < W; ++c) lh[c] = __float2half(y[c]);
         }
     } else {
-        // U12w column solve: L x = b, b = M12[0..w-1][col] at column (joe+col).
-        // fwd-sub (UNIT L, no division -> no small-pivot cancellation) over rows
-        // r=0..w-1: x[r] = b[r] - sum_{k<r} L[r][k] x[k]. FP32 here suffices (the
-        // orth-margin-sensitive part is the L21 U-solve's divide by the sign-
-        // stabilized pivots, kept in FP64 above).
+        // U12w column solve: L x = b at column (joe+col). fwd-sub (UNIT L, no division) over
+        // rows r: x[r] = b[r] - sum_{k<r} L[r][k] x[k]. FP32 suffices (the orth-margin-sensitive
+        // part is the L21 U-solve's divide by the sign-stabilized pivots, kept in FP64 above).
         int col = item - mrows;                          // 0..rest-1
         float* b = M + (long)jo * n + (joe + col);       // w x rest region, ld=n (col step = 1)
         float x[W];
