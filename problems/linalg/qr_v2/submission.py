@@ -877,9 +877,7 @@ panel_factor_smem_wsp_cmf_tmpl_kernel(ST* __restrict__ H, float* __restrict__ ta
     const int mat = blockIdx.x;
     ST* A = H + (size_t)mat * n * n;
     float* Aout = (Hout != nullptr) ? Hout + (size_t)mat * n * n : nullptr;
-    // Af32 (always null at the live call sites): when non-null the panel would read its k==0
-    // input columns from the FP32 original instead of bf16 H; null = the bf16-input path.
-    const float* Af = (Af32 != nullptr) ? Af32 + (size_t)mat * n * n : nullptr;
+    (void)Af32;   // always null at every live call site; the FP32-input k==0 load was pruned.
     float* TAU = tau + (size_t)mat * n;
     const int lane = threadIdx.x, warp = threadIdx.y;
     const int tid = warp * 32 + lane, nthreads = NWARPS * 32;
@@ -891,13 +889,7 @@ panel_factor_smem_wsp_cmf_tmpl_kernel(ST* __restrict__ H, float* __restrict__ ta
     // three aligned 16B chunks (uint4), loaded in one transaction. FP32 storage never
     // takes this path (if constexpr drops it from the float instantiation). Other widths
     // fall back to the scalar load below.
-    if (Af != nullptr) {
-        // FP32-input load: full-precision panel columns from the original matrix.
-        for (int idx = tid; idx < m * b; idx += nthreads) {
-            int r = idx / b, c = idx % b;          // row-major iter -> coalesced global read
-            s[(size_t)c * LDM + r] = Af[(size_t)(k + r) * n + (k + c)];
-        }
-    } else if constexpr (!std::is_same<ST, float>::value) {
+    if constexpr (!std::is_same<ST, float>::value) {
         if (b == 24 && ((k & 7) == 0)) {
             const int chunks = 3;
             for (int idx = tid; idx < m * chunks; idx += nthreads) {
