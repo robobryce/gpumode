@@ -4669,19 +4669,13 @@ std::tuple<torch::Tensor, torch::Tensor> blocked_qr_2level_bf16_indexed(torch::T
                             n, ki, ib, m_i, ki + ib, inner_rest,                              \
                             g_paf_no_csh, g_paf_no_vsh, idxp);                                \
                 } while (0)
-            // Only THREE (NWARPS,HELP) instances are ever launched by a scored shape: <8,1>
-            // (n=512 dense/mixed good), <8,2> (n=512 rankdef/clustered capped via
-            // apply_n512_rr_overrides), <32,2> (n=1024 _LARGE_LO, paf_warps=32/paf_help=2).
-            // g_paf_warps is only ever 8 or 32 and at 32 paf_help is only ever 2, so the other
-            // arms (<32,1>,<32,4>,<8,4>) are unreachable -- dropped. The guard fails loudly.
+            // Live instances: <8,1> (n512 dense/mixed), <8,2> (n512 capped), <32,2> (n1024).
+            // g_paf_warps only 8 or 32, at 32 paf_help only 2 -> <32,1>/<32,4>/<8,4> dropped.
             if (g_paf_warps >= 32) {
                 TORCH_CHECK(paf_help == 2, "PAF: only <32,2> is instantiated at 32 warps");
                 PAF_LAUNCH(32, 2);
-            } else if (paf_help == 2) {
-                PAF_LAUNCH(8, 2);
-            } else {
-                PAF_LAUNCH(8, 1);
-            }
+            } else if (paf_help == 2) PAF_LAUNCH(8, 2);
+            else                      PAF_LAUNCH(8, 1);
             #undef PAF_LAUNCH
             return true;
         });
