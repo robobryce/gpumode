@@ -83,11 +83,16 @@ autocuda run exclusive --data-dir "$DATA_DIR" -- \
 
 ## Profiling
 
-`eval.py` runs `custom_kernel` in a spawned subprocess and only runs at all when `POPCORN_FD` is set (it exits immediately otherwise). `nsys` follows the subprocess by default, so the usual reason a capture comes back with **zero kernels** is that the benchmark never ran — a missing `POPCORN_FD`, or a setup step that aborted the command (a relative `source harness/env.sh` fails unless the working dir is the repo root). An empty trace is a failed capture, not a result; confirm kernels with `nsys stats --report cuda_gpu_kern_sum <file>.nsys-rep` before trusting it, and use the verified invocation in `autocuda/environment.md`'s **Profiling** section (written per-machine by `/autocuda:discover`) rather than improvising one.
+Profile through the harness scripts — they exist so the capture is correct and reproducible, not improvised per run. Both wrap a small driver (`harness/profile_driver.py`) that imports the live `submission.custom_kernel` and times it on one shape inside a CUDA profiler range, so the capture holds **only your kernels** — not eval.py's `spawn`-Pool indirection and not the cuSOLVER/cuBLAS reference checker that `eval.py benchmark` interleaves with every timed call.
 
-`ncu` needs root: drive it through `harness/profile_ncu.sh <set>/<problem> [<shape-spec>]` (wrapped in `autocuda run exclusive`), which handles the `sudo`/closed-fd-3/`PYTHONPATH` issues for you. Reach for it once you know which kernel to attack — it reports the memory-vs-compute/occupancy/stall detail `nsys` can't.
+```bash
+autocuda run exclusive --data-dir "$DATA_DIR" -- \
+  bash harness/profile_nsys.sh <set>/<problem> [<shape-spec>]                  # timeline
+autocuda run exclusive --data-dir "$DATA_DIR" -- \
+  bash harness/profile_ncu.sh  <set>/<problem> [<shape-spec>] [<kernel-regex>] # per-kernel (root)
+```
 
-Profile `custom_kernel` on **one representative shape in isolation**, never the whole benchmark: a whole-benchmark profile interleaves the reference checker's own kernels (cuSOLVER/cuBLAS/cutlass) with yours and mis-attributes time.
+`profile_nsys.sh` prints the per-kernel summary; `profile_ncu.sh` runs the full `ncu` section set (memory-vs-compute, occupancy, stalls — reach for it once you know which kernel to attack) and handles the `sudo`/`PYTHONPATH` it needs. Default to the first benchmark shape; pass a `<shape-spec>` (a `task.yml` benchmark line) to pick another. Redirect stdout to a SHA-named `.{nsys,ncu}-txt` under `profiles/<tag>/` (and set `NSYS_OUT=<...>.nsys-rep` to keep the nsys report) so `autocuda init brief` can hand it on.
 
 ## Cross-benchmark aggregation
 

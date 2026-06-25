@@ -1,55 +1,54 @@
 #!/usr/bin/env bash
 # PROFILE helper (Nsight Compute) — autocuda <-> GPU MODE bridge.
 #
-# Profiles ONE representative benchmark shape under ncu, capturing the kernel
-# custom_kernel launches. The first arg is the <set>/<problem> to profile; an
+# Profiles ONE benchmark shape's `custom_kernel` under ncu, capturing the
+# kernels it launches. The first arg is the <set>/<problem> to profile; an
 # optional second arg pins the shape spec, else the first benchmark shape from
-# the problem's task.yml is used.
+# the problem's task.yml is used. A third optional arg is an ncu --kernel-name
+# value (e.g. `regex:gemm`) to focus on the dominant kernel; default profiles
+# the first few kernels in the range.
 #
 # Usage (wrap with autocuda run exclusive):
 #   autocuda run exclusive --data-dir "$DATA_DIR" -- \
-#     bash harness/profile_ncu.sh <set>/<problem> [<shape-spec>] \
+#     bash harness/profile_ncu.sh <set>/<problem> [<shape-spec>] [<kernel-filter>] \
 #       > "$DATA_DIR/profiles/<tag>/<name>-<sha>.ncu-txt" 2>&1
 # (e.g. <set>/<problem> = pmpp_v2/histogram_py). Redirect to a SHA-named file so
-# `autocuda init brief` can hand it to the next brief. A pure-PyTorch baseline
-# shows torch's internal kernels; a custom-CUDA submission shows your single
-# kernel cleanly.
+# `autocuda init brief` can hand it to the next brief.
+#
+# Why a driver instead of profiling eval.py directly: eval.py runs custom_kernel
+# in a `spawn` Pool AND `benchmark` mode interleaves the cuSOLVER/cuBLAS
+# reference checker with every timed call, so profiling eval.py mixes reference
+# kernels with yours and needs fragile --launch-skip guesswork to dodge them.
+# profile_driver.py imports the live submission + reference and wraps ONLY the
+# timed custom_kernel calls in a cudaProfiler range, so `--profile-from-start
+# off` records just your kernels. Correctness stays eval.py's job.
 set -uo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/env.sh" "$@"
 
 if [ "${2:-}" ]; then SPEC="$2"
 else SPEC="$("$PYTHON" "$REPO_DIR/bin/gen_specs.py" "$PROBLEM_DIR/task.yml" --emit benchmarks | head -n1)"; fi
-SPECFILE="$(mktemp)"; trap 'rm -f "$SPECFILE"' EXIT
-printf '%s\n' "$SPEC" > "$SPECFILE"
+KERNEL_FILTER="${3:-}"
 
 cd "$PROBLEM_DIR" || exit 1
 NCU="$(command -v ncu || echo "$CUDA_HOME/bin/ncu")"
 
+# Profiler capture range (driver's cudaProfilerStart/Stop) excludes warmup;
+# --profile-from-start off honours it. --launch-count caps collected kernels;
+# the warmup runs 5 calls so the captured iters are steady-state. An optional
+# --kernel-name focuses the dominant kernel (e.g. the trailing GEMM).
+NCU_ARGS=(--profile-from-start off --set full --launch-count 6)
+[ -n "$KERNEL_FILTER" ] && NCU_ARGS+=(--kernel-name "$KERNEL_FILTER")
+
 # ncu must run as root to read the GPU performance counters; without it the
 # profile aborts with ERR_NVGPUCTRPERM. So run it under sudo (skipped when we
-# are already root). Two sudo behaviours bite the profiler — both are handled
-# here so the script needs no special sudoers configuration:
-#
-#   * env_reset drops PYTHONPATH / LD_LIBRARY_PATH across the privilege boundary
-#     even under `sudo -E`: they sit on sudo's built-in blocklist, so an
-#     env_keep allow-list does not rescue them under -E. eval.py's `spawn` Pool
-#     re-imports submission/reference/utils through PYTHONPATH (see env.sh), so
-#     dropping it breaks the profiled run. We re-establish the load-bearing vars
-#     on the far side of sudo with `env`, which its filtering cannot touch.
-#   * sudo closes inherited fds >= 3 (closefrom), discarding the POPCORN_FD=3
-#     channel eval.py writes its protocol to — eval.py would die with EBADF
-#     before timing. A one-line bash shim reopens fd 3 -> /dev/null after the
-#     boundary, then execs the real command in the same process so ncu still
-#     profiles the kernels.
+# are already root). sudo's env_reset drops PYTHONPATH / LD_LIBRARY_PATH even
+# under -E (they sit on its blocklist), and the driver's `spawn`-free imports
+# resolve through PYTHONPATH (see env.sh), so we re-establish the load-bearing
+# vars on the far side of sudo with `env`, which its filtering cannot touch.
 run_ncu() {
     # "$@" is the privilege prefix (`sudo -n env VAR=val ...`); empty when root.
-    # The shim runs past sudo's closefrom, so it both reopens fd 3 -> /dev/null
-    # and points POPCORN_FD at it there — setting POPCORN_FD before sudo is
-    # pointless since sudo would strip it. fd 3 carries eval.py's protocol, which
-    # we discard; ncu's textual report stays on stdout/stderr.
-    "$@" "$NCU" --set full --launch-skip 5 --launch-count 1 \
-        bash -c 'exec 3>/dev/null; export POPCORN_FD=3; exec "$@"' profile_ncu \
-        "$PYTHON" "$EVAL_PY" benchmark "$SPECFILE" 3>/dev/null
+    "$@" "$NCU" "${NCU_ARGS[@]}" \
+        "$PYTHON" "$HARNESS_DIR/profile_driver.py" "$SPEC" 5 6
 }
 
 if [ "$(id -u)" -eq 0 ]; then
@@ -57,14 +56,14 @@ if [ "$(id -u)" -eq 0 ]; then
 else
     command -v sudo >/dev/null \
         || { echo "profile_ncu: ncu needs root but sudo is not installed" >&2; exit 1; }
-    # The vars env.sh set up that the profiled eval.py (and its nvcc/torch JIT)
-    # need on the far side of sudo. PATH carries $CUDA_HOME/bin (nvcc) and
-    # overrides sudo's secure_path. LD_LIBRARY_PATH is forwarded only when the
-    # machine actually set it, so an unset value is never turned into an empty
-    # one (an empty LD_LIBRARY_PATH element means "cwd" to the loader).
+    # The vars env.sh set up that the profiled driver (and its torch JIT) need on
+    # the far side of sudo. PATH carries $CUDA_HOME/bin and overrides sudo's
+    # secure_path. LD_LIBRARY_PATH is forwarded only when the machine set it, so
+    # an unset value is never turned into an empty one (an empty element means
+    # "cwd" to the loader).
     KEEP=(
         PATH="$PATH"
-        PYTHONPATH="${PYTHONPATH:-}"
+        PYTHONPATH="$PYTHONPATH"
         CUDA_HOME="$CUDA_HOME"
         CUDA_VISIBLE_DEVICES="$CUDA_VISIBLE_DEVICES"
         TORCH_EXTENSIONS_DIR="$TORCH_EXTENSIONS_DIR"
