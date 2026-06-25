@@ -1439,11 +1439,21 @@ __global__ void classify_decide_n512_kernel(const int* __restrict__ scratch,
         const bool b_off = (off_frac > 0.92f);
         const bool b_mid = (mid_ratio < 1.0e-9f);
         const bool hard = b_row || b_cos || b_off;
-        const bool bad = hard || b_mid;
+        // ROUTING (brief-2): only the HARD FP16-killers (row-scaled / near-collinear /
+        // banded) go to the slow exact-FP32 bad subset. The SOFT b_mid signal
+        // (clustered / rank-deficient via a tiny mid-column) is NOT an FP16-killer: the
+        // FP16 good path's FP32-V reflectors are orthogonality-exact at any conditioning,
+        // so those matrices factor CORRECTLY and ~3x FASTER on the good FP16 path
+        // (measured: of the mixed batch's 62 b_mid-only matrices, 0/62 fail the factor or
+        // orth gate on the FP16 good path). Routing them to good shrinks the underfilled
+        // serial exact-FP32 bad subset (~1900us of the mixed shape's 5237us). The driver's
+        // near-all-bad fallback still routes a HOMOGENEOUS b_mid batch (clustered/rankdef
+        // shapes) through the good rank-reveal path via bad_count==0, unchanged.
+        const bool bad = hard;
         int slot = atomicAdd(counts + (bad ? 0 : 1), 1);
         if (bad) {
             if (bad_idx && slot < max_bad) bad_idx[slot] = (long long)mat;
-            if (hard) atomicAdd(counts + 3, 1);
+            atomicAdd(counts + 3, 1);   // every bad matrix is now hard
         } else {
             if (good_idx && slot < max_good) good_idx[slot] = (long long)mat;
         }
