@@ -4531,7 +4531,9 @@ std::tuple<torch::Tensor, torch::Tensor> blocked_qr_2level_bf16_indexed(torch::T
                             g_paf_no_csh, g_paf_no_vsh, idxp);                                \
                 } while (0)
             // Live instances: <8,1> (n512 dense/mixed), <8,2> (n512 capped), <32,2> (n1024).
-            // g_paf_warps only 8 or 32, at 32 paf_help only 2 -> <32,1>/<32,4>/<8,4> dropped.
+            // (BRIEF-2 swept <32,4>/<32,8> -- both slightly WORSE than <32,2>: splitting warp-0's
+            // serial m-pass over more HELP warps costs more in barriers/reductions than the
+            // latency it saves, so only <32,2> is kept.)
             if (g_paf_warps >= 32) {
                 TORCH_CHECK(paf_help == 2, "PAF: only <32,2> is instantiated at 32 warps");
                 PAF_LAUNCH(32, 2);
@@ -6059,7 +6061,7 @@ _LARGE_LO = {   # n in [1024,2048); FP16 trailing wants a NARROW outer block (ba
     # minv_blk4=1 (blk4, OB-only via blk4_minw=48); inner_wmma=2 + panel_apply_fused=1 =
     # the fused inner-block megakernel at paf_warps=32 (matches the standalone panel's occ).
     "fp16_min_batch": 16,   # B>=16 -> FP16 trailing; a perf floor, not correctness (FP16-V keeps orth exact)
-    "ob": 64, "ib": 32, "defer": 5,
+    "ob": 64, "ib": 32, "defer": 5,   # BRIEF-2: IB=16 swept (1748us, WORSE: 4 inner panels add more trailing+build_Minv than the shorter serial chain saves). IB=32 optimal.
     "warps": 32, "bf16_nt": 512,
     "ov_fold": 1, "wsp_pad": 0,
     "minv_blk4": 0,
@@ -6069,7 +6071,7 @@ _LARGE_LO = {   # n in [1024,2048); FP16 trailing wants a NARROW outer block (ba
     "inner_wmma_wmax": 32,   # route the w=64 OB-wide outer apply (penultimate block, m=128/rest=64)
                              # off the single-CTA WMMA (4.8% SM @ B=60) to cuBLAS-batched GEMMs.
     "paf_warps": 32,
-    "paf_help": 2,   # PHASE-P pivot cooperation: 2 warps split warp-0's serial m-pass (m_i<=1024).
+    "paf_help": 2,   # PHASE-P pivot cooperation: 2 warps split warp-0's serial m-pass (m_i<=1024). HELP=4/8 swept, both slightly WORSE (barrier overhead > latency saved).
     "ov_coop": 2,    # standalone OV panel pivot-coop: split next-pivot m-pass over 2 warps.
 }
 _LARGE_HI = {   # n in [2048,4096); B=8 is SM-starved -> the coop panel
