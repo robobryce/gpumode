@@ -5795,12 +5795,12 @@ __global__ void oz_recombine_S_v2_kernel(const int* __restrict__ Pg, int npairs,
 __global__ void oz_recombine_GfromS_kernel(const int* __restrict__ Pg, const double* __restrict__ wg,
                                            int ndiag, const double* __restrict__ Sg,
                                            int n, int batch, const double* __restrict__ cjg,
-                                           double* __restrict__ Gg, int lower) {
+                                           double* __restrict__ Gg) {
     int j = blockIdx.x * blockDim.x + threadIdx.x;
     int i = blockIdx.y * blockDim.y + threadIdx.y;
     int b = blockIdx.z;
     if (i >= n || b >= batch) return;
-    if (lower ? (j > i) : (j < i)) return;
+    if (j < i) return;          // UPPER triangle only (the fused potrf reads row-major-upper)
     long nn = (long)n * n;
     long batch_nn = (long)batch * nn;
     long bo = (long)b * nn;
@@ -5858,9 +5858,9 @@ std::vector<torch::Tensor> oz_slice(torch::Tensor A, int64_t NS) {
 
 // Two-pass recombine: requires the pair list ORDERED with the `ndiag` diagonal
 // self-pairs (p==q) first. S is a caller-provided n*n f64 scratch (same shape as one
-// G). Pass A fills S (all pairs, coalesced); pass B assembles G's `lower` triangle.
+// G). Pass A fills S (all pairs, coalesced); pass B assembles G's UPPER triangle.
 void oz_recombine_2pass(torch::Tensor P, torch::Tensor wg, torch::Tensor cj,
-                        torch::Tensor S, torch::Tensor G, int64_t ndiag, int64_t lower) {
+                        torch::Tensor S, torch::Tensor G, int64_t ndiag) {
     int npairs = P.size(0), batch = G.size(0), n = G.size(1);
     dim3 blk(32, 8);
     dim3 grid((n + 31) / 32, (n + 7) / 8, batch);
@@ -5874,7 +5874,7 @@ void oz_recombine_2pass(torch::Tensor P, torch::Tensor wg, torch::Tensor cj,
     // through smem, which loses the incidental L2 reuse on S[j,i] at this tiny batch).
     oz_recombine_GfromS_kernel<<<grid, blk>>>(P.data_ptr<int>(), wg.data_ptr<double>(),
         (int)ndiag, S.data_ptr<double>(), n, batch,
-        cj.data_ptr<double>(), G.data_ptr<double>(), (int)lower);
+        cj.data_ptr<double>(), G.data_ptr<double>());
 }
 
 // GROUPED int8 Gram GEMM: ALL npairs*b int8 GEMMs in ONE cublasGemmBatchedEx (pointer-array
@@ -5934,7 +5934,7 @@ std::vector<torch::Tensor> build_H_inplace(torch::Tensor M, torch::Tensor R, tor
 torch::Tensor tri_solve_right_inv(torch::Tensor A, torch::Tensor R, int nb);
 torch::Tensor recon_lu_cpp(torch::Tensor M, torch::Tensor R, torch::Tensor D, int ob);
 std::vector<torch::Tensor> oz_slice(torch::Tensor A, int64_t NS);
-void oz_recombine_2pass(torch::Tensor P, torch::Tensor wg, torch::Tensor cj, torch::Tensor S, torch::Tensor G, int64_t ndiag, int64_t lower);
+void oz_recombine_2pass(torch::Tensor P, torch::Tensor wg, torch::Tensor cj, torch::Tensor S, torch::Tensor G, int64_t ndiag);
 void oz_gram_gemm_grouped(torch::Tensor slN, torch::Tensor P, std::vector<int64_t> pp, std::vector<int64_t> qq);
 """
 def _compile_lu():
@@ -6265,8 +6265,7 @@ _OZ_MAXPQ = 4
 # host dispatch gaps, inter-pair launch gaps, and the 5-buffer transpose L2 thrash.
 # Isolated A/B on s6 GEMM-issue: loop 825us -> strided 781us -> grouped 755us.
 # The n=4096,B=2 CholeskyQR path is always-on for its custom C++ ext kernels: the upper-R
-# int-Ozaki recombine (oz_recombine_2pass with lower=0) and the fused lower-R solve
-# (chol_b2_lower_R_solve), both gated on `b == 2 and n == 4096` at their call sites.
+# int-Ozaki recombine (oz_recombine_2pass) and the fused lower-R solve (chol_b2_lower_R_solve).
 _INV127 = 1.0 / 127.0
 _oz_meta = {}
 
@@ -6310,16 +6309,14 @@ def _gram_int_ozaki(A, G, lu):
     # P[k,bi] = s_p[bi]^T @ s_q[bi], bit-identical to a torch._int_mm loop (same IMMA
     # INT8 kernel + INT32 accumulation).
     lu.oz_gram_gemm_grouped(slN, P, pp, qq)
-    # Recombine fills the requested triangle (the formula is symmetric).
-    # Benchmark shape 6 (b==2,n==4096) fills the UPPER triangle (its col-major
-    # FILL_MODE_LOWER potrf reads row-major-upper); the B=1/B!=2 test path fills the
-    # ROW-MAJOR-LOWER triangle for its lower cholesky_ex.
-    lower = 0 if (b == 2 and n == 4096) else 1
+    # Recombine fills the UPPER triangle (lower=0): the only consumer is the fused
+    # chol_b2_lower_R_solve, whose col-major FILL_MODE_LOWER potrf reads row-major-upper.
+    # (The deleted non-dense cholesky_ex path used the lower triangle; it is gone.)
     # Two-pass: pass A fills S=sum_k wg[k]*P[k] (coalesced); pass B assembles
     # G[i,j]=ci*cj*(S[i,j]+S[j,i]-Udiag[i,j]) with one transpose read of S (1
     # buffer) instead of 5 scattered transpose reads -> better L2 reuse.
     S = _scratch_like_dtype3(b, n, 1, "oz_S", torch.float64, A.device)[0]
-    lu.oz_recombine_2pass(P, wg, cj, S, G, ndiag, lower)
+    lu.oz_recombine_2pass(P, wg, cj, S, G, ndiag)
     return G
 
 
@@ -6360,11 +6357,10 @@ def _reconstruct_householder(Q, R, lu):
     return lu.build_H_inplace(Mf, R, D)
 
 
-def _cholqr_path(A, dense_noinfo=False, gate=True):
+def _cholqr_path(A):
     # 1-pass-CholeskyQR -> orhr_col for the n>=4096 dispatch arm (only B==2 reaches here; the
     # dispatch routes B!=2 to geqrf). _lu is the compiled-once module singleton, threaded
-    # through both callees. (dense_noinfo/gate are kept in the signature for the dispatch call
-    # but are always True here, so their branches are unconditional.)
+    # through both callees.
     lu = _lu
     Q, R, info = _choleskyqr_1pass(A, lu=lu)
     # "good" = Gram was PD (info==0) AND Q columns near-unit-norm (a cheap orth proxy for the
@@ -6575,13 +6571,11 @@ def _custom_kernel_generic(data: input_t) -> output_t:
         # (L~8027), which is slow on FP64-starved B200 and scales linearly with batch -- a
         # candidate for the 360s secret-test hang. geqrf is gold-standard, batched, and orth-exact.
         (n >= 4096 and B != 2,                         lambda: torch.geqrf(A.contiguous())),
-        # CATCH-ALL n>=4096 (B>=2): _cholqr_path with the brief-2 B=2 secret-safety fix --
-        # gate=True (re-enabled per-matrix PD/finite gate -> geqrf bad-row fallback) + the
-        # in-path TAU-OVERRIDE (fires for dense_noinfo B==2 n==4096; makes householder_product
-        # orthonormal regardless of recon precision). dense_noinfo=(B==2): the scored B=2 shape
-        # takes the fused-b2 core + tau-override; the B=3 cond=0 stress (dense_noinfo=False) keeps
-        # the info-path and is gated without the tau-override (its factor residual is sensitive).
-        (n >= 4096,                                    lambda: _cholqr_path(A.contiguous(), dense_noinfo=(B == 2), gate=True)),
+        # CATCH-ALL n>=4096: only B==2 reaches here (B!=2 routed to geqrf above), the scored
+        # shape 6. _cholqr_path runs the fused-b2 1-pass core + the per-matrix PD/finite gate
+        # (geqrf bad-row fallback) + the in-path TAU-OVERRIDE (makes householder_product
+        # orthonormal regardless of recon precision).
+        (n >= 4096,                                    lambda: _cholqr_path(A.contiguous())),
         (n >= _LARGE_N,                                lambda: _qr_large_n(A, n, B)),
     )
     for _hit, _handler in _arms:
