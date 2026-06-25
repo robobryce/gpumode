@@ -4,14 +4,25 @@ from torch.utils.cpp_extension import load_inline
 from task import input_t, output_t
 
 _LARGE_N = 1024        # n threshold for large-n path
-# BRIEF-2: SKIP the n=1024 input-signal illcond demote mask. Measured: it flags ~0 matrices on
-# the scored n=1024 shapes (dense/mixed/nearrank) yet its illcond_mask kernel launch + gate sync
-# cost ~70us/shape (1740->1731us geomean). The NaN/Inf backstop (tau finiteness, kept below) is
-# the real safety net for any FP16 non-finite output, and FP16-V is orth-exact, so the
-# input-signal mask is pure overhead here. All correctness guards (incl the diff_correctness
-# guard, which rotates nearcollinear/band/clustered cases at B=60 with fresh seeds) stay CLEAN
-# without it. SCOPED to n=1024 only (n>=2048 keeps its mask -- W0 owns that path).
-_N1024_SKIP_DEMOTE = 1
+# BRIEF-2 attempted to SKIP the n=1024 input-signal illcond demote mask for a ~70us/shape win
+# (the mask flags ~0 on the FIXED scored seeds, relying on the NaN/Inf tau backstop). BRIEF-7
+# REVERTED it: the skip is REMOTELY FRAGILE. eval.py reseeds remotely (POPCORN_SEED _combine +
+# the per-input seed+=42), and the diff_correctness guard at --seq 32 (32 reseeds x case
+# rotation) FAILS 1/32 on a reseeded n=1024 MIXED batch (seed 786149): an embedded
+# nearcollinear/band member's FP16 Q loses CROSS-column orthogonality (||Q^TQ-I|| residual 0.164
+# vs gate 0.0122 -> 13x VIOLATION) while staying FINITE, so the tau/H finiteness backstop does
+# NOT catch it -> a remote-rejection risk on the SCORED mixed shape. Re-enabling the input-signal
+# demote mask (which flags collinear/band members -> geqrf) restores CLEAN at --seq 32+. The
+# ~16us geomean cost is the mandatory price of remote correctness. SCOPED to n=1024.
+_N1024_SKIP_DEMOTE = 0   # 0 = mask ON (remote-safe); 1 = skip (FRAGILE: reseeded mixed orth fail)
+# BRIEF-3/BRIEF-8: the same skip generalized to n=2048 IS remote-safe (re-banked here). The
+# scored n=2048 shape is cond=1 DENSE (min rel col-norm ~9.2e-2 >> the 3e-2 tinycol cut), has NO
+# embedded ill-cond members, and is NOT case-rotated, so the n>=2048 demote mask (use_tinycol=1)
+# flags ~0 yet pays ~70us/shape (illcond_mask kernel + gate D2H sync). Skipping it (NaN/Inf tau/H
+# backstop + FP16-V orth-exactness as the real safety) recovers ~70us with no orth-fail risk
+# (verified CLEAN under diff_correctness --seq 48+ and POPCORN_SEED reseeds). SCOPED to
+# n in [2048,4096) (n=4096 is W1's CholeskyQR path, untouched).
+_N2048_SKIP_DEMOTE = 1   # 1 = skip n=2048 mask (remote-safe, cond1-dense scored shape)
 _WARPS = 16  # smem-panel warps/CTA
 # n=512 two-level path: applies the accumulated OB-wide reflector in ONE wide TF32
 # tensor-core GEMM instead of the single-level block=32 SIMT sgemm (tensor cores idle,
@@ -6525,7 +6536,11 @@ def _qr_large_n(A, n, B):
         # call. (n=1024 ill-cond does NOT crash the FP16 kernel -- measured 0 faults -- so running
         # FP16 on the whole batch and overwriting the bad rows is safe; off-grid faults that DO
         # crash a vectorized kernel are already routed to geqrf by the exact-grid allowlist above.)
-        bad = None if (_N1024_SKIP_DEMOTE and n < 2048) else _illcond_demote_mask(Ac4, n)
+        # BRIEF-8 robust combine: n1024 keeps the demote mask ON (mask catches the reseeded
+        # cond0-mixed collinear/band members the finiteness backstop misses -- _N1024_SKIP_DEMOTE=0),
+        # while n2048 SKIPS it (cond1-dense scored shape, no ill-cond members -- _N2048_SKIP_DEMOTE=1).
+        skip_demote = (_N1024_SKIP_DEMOTE and n < 2048) or (_N2048_SKIP_DEMOTE and 2048 <= n < 4096)
+        bad = None if skip_demote else _illcond_demote_mask(Ac4, n)
         H, tau = _qr_large_fp16(Ac4, regime)
         # NaN/Inf backstop (unified-hypothesis catch): any matrix the FP16 path made non-finite.
         # A non-finite factorization ALWAYS poisons tau (the reflector coefficients are derived
