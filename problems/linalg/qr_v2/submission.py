@@ -8,7 +8,6 @@ _WARPS = 16  # smem-panel warps/CTA
 # n=512 two-level path: applies the accumulated OB-wide reflector in ONE wide TF32
 # tensor-core GEMM instead of the single-level block=32 SIMT sgemm (tensor cores idle,
 # 61% of GPU time). DISJOINT from the n=4096 R-solve path; all algebraically exact.
-_BIGBATCH_WARPS = 8  # panel warps/CTA, n<1024 two-level (the C++ raw-path's only launch shape)
 _BIGBATCH_MIN_N = 512  # apply n<1024 two-level only at n>=this
 
 # Fully-resident register/warp Householder megakernel for the small launch/overhead-bound
