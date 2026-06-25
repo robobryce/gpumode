@@ -4163,18 +4163,13 @@ static void apply_block_reflector_t(cublasHandle_t handle, STORE* Hp, float* tau
 
     if constexpr (F32) {
         mm_S_tf32(handle, Vp, w, m, Sp, B);                 // S = V^T V (w x w)
-        // W = V^T @ C. g_prec_w==1 selects a GATHER-FREE TF32 W step INDEPENDENT of g_prec, so
-        // the W GEMM can run on TF32 tensor cores even while the wide final update C-=V@Y below
-        // stays SIMT-FP32 (g_prec==0). Otherwise the single-pass mm3g reads C in place (g_prec<=1).
-        // The 3xTF32 split W-steps (g_prec_w==2 / g_prec>=2, gather_split_C_kernel + mm2/mm3
-        // splits) are unreachable on every benchmark and test shape -- pruned.
-        if (g_prec_w == 1) {
-            mm1_tf32_inplace(handle, /*tA=*/true, Vp, w, m, Cin, rest, /*ldB=*/n, (long)n * n,
-                 Wp_f32, /*ldR=*/rest, (long)w * rest, 1.f, 0.f, B);
-        } else {
-            mm3g(handle, /*tA=*/true, Vp, w, m, Cin, rest, /*ldB=*/n, (long)n * n,
-                 Wp_f32, /*ldR=*/rest, (long)w * rest, 1.f, 0.f, B);
-        }
+        // W = V^T @ C via single-pass mm3g (reads C in place). g_prec_w is provably ALWAYS 0
+        // (no Python setter exists; the only C++ writes are =0 in set_n512_bad_flags /
+        // restore_after_n512_bad), so the former gather-free TF32 W-step arm (g_prec_w==1,
+        // mm1_tf32_inplace) and the 3xTF32 split W-steps (g_prec_w>=2) were unreachable on
+        // every scored shape -- the if/else was folded to this unconditional mm3g.
+        mm3g(handle, /*tA=*/true, Vp, w, m, Cin, rest, /*ldB=*/n, (long)n * n,
+             Wp_f32, /*ldR=*/rest, (long)w * rest, 1.f, 0.f, B);
         // M = L^{-1} = T^T (the always-on 2-block-merge blk2, the ~2x-shorter-
         // critical-path T-inverse, for EVERY even-width reflector here); Y = M W.
         // nlev>=2 further shortens the serial diagonal forward-sub chain (depth
