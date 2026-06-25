@@ -1260,8 +1260,8 @@ static int g_panel_cmf = 0;
 //
 // counts layout (extends the classifier's 4 slots): [0]=bad, [1]=good, [2]=rank-reveal
 // stage-1 "tail not negligible" flag, [3]=hard-bad count, [4]=rank-reveal trailing
-// block-column tailmask (the bits f32_to_bf16_rr_kernel would set; only meaningful when
-// do_rr!=0).
+// block-column tailmask (this kernel ORs in the collapsible trailing OB-block-column bits;
+// only meaningful when do_rr!=0).
 // scratch layout: per (mat, k) slice slot, 11 int32 words (the 8 float sums bit-cast via
 // __float_as_int): [0..7]=head_col,tail_col,head_row,tail_row,mid_col,dot0,norm0,norm1;
 // [8]=off_cnt, [9]=off_zero, [10]=rrmask. classify_decide_n512_kernel reduces over K.
@@ -2213,88 +2213,6 @@ __global__ void f32_to_bf16_kernel(const float* __restrict__ x, bf16* __restrict
     }
 }
 
-// FP32 -> BF16 convert that ALSO folds the rank-reveal tail detection into the same
-// full-matrix read (n == 512). For each element it converts to BF16 and, when the
-// element is in a trailing OB-block-column (col >= 256) with |value| > thr, ORs the
-// block-column bit into `tailmask`. This makes the rank detection essentially FREE
-// (it piggybacks on the convert pass that runs anyway) instead of a separate
-// ~335 MB read. After this kernel a single D2H of tailmask drives the column cap.
-__global__ void f32_to_bf16_rr_kernel(const float* __restrict__ x, bf16* __restrict__ y,
-                                      long count, float thr, unsigned int* __restrict__ tailmask) {
-    unsigned int local = 0u;
-    // 8-elem/thread grid-strided (2x float4 load -> one int4 = 8x bf16 store), matching the
-    // plain convert: halves CTA count + store traffic, raises MLP on this full-matrix pass.
-    const long stride = (long)gridDim.x * blockDim.x * 8;
-    for (long base = ((long)blockIdx.x * blockDim.x + threadIdx.x) * 8; base < count; base += stride) {
-        if (base + 7 < count) {
-            float4 a = *reinterpret_cast<const float4*>(x + base);
-            float4 b = *reinterpret_cast<const float4*>(x + base + 4);
-            __half2 h[4];
-            h[0] = __floats2half2_rn(a.x, a.y); h[1] = __floats2half2_rn(a.z, a.w);
-            h[2] = __floats2half2_rn(b.x, b.y); h[3] = __floats2half2_rn(b.z, b.w);
-            *reinterpret_cast<int4*>(y + base) = *reinterpret_cast<int4*>(h);
-            // column of element (base + i) is (base + i) % 512; block-col = col >> 6.
-            const float av[8] = {fabsf(a.x), fabsf(a.y), fabsf(a.z), fabsf(a.w),
-                                 fabsf(b.x), fabsf(b.y), fabsf(b.z), fabsf(b.w)};
-            #pragma unroll
-            for (int i = 0; i < 8; ++i) {
-                int col = (int)((base + i) & 511);     // n == 512
-                if (col >= 256 && av[i] > thr) local |= (1u << ((col >> 6) - 4));
-            }
-        } else {
-            for (long i = base; i < count && i < base + 8; ++i) {
-                y[i] = __float2half(x[i]);
-                int col = (int)(i & 511);
-                if (col >= 256 && fabsf(x[i]) > thr) local |= (1u << ((col >> 6) - 4));
-            }
-        }
-    }
-    // warp-OR, then one atomicOr per warp -- but SKIP bits already globally set. The
-    // global mask is monotonic (bits only turn on, from cudaMemset 0), so a plain read of
-    // the current mask and masking it off (local & ~seen) can only ever drop a REDUNDANT
-    // atomic (a bit that is already set): it can never lose a bit (a stale "0" read just
-    // does the atomic). This collapses the rankdef atomic storm -- its O(1) cols 256..383
-    // make ~every warp want to set bits 0/1, but once the first wave sets them globally
-    // every later warp reads them as set and issues no atomic (410us -> ~read-bound).
-    for (int o = 16; o > 0; o >>= 1) local |= __shfl_down_sync(0xffffffff, local, o);
-    if ((threadIdx.x & 31) == 0 && local) {
-        unsigned int seen = *((volatile unsigned int*)tailmask);
-        unsigned int add = local & ~seen;
-        if (add) atomicOr(tailmask, add);
-    }
-}
-
-// Indexed FP32->BF16 convert of the n512-mixed GOOD subset. 8 elems/thread,
-// grid-strided (matches the plain f32_to_bf16_kernel: the 4/thread version it
-// replaced was SM-issue-bound at ~70% SM / too many tiny CTAs). 262144 = 512*512
-// is divisible by 8 and matrices are >=16B aligned, so an 8-aligned base never
-// straddles a matrix boundary -> one idx[src] lookup, two float4 loads, one int4
-// (8x bf16) store per step. Output y[base] is contiguous; input gathered via
-// idx[src]. Bit-identical to the per-4 version (same __floats2half2_rn convert of
-// the same source floats; cvt4 already used __floats2half2_rn).
-__global__ void f32_to_bf16_indexed_n512_kernel(const float* __restrict__ x,
-                                                bf16* __restrict__ y,
-                                                const long long* __restrict__ idx,
-                                                int B) {
-    const long total = (long)B * 512 * 512;
-    const long stride = (long)gridDim.x * blockDim.x * 8;
-    for (long base = ((long)blockIdx.x * blockDim.x + threadIdx.x) * 8; base < total; base += stride) {
-        const int src = (int)(base / (512 * 512));
-        const long rem = base - (long)src * 512 * 512;
-        const long in_base = (long)idx[src] * 512 * 512 + rem;
-        if (base + 7 < total) {                              // rem+7 < 262144 holds (262144%8==0)
-            float4 a = *reinterpret_cast<const float4*>(x + in_base);
-            float4 b = *reinterpret_cast<const float4*>(x + in_base + 4);
-            __half2 h[4];
-            h[0] = __floats2half2_rn(a.x, a.y); h[1] = __floats2half2_rn(a.z, a.w);
-            h[2] = __floats2half2_rn(b.x, b.y); h[3] = __floats2half2_rn(b.z, b.w);
-            *reinterpret_cast<int4*>(y + base) = *reinterpret_cast<int4*>(h);
-        } else {
-            for (long i = 0; i < 8 && base + i < total; ++i) y[base + i] = __float2half(x[in_base + i]);
-        }
-    }
-}
-
 // Indexed BF16->BF16 GATHER of the n512-mixed GOOD subset from the dense pre-converted
 // buffer cHb_pre (the fused classify+convert pass already converted EVERY matrix to BF16
 // at its original row). Packs good matrix src's BF16 (at row idx[src]) into the compact
@@ -2322,36 +2240,6 @@ __global__ void bf16_gather_indexed_n512_kernel(const bf16* __restrict__ x,
         int4* yp = reinterpret_cast<int4*>(ys + off);
         yp[0] = xp[0];
         yp[1] = xp[1];
-    }
-}
-
-// Zero the trailing rank-deficient region of the FP32 output after a capped factor:
-// H[:, :, nfac:] (all rows, columns >= nfac -> both the would-be-R upper triangle and
-// the would-be-V strict-lower) and tau[:, nfac:] (identity reflectors). The fill kernel
-// does NOT write the trailing block-cols' R, so the full rectangle must be zeroed here
-// (zeroing only the strict-lower V would leave garbage in the would-be-R upper triangle).
-// Each row's trailing slice [nfac, n) IS contiguous in row-major storage, so one warp
-// zeros one row's tail with float4 stores. Flat 1D grid of warps over all B*n rows
-// (nfac a multiple of 64 -> the slice base is 16-byte aligned for float4). This fills
-// the device with many CTAs (vs the prior 1-CTA-per-matrix) to saturate write bandwidth.
-__global__ void n512_zero_tail_kernel(float* __restrict__ Hout, float* __restrict__ tau,
-                                      int B, int n, int nfac) {
-    const int warps_per_blk = blockDim.x >> 5;
-    const long warp_id = (long)blockIdx.x * warps_per_blk + (threadIdx.x >> 5);
-    const int lane = threadIdx.x & 31;
-    const long total_rows = (long)B * n;
-    const int tcols = n - nfac;
-    const int tcols4 = tcols >> 2;                 // float4 count (tcols % 4 == 0 here)
-    for (long row = warp_id; row < total_rows; row += (long)gridDim.x * warps_per_blk) {
-        float4* base = reinterpret_cast<float4*>(Hout + row * n + nfac);
-        for (int j = lane; j < tcols4; j += 32) base[j] = make_float4(0.f, 0.f, 0.f, 0.f);
-    }
-    // Zero tau[:, nfac:] -- block 0 handles the whole tau tail.
-    if (blockIdx.x == 0) {
-        for (long e = (long)threadIdx.x; e < (long)B * tcols; e += blockDim.x) {
-            int b = (int)(e / tcols), c = nfac + (int)(e % tcols);
-            tau[(size_t)b * n + c] = 0.f;
-        }
     }
 }
 
@@ -2627,7 +2515,7 @@ __global__ void fill_R_zero_tail_n512_kernel(float* __restrict__ Hout,
             }
         }
     } else {
-        // ---- rank-reveal zero-tail (identical math to n512_zero_tail_kernel) ----
+        // ---- rank-reveal zero-tail (folds the standalone tail-zero into this fused pass) ----
         // Tail CTAs span the FULL 2D grid (blockIdx.x in [36,36+ztb), blockIdx.y in
         // [0,B)); the matrix index blockIdx.y is folded into the global warp id so the
         // tail rectangle is zeroed ONCE (not B times). With ztb=64 and 8 warps/CTA the
@@ -4373,27 +4261,19 @@ std::tuple<torch::Tensor, torch::Tensor> blocked_qr_2level_bf16_indexed(torch::T
         // The fused kernel also resolved the rank-reveal tailmask, so when this is the
         // rr path use the cap it computed (g_pre_rr_ncap); otherwise stay dense (n).
         if (rr_detect && g_pre_rr_ncap > 0) rr_ncap = g_pre_rr_ncap;
-    } else if (rr_detect) {
-        static torch::Tensor rr_mask;
-        if (!rr_mask.defined() || rr_mask.device() != A.device())
-            rr_mask = torch::empty({1}, opts.dtype(torch::kInt32));
-        cudaMemset(rr_mask.data_ptr<int>(), 0, sizeof(int));
-        f32_to_bf16_rr_kernel<<<nblk8, 256>>>(Hf.data_ptr<float>(), Hb, total,
-                                             g_n512_rr_detect, (unsigned int*)rr_mask.data_ptr<int>());
-        unsigned int hmask = 0u;
-        cudaMemcpy(&hmask, rr_mask.data_ptr<int>(), sizeof(int), cudaMemcpyDeviceToHost);
-        int hi = -1;
-        for (int b = 3; b >= 0; --b) { if (hmask & (1u << b)) { hi = b; break; } }
-        // hi in {-1,0,1,2,3} (4 tail block-cols) -> rr_ncap in {256,320,384,448,512},
-        // already within [64, n=512] and a multiple of OB=64, so no clamp is needed.
-        rr_ncap = (hi < 0) ? 256 : (hi + 5) * 64;
     } else if (pre_gather) {
         // BF16->BF16 gather of the good subset out of the dense pre-converted buffer.
         bf16_gather_indexed_n512_kernel<<<dim3(8, B), 256>>>(g_pre_Hb, Hb, idxp, B, 8);
-    } else if (indexed_out) {
-        // 8 elems/thread, grid-strided (nblk8, capped) -- matches the plain convert.
-        f32_to_bf16_indexed_n512_kernel<<<nblk8, 256>>>(Hf.data_ptr<float>(), Hb, idxp, B);
     } else {
+        // Plain dense FP32->BF16 convert (the only reachable non-pre_conv/pre_gather case:
+        // n != 512, or n==512 without the mixed driver's pre-converted buffer). The
+        // standalone rank-reveal convert (rr_detect) and the indexed convert (indexed_out)
+        // are unreachable: every n==512 caller comes through qr_n512_mixed_driver, which
+        // pre-sets g_pre_Hb (=> pre_conv on the non-indexed arm, pre_gather on the indexed
+        // arm), so rr_detect/indexed_out never co-occur with g_pre_Hb==nullptr here.
+        TORCH_CHECK(!rr_detect && !indexed_out,
+                    "blocked_qr_2level_bf16_indexed: standalone rr/indexed convert is "
+                    "unreachable (pruned -- the n=512 mixed driver always pre-converts)");
         f32_to_bf16_kernel<<<nblk8, 256>>>(Hf.data_ptr<float>(), Hb, total);
     }
 
@@ -4690,14 +4570,12 @@ std::tuple<torch::Tensor, torch::Tensor> blocked_qr_2level_bf16_indexed(torch::T
             int T = nbc * (nbc + 1) / 2;     // block-upper-triangle tile count per matrix
             fill_above_panel_R_tiled_kernel<<<dim3(T, B), dim3(32, 8)>>>(
                 Hop, Hb, n, OB, IB, nbc);
-            // RANK-REVEAL tail for the non-n512 path: zero columns [ncap, n). (n512 folds
-            // this into the fused kernel above.) Only on the dense (non-indexed) output.
-            if (ncap < n && !indexed_out) {
-                int zrows = B * n;
-                int zblocks = (zrows + (256 >> 5) - 1) / (256 >> 5);   // one warp per row
-                if (zblocks > 65535) zblocks = 65535;                  // grid-stride caps
-                n512_zero_tail_kernel<<<zblocks, 256>>>(Hop, taup, B, n, ncap);
-            }
+            // The rank-reveal column cap (ncap < n) is set ONLY on the n=512 path (it derives
+            // from g_pre_rr_ncap / the in-convert rr scan, both n==512-gated), which takes the
+            // fused fill+zero-tail branch above. So on this non-n512 path ncap==n always and the
+            // standalone tail-zero is unreachable (pruned).
+            TORCH_CHECK(ncap == n, "blocked_qr_2level_bf16_indexed: non-n512 rank-reveal "
+                                   "tail-zero is unreachable (pruned)");
         }
     }
     if (indexed_out) {
