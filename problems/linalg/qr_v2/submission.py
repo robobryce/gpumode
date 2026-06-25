@@ -5292,19 +5292,6 @@ static void gemm3_fp16_strided(cublasHandle_t h, int M, int N, int K, float alph
 }
 
 static cublasHandle_t g_trsm_handle = nullptr;
-// Recon-LU Schur-GEMM precision: 1 = FP16 (FP32-accum) Schur update C -= L21 @ U12 in
-// recon_lu_cpp; 0 = TF32. The (H,tau)->Q via householder_product is orthogonal regardless
-// of V precision (only the loose factor residual is touched), so a low-precision Schur is safe.
-static int g_recon_lowp = 0;
-// Recon panel-solve accumulation precision: 1 = FP32 (faster), 0 = FP64 (orth-margin).
-static int g_recon_solve_fp32 = 0;
-// Recon low-precision panel BOUNDARY: the panel index (in COLUMNS, a multiple of ob) from
-// which the Schur GEMM goes FP16 and the panel-solve goes FP32. -1 = legacy 3*ob default;
-// >=0 = explicit column boundary (0 = low-prec from the first panel).
-static int g_recon_lowp_from = -1;
-// Recon diag-LU knob (retained for the Python interface; the diag-LU is now always the
-// warp-level diag_lu_warp_kernel, the only variant the n=4096 scored path uses).
-static int g_recon_warplu = 0;
 
 // Combined gather + identity-fill for the blocked right-TRSM. In ONE grid pass, per diagonal
 // block (bi of matrix mb at grid.z = bi*batch + mb), writes (a) the gathered R[j:j+w, j:j+w]
@@ -6108,13 +6095,6 @@ void oz_gram_gemm_grouped(torch::Tensor slN, torch::Tensor P,
         Carr, CUDA_R_32I, n, G, CUBLAS_COMPUTE_32I, CUBLAS_GEMM_DEFAULT));
 }
 
-// Python knobs: recon Schur/solve precision + low-prec panel boundary + warp-LU toggle.
-// The recon's (H,tau)->Q is orth-exact regardless of V precision, so only the loose factor
-// residual is at risk.
-void set_recon_lowp(int v) { g_recon_lowp = v; }
-void set_recon_solve_fp32(int v) { g_recon_solve_fp32 = v; }
-void set_recon_lowp_from(int v) { g_recon_lowp_from = v; }
-void set_recon_warplu(int v) { g_recon_warplu = v; }
 """
 
 _CPP_LU_SRC = r"""
@@ -6125,18 +6105,13 @@ torch::Tensor recon_lu_cpp(torch::Tensor M, torch::Tensor R, torch::Tensor D, in
 std::vector<torch::Tensor> oz_slice(torch::Tensor A, int64_t NS);
 void oz_recombine_2pass(torch::Tensor P, torch::Tensor wg, torch::Tensor cj, torch::Tensor S, torch::Tensor G, int64_t ndiag, int64_t lower);
 void oz_gram_gemm_grouped(torch::Tensor slN, torch::Tensor P, std::vector<int64_t> pp, std::vector<int64_t> qq);
-void set_recon_lowp(int v);
-void set_recon_solve_fp32(int v);
-void set_recon_lowp_from(int v);
-void set_recon_warplu(int v);
 """
 def _compile_lu():
     return _compile_qr(
         "qr_orhr_lu_w6m", _CPP_LU_SRC, _CUDA_LU_SRC,
         ["chol_b2_lower_R_solve", "build_H_inplace", "tri_solve_right_inv",
          "recon_lu_cpp", "oz_slice", "oz_recombine_2pass",
-         "oz_gram_gemm_grouped", "set_recon_lowp", "set_recon_solve_fp32",
-         "set_recon_lowp_from", "set_recon_warplu"],
+         "oz_gram_gemm_grouped"],
         ["-lcublas", "-lcublasLt", "-lcusolver"])
 
 
@@ -6423,23 +6398,6 @@ _COLNORM_TOL = 5e-2  # cholqr good-gate vs orth_rtol
 # AFTER the orhr_col recon (as the checker does), NOT the raw Q^TQ proxy which skips the
 # recon's TF32 error amplification.
 _TRSM_NB_CPP = 512   # nb sweep WINNER (s6 optimum): 384(11728)/512(11190)/640(11239)/768(11628)/1024(11662). Orth no longer binds nb (tau-override); factor residual holds at 512.
-# === TRSM precision knobs for the SCORED s6 path (B=2, n=4096) ===
-# Recon Schur-GEMM precision for the s6 n4096 B=2 path: 1 = FP16 (FP32-accum) Schur update
-# (orth is recon-precision-independent), 0 = TF32.
-_RECON_LOWP = 1
-# FP32 recon panel-solve accumulation for s6: 1 = FP32 substitution (faster than the FP64
-# default) in panel_solve_fused on the FP16-Schur panels (jo>=RECON_LOWP_FROM). Only the
-# loose factor residual is touched.
-_RECON_SOLVE_FP32 = 1
-# RECON LOW-PREC PANEL BOUNDARY: the column index from which the recon Schur GEMM goes FP16
-# and the panel-solve goes FP32 (panels before it stay TF32/FP64). The tau-override makes
-# householder_product orthonormal regardless of recon precision, so only the loose factor
-# residual limits how early we drop. 0 = low-prec from the first panel; -1 = legacy 3*ob.
-_RECON_LOWP_FROM = 0
-# RECON WARP-LEVEL diag-LU: 1 = factor the 64x64 diag block in a SINGLE warp
-# (diag_lu_warp_kernel: __shfl pivot broadcast, no __syncthreads); 0 = the register-blocked
-# diag_lu_reg (256 threads). Gated to s6.
-_RECON_WARPLU = 1
 # SECRET-SAFETY TAU-OVERRIDE (n4096 B=2 scored-shape fix). The 3xTF32 TRSM solve + orhr_col
 # recon lose ORTHOGONALITY at high cond(A) (orhr_col tau drifts). FIX: recompute each
 # reflector's tau EXACTLY from the reconstructed Householder vectors V (strict-lower of H,
@@ -6566,28 +6524,10 @@ def _reconstruct_householder(Q, R, lu):
     # caller's good-gate already consumed it, so factor in place (no 256MB clone).
     M = Q.contiguous()
     D = Q.new_empty(b, n)
-    # LOW-PREC RECON SCHUR (worker-3 brief-0): the recon's (H,tau)->Q is orth-exact
-    # regardless of V precision (householder_product re-orthogonalizes), so the Schur
-    # GEMM only touches the loose factor residual. FP16 Schur is the brief's low-prec-TC
-    # lever, gated to the s6 dense bench shape (b==2,n==4096); the B=1/B=3 cond=0 stress
-    # tests keep TF32 (their factor residual is more sensitive). Reset after the call.
-    lu.set_recon_lowp(_RECON_LOWP if (b == 2 and n == 4096) else 0)
-    # FP32 panel-solve accumulation (worker-3 brief-2 lever B): faster than the FP64
-    # default; gated to s6 (the B=1/B=3 cond=0 stress keep FP64). Tested vs factor gate.
-    lu.set_recon_solve_fp32(_RECON_SOLVE_FP32 if (b == 2 and n == 4096) else 0)
-    # LOW-PREC PANEL BOUNDARY (worker-3 brief-4): drop the low-precision Schur/solve from
-    # an earlier panel now that the tau-override owns orthogonality. Gated to s6.
-    lu.set_recon_lowp_from(_RECON_LOWP_FROM if (b == 2 and n == 4096) else -1)
-    # WARP-LEVEL diag-LU (worker-3 brief-5): factor the 64x64 diag block in one warp with
-    # __shfl pivot broadcast (no __syncthreads) -- attacks the recon's 1894us diag-LU. Gated s6.
-    lu.set_recon_warplu(_RECON_WARPLU if (b == 2 and n == 4096) else 0)
-    # ob=64 single-level right-looking blocked LU in C++ (recon_lu_cpp) + in-place
-    # build_H/tau. (ob=64 beat the wider 2-level ob=256 scheme, 7299 vs 7926us.)
+    # ob=64 single-level right-looking blocked LU in C++ (recon_lu_cpp) + in-place build_H/tau.
+    # The recon runs low-precision (FP16 Schur + FP32 panel-solve) -- the (H,tau)->Q is orth-
+    # exact regardless of V precision, so only the loose factor residual is touched.
     Mf = lu.recon_lu_cpp(M, R, D, 64)
-    lu.set_recon_lowp(0)
-    lu.set_recon_solve_fp32(0)
-    lu.set_recon_lowp_from(-1)
-    lu.set_recon_warplu(0)
     return lu.build_H_inplace(Mf, R, D)
 
 
