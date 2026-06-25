@@ -6379,130 +6379,13 @@ _CUDA_LU_SRC = r"""
 
 #define BKSOL(expr) do { cusolverStatus_t _s = (expr); TORCH_CHECK(_s == CUSOLVER_STATUS_SUCCESS, "cuSOLVER failed"); } while(0)
 
-// ONE-barrier fused no-pivot diagonal-block LU for the latency-bound recon. The base kernel
-// pays TWO barriers/column; this REMOVES the pivot-handoff barrier: every thread reads the
-// column's diagonal (finalized by the prior column's trailing update, race-free since the
-// diagonal slot is not written in the loop) and computes d/piv/inv LOCALLY. The pivot is
-// stashed in smem pivs[] and applied at write-back (diagonal:=piv, strict-lower/=col piv).
-// Numerically IDENTICAL: the trailing update reads only the final U-row kk + the raw
-// sub-diagonal col kk (scaled at the end), so V and the recon's (H,tau) are bit-for-bit same.
-__global__ void diag_lu_static_fused_kernel(float* __restrict__ Mg,
-                                            float* __restrict__ Dg,
-                                            int n, int batch, int j0, int w) {
-    int mat = blockIdx.x;                       // grid is <<<batch,nt>>> -> mat < batch
-    float* M = Mg + (long)mat * n * n;
-    float* D = Dg + (long)mat * n;
-    int tid = threadIdx.x, nt = blockDim.x;
-    __shared__ float sblk[64 * 64];   // static (w<=64)
-    __shared__ float pivs[64];        // per-column pivot (deferred to write-back)
-    for (int idx = tid; idx < w * w; idx += nt) {
-        int r = idx / w, c = idx % w;
-        sblk[idx] = M[(long)(j0 + r) * n + (j0 + c)];
-    }
-    __syncthreads();
-    for (int kk = 0; kk < w; ++kk) {
-        // All threads independently derive the column's pivot from its diagonal entry
-        // (finalized by the prior column's trailing update; the diagonal slot is not
-        // written during the loop, so this read is race-free). No barrier needed here.
-        float diag = sblk[kk * w + kk];
-        float d = (diag > 0.f) ? -1.f : 1.f;     // d != 0 (0 -> +1)
-        float piv = diag - d;
-        float inv = 1.0f / piv;
-        if (tid == 0) { D[j0 + kk] = d; pivs[kk] = piv; }
-        int rows = w - (kk + 1), cols = w - (kk + 1);
-        // Trailing Schur update with on-the-fly multiplier; raw L column untouched.
-        // Reads row kk (sblk[kk*w+c], final) and sub-diagonal col kk (sblk[r*w+kk],
-        // raw) -- NEITHER is the diagonal slot, so no hazard with pivs[] storage.
-        for (int idx = tid; idx < rows * cols; idx += nt) {
-            int rr = idx / cols, cc = idx % cols;
-            int r = kk + 1 + rr, c = kk + 1 + cc;
-            sblk[r * w + c] -= (sblk[r * w + kk] * inv) * sblk[kk * w + c];
-        }
-        __syncthreads();   // ONE barrier: trailing done + next diagonal visible
-    }
-    // Write-back: diagonal := pivs[r]; strict-lower := raw / pivs[c] (deferred scale);
-    // upper (r<c) unchanged. Same final factored block as the base two-barrier LU.
-    for (int idx = tid; idx < w * w; idx += nt) {
-        int r = idx / w, c = idx % w;
-        float v = sblk[idx];
-        if (r == c) v = pivs[r];
-        else if (r > c) v *= (1.0f / pivs[c]);
-        M[(long)(j0 + r) * n + (j0 + c)] = v;
-    }
-}
-
-// REGISTER-BLOCKED 64x64 variant of the diag_lu (used when the panel is exactly 64 wide --
-// the n=4096 recon's every panel). Unlike the static-smem kernel above (smem-bandwidth bound
-// at 2 CTAs), each thread keeps its 4x4 register tile of the 64x64 block in REGISTERS across
-// the whole column loop (16x16 thread grid, 256 threads); only the pivot row kk (srow) and
-// column kk (scol) cross __shared__ per column. The math is IDENTICAL (bit-for-bit verified):
-// same on-the-fly multiplier (scol[r]*inv)*srow[c], same deferred-scale write-back, same D
-// signs -- so V and the recon's (H,tau) are unchanged.
-template<int W, int TX, int TY>
-__global__ void diag_lu_reg_kernel(float* __restrict__ Mg, float* __restrict__ Dg,
-                                   int n, int j0) {
-    int mat = blockIdx.x;
-    float* M = Mg + (long)mat * n * n;
-    float* D = Dg + (long)mat * n;
-    const int RX = W / TX, RY = W / TY;          // 4, 4 for W=64, TX=TY=16
-    int tx = threadIdx.x % TX, ty = threadIdx.x / TX;
-    __shared__ float scol[W];                     // pivot column kk (the raw L column)
-    __shared__ float srow[W];                     // pivot row kk (the final U row)
-    __shared__ float pivs[W];                     // per-column pivot (deferred write-back)
-    float reg[RY][RX];
-    #pragma unroll
-    for (int a = 0; a < RY; ++a)
-        #pragma unroll
-        for (int b = 0; b < RX; ++b) {
-            int r = ty + a * TY, c = tx + b * TX;
-            reg[a][b] = M[(long)(j0 + r) * n + (j0 + c)];
-        }
-    __syncthreads();
-    for (int kk = 0; kk < W; ++kk) {
-        // Publish pivot row kk (elements (kk,*)) and pivot column kk (elements (*,kk))
-        // to smem. The owning threads write their register entries out.
-        #pragma unroll
-        for (int a = 0; a < RY; ++a) { int r = ty + a * TY; if (r == kk) {
-            #pragma unroll
-            for (int b = 0; b < RX; ++b) { int c = tx + b * TX; srow[c] = reg[a][b]; } } }
-        #pragma unroll
-        for (int b = 0; b < RX; ++b) { int c = tx + b * TX; if (c == kk) {
-            #pragma unroll
-            for (int a = 0; a < RY; ++a) { int r = ty + a * TY; scol[r] = reg[a][b]; } } }
-        __syncthreads();
-        float diag = srow[kk];                    // == scol[kk]; finalized by column kk-1
-        float d = (diag > 0.f) ? -1.f : 1.f;
-        float piv = diag - d;
-        float inv = 1.0f / piv;
-        if (threadIdx.x == 0) { D[j0 + kk] = d; pivs[kk] = piv; }
-        // Trailing Schur update on this thread's register tile (r>kk && c>kk only).
-        #pragma unroll
-        for (int a = 0; a < RY; ++a) { int r = ty + a * TY;
-            #pragma unroll
-            for (int b = 0; b < RX; ++b) { int c = tx + b * TX;
-                if (r > kk && c > kk) reg[a][b] -= (scol[r] * inv) * srow[c];
-            } }
-        __syncthreads();                          // pivot row/col of next column visible
-    }
-    // Write-back: diagonal := pivs[r]; strict-lower := raw / pivs[c]; upper unchanged.
-    #pragma unroll
-    for (int a = 0; a < RY; ++a) { int r = ty + a * TY;
-        #pragma unroll
-        for (int b = 0; b < RX; ++b) { int c = tx + b * TX;
-            float v = reg[a][b];
-            if (r == c) v = pivs[r];
-            else if (r > c) v *= (1.0f / pivs[c]);
-            M[(long)(j0 + r) * n + (j0 + c)] = v;
-        } }
-}
-
-// WARP-LEVEL 64x64 diag-LU: cuts diag_lu_reg's barrier cost (the recon's bottleneck at 2
-// CTAs). 64 lanes (2 WARPS, <<<batch,64>>>); lane t owns COLUMN t as a 64-row REGISTER array
+// WARP-LEVEL 64x64 no-pivot diagonal-block LU for the latency-bound recon (n=4096 -> every
+// panel is exactly 64 wide). 64 lanes (2 WARPS, <<<batch,64>>>); lane t owns COLUMN t as a 64-row REGISTER array
 // col[64] (no spill). The pivot ROW element is thread-local col[kk]; the pivot COLUMN's
 // sub-diagonal is published by the owner lane to a tiny smem pcol[64] read by all lanes.
-// Barriers run over only 2 warps (vs diag_lu_reg's 8). SAME orhr_col math: d=(diag>0?-1:1),
-// piv=diag-d, on-the-fly (col_kk[r]*inv)*col_c[kk], deferred-scale write-back. No grid-wide
-// sync (kernelguard-safe); col[64] indices are static under the unrolled kk loop.
+// Barriers run over only 2 warps. SAME orhr_col math: d=(diag>0?-1:1), piv=diag-d, on-the-fly
+// (col_kk[r]*inv)*col_c[kk], deferred-scale write-back. No grid-wide sync (kernelguard-safe);
+// col[64] indices are static under the unrolled kk loop.
 __global__ void diag_lu_warp_kernel(float* __restrict__ Mg, float* __restrict__ Dg,
                                     int n, int j0) {
     const int mat = blockIdx.x;
@@ -6558,9 +6441,6 @@ __global__ void diag_lu_warp_kernel(float* __restrict__ Mg, float* __restrict__ 
         M[(long)(j0 + r) * n + (j0 + t)] = v;
     }
 }
-
-static constexpr int kLuNt = 768;
-static constexpr int kLuRegNt = 256;   // 16x16 threads for diag_lu_reg_kernel<64,16,16>
 
 // Fused IN-PLACE assembly of the compact-Householder factor H + tau extraction from the LU
 // result M, the R-factor, and the diagonal signs D, in ONE pass (replaces H = tril(M,-1) +
@@ -6730,9 +6610,8 @@ static int g_recon_solve_fp32 = 0;
 // which the Schur GEMM goes FP16 and the panel-solve goes FP32. -1 = legacy 3*ob default;
 // >=0 = explicit column boundary (0 = low-prec from the first panel).
 static int g_recon_lowp_from = -1;
-// Recon WARP-LEVEL diag-LU: 1 = factor the 64x64 diag block in a SINGLE warp
-// (diag_lu_warp_kernel, __shfl pivot broadcast, no __syncthreads); 0 = the register-blocked
-// diag_lu_reg (256 threads). Only the w==64 path uses it; w<64 tail keeps diag_lu_static_fused.
+// Recon diag-LU knob (retained for the Python interface; the diag-LU is now always the
+// warp-level diag_lu_warp_kernel, the only variant the n=4096 scored path uses).
 static int g_recon_warplu = 0;
 
 // Combined gather + identity-fill for the blocked right-TRSM. In ONE grid pass, per diagonal
@@ -7259,7 +7138,6 @@ torch::Tensor recon_lu_cpp(torch::Tensor M, torch::Tensor R, torch::Tensor D, in
     float* Mp = M.data_ptr<float>();
     long nn = (long)n * n;
     const float negone = -1.f, one = 1.f;
-    int nt = kLuNt;
     bool rlowp_on = (g_recon_lowp != 0);
     // HYBRID PRECISION: the first few right-looking panels' Schur updates propagate FP16
     // error through ALL subsequent panels, so keep them TF32 (exact-class) and only drop to
@@ -7281,21 +7159,10 @@ torch::Tensor recon_lu_cpp(torch::Tensor M, torch::Tensor R, torch::Tensor D, in
     for (int jo = 0; jo < n; jo += ob) {
         int joe = (jo + ob < n) ? (jo + ob) : n;
         int w = joe - jo;                                // panel width (<=ob<=64)
-        // --- no-pivot diagonal LU of the w x w block at (jo,jo) (custom kernel).
-        // w==64 (the n=4096 recon's every panel) -> the register-blocked kernel
-        // (each thread keeps a 4x4 tile of the 64x64 block in registers across the
-        // column loop, ~22% faster than moving the block through smem each column).
-        // w<64 (a non-64-divisible tail, not hit by the n=4096 path) -> the static
-        // smem fused kernel, which handles any w<=64. Both are bit-for-bit identical.
-        if (w == 64) {
-            if (g_recon_warplu)
-                // WARP-LEVEL diag-LU: 2 warps/matrix (64 lanes, 1 column each), smem pivot
-                // publish, barriers over only 2 warps (cheap vs reg's 8).
-                diag_lu_warp_kernel<<<batch, 64>>>(Mp, D.data_ptr<float>(), n, jo);
-            else
-                diag_lu_reg_kernel<64, 16, 16><<<batch, kLuRegNt>>>(Mp, D.data_ptr<float>(), n, jo);
-        } else
-            diag_lu_static_fused_kernel<<<batch, nt>>>(Mp, D.data_ptr<float>(), n, batch, jo, w);
+        // --- no-pivot diagonal LU of the 64x64 block at (jo,jo): the n=4096 recon's every
+        // panel is w==64, factored by the WARP-LEVEL kernel (2 warps/matrix, 64 lanes/1 column
+        // each, smem pivot publish, barriers over only 2 warps).
+        diag_lu_warp_kernel<<<batch, 64>>>(Mp, D.data_ptr<float>(), n, jo);
         if (joe < n) {
             int mrows = n - joe, rest = n - joe;
             float* L21  = Mp + (long)joe * n + jo;        // (mrows x w), ld=n
