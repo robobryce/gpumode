@@ -14,9 +14,9 @@ _BIGBATCH_MIN_N = 512  # apply n<1024 two-level only at n>=this
 # Fully-resident register/warp Householder megakernel for the small launch/overhead-bound
 # n=176 shape (s1): one CTA owns one matrix, the whole batched QR is ONE launch (no
 # per-panel/per-trailing-GEMM launch storm). The n=176 dense matrix fits one CTA's smem
-# (124KB < 232KB). _MEGA_N176 holds the warp count (LIVE by default; 0 would fall back to
-# the FP32 champion blocked_qr path below).
-_MEGA_N176 = 24   # warps/CTA for the n=176 resident megakernel
+# (124KB < 232KB). _MEGA_N176 is the on/off toggle (LIVE by default; 0 falls back to the
+# FP32 champion blocked_qr path below). The 24 warps/CTA are hardcoded in qr_mega_small.
+_MEGA_N176 = 1   # toggle: enable the n=176 resident megakernel
 
 # Whole blocked-QR hot loop lives in one C++ call below: custom panel/T kernels
 # plus cuBLAS TF32 tensor-core GEMMs, all on the default execution queue with a
@@ -1763,12 +1763,6 @@ std::tuple<torch::Tensor, torch::Tensor> blocked_qr_tiny(torch::Tensor A) {
     return std::make_tuple(H, tau);
 }
 
-// Number of warps/CTA for the resident megakernel (set from Python; default 32, but
-// n=176 sets 24 -- see _MEGA_N176: the 2-wide trailing apply shortened each warp's serial
-// reduction latency, which shifted the cu130 n=176 warp optimum down from 32 to 24).
-static int g_mega_warps = 32;
-void set_mega_warps(int w) { g_mega_warps = w; }
-
 // Host launcher for the resident small-n megakernel. One CTA per matrix, grid=batch,
 // the whole n x n matrix (+ scratch) in dynamic smem -> the entire batched QR is ONE
 // launch. Allocates a single fused output buffer (H front, tau back -- one allocator
@@ -1786,29 +1780,14 @@ std::tuple<torch::Tensor, torch::Tensor> qr_mega_small(torch::Tensor A) {
     float* Hp = H.data_ptr<float>();
     float* taup = tau.data_ptr<float>();
     int LDC = n | 1;
-    int W = g_mega_warps;
-    int MR = (n + 31) / 32;   // per-lane register-cache depth = ceil(n/32)
-    dim3 blk(32, W);
-    size_t base = (size_t)n * LDC + n;            // matrix + invs
-    auto launch = [&](auto kern, size_t smem) {
-        cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
-        kern<<<B, blk, smem>>>(Ap, Hp, taup, n, B);
-    };
-    size_t smem = base * sizeof(float);
-    #define MEGA_LAUNCH_U(MRV) \
-        switch (W) { \
-            case 32: launch(qr_mega_resident_kernel<32, MRV>, smem); break; \
-            case 28: launch(qr_mega_resident_kernel<28, MRV>, smem); break; \
-            case 24: launch(qr_mega_resident_kernel<24, MRV>, smem); break; \
-            case 20: launch(qr_mega_resident_kernel<20, MRV>, smem); break; \
-            case 16: launch(qr_mega_resident_kernel<16, MRV>, smem); break; \
-            case 8:  launch(qr_mega_resident_kernel<8,  MRV>, smem); break; \
-            default: launch(qr_mega_resident_kernel<32, MRV>, smem); break; \
-        }
-    if (MR <= 6)       { MEGA_LAUNCH_U(6);  }
-    else if (MR <= 11) { MEGA_LAUNCH_U(11); }
-    else { TORCH_CHECK(false, "qr_mega_small: n too large (MR>11)"); }
-    #undef MEGA_LAUNCH_U
+    // The only caller is the n=176 dispatch arm, so W=24 warps/CTA and MR=ceil(176/32)=6:
+    // launch the single live qr_mega_resident_kernel<24,6> instance.
+    TORCH_CHECK(n == 176, "qr_mega_small is specialized for n=176");
+    dim3 blk(32, 24);
+    size_t smem = ((size_t)n * LDC + n) * sizeof(float);   // matrix + invs
+    cudaFuncSetAttribute(qr_mega_resident_kernel<24, 6>,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
+    qr_mega_resident_kernel<24, 6><<<B, blk, smem>>>(Ap, Hp, taup, n, B);
     return std::make_tuple(H, tau);
 }
 
@@ -5517,7 +5496,6 @@ std::tuple<torch::Tensor, torch::Tensor> qr_n512_mixed_driver(torch::Tensor A);
 std::tuple<torch::Tensor, torch::Tensor> blocked_qr_tiny(torch::Tensor A);
 std::tuple<torch::Tensor, torch::Tensor> qr_mega_small(torch::Tensor A);
 torch::Tensor n352_illcond_mask_cuda(torch::Tensor A);
-void set_mega_warps(int w);
 void set_bf16_nt(int v);
 void set_bf16_wf16(int v);
 void set_fp16_pure(int v);
@@ -5571,7 +5549,7 @@ def _compile_qr(name, cpp, cuda, functions, ldflags):
 
 
 def _compile_ext():
-    functions = ["blocked_qr", "illcond_mask", "n352_illcond_mask_cuda", "blocked_qr_2level", "blocked_qr_2level_bf16", "qr_n512_mixed_driver", "blocked_qr_tiny", "qr_mega_small", "set_mega_warps", "set_bf16_nt", "set_bf16_wf16", "set_fp16_pure", "set_prec", "set_warps", "set_minv_nt", "set_minv_blk4", "set_minv_blk4_minw", "set_minv_nt_sl", "set_panel_defer", "set_panel_raw", "set_wsp_pad", "set_wsp_cm_coop", "set_panel_cm", "set_panel_cm2", "set_cmf_warps", "set_cmf_mrfine", "set_ov_fold", "set_inner_wmma", "set_inner_wmma_wmax", "set_panel_apply_fused", "set_paf_warps", "set_n2048_h", "set_paf_help", "set_yfold", "set_yfold_maxrest", "set_ov_coop"]
+    functions = ["blocked_qr", "illcond_mask", "n352_illcond_mask_cuda", "blocked_qr_2level", "blocked_qr_2level_bf16", "qr_n512_mixed_driver", "blocked_qr_tiny", "qr_mega_small", "set_bf16_nt", "set_bf16_wf16", "set_fp16_pure", "set_prec", "set_warps", "set_minv_nt", "set_minv_blk4", "set_minv_blk4_minw", "set_minv_nt_sl", "set_panel_defer", "set_panel_raw", "set_wsp_pad", "set_wsp_cm_coop", "set_panel_cm", "set_panel_cm2", "set_cmf_warps", "set_cmf_mrfine", "set_ov_fold", "set_inner_wmma", "set_inner_wmma_wmax", "set_panel_apply_fused", "set_paf_warps", "set_n2048_h", "set_paf_help", "set_yfold", "set_yfold_maxrest", "set_ov_coop"]
     return _compile_qr("qr_blocked_v7k_wf16", _CPP_SRC, _CUDA_SRC, functions, ["-lcublas"])
 
 _CUDA_LU_SRC = r"""
@@ -7285,11 +7263,11 @@ def _custom_kernel_generic(data: input_t) -> output_t:
             # perf cost (this branch is never on a timed/scored shape).
             return torch.geqrf(Ac)
         return _ext.qr_n512_mixed_driver(Ac)
-    # Fully-resident register/warp Householder megakernel for n=176 (LIVE by default,
-    # _MEGA_N176=24, cu130-tuned). One CTA per matrix, whole 176x176 in smem (124KB), the
-    # entire batched QR in ONE launch -- no per-panel cmf launch + no trailing-GEMM storm.
+    # Fully-resident register/warp Householder megakernel for n=176 (LIVE by default;
+    # _MEGA_N176 toggles it, 0 falls through to the blocked _SMALL_LO path below). One CTA per
+    # matrix, whole 176x176 in smem (124KB), the entire batched QR in ONE launch (24 warps/CTA,
+    # cu130-tuned) -- no per-panel cmf launch + no trailing-GEMM storm.
     if _MEGA_N176 and n == 176:
-        _ext.set_mega_warps(_MEGA_N176)
         return _ext.qr_mega_small(Ac)
     # The only remaining small-n shape on the active set is n=176 (n<=32->tiny, n in (176,352]
     # ->bf16, n=512->above, n>=1024->large/cholqr all returned earlier). Straight-line its
