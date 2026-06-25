@@ -2068,9 +2068,11 @@ std::tuple<torch::Tensor, torch::Tensor> blocked_qr_2level(torch::Tensor A, int 
                         Hp, taup, n, k, b, m, Vfold, nullptr, ldm);
                 return;
             }
-            panel_factor_smem_wsp_cmf_tmpl_kernel<32,16,float><<<B, dim3(32, 32), cm_sm>>>(
-                Hp, taup, n, k, b, m, Vfold, nullptr, ldm);
-            return;
+            // The only caller that sets g_panel_cmf=1 (set_n512_bad_flags) ALSO sets
+            // g_cmf_mrfine=1, and blocked_qr_2level is only ever entered via that path, so the
+            // non-mrfine flat-<32,16> launch is unreachable -- trap if a future config reaches it.
+            TORCH_CHECK(false, "run_panel: the FP32 cmf path is always g_cmf_mrfine=1 "
+                               "(set with g_panel_cmf); the flat-MROWS launch is unreachable");
         }
         // The cmf panel above is the ONLY reachable two-level FP32 panel (the n=512-bad
         // subfactor sets g_panel_cmf). The raw / deep-pipeline / fused-norm-OV variants were
