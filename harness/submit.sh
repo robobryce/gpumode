@@ -72,21 +72,107 @@ set -e
 # B=640 batches where a kernel bug surfaces. So a failure marker ANYWHERE must
 # override any success marker. Only a clean run with NO failure marker AND the
 # leaderboard-success marker counts as ACCEPTED.
-verdict="UNKNOWN"
+# --- JSON-aware verdict (authoritative) + text-marker fallback. ---
+# Current popcorn-cli ends the transcript with a pretty-printed JSON result
+# object: {"done": true, "submission_id": N, "runs": [{"mode","passed","score",
+# "secret"}, ...]}. That is the authoritative verdict and the ONLY reliable
+# signal in the JSON format — the legacy text markers ("Leaderboard run
+# successful", "Passed N/N tests") are absent, so a JSON-only parser previously
+# reported a genuinely-ACCEPTED submission (all runs passed, real leaderboard
+# score) as UNKNOWN/exit 3. We parse the JSON for the verdict and keep the text
+# scan as (a) a fallback for older/error transcripts and (b) a failure-first
+# override: ANY failure signal from EITHER source => REJECTED.
+set +e
+JSON_VERDICT="$("$PYTHON" - "$SUBMIT_LOG" <<'PY' 2>/dev/null
+import json, sys
+try:
+    text = open(sys.argv[1], encoding="utf-8", errors="replace").read()
+except Exception:
+    print("json_verdict=UNKNOWN\npublic_score=\nsubmission_id="); sys.exit(0)
+
+def objects(s):
+    out, i, n = [], 0, len(s)
+    while i < n:
+        if s[i] == '{':
+            depth = 0; in_str = False; esc = False; start = i; j = i
+            while j < n:
+                c = s[j]
+                if in_str:
+                    if esc: esc = False
+                    elif c == '\\': esc = True
+                    elif c == '"': in_str = False
+                else:
+                    if c == '"': in_str = True
+                    elif c == '{': depth += 1
+                    elif c == '}':
+                        depth -= 1
+                        if depth == 0:
+                            try: out.append(json.loads(s[start:j+1]))
+                            except Exception: pass
+                            i = j; break
+                j += 1
+        i += 1
+    return out
+
+result = None
+for o in objects(text):
+    if isinstance(o, dict) and "runs" in o:
+        result = o  # last object carrying a runs[] wins
+verdict, public_score, submission_id = "UNKNOWN", "", ""
+if result is not None:
+    runs = result.get("runs") or []
+    submission_id = str(result.get("submission_id") or "")
+    if runs:
+        any_failed = any(r.get("passed") is False for r in runs)
+        all_passed = all(bool(r.get("passed")) for r in runs)
+        has_lb = any(r.get("mode") == "leaderboard" for r in runs)
+        done = result.get("done") is True
+        if any_failed:
+            verdict = "REJECTED"
+        elif all_passed and done and has_lb:
+            verdict = "ACCEPTED"
+        elif all_passed and done:
+            verdict = "ACCEPTED_NO_TESTLINE"
+        for r in runs:
+            if r.get("mode") == "leaderboard" and not r.get("secret") and r.get("score") is not None:
+                public_score = f"{float(r['score']):.9g}"; break
+print(f"json_verdict={verdict}")
+print(f"public_score={public_score}")
+print(f"submission_id={submission_id}")
+PY
+)"
+set -e
+json_verdict="$(printf '%s\n' "$JSON_VERDICT" | sed -n 's/^json_verdict=//p' | head -1)"
+public_score="$(printf '%s\n' "$JSON_VERDICT" | sed -n 's/^public_score=//p' | head -1)"
+submission_id_json="$(printf '%s\n' "$JSON_VERDICT" | sed -n 's/^submission_id=//p' | head -1)"
+: "${json_verdict:=UNKNOWN}"
+
 full_pass="$(awk '
     match($0, /Passed ([0-9]+)\/([0-9]+) tests/, m) { if (m[1]==m[2] && m[1]>0) print "yes" }
 ' "$SUBMIT_LOG" | head -1)"
-# Hard failure markers — any one of these => REJECTED, no matter what else is present.
+# Text-marker verdict (legacy format / fallback). Hard failure markers first.
+text_verdict="UNKNOWN"
 if grep -qiE "Leaderboard run failed|failed testing|Benchmarking failed|Testing failed|compilation error|build error|too large|not orthogonal|Submission failed|exceeded" "$SUBMIT_LOG"; then
-    verdict="REJECTED"
+    text_verdict="REJECTED"
 elif grep -qi "Leaderboard run successful" "$SUBMIT_LOG"; then
     if [ "$full_pass" = "yes" ]; then
-        verdict="ACCEPTED"
+        text_verdict="ACCEPTED"
     else
-        verdict="ACCEPTED_NO_TESTLINE"  # ran but couldn't confirm full test pass
+        text_verdict="ACCEPTED_NO_TESTLINE"  # ran but couldn't confirm full test pass
     fi
-elif grep -qiE "failed|rejected|mismatch|timeout|exceeded|cheat|invalid|compilation error|runtime error" "$SUBMIT_LOG"; then
+elif grep -qiE "failed|rejected|mismatch|timeout|cheat|invalid|compilation error|runtime error" "$SUBMIT_LOG"; then
+    text_verdict="REJECTED"
+fi
+
+# Combine: failure-first across BOTH sources; JSON is authoritative for acceptance.
+if [ "$text_verdict" = "REJECTED" ] || [ "$json_verdict" = "REJECTED" ]; then
     verdict="REJECTED"
+elif [ "$json_verdict" = "ACCEPTED" ] || [ "$json_verdict" = "ACCEPTED_NO_TESTLINE" ]; then
+    verdict="$json_verdict"
+elif [ "$text_verdict" = "ACCEPTED" ] || [ "$text_verdict" = "ACCEPTED_NO_TESTLINE" ]; then
+    verdict="$text_verdict"
+else
+    verdict="UNKNOWN"
 fi
 
 echo "===GPUMODE_SUBMIT_BEGIN==="
@@ -94,6 +180,8 @@ echo "commit=$COMMIT"
 echo "leaderboard=$LEADERBOARD gpu=$GPU mode=$MODE"
 echo "cli_exit=$CLI_RC"
 echo "verdict=$verdict"
+[ -n "$submission_id_json" ] && echo "submission_id=$submission_id_json"
+[ -n "$public_score" ] && echo "public_score=$public_score"
 # Surface the submission id and the ranked per-shape timings if present.
 grep -iE "submission .*id|Submitted|^[0-9]{5,} " "$SUBMIT_LOG" | head -3 || true
 # Echo the terminal success/failure block for the record.
