@@ -1,0 +1,675 @@
+                       Communication-Avoiding QR Decomposition for GPUs
+
+
+                            Michael Anderson, Grey Ballard, James Demmel and Kurt Keutzer
+                         UC Berkeley: Department of Electrical Engineering and Computer Science
+                                                   Berkeley, CA USA
+                                   {mjanders,ballard,demmel,keutzer}@cs.berkeley.edu
+
+
+
+   Abstract—We describe an implementation of the                      Matrices with these extreme aspect ratios would seem
+Communication-Avoiding QR (CAQR) factorization that                like a rare case, however they actually occur frequently in
+runs entirely on a single graphics processor (GPU). We show        applications of the QR decomposition. The most common
+that the reduction in memory traffic provided by CAQR allows
+us to outperform existing parallel GPU implementations of          example is linear least squares, which is ubiquitous in nearly
+QR for a large class of tall-skinny matrices. Other GPU            all branches of science and engineering and can be solved
+implementations of QR handle panel factorizations by either        using QR. Least squares matrices may have thousands of
+sending the work to a general-purpose processor or using           rows representing observations, and only a few tens or
+entirely bandwidth-bound operations, incurring data transfer       hundreds of columns representing the number of parameters.
+overheads. In contrast, our QR is done entirely on the
+GPU using compute-bound kernels, meaning performance is            Another example is stationary video background subtraction.
+good regardless of the width of the matrix. As a result, we        This problem can be solved using many QR decompositions
+outperform CULA, a parallel linear algebra library for GPUs        of matrices on the order of 100,000 rows by 100 columns [1].
+by up to 17x for tall-skinny matrices and Intel’s Math Kernel      An even more extreme case of tall-skinny matrices are found
+Library (MKL) by up to 12x.                                        in s-step Krylov methods [2]. These are methods for solving
+   We also discuss stationary video background subtraction as a
+motivating application. We apply a recent statistical approach,
+                                                                   a linear equation Ax = b by generating an orthogonal
+which requires many iterations of computing the singular value     basis for the Krylov sequence {v, Av, A2 v, ...An v} for a
+decomposition of a tall-skinny matrix. Using CAQR as a first       starting vector v. In s-step methods, multiple basis vectors
+step to getting the singular value decomposition, we are able to   are generated at once and can be orthogonalized using a QR
+get the answer 3x faster than if we use a traditional bandwidth-   factorization. The dimensions of this QR factorization can
+bound GPU QR factorization tuned specifically for that matrix
+size, and 30x faster than if we use Intel’s Math Kernel Library
+                                                                   be millions of rows by less than ten columns.
+(MKL) singular value decomposition routine on a multicore             These applications demand a high-performance QR rou-
+CPU.                                                               tine. Extracting the foreground from a 10-second surveil-
+  Keywords-GPGPU; Linear Algebra; QR Decomposition; Ro-
+                                                                   lance video, for example, can require over a teraflop of
+bust PCA;                                                          computation [1]. Unfortunately, existing GPU libraries do
+                                                                   not provide good performance for these applications. While
+                     I. I NTRODUCTION                              several parallel implementations of QR factorization for
+                                                                   GPUs are currently available [3], [4], [5], they all use
+   One of the fundamental problems in linear algebra is the        generally the same approach, tuned for large square matrices,
+QR decomposition, in which a matrix A is factored into a           and thus have up to an order of magnitude performace degre-
+product of two matrices Q and R, where Q is orthogonal and         dation for tall-skinny problems. The loss in performance is
+R is upper triangular. The QR decomposition is most well           largely due to the communication demands of the tall-skinny
+known as a method for solving linear least squares problems,       case. We aim to supplement the existing libraries with a QR
+and is used commonly across all of dense linear algebra.           solution that performs well over all matrix sizes.
+   In terms of getting good performance, a particularly               Communication-Avoiding QR (CAQR) is a recent algo-
+challenging case of the QR decomposition is tall-skinny            rithm for solving QR decomposition which is optimal with
+matrices. These are matrices where the number of rows              regard to the amount of communication performed [6]. This
+is much larger than the number of columns. For example             means that the algorithm minimizes the amount of data that
+the ratio of rows to columns can be 3 to 1, 1,000 to 1,            must be sent between processors in the parallel setting, or
+or even 100,000 to 1 in some cases. QR decompositions              alternatively the amount of data transmitted to and from
+of this shape matrix, more than any other, require a large         global memory. As a result, the CAQR algorithm is a natural
+amount of communication between processors in a parallel           fit for the tall-skinny case where communication is usually
+setting. This means that most libraries, when faced with this      the bottleneck.
+problem, employ approaches that are bandwidth-bound and               In this work we discuss the implementation and perfor-
+cannot saturate the floating-point capabilities of processors.     mance of CAQR for a single graphics processor (GPU). It
+is a distinguishing characteristic of our work that the entire     time. Note, however, that implementing CAQR on GPUs is
+decomposition is performed on the GPU using compute-               a much different problem than on multi-core and it is likely
+bound kernels. Despite their increasing general-purpose ca-        that both will be needed in future libraries and applications.
+pabilities, it is still a very challenging task to map the            The paper is organized as follows. In Section I we
+entirety of this particular algorithm to the GPU. In doing         survey previous algorithms and implementations of the QR
+so, however, we are able to leverege the enormous compute          decomposition. Next we discuss the high-level problem of
+capibility of GPUs while avoiding potentially costly CPU-          mapping CAQR to heterogenous systems in Section III. Sec-
+GPU transfers in the inner loop of the algorithm. The bene-        tion IV describes the specifics of our GPU implementation
+fits can most clearly be seen for very skinny matrices where       and tuning process. Section V contains our performance
+communication demands are large relative to the amount of          compared to currently available software. In Section VI we
+floating-point work. As a result, we can outperform existing       outline our motivating video processing application and the
+libraries for a large class of tall-skinny matrices. In the more   performance benefits of using CAQR. Section VII draws
+extreme ratios of rows to columns, such as 1 million by 192,       conclusions.
+we saw speedups of up to 17x over linear algebra libraries
+parallelized for GPUs. It is important to note that everything              II. BACKGROUND ON QR A PPROACHES
+we compare to is parallel. The speedups we show are a result          There are several algorithms to find the QR decomposition
+of using the parallel hardware more efficiently.                   of a matrix. For example, one can use Cholesky QR, the
+   We do not directly use available Basic Linear Algebra           Gram-Schmidt process, Givens rotations, or Householder
+Subroutine (BLAS) libraries as a building block. The al-           reflectors [13]. It is well-known however that Cholesky QR
+gorithm requires many hundreds or thousands of small QR            and the Gram-Schmidt process are not as numerically stable,
+decompositions and other small BLAS and LAPACK [7]                 so most general-purpose software for QR uses either Givens
+operations to be performed in parallel. This is not currently      rotations or Householder reflectors. CAQR is a form of the
+supported in the vendor’s BLAS library [8]. Consequently,          Householder approach, where the Householder vectors are
+we had to do significant low-level tuning of these very small      broken up in such a way that communication is minimized.
+operations to achieve sufficient performance. We will discuss
+and quantify the effect of specific low-level optimizations        A. Householder QR
+that were critical to improving performance. We also high-            Most existing implementations of QR for GPUs have used
+light new tradeoffs the GPU introduces, which differ from          the Householder approach, as does LAPACK. One favorable
+previous CAQR work on clusters and multicore architectures         property of the Householder algorithm is that it can be
+[9] [10].                                                          organized in such a way that it makes use of BLAS3 (matrix-
+   Finally, we discuss the application of CAQR to station-         matrix) operations. Specifically, the trailing matrix updates
+ary video background subtraction, which was a motivating           for several Householder vectors can be delayed and done
+application for this work. Stationary video background sub-        all at once using matrix-multiply. This allows for higher
+traction can be solved using Robust Principal Component            arithmetic intensity on machines with a memory hierarchy.
+Analysis (PCA), by formulating the problem as a regular-           Higher arithmetic intensity then leads to better performance.
+ized nuclear norm minimization [1]. In the Robust PCA              This is called blocked Householder QR, because it allows the
+algorithm, the video is transformed into a tall-skinny matrix      updates to the trailing matrix to be blocked in cache. Several
+where each column contains all pixels in a frame, and the          implementations of the blocked Householder approach for
+number of columns is equal to the number of frames. In an          GPUs are currently available [5] [4], or will soon become
+iterative process, the matrix is updated by taking its singular    available [14]. These are generally all very fast due to the
+value decomposition (SVD) and thresholding its singular            heavy use of well-optimized matrix-multiply routines [15]
+values. The SVD can be solved using the QR decomposition           [3].
+as a first step. We will show our CAQR implementation gives           Figure 1 shows a sketch of one step in the blocked House-
+us a significant runtime improvement for this problem.             holder algorithm. Here, a panel of some width less than the
+   Several implementations CAQR have been done, as well            total number of columns is factored using the Householder
+as Tall-Skinny QR (TSQR), a building block of CAQR                 algorithm with BLAS2 (matrix-vector) operations. Next, a
+that deals only with extremely tall-skinny matrices. TSQR          triangular matrix T is formed from the inner products of
+has been applied in distributed memory machines [9] [11]           the columns in the panel. Finally, the trailing submatrix
+and grid environments [12] where communication is excep-           is updated using a matrix-matrix multiply of the panel’s
+tionally expensive. However, previous work in large-scale          Householder vectors, T, and the trailing matrix itself. After
+distributed environments focuses on different scales and           the update, the next panel is factored, and so on.
+types of problems than ours. More recently, CAQR was also             From Figure 1 we can intuitively understand a short-
+applied to multicore machines [10], and resulted in speedups       coming of the blocked Householder algorithm. For very
+of up to 12x over Intel’s Math Kernel Library (MKL) at the         wide matrices, a significant portion of the runtime is spent
+                                                                                           R1!             R12!           R1234!
+
+
+
+
+                   BLAS2 Panel Factorization
+                                                                                         U1!               U12!           U1234!
+
+
+
+
+                                               BL atri
+                                                 AS x U
+                                                 M
+
+                                                   3 T pd
+                                                                                           R2!
+
+
+
+
+                                                       rai ate
+                                                          lin
+                                                                                         U2!
+
+
+
+                                                              g
+                                                                                           R3!             R34!
+
+                                                                                         U3!               U34!
+
+            Figure 1: Blocked Householder QR                                               R4!
+
+                                                                                         U4!
+doing matrix-matrix multiply, which is a very efficient use
+of hardware given the available high-performance dense
+matrix-multiply routines for GPUs [16]. However, if the                 (a)!             (b)!             (c)!            (d)!
+matrix is skinny, a greater portion of the runtime is being
+spent in the BLAS2 panel factorization, which is not an
+efficent use of the hardware because matrix-vector routines                    Figure 2: Stages of Tall-Skinny QR
+are generally bandwidth-bound. Clever implementations of
+blocked Householder for heterogeneus CPU+GPU envoron-
+ments can hide this cost by sending the panel factorization
+                                                                    In the figure, the Rs were eliminated in a binary tree.
+to the CPU and overlapping it with the previous trailing
+                                                                  However, this can be done using any tree shape. The
+matrix update, which is performed on the GPU [3]. While
+                                                                  optimal shape can differ depending on the characteristics
+this greatly improves the performance for wide matrices, it
+                                                                  of the architecture. For example, on multi-core machines a
+does not eliminate the latency problem for the skinny case.
+                                                                  binomial tree reduction was used [10], whereas our GPU
+B. Tall-Skinny QR (TSQR)                                          approach employs a quad-tree reduction. The motivation
+                                                                  behind this choice will be expanded in Section IV.
+   The TSQR algorithm reorganizes the factorization of a
+tall-skinny matrix (such as a column panel) to minimize
+                                                                  C. Communication-Avoiding QR (CAQR)
+memory accesses [6]. Instead of computing one Householder
+vector for each column directly, we divide the tall-skinny           CAQR is an extension of TSQR for arbitrarily sized
+matrix vertically into small blocks, as shown in Figure 2(a).     matrices [6]. This time we divide the matrix into a grid
+Next, we factor each block independently using Householder        of small blocks. Like blocked Householder, CAQR involves
+reflectors. This creates a small Householder representation       a panel factorization and a trailing matrix update. The
+of Q, which we call U, and an upper-triangular R for each         panel factorization is done using TSQR, shown in Figure
+block. This is shown in Figure 2(b). We would like to             3(a). We must then do the trailing matrix update, which
+eliminate all the Rs below the top-most diagonal, so we can       means applying the QT of the panel to the trailing matrix.
+group sets together in a stack and apply the Householder          Note that because TSQR works on blocks in the column
+algorithm to each (possibly exploiting the sparsity pattern),     panel, the trailing matrix update can begin before the entire
+which is done in Figure 2(c). We can continue to reduce the       panel is factored. This removes the synchronization in the
+Rs with another level as in Figure 2(d). This leaves us with      standard blocked Householder approach and exposes more
+our final upper triangular matrix R, and a series of small        parallelism. Unfortunately, we cannot just use a large matrix-
+Us which, if needed, can be used to generate the explicit         matrix multiply as we did in blocked Householder. This is
+orthogonal matrix Q of the factorization.                         due to the distributed format in which TSQR produces its
+   The TSQR algorithm exposes parallelism. Each block in          Q. Instead, we carry out small updates in each small block
+the panel can be processed independently by a different           of the trailing submatrix.
+processor. TSQR also allows us to divide the problem into            There are two types of trailing matrix updates: horizontal
+chunks with a more managable size. If we choose block             updates and tree updates. Horizontal updates are the easier
+sizes that fit in cache, we can achieve significant bandwidth     case. Here we take the Householder vectors generated from
+savings.                                                          the first stage of TSQR and apply them horizontally across
+            R1234!                   R1234!
+                                                                  link between the two memories. The GPU has more compute
+                                                                  and bandwidth capability generally than the CPUs, whereas
+            U1!                      U1!
+                                                                  CPUs generally have a larger cache, more ability to exploit
+             U12!                     U12!                        instruction-level parallelism, and are better equipped to
+            U2!                      U2!
+                                                                  handle irregular computation and data accesses.
+                                                                     The two questions we want to answer with regard to
+            U1234!
+                                                                  CAQR are: where we should do each step of the compu-
+                                     U1234!
+
+
+            U3!                      U3!                          tation? Where should we store the data?
+             U34!                     U34!
+                                                                  A. First option: CPU panel factorization and GPU trailing
+            U4!                      U4!                          matrix update
+                                                                     With this approach, the algorithm proceeds as follows.
+                     (a)!                      (b)!               A thin panel is sent to the CPU, if necessary, and the CPU
+                                                                  factors the panel using TSQR. The result of the factorization
+            R1234!                    R1234!
+                                                                  is sent back to the GPU and used for the trailing matrix
+            U1!                      U1!                          update. Potentially, the CPU could begin factoring the next
+                                                                  panel while the GPU is still busy applying the previous panel
+             U12!                     U12!
+                                                                  to the trailing matrix.
+            U2!                      U2!
+                                                                     The main advantage of this approach is that offloading
+            U1234!                   U1234!                       work to the CPU makes it possible to overlap GPU and
+            U3!                      U3!
+                                                                  CPU work. This allows you to use the entire system. The
+                                                                  TSQR panel factorization can be a good fit for the CPU
+             U34!                     U34!
+                                                                  because of the irregular nature of the reduction tree. The
+            U4!                      U4!                          trailing matrix update is regular and can be done efficiently
+                                                                  on the GPU.
+                        (c)!                    (d)!                 One disadvantage of this approach is that in order to
+                                                                  offload work to the CPU we must transfer the data between
+                                                                  CPU and GPU memories. On current systems, this involves
+          Figure 3: Communication-Avoiding QR                     latency that can hurt performance for skinny problems.
+                                                                  Unless we successfully overlap CPU and GPU computation,
+                                                                  sending the panel factorization to the CPU means we cannot
+the matrix, shown in Figure 3(b). This operation is very          use the superior compute and bandwidth capabilities of the
+uniform, and the update of each block in the trailing matrix is   GPU for these parts of the computation.
+independent. The more challenging update is the tree update.
+Here we take the Householder vectors generated during each        B. Second Option: Entire factorization the GPU
+level of TSQR’s tree reduction and apply them across the             With this approach, the entire factorization is done on the
+matrix. This involves mixing small pieces of the trailing         GPU. This includes the TSQR panel factorization and the
+matrix, as shown in Figure 3(c) and (d). The rows of the          trailing matrix updates.
+trailing matrix that get updated vary with each level of the         Assuming the matrix is entirely in GPU memory, this
+reduction tree. This can be challenging on the GPU because        approach eliminates transfer latency. This means that we can
+the accesses to the matrix are more irregular and somewhat        get good performance even on skinny problems. We also can
+sparse.                                                           benefit from the higher compute and bandwidth capability
+   After the trailing matrix is updated we can move to the        of the GPU for the panel factorizations.
+next panel. We must take care to redraw the grid lower by a          Unfortunately, this approach is much more difficult to
+number of rows equal to the panel width, reflecting the fact      program. This is first because we cannot reuse existing
+that the trailing matrix becomes both shorter and narrower        tuned CPU libraries. Also, certain parts of the QR algorithm
+after each step.                                                  involve more irregular computations and are therefore more
+                                                                  challenging and less efficient to carry out in the GPU’s
+III. M APPING CAQR TO H ETEROGENOUS (CPU+GPU)
+                                                                  programming and execution models. The pseudocode in
+                    S YSTEMS
+                                                                  Figure 4, described in the next section, illustrates some of
+  Here we briefly discuss two different options for mapping       the irregular operations necessary for a GPU-only approach.
+CAQR to current heterogeneous systems. We consider a                 In this work we choose the second option, performing the
+heterogeneous system containing one or more multi-core            entire factorization on the GPU, for the following reason.
+host CPUs with DRAM, a GPU with DRAM, and a physical              Our motivating application is Robust PCA for stationary
+video background subtraction. The dimensions of the video
+matrices we deal with in this application are on the order of
+100,000 tall by 100 wide. For this size problem, the latency       Foreach panel!
+                                                                     !Do small QRs in panel
+of transferring data to the CPU will have high adverse impact
+                                                                     !(factor)
+on performance. During the course of the application, we are
+doing many QR decompositions and the video matrix is able
+to stay on the GPU. So the cost of initially transferring the         !Foreach level in tree!
+video matrix to GPU memory is easily amortized.                       ! !Do small QRs in tree!
+                                                                      ! !(factor_tree)
+               IV. GPU I MPLEMENTATION
+   In this section we describe implementation details of
+                                                                      !Apply QT horizontally!
+our QR decomposition for the GPU. We start with an                    !across trailing matrix!
+overview of the hardware, then give a high-level description          !(apply_qt_h)
+of how the computation is organized. This is followed by
+an examination of the key individual kernels and low-level
+tradeoffs. Everything here is done using single-precision,            !Foreach level in tree!
+which is adequate for our video application.                          ! !Apply QT from the tree
+                                                                      ! !across trailing matrix!
+A. Hardware Overview                                                  ! !(apply_qt_tree)
+   Our target is an NVIDIA C2050 GPU, which is the
+version of NVIDIA’s recent Fermi architecture intended for
+high-performance computing. This choice of architecture is
+                                                                 Figure 4: Host pseudocode for CAQR with a binomial
+motivated by GPUs track record for good performance on
+                                                                 reduction tree
+high-throughput numerical computing [16], [17]. Though we
+use the C2050, our code can be run on any CUDA-capable
+GPU.                                                             B. Top-Level Pseudocode
+   The 1.15 GHz C2050 has 14 multiprocessors, each of               Figure 4 shows pseudocode for our CAQR. Each function
+which has 32 floating-point units capable of executing one       represents a GPU kernel, which is a subroutine that is
+single-precision FLOP per cycle. In total, the chip is capable   performed in parallel over different parts of the matrix. Next
+of 1.3 single precision TFLOPs.                                  to each kernel call there is a graphic of our matrix showing
+   Tasks are scheduled on the multiprocessors in units called    how it is divided among thread blocks and which portions
+thread blocks. Each thread block contains up to 512 threads,     of the matrix are being processed by that kernel. So for
+which can synchronize and share data among one another           example, the TSQR panel factorization is done in the first
+through a small shared memory. Thread blocks, however, are       two kernel calls to factor. Once that has completed, the trail-
+assumed to be independent and do not generally synchronize       ing matrix is updated using apply qt h and apply qt tree.
+or communicate during a single parallel task. As an example,     This pseudocode is executed on the host CPU. The CPU
+in our application each small block QR decomposition is          coordinates the GPU’s actions and updates pointers so that
+done by a different thread block. Within the thread block        GPU thread blocks know where to look in the matrix.
+there are 64 threads that work together to compute the QR.
+   There is one large global memory (DRAM) shared by             C. Reduction Tree
+all multiprocessors. The peak bandwidth to and from global          The shape of our reduction tree is a function of the block
+memory for the C2050 with ECC enabled is 144 GB/sec.             sizes. For example, if the block size is 64 × 16, each block
+There is a small 768 KB L2 cache shared by all multipro-         produces an R which fits in a 16 × 16 space. When these
+cessors. Each multiprocessor has access to 48 KB of shared       Rs are stacked for the next level of the reduction tree, we
+memory and 16 KB of L1 cache, which can alternatively
+                                                                         16 = 4 of them in each 64 × 16 block. This means
+                                                                 can fit 64
+be configured as 48 KB of L1 and 16 KB of shared                 we reduce the height of the panel by a factor of 4 at each
+memory. The register file is the largest and fastest local       level and the reduction is a quad-tree. The tree reduction
+memory available to the processing units. It is 128 KB per       ends when the panel height becomes less than 64, meaning
+multiprocessor, can be accessed in one or two cycles, and        it can be processed completely in a single thread block.
+generally provides enough bandwidth to saturate the floating
+point units. Registers are not shared. Any time threads need     D. Overview of Kernels
+to communicate, in a parallel reduction for example, either       The following four kernels are the building blocks of our
+shared memory or DRAM must be used.                              CAQR. The parts of the matrix affected by each kernel are
+shown in Figure 4.
+                                                                                  ATu!                                ATu!
+   1) factor: Perform a QR decomposition of a small block
+in fast memory using customized BLAS2 routines. Over-
+write the Householder vectors and upper triangular R on
+top of the original small input matrix.
+   2) factor tree: Gather a stack of upper triangular Rs
+generated by factor and store them in fast memory. Then
+perform a QR decomposition on that small block, as was                u!            A!                   u!            A!
+done in factor. The shape of the resulting Householder
+vectors and R is also a stack of upper triangular matrices, and
+thus can overwrite the Rs that were read into fast memory.
+   3) apply qt h: Apply QT from the Householder vectors
+generated in factor horizontally to small blocks across the
+trailing matrix. Write back the updated trailing matrix blocks
+to the locations from which they were read.                                       (a)!                               (b)!
+   4) apply qt tree: Apply QT from the Householder vec-
+tors generated by factor tree during the TSQR reduction           Figure 5: Matrix-vector multiply and rank-1 update. These
+tree to the correct locations in the trailing matrix. To do so,   two operations make up the core computations in each kernel
+collect the distributed components of the trailing matrix to
+be updated as well as the distributed Householder vectors.
+Perform the application of QT , and write back the updated        corresponding performance for the matrix-vector product
+trailing matrix blocks to the same distributed locations from     and rank-1 update on 128 × 16 blocks.
+which they were read.                                                1) Shared Memory Parallel Reductions (55 GFLOPS):
+   Inserting these kernels into the pseudocode in Figure 4        The most obvious approach is to store the matrix in the
+should complete a high-level understanding of our CAQR            register file assigning each thread one row. Then reduce each
+implementation.                                                   column one at a time using parallel reductions in shared
+                                                                  memory. This approach is inefficient because many of the
+E. Kernel Tuning                                                  threads sit idle during the consecutive parallel reductions.
+   Now we examine an individual kernel so as to understand           2) Shared Memory Serial Reductions (168 GFLOPS):
+the specifics of the data layout and thread-level execution.      The 128 × 16 matrix is originally stored in column major
+Fortunately, all four kernels do the same two core compu-         order, so we put it into shared memory to reduce it serially.
+tations: matrix-vector multiply and rank-1 update. We will        The advantage of this approach is that it gives us near
+analyze only the simplest of these which is apply qt h.           optimal thread utilization for the reduction.
+   Suppose we have a set of Householder vectors in shared            3) Register File Serial Reductions (194 GFLOPS): Store
+memory and a small block A to which we’d like to apply the        the matrix entirely in the register file. Instead of distributing
+vectors. This is equivalent to applying
+                                      �n Q , represented
+                                           T
+                                                            by    the data to each thread by row, distribute it cyclically
+the Householder vectors, i.e. Q = i=1 (I − τi ui uTi ); τi =      among the threads, as shown in Figure 6. Notice that each
+   2
+||ui ||22
+          , to the block A. For each Householder vector u we      thread’s data is located in a single column. This means that
+first compute the matrix-vector product AT ∗u. This is shown      each thread can do a serial reduction over its part of the
+in Figure 5(a). Then we update each element of A with the         matrix and write only the result into shared memory for
+scaled outer product of AT ∗ u and u, Figure 5 (b). So the        parallel reduction. This minimizes traffic in and out of shared
+computation here consists of a reduction sum of each column       memory, which helps performance.
+of A during the matrix-vector product, and a data-parallel           4) Register File Serial Reductions + Transpose (388
+rank-1 update of A. This is repeated for each Householder         GFLOPS): The register file serial reduction (Approach 2)
+vector.                                                           can be improved if the block is already stored in transposed
+   Two important questions must be answered in our design.        form. Instead of doing a small transpose in each thread
+How should we assign threads to computation, and how              block, this transpose can be done as a preprocessing step.
+do we store the matrix in our fast memories such that it          This is beneficial because these kernels are called many
+can be accessed most quickly? During the course of tuning         times on the same block of the matrix. This is not a transpose
+we tried several different approaches. The main difference        of the entire matrix. We only need to transpose each panel
+between these lies in how the reductions in the matrix-           from column major to row major. Unfortunately this means
+vector product are carried out. The following is a description    that the factorization is done out of place, as an in-place
+of each approach to the matrix-vector product, with its           transpose is difficult for non-square matrices.
+                    0 1 2 3 4 5 6 7
+                    9 10 11 . . .
+
+
+
+
+                        ...
+                    0 1 2 3 4 5 6 7
+                    9 10 11 . . .
+                              A!
+
+
+Figure 6: In approaches 2 and 4, the matrix is stored in the
+register file and distributed among threads in this manner.
+All data owned by a thread belongs to the same column.
+
+
+F. Autotuning Block Size
+   In the previous section we showed how changing the data
+layout and reduction technique could improve performance.
+After commiting to a data layout, we can write scripts to
+                                                                 Figure 7: Performance for various choices of block size in
+test many different block sizes and choose the best.
+                                                                 single precision GFLOPS.
+   Our block size is fundamentally limited by our shared
+memory size and/or register file size. We must however de-
+cide what the shape of the block should be. The apply qt h
+                                                                 choosing the right block size was critical in achieving good
+kernel gets better performance when the block width is
+                                                                 performance.
+wider. This is for several reasons. First, since the number of
+FLOPs performed in the Householder algorithm is O(mn2 ),                             V. P ERFORMANCE
+we get far higher arithmetic intensity, i.e. FLOPs/byte, by
+                                                                    We compare our performance against common commer-
+increasing the width n, than we do by increasing the height
+                                                                 cially available and open source software for both GPU
+m. Secondly, the wider the block is the more parallelism
+                                                                 and multicore. Below we describe the software to which
+there is in each matrix-vector product. If the block width
+                                                                 we compare and the details of the hardware platforms. Our
+were equal to the number of threads, for example, then the
+                                                                 code is optimized for tall-skinny matrices, so we will focus
+matrix-vector product could be done entirely using efficient
+                                                                 mostly on this case. All FLOPs are single precision.
+serial reductions.
+   However, the Householder vector u must be communi-            A. Software
+cated to every thread. If the block is so wide that each
+thread owns an entire column, then each thread must read the        1) Intel Math Kernel Library (MKL): MKL contains
+entire u vector from shared memory. The optimal solution         BLAS, LAPACK, and various other common functions
+is somewhere between the two extremes. The performance           tuned specifically for Intel’s processors. In our comparison
+of each block size is shown in Figure 7. Our best overall        we use version 10.2.2.025, and link to the multithreaded
+performance comes from using 128 × 16 blocks. For the            library.
+apply qt h kernel we are able to get 388 GFLOPS.                    2) MAGMA: Matrix Algebra on GPU and Multicore
+                                                                 Architectures (MAGMA) is an open source dense linear
+                                                                 algebra library for heterogeneous CPU+GPU systems. It
+G. Tuning Summary
+                                                                 is developed by the Innovative Computing Laboratory at
+   Through our tuning process we were able to improve            the University of Tennessee. Version 1.0 is used in this
+the performance of apply qt h, our main kernel, from 55          comparison.
+GFLOPS to 388 GFLOPS using low-level tuning. The main               3) CULA: CULA is a library of LAPACK routines for
+focus was optimizing the matrix-vector product and rank-1        GPUs [5]. It is a commercial library, made by EM Photonics.
+update that is at the core of the Householder QR algorithm.      Since CULA source is not available, we do not know exactly
+The most important tuning optimization was to avoid shared       how they implement their QR. However, the performance
+memory and L1 cache in favor of the register file. Also,         of the QR routine across different square matrix sizes is
+Figure 8: Speedup vs. SGEQRF from popular linear algebra libraries on a range of different matrix sizes. The dashed line
+is a crossover point, to the right of which the libraries outperform our QR.
+
+
+very similar to the performance of a previous blocked             representation that can later be used to retreive or apply
+Householder approach by Volkov et al.[3]. For this reason,        Q. Though not shown on the graph, retreiving Q explicitly
+we will not separately report the performance of CULA and         (SORGQR) using CAQR is just as efficient as factoring the
+Volkov.                                                           matrix. All preprocessing (e.g. transpose) done for CAQR is
+                                                                  included in these runtimes. For all GPU routines, the matrix
+B. Hardware                                                       is assumed to begin on the GPU. The initial data transfer
+  Our test platform is the Dirac GPU cluster at the National      from CPU to GPU is not counted.
+Energy Research Scientific Computing Center (NERSC)                  The absolute performance numbers in single precision
+[18]. One node consists of dual-socket quad-core Intel 5530       GFLOPS are shown in Figure 9. In this case we consider a
+processors, 8 cores total, running at 2.4 GHz connected over      matrix with a fixed height of 8192 and varying width from 64
+PCI-express to an NVIDIA C2050 (Fermi) GPU. The GPU               to 8192. The crossover point, where CAQR becomes slower
+has ECC enabled, so its effective bandwidth is reduced to         than the best best GPU libraries, is around 4000 columns
+144 GB/s.                                                         wide. This suggests an autotuning framework for QR where
+                                                                  a different algorithm may be chosen depending on the matrix
+C. Performance vs. Matrix Width
+                                                                  size.
+   Figure 8 shows the performance of our single-precision
+CAQR code for a range of matrix sizes compared to
+MAGMA, CULA, and MKL. Each point in the chart rep-                D. Very Skinny Matrices
+resents a different matrix size. The points on the left are
+skinnier matrices, such as those found in robust background          In the case of extremely tall-skinny matrices, such as those
+subtraction, and the points on the far right are square matri-    found in our video processing application, we see up to
+ces. Our CAQR implementation is tuned for the tall-skinny         17x speedups vs. GPU libraries and 12x vs. MKL. Table I
+matrices. As a result, we see large speedups compared to          shows the performance on extremely tall-skinny matrices for
+other linear algebra libraries for this case. The operation       CAQR, MAGMA, CULA, and MKL. Another application
+being performed is a single precision QR factorization            where matrices like these appear is communication-avoiding
+defined by the LAPACK SGEQRF routine. This routine                linear solvers, when vectors must be orthoganalized period-
+doesn’t return Q explicitly, instead it returns an intermediate   ically [2].
+                                          SGEQRF Performance vs. Matrix Width (Height=8192)
+                          500
+                                         CAQR (C2050)
+                          450            MAGMA (C2050)
+                                         CULA (C2050)
+                          400            MKL (8 cores)
+Performance(GFLOP/Sec.)
+
+
+
+
+                          350
+
+                          300                                                                           Figure 10: Sample output of Robust PCA for stationary
+                          250
+                                                                                                        video background subtraction
+
+                          200
+
+                          150
+                                                                                                                               M = L0 + S0
+                          100
+                                                                                                           The problem is solved using �1 regularized nuclear norm
+                           50
+                                                                                                        minimization. Minimizing the nuclear norm, the sum of the
+                            0                                                                           singular values, of L0 enforces low-rank. Meanwhile, the
+                                0      1000   2000     3000    4000     5000     6000     7000   8000
+                                                         Number of Columns
+                                                                                                        �1 norm of S0 enforces sparsity. Minimizing a weighted
+                                                                                                        combination of these two penalty functions with linear
+Figure 9: Performance on matrices with 8192 rows and                                                    constraints is convex.
+varying numbers of columns. For the tall-skinny case CAQR                                                  An application of Robust PCA is stationary video back-
+performs best                                                                                           ground subtraction. A survellience video is transformed into
+                                                                                                        a tall-skinny matrix where each column contains all pixels in
+                                                         Performance (SP FLOPS)                         a frame, and the number of columns is equal to the number
+                                                   CAQR MAGMA CULA MKL                                  of frames. The low-rank component of this matrix is the
+                                      1k x 192      39.6       5.01      2.99   3.12                    background and the sparse component is the people walking
+                                                                                                        in the foreground. To give a better idea of the problem being
+            Matrix Size
+
+
+
+
+                                     10k x 192      111        18.7      9.67   16.9
+                                     50k x 192      174        20.8      9.42   22.8                    solved, Figure 10 shows a sample of the output of the Robust
+                                    100k x 192      180        18.8      8.90   21.4                    PCA code.
+                                    500k x 192      194        12.4      8.40   17.8                    B. SVD using QR
+                                     1M x 192       195        11.4      7.79   16.5
+                                                                                                           The main computation in Robust PCA is a singular value
+Table I: Performance in single precision GFLOPS for very                                                decomposition (SVD) of the tall-skinny video matrix. In the
+tall-skinny matrices.                                                                                   SVD of the video matrix, the top singular values, those that
+                                                                                                        have a strong presence of every frame of the video, are
+                                                                                                        usually associated with the background.
+                  VI. A PPLICATION : ROBUST PCA FOR S URVELLIANCE                                          Instead of trying to do a large SVD on the GPU, we use
+                          V IDEO BACKGROUND S UBTRACTION                                                the following well known technique for tall-skinny matrices
+                                                                                                        to reduce the bulk of the work to a QR decomposition. First
+   The motivating application for this work is stationary
+                                                                                                        A is decomposed into Q ∗ R. Then we find the SVD of R,
+video background subtraction using a recent statistical al-
+                                                                                                        which is cheap because R is an n × n matrix and done on
+gorithm for Robust Principal Component Analysis (PCA)
+                                                                                                        the CPU using MKL. Next, we can multiply the orthogonal
+[1]. This section will present specifics of the application,
+                                                                                                        matrices Q ∗ U to get the left singular vectors of A.
+how it uses the QR decomposition, and the performance of
+the application using ours and other QR implementations.
+                                                                                                                           A=Q∗R
+A. Robust PCA                                                                                                                  �        �
+                                                                                                                            =Q∗ U ∗Σ∗VT
+   Principal Component Analysis is a widely used method
+for data analysis. The goal is to find the best low rank                                                                     = (Q ∗ U ) ∗ Σ ∗ V T
+approximation of a given matrix, as judged by minimization                                                                   = U� ∗ Σ ∗ V T
+of the difference between the original matrix and the low
+rank approximation. However, the classical method is not                                                C. Robust PCA Algorithm
+robust to large sparse errors. In Robust PCA, a matrix M is                                                The algorithm for Robust PCA tries to minimize the rank
+decomposed as the sum of a low rank component L0 and a                                                  of L0 and enforce sparsity on S0 . It does so with an iterative
+sparse component S0 . S0 is allowed to have entries that are                                            alternating-directions method [19]. The flowchart for the
+large in absolute value, as long as they are sparse.                                                    algorithm is shown in Figure 11. The algorithm thresholds
+                                                                 precision.
+
+
+                                                                         SVD type              Number of Iterations/Sec.
+                                                                      MKL SVD (4 cores)                  0.9
+              *       U      *       !      *        VT              BLAS2 QR (GTX480)                   8.7
+                                                                       CAQR (GTX480)                    27.0
+                                    !"
+         Q                                                       Table II: Performance of various Robust PCA implementa-
+                                                                 tions
+
+                   Threshold these singular values                  Table II shows moving from the CPU-only code to our
+                                                                 BLAS2 GPU code results in a 9.6x speedup. This mostly
+                                                                 reflects the fact that the GPU has much higher bandwidth
+                                                                 and compute power than our CPU, and that the MKL SVD
+                                                                 function may not be optimized for the tall-skinny case.
+                                                                 However, we see an additional speedup of about 3x when
+                                                                 using CAQR as compared to the BLAS2 QR. Even though
+                                                                 the QR itself is sped up by more than a factor of 3, we
+                                                                 only get 3x in the application overall due to Ahmdal’s law.
+                                                                 Overall our GPU solution gives us a 30x speedup over
+                                                                 the original CPU code using MKL, reducing the time to
+Figure 11: Flowchart of the alternating-directions algorithm     solve the problem completely from over nine minutes to 17
+for solving Robust PCA                                           seconds, making this approach feasible for latency-critical
+                                                                 applications [21].
+                                                                                      VII. C ONCLUSION
+(sets to zero) the smallest singular values of L0 in order
+to make it low rank. Next, a shrinkage operation (pushing           In this paper we described a high-performance imple-
+the values of the matrix towards zero) is done on S0 to          mentation of Communication-Avoiding QR Decomposition
+enforce sparsity. The vast majority of the runtime is spent      entirely on a single GPU using compute-bound kernels. The
+in the singular value threshold, specifically the SVD of the     main advantage of our approach over the traditional blocked
+L0 matrix.                                                       Householder algorithm is that it can handle tall-skinny
+                                                                 matrices without relying on bandwidth-bound BLAS2 panel
+                                                                 factorizations or potentially high-latency GPU-CPU trans-
+D. Performance using CAQR
+                                                                 fers.
+   We have three different versions of Robust PCA for               We showed low-level implementation choices that allowed
+video background subtraction. The first uses entirely a CPU      us to achieve good performance on the GPU. The best
+(Intel Core i7 2.6 GHz), and relies on multithreaded MKL         performance for our kernels came from using the register
+version 10.2.5.035 for the SVD as well as other basic BLAS       file as much as possible and arranging the data in transposed
+routines. The second is done entirely on the GPU (GTX480),       form so as to minimize necessary communication between
+except for the small SVD of R which is done on the CPU,          threads. Our tuning improved the performance of the most
+and uses our BLAS2 QR decomposition that was specifically        heavily-used kernel from 55 GFLOPS to 337 GFLOPS.
+designed and tuned for tall-skinny matrices. Finally, there is      Our CAQR code outperformed leading parallel CPU and
+a version which also runs on the GPU and uses our CAQR.          GPU libraries for tall-skinny matrices up to roughly 4000
+   Our benchmark video comes from the ViSOR surveillance         columns wide and 8192 rows tall. In more extreme ratios
+video database [20]. We extract 100 frames for processing.       of rows to columns, such as 1 million by 192, we saw
+Each frame is 288 pixels tall by 384 pixels wide, which is       speedups of up to 17x over GPU linear algebra libraries.
+a total of 110,592 pixels per frame. This means the matrix       Note that these extreme cases were motivated by practical
+dimensions are 110,592 by 100. The problem technically           applications.
+takes over 500 iterations to converge, however the solution         Finally, we applied the CAQR code to Robust PCA for
+begins to look good earlier than that. The quality of            stationary video background subtraction. We showed that
+solution, and therefore number of iterations required, seems     using CAQR we could achieve a 3x speedup over our best
+to depend on the application. We therefore report the            BLAS2 QR tuned specifically for the tall-skinny case, and
+number of iterations per second that each implementation         a 30x speedup over a CPU implementation using MKL’s
+is able to complete. All computation is done in single           parallel SVD.
+                           R EFERENCES                                    [15] G. Quintana-Ortı́, F. Igual, E. Quintana-Ortı́, and R. van de
+                                                                               Geijn, “Solving dense linear systems on platforms with mul-
+ [1] E. Candes, X. Li, Y. Ma, and J. Wright, “Robust principal                 tiple hardware accelerators,” ACM SIGPLAN Notices, vol. 44,
+     component analysis,” Preprint, 2009.                                      no. 4, pp. 121–130, 2009.
+
+ [2] M. Mohiyuddin, M. Hoemmen, J. Demmel, and K. Yelick,                 [16] V. Volkov and J. Demmel, “Benchmarking GPUs to tune
+     “Minimizing communication in sparse matrix solvers,” in                   dense linear algebra,” in Proceedings of the 2008 ACM/IEEE
+     Proceedings of the 2009 ACM/IEEE conference on supercom-                  conference on Supercomputing. IEEE Press, 2008, pp. 1–11.
+     puting, ser. SC ’09. New York, NY, USA: ACM, 2009, pp.
+     36:1–36:12.                                                          [17] K. Datta, M. Murphy, V. Volkov, S. Williams, J. Carter,
+                                                                               L. Oliker, D. Patterson, J. Shalf, and K. Yelick, “Stencil
+ [3] V. Volkov and J. Demmel, “LU, QR and Cholesky factoriza-                  computation optimization and auto-tuning on state-of-the-art
+     tions using vector capabilities of GPUs,” EECS Department,                multicore architectures,” in High Performance Computing,
+     University of California, Berkeley, Tech. Rep. UCB/EECS-                  Networking, Storage and Analysis, 2008. SC 2008. Interna-
+     2008-49, May, pp. 2008–49, 2008.                                          tional Conference for. IEEE, 2009, pp. 1–12.
+
+ [4] A. Kerr, D. Campbell, and M. Richards, “QR decomposition             [18] NERSC,      “Experimental       GPU      cluster:      Dirac,”
+     on GPUs,” in Proceedings of 2nd Workshop on General                       http://www.nersc.gov/nusers/systems/dirac/.
+     Purpose Processing on Graphics Processing Units. ACM,
+     2009, pp. 71–78.                                                     [19] X. Yuan and J. Yang, “Sparse and low-rank matrix decompo-
+                                                                               sition via alternating direction methods,” Preprint, 2009.
+ [5] J. Humphrey Jr, D. Price, K. Spagnoli, A. Paolini, and
+     E. Kelmelis, “CULA: hybrid GPU accelerated linear algebra            [20] R. Vezzani and R. Cucchiara, “ViSOR: Video surveillance
+     routines,” in Proceedings of SPIE, vol. 7705, 2010, p. 770502.            on-line repository for annotation retrieval,” in Multimedia and
+                                                                               Expo, 2008 IEEE International Conference on. IEEE, 2008,
+                                                                               pp. 1281–1284.
+ [6] J. Demmel, L. Grigori, M. Hoemmen, and J. Langou,
+     “Communication-optimal parallel and sequential QR and LU             [21] Y. Dong and G. DeSouza, “Adaptive Learning of Multi-
+     factorizations,” LAPACK Working Note #204.                                Subspace for Foreground Detection under Illumination
+                                                                               Changes,” Computer Vision and Image Understanding, 2010.
+ [7] E. Anderson, Z. Bai, and C. Bischof, LAPACK Users’ guide.
+     Society for Industrial Mathematics, 1999.
+
+ [8] C. NVIDIA, “CUBLAS Library,” NVIDIA Corporation, Santa
+     Clara, California, 2008.
+
+ [9] J. Demmel, L. Grigori, and M. Hoemmen, LAPACK Working
+     Note #204.
+
+[10] B. Hadri, H. Ltaief, E. Agullo, and J. Dongarra, “Enhancing
+     parallelism of tile qr factorization for multicore architectures,”
+     Matrix.
+
+[11] M. A. Heroux, R. A. Bartlett, V. E. Howle, R. J. Hoekstra,
+     J. J. Hu, T. G. Kolda, R. B. Lehoucq, K. R. Long, R. P.
+     Pawlowski, E. T. Phipps, A. G. Salinger, H. K. Thornquist,
+     R. S. Tuminaro, J. M. Willenbring, A. Williams, and K. S.
+     Stanley, “An overview of the trilinos project,” ACM Trans.
+     Math. Softw., vol. 31, no. 3, pp. 397–423, 2005.
+
+[12] E. Agullo, C. Coti, J. Dongarra, T. Herault, and J. Langem,
+     “QR factorization of tall and skinny matrices in a grid com-
+     puting environment,” in Parallel & Distributed Processing
+     (IPDPS), 2010 IEEE International Symposium on. IEEE,
+     2010, pp. 1–11.
+
+[13] J. Demmel, Applied numerical linear algebra. Society for
+     Industrial and Applied Mathematics, Philadelphia, 1997.
+
+[14] E. Agullo, J. Demmel, J. Dongarra, B. Hadri, J. Kurzak,
+     J. Langou, H. Ltaief, P. Luszczek, and S. Tomov, “Numerical
+     linear algebra on emerging architectures: The PLASMA and
+     MAGMA projects,” in Journal of Physics: Conference Series,
+     vol. 180. IOP Publishing, 2009, p. 012037.
+

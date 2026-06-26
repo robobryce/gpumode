@@ -1,0 +1,1722 @@
+Reconstructing Householder Vectors from Tall-Skinny
+                       QR
+
+
+
+
+                Grey Ballard
+                James Demmel
+                Laura Grigori
+                Mathias Jacquelin
+                Hong Diep Nguyen
+                Edgar Solomonik
+
+
+
+
+                Electrical Engineering and Computer Sciences
+                University of California at Berkeley
+
+
+                Technical Report No. UCB/EECS-2013-175
+                http://www.eecs.berkeley.edu/Pubs/TechRpts/2013/EECS-2013-175.html
+
+
+                October 26, 2013
+                     Copyright © 2013, by the author(s).
+                            All rights reserved.
+
+Permission to make digital or hard copies of all or part of this work for
+personal or classroom use is granted without fee provided that copies are
+not made or distributed for profit or commercial advantage and that copies
+bear this notice and the full citation on the first page. To copy otherwise, to
+republish, to post on servers or to redistribute to lists, requires prior specific
+permission.
+
+
+                               Acknowledgement
+
+We would like to thank Yusaku Yamamoto for sharing his slides from SIAM
+ALA 2012 with us. We also thank Jack Poulson for help configuring
+Elemental. Solomonik was supported by a Department of Energy
+Computational Science Graduate Fellowship, grant number DE-FG02-
+97ER25308. This research used resources of the National Energy
+Research Scientific Computing Center (NERSC), which is supported by the
+Office of Science of the U.S. Department of Energy under Contract No. DE-
+AC02-05CH11231. We also acknowledge DOE grants DE-SC0004938,
+DE-SC0005136, DE-SC0003959, DE-SC0008700, DE-SC0010200, AC02-
+05CH11231, and DARPA grant
+HR0011-12-2-0016.
+            Reconstructing Householder Vectors from Tall-Skinny QR
+
+
+                                                October 26, 2013
+
+
+    Grey Ballard1 , James Demmel2 , Laura Grigori3 , Mathias Jacquelin4 , Hong Diep Nguyen2 , and Edgar
+                                               Solomonik2
+
+                                1 Sandia National Laboratories, Livermore, USA
+                               2 University of California, Berkeley, Berkeley, USA
+                                  3 INRIA Paris - Rocquencourt, Paris, France
+                           4 Lawrence Berkeley National Laboratory, Berkeley, USA
+
+
+                                                     Abstract
+          The Tall-Skinny QR (TSQR) algorithm is more communication efficient than the standard House-
+       holder algorithm for QR decomposition of matrices with many more rows than columns. However,
+       TSQR produces a different representation of the orthogonal factor and therefore requires more software
+       development to support the new representation. Further, implicitly applying the orthogonal factor to
+       the trailing matrix in the context of factoring a square matrix is more complicated and costly than with
+       the Householder representation.
+          We show how to perform TSQR and then reconstruct the Householder vector representation with
+       the same asymptotic communication efficiency and little extra computational cost. We demonstrate
+       the high performance and numerical stability of this algorithm both theoretically and empirically. The
+       new Householder reconstruction algorithm allows us to design more efficient parallel QR algorithms,
+       with significantly lower latency cost compared to Householder QR and lower bandwidth and latency
+       costs compared with Communication-Avoiding QR (CAQR) algorithm. As a result, our final parallel
+       QR algorithm outperforms ScaLAPACK and Elemental implementations of Householder QR and our
+       implementation of CAQR on the Hopper Cray XE6 NERSC system.
+
+
+1     Introduction
+Because of the rising costs of communication (i.e., data movement) relative to computation, so-called
+communication-avoiding algorithms—ones that perform roughly the same computation as alternatives
+but significantly reduce communication—often run with reduced running times on today’s architectures.
+In particular, the standard algorithm for computing the QR decomposition of a tall and skinny matrix
+(one with many more rows than columns) is often bottlenecked by communication costs. A more recent
+algorithm known as Tall-Skinny QR (TSQR) is presented in [1] (the ideas go back to [2]) and overcomes this
+bottleneck by reformulating the computation. In fact, the algorithm is communication optimal, attaining
+the lower bound for communication costs of QR decomposition (up to a logarithmic factor in the number
+of processors) [3]. Not only is communication reduced in theory, but the algorithm has been demonstrated
+to perform better on a variety of architectures, including multicore processors [4], graphics processing units
+[5], and distributed-memory systems [6].
+     The standard algorithm for QR decomposition, which is implemented in LAPACK [7], ScaLAPACK [8],
+and Elemental [9] is known as Householder-QR (given below as Algorithm 1). For tall and skinny matrices,
+the algorithm works column-by-column, computing a Householder vector and applying the corresponding
+transformation for each column in the matrix. When the matrix is distributed across a parallel machine,
+
+
+                                                          1
+this requires one parallel reduction per column. The TSQR algorithm (given below as Algorithm 2), on
+the other hand, performs only one reduction during the entire computation. Therefore, TSQR requires
+asymptotically less inter-processor synchronization than Householder-QR on parallel machines (TSQR also
+achieves asymptotically higher cache reuse on sequential machines).
+     Computing the QR decomposition of a tall and skinny matrix is an important kernel in many contexts,
+including standalone least squares problems, eigenvalue and singular value computations, and Krylov
+subspace and other iterative methods. In addition, the tall and skinny factorization is a standard building
+block in the computation of the QR decomposition of general (not necessarily tall and skinny) matrices.
+In particular, most algorithms work by factoring a tall and skinny panel of the matrix, applying the
+orthogonal factor to the trailing matrix, and then continuing on to the next panel. Although Householder-
+QR is bottlenecked by communication in the panel factorization, it can apply the orthogonal factor as an
+aggregated Householder transformation efficiently, using matrix multiplication [10].
+     The Communication-Avoiding QR (CAQR) [1] algorithm uses TSQR to factor each panel of a general
+matrix. One difficulty faced by CAQR is that TSQR computes an orthogonal factor that is implicitly
+represented in a different format than that of Householder-QR. While Householder-QR represents the
+orthogonal factor as a set of Householder vectors (one per column), TSQR computes a tree of smaller sets of
+Householder vectors (though with the same total number of nonzero parameters). In CAQR, this difference
+in representation implies that the trailing matrix update is done using the implicit tree representation rather
+than matrix multiplication as possible with Householder-QR. From a software engineering perspective,
+this means writing and tuning more complicated code. Furthermore, from a performance perspective,
+the update of the trailing matrix within CAQR is less communication efficient than the update within
+Householder-QR by a logarithmic factor in the number of processors.
+     Building on a method introduced by Yamamoto [11], we show that the standard Householder vector
+representation may be recovered from the implicit TSQR representation for roughly the same cost as the
+TSQR itself. The key idea is that the Householder vectors that represent an orthonormal matrix can be
+computed via LU decomposition (without pivoting) of the orthonormal matrix subtracted from a diagonal
+sign matrix. We prove that this reconstruction is as numerically stable as Householder-QR (independent
+of the matrix condition number), and validate this proof with experimental results.
+     This reconstruction method allows us to get the best of TSQR algorithm (avoiding synchronization)
+as well as the best of the Householder-QR algorithm (efficient trailing matrix updates via matrix multi-
+plication). By obtaining Householder vectors from the TSQR representation, we can logically decouple
+the block size of the trailing matrix updates from the number of columns in each TSQR. This abstraction
+makes it possible to optimize panel factorization and the trailing matrix updates independently. Our result-
+ing parallel implementation outperforms ScaLAPACK, Elemental, and our own lightly-optimized CAQR
+implementation on the Hopper Cray XE6 platform at NERSC. While we do not experimentally study
+sequential performance, we expect our algorithm will also be beneficial in this setting, due to the cache
+efficiency gained by using TSQR.
+
+
+2    Performance cost model
+In this section, we detail our algorithmic performance cost model for parallel execution on p processors. We
+will use the α-β-γ model which expresses algorithmic costs in terms of computation and communication
+costs, the latter being composed of a bandwidth cost as well as a latency cost. We assume the cost of a
+message of size w words is α+βw, where α is the per-message latency cost and β is the per-word bandwidth
+cost. We let γ be the cost per floating point operation. We ignore the network topology and measure the
+costs in parallel, so that the cost of two disjoint pairs of processors communicating the same-sized message
+simultaneously is the same as that of one message. We also assume that two processors can exchange
+equal-sized messages simultaneously, but a processor can communicate with only one other processor at a
+time.
+    Our algorithmic analysis will depend on the costs of collective communication, particularly broadcasts,
+
+
+                                                      2
+reductions, and all-reductions, and we consider both tree-based and bidirectional-exchange (or recursive
+doubling/halving) algorithms [12, 13, 14]. For arrays of size w ≥ p, the collectives scatter, gather, all-
+gather, and reduce-scatter can all be performed with communication cost
+                                                                     p−1
+                                                   α · log p + β ·       w                                  (1)
+                                                                      p
+(reduce-scatter also incurs a computational cost of γ·((p−1)/p)w). Since a broadcast can be performed with
+scatter and all-gather, a reduction can be performed with reduce-scatter and gather, and an all-reduction
+can be performed with reduce-scatter and all-gather, the communication costs of those collectives for large
+arrays are twice that of Equation (1). For small arrays (w < p), it is not possible to use pipelined or
+recursive-doubling algorithms, which require the subdivision of the message into many pieces, therefore
+collectives such as a binomial tree broadcast must be used. In this case, the communication cost of
+broadcast, reduction, and all-reduction is α · log p + β · w log p.
+
+
+3        Previous Work
+We distinguish between two types of QR factorization algorithms. We call an algorithm that distributes
+entire rows of the matrix to processors a 1D algorithm. Such algorithms are often used for tall and skinny
+matrices. Algorithms which distribute the matrix across a 2D grid of pr × pc processors are known as 2D
+algorithms. Many right-looking 2D algorithms for QR decomposition of nearly square matrices divide the
+matrix into column panels and work panel-by-panel, factoring the panel with a 1D algorithm and then
+updating the trailing matrix. We consider two such existing algorithms in this section: 2D-Householder-QR
+(using Householder-QR) and CAQR (using TSQR).
+
+3.1        Householder-QR
+We first present Householder-QR in Algorithm 1, following [15] so that each Householder vector has a
+unit diagonal entry. We use LAPACK [7] notation for the scalar quantities.1 We present Algorithm 1 in
+Matlab-style notation as a sequential algorithm. The algorithm works column-by-column, computing a
+Householder vector and then updating the trailing matrix to the right. The Householder vectors are stored
+in an m × b lower triangular matrix Y . Note that we do not include τ as part of the output because it can
+be recomputed from Y .
+    While the algorithm works for general m and n, it is most commonly used when m  n, such as a
+panel factorization within a square QR decomposition. In LAPACK terms, this algorithm corresponds to
+geqr2 and is used as a subroutine in geqrf. In this case, we also compute an upper triangular matrix T
+so that
+                                         n
+                                         Y
+                                    Q=     (I − τi yi yiT ) = I − Y T Y T ,
+                                                 i=1
+
+which allows the application of QT to the trailing matrix to be done efficiently using matrix multiplication.
+Computing T is done in LAPACK with larft but can also be computed from Y T Y by solving the equation
+Y T Y = T −1 + T −T for T −1 (since Y T Y is symmetric and T −1 is triangular, the off-diagonal entries are
+equivalent and the diagonal entries differ by a factor of 2) [16].
+
+3.1.1        1D Algorithm
+We will make use of Householder-QR as a sequential algorithm, but there are parallelizations of the al-
+gorithm in libraries such as ScaLAPACK [8] and Elemental [9] against which we will compare our new
+approach. Assuming a 1D distribution across p processors, the parallelization of Householder-QR (Algo-
+rithm 1) requires communication at lines 2 and 8, both of which can be performed using an all-reduction.
+    1
+        However, we depart from the LAPACK code in that there is no check for a zero norm of a subcolumn.
+
+
+                                                              3
+Algorithm 1 [Y, R] = Householder-QR(A)
+Require: A is m × b
+ 1: for i = 1 to b do
+    % Compute the Householder vector
+ 2:    α = A(i, i), β = kA(i:m, i)k2
+ 3:    if α > 0 then
+ 4:        β = −β
+ 5:    end if
+ 6:    A(i, i) = β, τ (i) = β−α β
+                           1
+ 7:    A(i+1:m, i) = α−β      · A(i+1:m, i)
+    % Apply the Householder transformation to the trailing matrix
+ 8:    z = τ (i) · [A(i, i+1:b) + A(i+1:m, i)T · A(i+1:m, i+1:b)]
+ 9:    A(i+1:m, i+1:b) = A(i+1:m, i+1:b) − A(i+1:m, i) · z
+10: end for
+                 Qn                 T
+                                       
+Ensure: A =         i=1 (I − τi yi yi ) R
+Ensure: R overwrites the upper triangle and Y (the Householder vectors) has implicit unit diagonal and
+    overwrites the strict lower triangle of A; τ is an array of length b with τi = 2/(yiT yi )
+
+
+Because these steps occur for each column in the matrix, the total latency cost of the algorithm is 2b log p.
+This synchronization cost is a potential parallel scaling bottleneck, since it grows with the number of
+columns of the matrix and does not decrease with the number of processors. The bandwidth cost is domi-
+nated by the all-reduction of the z vector, which has length b − i at the ith step. Thus, the bandwidth cost
+of Householder-QR is (b2 /2) log p. The computation within the algorithm is load balanced for a parallel
+cost of (2mb2 − 2b3 /3)/p flops.
+
+3.1.2    2D Algorithm
+In the context of a 2D algorithm, in order to perform an update with the computed Householder vectors,
+we must also compute the T matrix from Y in parallel. The leading order cost of computing T −1 from
+Y T Y is mb2 /p flops plus the cost of reducing a symmetric b × b matrix, α · log p + β · b2 /2; note that the
+communication costs are lower order terms compared to computing Y . We present the costs of parallel
+Householder-QR in the first row of Table 1, combining the costs of Algorithm 1 with those of computing
+T.
+    We refer to the 2D algorithm that uses Householder-QR as the panel factorization as 2D-Householder-
+QR. In ScaLAPACK terms, this algorithm corresponds to pxgeqrf. The overall cost of 2D-Householder-
+QR, which includes panel factorizations and trailing matrix updates, is given to leading order by
+     6mnb − 3n2 b n2 b 2mn2 − 2n3 /3                          2mn − n2 n2
+                                                                                                       
+                                                                                                   2n
+γ·                 +     +                    +β· nb log pr +           +       +α· 2n log pr +       log pc .
+         2pr         2pc            p                             pr       pc                       b
+                                                                                                            √
+The derivation of these costs is very similar to that of CAQR-HR (see Section 4.3). If we pick pr = pc = p
+                                 √
+(assuming m ≈ n) and b = n/( p log p) then we obtain the leading order costs
+                                                                  √
+                           γ · (2mn2 − 2n3 /3)/p + β · (mn + n2 )/ p + α · n log p.
+Note that these costs match those of [1, 8], with exceptions coming from the use of more efficient collectives.
+The choice of b is made to preserve the leading constants of the parallel computational cost. We present
+the costs of 2D-Householder-QR in the first row of Table 2.
+
+3.2     Communication-Avoiding QR
+In this section we present parallel Tall-Skinny QR (TSQR) [1, Algorithm 1] and Communication-Avoiding
+QR (CAQR) [1, Algorithm 2], which are algorithms for computing a QR decomposition that are more
+
+                                                      4
+communication efficient than Householder-QR, particularly for tall and skinny matrices.
+
+3.2.1   1D Algorithm (TSQR)
+We present a simplified version of TSQR in Algorithm 2: we assume the number of processors is a power
+of two and use a binary reduction tree (TSQR can be performed with any tree). Note also that we present
+a reduction algorithm rather than an all-reduction (i.e., the final R resides on only one processor at the
+end of the algorithm). TSQR assumes the tall-skinny matrix A is distributed in block row layout so that
+each processor owns a (m/p) × n submatrix. After each processor computes a local QR factorization of
+its submatrix (line 1), the algorithm works by reducing the p remaining n × n triangles to one final upper
+triangular R = QT A (lines 2–10). The Q that triangularizes A is stored implicitly as a tree of sets of
+Householder vectors, given by {Yi,k }. In particular, {Yi,k } is the set of Householder vectors computed by
+processor i at the kth level of the tree. The ith leaf of tree, Yi,0 is the set of Householder vectors which
+processor i computes by doing a local QR on its part of the initial matrix A.
+    In the case of a binary tree, every internal node of the tree consists of a QR factorization of two stacked
+b × b triangles (line 6). This sparsity structure can be exploited, saving a constant factor of computation
+compared to a QR factorization of a dense 2b×b matrix. In fact, as of version 3.4, LAPACK has subroutines
+for exploiting this and similar sparsity structures (tpqrt). Furthermore, the Householder vectors generated
+during the QR factorization of stacked triangles have similar sparsity; the structure of the Yi,k for k > 0 is
+an identity matrix stacked on top of a triangle.
+    Because the set {Yi,k } constitutes the implicit tree representation of the orthogonal factor, it is impor-
+tant to note how the tree is distributed across processors since the Q factor will be either applied to a
+matrix (see [1, Algorithm 2]) or constructed explicitly (see Section 3.2.3). For a given Yi,k , i indicates the
+processor number (both where it is computed and where it is stored), and k indicates the level in the tree.
+Although 0 ≤ i ≤ p − 1 and 0 ≤ k ≤ log p, many of the Yi,k are null; for example, Yi,log p = ∅ for i > 0 and
+Yp−1,k = ∅ for k > 0. In the case of the binary tree in Algorithm 2, processor 0 computes and stores Y0,k
+for 0 ≤ k ≤ log p and thus requires O(b2 log p) extra memory.
+    The costs and analysis of TSQR are given in [1, 17]:
+
+                                   2mb2 2b3
+                                                           2       
+                                                              b
+                             γ·          +     log p + β ·       log p + α · log p.
+                                     p       3                 2
+We tabulate these costs in the second row of Table 1. We note that the TSQR inner tree factorizations
+require an extra computational cost O(b3 log p) and a bandwidth cost of O(b2 log p). Also note that in the
+context of a 2D algorithm, using TSQR as the panel factorization implies that there is no b × b T matrix
+to compute; the update of the trailing matrix is performed differently.
+
+3.2.2   2D Algorithm (CAQR)
+The 2D algorithm that uses TSQR for panel factorizations is known as CAQR. In order to update the
+trailing matrix within CAQR, the implicit orthogonal factor computed from TSQR needs to be applied as
+a tree in the same order as it was computed. See [1, Algorithm 2] for a description of this process, or see
+[18, Algorithm 4] for pseudocode that matches the binary tree in Algorithm 2. We refer to this application
+of implicit QT as Apply-TSQR-QT . The algorithm has the same tree dependency flow structure as TSQR
+but requires a bidirectional exchange between paired nodes in the tree. We note that in internal nodes of
+the tree it is possible to exploit the additional sparsity structure of Yi,k (an identity matrix stacked on top
+of a triangular matrix), which our implementation does via the use of the LAPACK v3.4+ routine tpmqrt.
+    Further, since A is m × n and intermediate values of rows of A are communicated, the trailing matrix
+update costs more than TSQR when n > b. In the context of CAQR on a square matrix, Apply-TSQR-QT
+is performed on a trailing matrix with n ≈ m columns. The extra work in the application of the inner
+                                                    √                                                      √
+leaves of the tree is proportional to O(n2 b log(p)/ p) and bandwidth cost proportional to O(n2 log(p)/ p).
+Since the cost of Apply-TSQR-QT is almost leading order in CAQR, it is desirable in practice to optimize
+
+                                                      5
+Algorithm 2 [{Yi,k }, R] = TSQR(A)
+Require: Number of processors is p and i is the processor index
+Require: A is m × b matrix distributed in block row layout; Ai is processor i’s block
+ 1: [Yi,0 , R̄i ] = Householder-QR(Ai )
+ 2: for k = 1 to dlog pe do
+ 3:     if i ≡ 0 mod 2k and i + 2k−1 < p then
+ 4:           j = i + 2k−1
+ 5:           Receive R̄j from processor j  
+                                             R̄i
+ 6:           [Yi,k , R̄i ] = Householder-QR
+                                             R̄j
+ 7:     else if i ≡ 2k−1 mod 2k then
+ 8:           Send R̄i to processor i − 2k−1
+ 9:     end if
+10: end for
+11: if i = 0 then
+12:     R = R̄0
+13: end if
+Ensure: A = QR with Q implicitly represented by {Yi,k }
+Ensure: R is stored by processor 0 and Yi,k is stored by processor i
+
+
+the update routine. However, the tree dependency structure complicates this manual developer or compiler
+optimization task.
+    The overall cost of CAQR is given to leading order by
+
+                         6mnb − 3n2 b       4nb2 3n2 b              6mn2 − 2n3
+                                                                             
+                   γ·                  +         +        log pr +                +
+                             2pr             3      2pc                  3p
+                          nb n2                2mn − n2
+                                                                                   
+                                                                   3n          4n
+                   β·        +       log pr +              +α·        log pr +    log pc .
+                           2    pc                pr                b           b
+
+See [1] for a discussion of these costs and [17] for detailed analysis. Note that the bandwidth cost is slightly
+                                                                                    √
+lower here due to the use of more efficient broadcasts. If we pick pr = pc = p (assuming m ≈ n) and
+        n
+b = √p log 2
+             p
+               then we obtain the leading order costs
+
+                                2mn2 − 2n3 /3                 2mn + n2 log p
+                                                                                                   
+                                                                                             7√
+                       γ·                           +β·           √                +α·          p log3 p .
+                                     p                              p                        2
+
+Again, we choose b to preserve the leading constants of the computational cost. Note that b needs to be
+chosen smaller here than in Section 3.1.2 due to the costs associated with Apply-TSQR-QT .
+    It is possible to reduce the costs of Apply-TSQR-QT further using ideas from efficient recursive dou-
+bling/halving collectives. See Appendix A for details.
+
+3.2.3    Constructing Explicit Q from TSQR
+In many use cases of QR decomposition, an explicit orthogonal factor is not necessary; rather, we need
+only the ability to apply the matrix (or its transpose) to another matrix, as done in the previous section.
+For our purposes (see Section 4), we will need to form the explicit m × b orthonormal matrix from the
+implicit tree representation.2 Though it is not necessary within CAQR, we describe it here because it is a
+known algorithm (see [19, Figure 4]) and the structure of the algorithm is very similar to TSQR.
+   2
+    In LAPACK terms, constructing (i.e., generating) the orthogonal factor when it is stored as a set of Householder vectors
+is done with orgqr.
+
+
+                                                                 6
+Algorithm 3 [B] = Apply-TSQR-QT ({Yi,k }, A)
+Require: Number of processors is p and i is the processor index
+Require: A is m × n matrix distributed in block row layout; Ai is processor i’s block
+Require: {Yi,k } is the implicit tree TSQR representation of b Householder vectors of length m.
+ 1: Bi = Apply-Householder-QT (Yi,0 , Ai )
+ 2: Let B̄i be the first b rows of Bi
+ 3: for k = 1 to dlog pe do
+ 4:    if i ≡ 0 mod 2k and i + 2k−1 < p then
+ 5:        j = i + 2k−1
+ 6:        Receive
+             B̄j from processor j                 
+             B̄i                                     B̄
+ 7:              = Apply-Householder-Q     T  Yi,k , i
+             B̄j                                     B̄j
+ 8:        Send B̄j back to processor j
+ 9:    else if i ≡ 2k−1 mod 2k then
+10:        Send B̄i to processor i − 2k−1
+11:        Receive updated rows B̄i from processor i − 2k−1
+12:        Set the first b rows of Bi to B̄i
+13:    end if
+14: end for
+Ensure: B = QT A with processor i owning block Bi , where Q is the orthogonal matrix implicitly repre-
+    sented by {Yi,k }
+
+
+    Algorithm 4 presents the method for constructing the m × b matrix Q by applying the (implicit) square
+orthogonal factor to the first b columns of the m×m identity matrix. Note that while we present Algorithm
+4 assuming a binary tree, any tree shape is possible, as long as the implicit Q is computed using the same
+tree shape as TSQR. While the nodes of the tree are computed from leaves to root, they will be applied in
+reverse order from root to leaves. Note that in order to minimize the computational cost, the sparsity of
+the identity matrix at the root node and the sparsity structure of {Yi,k } at the inner tree nodes is exploited.
+In particular, since Ib is upper triangular and Y0,dlog pe has the structure of identity stacked on top of an
+upper triangle, the output of the root node application in line 7 is a stack of two upper triangles. By
+induction, since every Yi,k for k > 0 has the same structure, all output Qi,k are triangular matrices. At
+the leaf nodes, when Yi,0 is applied in line 13, the output is a dense (m/p) × b block.
+    Since the communicated matrices Q̄j are triangular just as R̄j was triangular in the TSQR algorithm,
+Construct-TSQR-Q incurs the exact same computational and communication costs as TSQR. So, we can
+reconstruct the unique part of the Q matrix from the implicit form given by TSQR for the same cost as
+the TSQR itself.
+
+3.3   Yamamoto’s Basis-Kernel Representation
+The main goal of this work is to combine Householder-QR with CAQR; Yamamoto [11] proposes a scheme
+to achieve this. As described in Section 3.1, 2D-Householder-QR suffers from a communication bottleneck
+in the panel factorization. TSQR alleviates that bottleneck but requires a more complicated (and slightly
+less efficient) trailing matrix update. Motivated in part to improve the performance and programmability
+of a hybrid CPU/GPU implementation, Yamamoto suggests computing a representation of the orthogonal
+factor that triangularizes the panel that mimics the representation in Householder-QR.
+    As described by Sun and Bischof [20], there are many so-called “basis-kernel” representations of an
+orthogonal matrix. See also [21] for general discussion of block reflectors. For example, the Householder-
+
+
+
+
+                                                       7
+Algorithm 4 Q = Construct-TSQR-Q({Yi,k })
+Require: Number of processors is p and i is the processor index
+Require: {Yi,k } is computed by Algorithm 2 so that Yi,k is stored by processor i
+ 1: if i = 0 then
+ 2:     Q̄0 = Ib
+ 3: end if
+ 4: for k = dlog pe down to 1 do
+ 5:     if i ≡ 0 mod 2k and i + 2k−1 < p then
+ 6:         j = i + 2k−1                       
+              Q̄i                                 Q̄
+ 7:                 = Apply-Householder-Q Yi,k , i
+              Q̄j                                  0
+ 8:          Send Q̄j to processor j
+ 9:     else if i ≡ 2k−1 mod 2k then
+10:          Receive Q̄i from processor i − 2k−1
+11:     end if
+12: end for                           
+                                        Q̄i
+13: Qi = Apply-Q-to-Triangle Yi,0 ,
+                                         0
+Ensure: Q is orthonormal m × b matrix distributed in block row layout; Qi is processor i’s block
+
+
+QR algorithm computes a lower triangular matrix Y such that A = (I − Y T Y1T )R, so that
+                                                    
+                                                    Y
+                             Q = I − Y T Y T = I − 1 T Y1T Y2T .
+                                                                  
+                                                                                                        (2)
+                                                    Y2
+Here, Y is called the “basis” and T is called the “kernel” in this representation of the square orthogonal
+factor Q. However, there are many such basis-kernel representations if we do not restrict Y and T to be
+lower and upper triangular matrices, respectively.
+           [11] chooses a basis-kernel representation that is easy to compute. For an m × b matrix A,
+    Yamamoto
+           Q1
+let A =         R where Q1 and R are b × b. Then define the basis-kernel representation
+           Q2
+                                                      
+                                          T       Q1 −I        −T 
+                                                                      (Q1 −I)T QT2 ,
+                                                                                  
+                         Q = I − Ỹ T̃ Ỹ = I −           I−Q1                                          (3)
+                                                   Q2
+                                                                                                    
+                                                                                T            T      R
+where I − Q1 is assumed to be nonsingular. It can be easily verified that Q Q = I and Q A =            ; in
+                                                                                                    0
+fact, this is the representation suggested and validated by [22, Theorem 3]. Note that both the basis and
+kernel matrices Ỹ and T̃ are dense.
+    The main advantage of basis-kernel representations is that they can be used to apply the orthogonal
+factor (or its transpose) very efficiently using matrix multiplication. In particular, the computational
+complexity of applying QT using any basis-kernel is the same to leading order, assuming Y has the same
+dimensions as A and m  b. Thus, it is not necessary to reconstruct the Householder vectors; from a
+computational perspective, finding any basis-kernel representation of the orthogonal factor computed by
+TSQR will do. Note also that in order to apply QT with the representation in Equation (3), we need to
+apply the inverse of I − Q1 , so we need to perform an LU decomposition of the b × b matrix and then apply
+the inverses of the triangular factors using triangular solves.
+    The assumption that I − Q1 is nonsingular can be dropped by replacing I with a diagonal sign matrix
+S chosen so that S − Q1 is nonsingular [23]; in this case the representation becomes
+                                                      
+                                         T       Q1 −S            −T 
+                                                                        (Q1 −S)T QT2 .
+                                                                                    
+                       QS = I − Ỹ T̃ Ỹ = I −           S S−Q1                                         (4)
+                                                   Q2
+
+                                                    8
+   Yamamoto’s approach is very closely related to TSQR-HR (Algorithm 6), presented in Section 4. We
+compare the methods in Section 4.1.
+
+
+4        New Algorithms
+We first present our main contribution, a parallel algorithm that performs TSQR and then reconstructs the
+Householder vector representation from the TSQR representation of the orthogonal factor. We then show
+that this reconstruction algorithm may be used as a building block for more efficient 2D QR algorithms. In
+particular, the algorithm is able to combine two existing approaches for 2D QR factorizations, leveraging
+the efficiency of TSQR in panel factorizations and the efficiency of Householder-QR in trailing matrix
+updates. While Householder reconstruction adds some extra cost to the panel factorization, we show that
+its use in the 2D algorithm reduces overall communication compared to both 2D-Householder-QR and
+CAQR.
+
+4.1        TSQR with Householder Reconstruction
+The basic steps of our 1D algorithm include performing TSQR, constructing the explicit tall-skinny Q
+factor, and then computing the Householder vectors corresponding to Q. The key idea of our reconstruction
+algorithm is that performing Householder-QR on an orthonormal matrix Q is the same as performing an
+LU decomposition on Q − S, where S is a diagonal sign matrix corresponding to the sign choices made
+inside the Householder-QR algorithm. This claim is proved explicitly in Lemma 5.2. Informally, ignoring
+signs, if Q = I − Y T Y1T with Y a matrix of Householder vectors, then Y · (−T Y1T ) is an LU decomposition
+of Q − I since Y is unit lower triangular and T Y1T is upper triangular.
+    In this section we present Modified-LU as Algorithm 5, which can be applied to any orthonormal matrix
+(not necessarily one obtained from TSQR). Ignoring lines 1, 3, and 4, it is exactly LU decomposition without
+pivoting. Note that with the choice of S, no pivoting is required since the effective diagonal entry will be at
+least 1 in absolute value and all other entries in the column are bounded by 1 (the matrix is orthonormal).3
+This holds true throughout the entire factorization because the trailing matrix remains orthonormal, which
+we prove within Lemma 5.2.
+
+Algorithm 5 [L, U, S] = Modified-LU(Q)
+Require: Q is m × b orthonormal matrix
+ 1: S = 0
+ 2: for i = 1 to b do
+ 3:     S(i, i) = − sgn(Q(i, i))
+ 4:     Q(i, i) = Q(i, i) − S(i, i)
+    % Scale ith column of L by diagonal element
+                           1
+ 5:     Q(i+1:m, i) = Q(i,i)  · Q(i+1:m, i)
+    % Perform Schur complement update
+ 6:     Q(i+1:m, i+1:b) = Q(i+1:m, i+1:b)−Q(i+1:m, i)·Q(i, i+1:b)
+ 7: end for
+Ensure: U overwrites the upper triangle and L has implicit unit diagonal and overwrites the strict lower
+    triangle of Q; S is diagonal so that Q − S = LU
+
+    Given the algorithms of the previous sections, we now present the full approach for computing the
+QR decomposition of a tall-skinny matrix using TSQR and Householder reconstruction. That is, in this
+section we present an algorithm such that the format of the output of the algorithm is identical to that
+of Householder-QR. However, we argue that the communication costs of this approach are much less than
+those of performing Householder-QR.
+    3
+        We use the convention sgn(0) = 1.
+
+
+                                                      9
+                                                Flops        Words      Messages
+                                             3mb2     2b3    b2
+                        Householder-QR          p − 3p        2 log p    2b log p
+                                           2mb2   2b3        b2
+                            TSQR            p + 3 log p       2 log p     log p
+                                           5mb2   4b3
+                          TSQR-HR           p + 3 log p      b2 log p    4 log p
+
+Table 1: Costs of QR factorization of tall-skinny m × b matrix distributed over p processors in 1D fashion.
+We assume these algorithms are used as panel factorizations in the context of a 2D algorithm applied to
+an m × n matrix. Thus, costs of Householder-QR and TSQR-HR include the costs of computing T .
+    The method, given as Algorithm 6, is to perform TSQR (line 1), construct the tall-skinny Q factor
+explicitly (line 2), and then compute the Householder vectors that represent that orthogonal factor using
+Modified-LU (line 3). The R factor is computed in line 1 and the Householder vectors (the columns of Y )
+are computed in line 3. An added benefit of the approach is that the triangular T matrix, which allows for
+block application of the Householder vectors, can be computed very cheaply. That is, a triangular solve
+involving the upper triangular factor from Modified-LU computes the T so that A = (I − Y T Y1T )R. To
+compute T directly from Y (as is necessary if Householder-QR is used) requires O(nb2 ) flops; here the
+triangular solve involves O(b3 ) flops. Our approach for computing T is given in line 4, and line 5 ensures
+sign agreement between the columns of the (implicitly stored) orthogonal factor and rows of R.
+
+Algorithm 6 [Y, T, R] = TSQR-HR(A)
+Require: A is m × b matrix distributed in block row layout
+ 1: [{Yi,k }, R̃] = TSQR(A)
+ 2: Q = Construct-TSQR-Q({Yi,k })
+ 3: [Y, U, S] = Modified-LU(Q)
+                   −T
+ 4: T = −U SY1
+ 5: R = S R̃
+Ensure: A = (I − Y T Y1T )R, where Y is m × b and unit lower triangular, Y1 is top b × b block of Y , and
+    T and R are b × b and upper triangular
+
+   On p processors, Algorithm 6 incurs the following costs (ignoring lower order terms):
+
+  1. Compute [{Yi,k }, R0 ] = TSQR(A)
+     The computational costs of this step come from lines 1 and 6 in Algorithm 2. Line 1 corresponds
+     to a QR factorization of a (m/p) × b matrix, with a flop count of 2(m/p)b2 − 2b3 /3 (each processor
+     performs this step simultaneously). Line 6 corresponds to a QR factorization of a b × b triangle
+     stacked on top of a b × b triangle. Exploiting the sparsity structure, the flop count is 2b3 /3; this
+     occurs at every internal node of the binary tree, so the total cost in parallel is (2b3 /3) log p.
+     The communication costs of Algorithm 2 occur in lines 5 and 8. Since every Ri,k is a b × b upper
+     triangular matrix, the cost of a single message is α + β · (b2 /2). This occurs at every internal node
+     in the tree, so the total communication cost in parallel is a factor log p larger.
+     Thus, the cost of this step is
+
+                                    2mb2 2b3
+                                                        2      
+                                                          b
+                               γ·       +    log p + β ·     log p + α · log p.
+                                     p    3                2
+
+  2. Q = Construct-TSQR-Q({Yi,k })
+     The computational costs of this step come from lines 7 and 13 in Algorithm 4. Note that for k > 0,
+     Yi,k is a 2b×b matrix: the identity matrix stacked on top of an upper triangular matrix. Furthermore,
+     Qi,k is an upper triangular matrix. Exploiting the structure of Yi,k and Qi,k , the cost of line 7 is
+     2b3 /3, which occurs at every internal node of the tree. Each Yi,0 is a (m/p) × b lower triangular
+
+                                                    10
+     matrix of Householder vectors, so the cost of applying them to an upper triangular matrix in line 13
+     is 2(m/p)b2 − 2b3 /3. Note that the computational cost of these two lines is the same as those of the
+     previous step in Algorithm 2.
+     The communication pattern of Algorithm 4 is identical to Algorithm 2, so the communication cost
+     is also the same as that of the previous step.
+     Thus, the cost of constructing Q is
+
+                                   2mb2 2b3
+                                                       2      
+                                                         b
+                              γ·        +   log p + β ·     log p + α · log p.
+                                    p     3               2
+
+  3. [Y, U, S] = Modified-LU(Q)
+     Ignoring lines 3–4 in Algorithm 5, Modified-LU is the same as LU without pivoting. In parallel, the
+     algorithm consists of a b×b (modified) LU factorization of the top block followed by parallel triangular
+     solves to compute the rest of the lower triangular factor. The flop count of the b × b LU factorization
+     is 2b3 /3, and the cost of each processor’s triangular solve is (m/p)b2 . The communication cost of
+     parallel Modified-LU is only that of a broadcast of the upper triangular b × b U factor (for which we
+     use a bidirectional-exchange algorithm): β · (b2 ) + α · (2 log p).
+     Thus, the cost of this step is
+
+                                               mb2 2b3
+                                                        
+                                      γ·          +          + β · b2 + α · 2 log p
+                                                p   3
+
+  4. T = −U SY1−T and R = SR0
+     The last two steps consist of computing T and scaling the final R appropriately. Since S is a sign
+     matrix, computing U S and SR0 requires no floating point operations and can be done locally on one
+     processor. Thus, the only computational cost is performing a b × b triangular solve involving Y1T .
+     If we ignore the triangular structure of the output, the flop count of this operation is b3 . However,
+     since this operation occurs on the same processor that computes the top m/p × b block of Y and
+     U , it can be overlapped with the previous step (Modified-LU). After the top processor performs the
+     b × b LU factorization and broadcasts the U factor, it computes only m/p − b rows of Y (all other
+     processors update m/p rows). Thus, performing an extra b × b triangular solve on the top processor
+     adds no computational cost to the critical path of the algorithm.
+
+   Thus, TSQR-HR(A) where A is m-by-b incurs the following costs (ignoring lower order terms):
+
+                          5mb2 4b3
+                                          
+                                      log p + β · b2 log p + α · (4 log p) .
+                                                          
+                     γ·         +                                                                        (5)
+                           p       3
+
+    Note that the LU factorization required in Yamamoto’s approach (see Section 3.3) is equivalent to
+performing Modified-LU(−Q1 ). In Algorithm 6, the Modified-LU algorithm is applied to an m × b matrix
+rather than to only the top b × b block; since no pivoting is required, the only difference is the update
+of the bottom m − b rows with a triangular solve. Thus it is not hard to see that, ignoring signs, the
+Householder basis-kernel representation in Equation (2) can be obtained from the representation given in
+Equation (3) with two triangular solves: if the LU factorization gives I − Q1 = LU , then Y = Ỹ U −1 and
+T = U L−T . Indeed, performing these two operations and handling the signs correctly gives Algorithm
+6. While Yamamoto’s approach avoids performing the triangular solve on Q2 , it still involves performing
+both TSQR and Construct-TSQR-Q.
+
+
+
+
+                                                     11
+                                                Flops         Words        Messages
+                                              2mn2 −2n3 /3    2mn+n2 /2
+                       2D-Householder-QR           p
+                                                                 √
+                                                                   p        n log p
+                                              2mn2 −2n3 /3   2mn+n 2
+                                                                 √ log p   7√     3
+                              CAQR                 p               p       2 p log p
+                                              2mn2 −2n3 /3    2mn+n2 /2     √     2
+                           CAQR-HR                 p
+                                                                 √
+                                                                   p       6 p log p
+
+Table 2: Costs of QR factorization of m × n matrix distributed over p processors in 2D fashion. Here we
+assume a square processor grid (pr = pc ). We also choose block sizes for each algorithm independently to
+ensure the leading order terms for flops are identical.
+4.2   LU Decomposition of A − R
+Computing the Householder vectors basis-kernel representation via Algorithm 6 requires forming the ex-
+plicit m × b orthonormal matrix. It is possible to compute this representation
+                                                                              more cheaply, though at
+                                                                        R1
+the expense of losing numerical stability. Suppose A is full rank, R =     is the upper triangular factor
+                                                                        0
+computed by TSQR, and A − R is also full rank. Then A = (I − Y T Y1T )R1 implies that the unique LU
+decomposition of A − R is given by
+                                           A − R = Y (−T Y1T R1 ),                                    (6)
+since Y is unit lower triangular and T , Y1T , and R1 are all upper triangular. The assumption that A − R
+is full rank can be dropped
+                             by choosing an appropriate diagonal sign matrix S and computing the LU
+                         SR1
+decomposition of A −          .
+                          0
+    Not surprisingly, choosing the signs to match the choices of the Householder-QR algorithm applied to
+A guarantees that the matrix is nonsingular. In fact, the signs can be computed during the course of a
+modified LU decomposition algorithm very similar to Algorithm 5 (designed for general matrices rather
+than only orthonormal). This more general algorithm can also be interpreted as performing Householder-
+QR on A but using R to provide “hints” to the algorithm to avoid certain expensive computations; see
+Appendix B for more details.
+    The advantage of this approach is that Y can be computed without constructing Q explicitly, which
+is as expensive as TSQR itself. Unfortunately, this method is not numerically stable. An intuition for
+the instability comes from considering a low-rank matrix A. Because the QR decomposition of A is
+not unique, the TSQR algorithm and the Householder-QR algorithm may compute different factor pairs
+(QTSQR , RTSQR ) and (QHh , RHh ). Performing an LU decomposition using A and RTSQR to recover the
+Householder vectors that represent QHh is hopeless if RTSQR 6= RHh , even in exact arithmetic. In floating
+point arithmetic, an ill-conditioned A corresponds to a factor R which is sensitive to roundoff error, so
+reconstructing the Householder vectors that would produce the same R as computed by TSQR is unstable.
+However, if A is well-conditioned, then this method is sufficient; one can view Algorithm 5 as applying the
+method to an orthonormal matrix (which is perfectly conditioned).
+    One method of decreasing the sensitivity of R is to employ column pivoting. That is, after performing
+TSQR apply QR with column pivoting to the b × b upper triangular factor R, yielding a factorization
+A = QTSQR (Q̃R̃P ), or AP = (QTSQR Q̃)R̃, where the diagonal entries of R decrease monotonically   in
+                                                                                                  S R̃
+absolute value. We have observed experimentally that performing LU decomposition of AP −                is a
+                                                                                                   0
+more stable operation than not using column pivoting, though it is still not as robust as Algorithm 6. See
+Section 5 for a discussion of experiments where the instability occurs (even with column pivoting).
+
+4.3   CAQR-HR
+We refer to the 2D algorithm that uses TSQR-HR for panel factorizations as CAQR-HR. Because Householder-
+QR and TSQR-HR generate the same representation as output of the panel factorization, the trailing matrix
+
+
+                                                     12
+Algorithm 7 [Y, T, R] = CAQR-HR(A)
+Require: A is m × n and distributed block-cyclically on p = pr · pc processors with block size b, so that
+    each b × b block Aij is owned by processor Π(i, j) = (i mod pr ) + pr · (j mod pc )
+ 1: for i = 0 to n/b − 1 do
+    % Compute
+                 TSQR and     reconstruct Householder representation using column of pr processors
+ 2:      Yi:m/b−1,i , Ti , Rii = Hh-Recon-TSQR(Ai:m/b−1,i )
+    % Update trailing matrix using all p processors
+ 3:    Π(i, i) broadcasts Ti to all other processors
+ 4:    for r ∈ [i, m/b − 1], c ∈ [i + 1, n/b − 1] do in parallel
+ 5:         Π(r, i) broadcasts Yri to all processors in its row, Π(r, :)
+ 6:         Π(r, c) computesP     W̃rc = YriT · Arc
+ 7:         Allreduce Wc = r W̃rc so that processor column Π(:, c) owns Wc
+ 8:         Π(r, c) computes Arc = Arc − Yri · TiT · Wc
+ 9:         Set Ric = Aic
+10:    end for
+11: end for                              
+                  Qn                   T) R
+Ensure: A =          i=1  (I − Y   T Y
+                                :,i i :,i
+
+
+
+
+update can be performed in exactly the same way. Thus, the only difference between 2D-Householder-QR
+and CAQR-HR, presented in Algorithm 7, is the subroutine call for the panel factorization (line 2).
+    Algorithm 7 with block size b, and matrix m-by-n matrix A, with m ≥ n and m, n ≡ 0 (mod b)
+distributed on a 2D pr -by-pc processor grid incurs the following costs over all n/b iterations.,
+                                                                
+   1. Compute Yi:m/b−1,i , Ti , Rii = Hh-Recon-TSQR Ai:m/b−1,i
+     Equation (5) gives the cost of a single panel TSQR factorization with Householder reconstruction.
+     We can sum over all iterations to obtain the cost of this step in the 2D QR algorithm (line 2 in
+     Algorithm 7),
+
+
+                    n/b−1 
+                              5(m − ib)b2 4b3
+                     X                                                                  
+                                                                2
+                                                                        
+                          γ·              +      log pr + β · b log pr + α · (4 log pr ) =
+                                   pr         3
+                    i=0
+                        5mnb 5n2 b 4nb2
+                                                                                     
+                                                                              4n log pr
+                   γ·        −       +      log pr + β · (nb log pr ) + α ·
+                         pr     2pr     3                                         b
+
+  2. Π(i, i) broadcasts Ti to all other processors
+     The matrix Ti is b-by-b and triangular, so we use a bidirectional exchange broadcast. Since there are
+     a total of n/b iterations, the total communication cost for this step of Algorithm 7 is
+
+                                                                         
+                                                                  2n
+                                             β · (nb) + α ·          log p
+                                                                   b
+
+  3. Π(r, i) broadcasts Yri to all processors in its row, Π(r, :)
+     At this step, each processor which took part in the TSQR and Householder reconstruction sends
+     its local chunk of the panel of Householder vectors to the rest of the processors. At iteration i of
+     Algorithm 7, each processor owns at most d m/b−i
+                                                  pr e blocks Yri . Since all the broadcasts happen along
+     processor rows, we assume they can be done simultaneously on the network. The communication
+     along the critical path is then given by
+
+                                                      13
+               n/b−1 
+                                   2(m/b − i) · b2                                         2mn − n2
+                                                                                                                                 
+                X                                                                                                          2n
+                          β·                                + α · 2 log pc       =β·                          +α·             log pc
+                                        pr                                                   pr                             b
+                i=0
+
+  4. Π(r, c) computes W̃rc = YriT · Arc
+     Each block W̃rc is computed on processor Π(r, c), using Arc , which it owns, and Yri , which it just
+     received from processor Π(r, i). At iteration i, processor j may own up to d m/b−i        n/b−i
+                                                                                      pr e · d pc e blocks
+     W̃rc , Π(r, c) = j. Each, block-by-block multiply incurs 2b3 flops, therefore, this step incurs a total
+     computational cost of
+                                                                                 
+                                            n/b−1
+                                             X 2(m/b − i)(n/b − i)b3                        
+                                                                                                mn2 − n3 /3
+                                                                                                                   
+                                   γ·                                            =γ·
+                                                                  p                                 p
+                                             i=0
+
+                       P
+  5. Allreduce Wc =          r W̃rc so that processor column Π(:, c) owns Wc
+
+     At iteration i of Algorithm 7, each processor j may own up to d m/b−i         n/b−i
+                                                                           pr e · d pc e blocks Wrc . The
+     local part of the reduction can be done during the computation of Wrc on line 6 of Algorithm 7.
+     Therefore, no process should contribute more than d n/b−i
+                                                            pc e b-by-b blocks Wrc to the reduction. Using
+     a bidirectional exchange all-reduction algorithm and summing over the iterations, we can obtain the
+     cost of this step throughout the entire execution of the 2D algorithm:
+
+                   n/b−1 
+                                           2(n/b − i) · b2                                      n2
+                                                                                                                         
+                      X                                                                                            2n
+                                  β·                             + α · 2 log pr       =β·                +α·          log pr
+                                                 pc                                             pc                  b
+                      i=0
+
+  6. Π(r, c) computes Arc = Arc − Yri · Ti · Wc
+     Since in our case, m ≥ n, it is faster to first multiply Ti by Wc rather than Yri by Ti . Any processor
+     j may update up to d m/b−i       n/b−i                        m/b−i                      n/b−i
+                            pr e · d pc e blocks of Arc using d pr e blocks of Yri and d pc e blocks of
+     Wc . When multiplying Ti by Wc , we can exploit the triangular structure of T , to lower the flop count
+     by a factor of two. Summed over all iterations, these two multiplications incur a computational cost
+     of
+                                                                                   
+                          n/b−1
+                          X 2(m/b − i)(n/b − i)b3                       (n/b − i)b3 
+                                                                                          
+                                                                                            mn2 − n3 /3 n2 b
+                                                                                                             
+                 γ·                                                  +               =γ·              +
+                                                    p                       pc                  p        2pc
+                            i=0
+
+    The overall costs of CAQR-HR are given to leading order by
+
+                           10mnb − 5n2 b 4nb2          n2 b 2mn2 − 2n3 /3
+                                                                            
+                      γ·                +     log pr +     +                   +
+                                2pr         3          2pc           p
+                                      2mn − n2 n2
+                                                                               
+                                                             8n          4n
+                      β · nb log pr +         +      +α·        log pr +    log pc .
+                                        pr      pc            b           b
+                     √
+If we pick pr = pc = p (assuming m ≈ n) and b = √p nlog p then we obtain the leading order costs
+
+                                  2mn2 − 2n3 /3                       2mn + n2 /2
+                                                                                   
+                                                                                                 √
+                                                                                          + α · 6 p log2 p ,
+                                                                                                          
+                       γ·                                   +β·          √
+                                       p                                   p
+
+shown in the third row of Table 2.
+
+
+
+                                                                       14
+    Comparing the leading order costs of CAQR-HR with the existing approaches, we note again the
+O(n log p) latency cost incurred by the 2D-Householder-QR algorithm. CAQR and CAQR-HR eliminate
+this synchronization bottleneck and reduce the latency cost to be independent of the number of columns
+of the matrix. Further, both the bandwidth and latency costs of CAQR-HR are factors of O(log p) lower
+than CAQR (when m ≈ n). As previously discussed, CAQR includes an extra leading order bandwidth
+                        √
+cost term (β · n2 log p/ p), as well as a computational cost term (γ · (n2 b/pc ) log pr ) that requires the choice
+of a smaller block size and leads to an increase in the latency cost.
+    Further, the Householder form allows us to decouple the block sizes used for the trailing matrix update
+from the width of each TSQR. This is a simple algorithmic optimization to add to our 2D algorithm, which
+has the same leading order costs. We show this nested blocked approach in Algorithm 8, which is very
+similar to Algorithm 7, and does not require any additional subroutines. While this algorithm does not
+have a theoretical benefit, it is highly beneficial in practice, as we will demonstrate in the performance
+section. We note that it is not possible to aggregate the implicit TSQR updates in this way.
+
+Algorithm 8 [Y, T, R] = CAQR-HR-Agg(A)
+Require: A is m × n and distributed block-cyclically on p = pr · pc processors with block size b1 , so that
+    each b1 × b1 block Aij is owned by processor Π(i, j) = (i mod pr ) + pr · (j mod pc )
+ 1: for i = 0 to n/b2 − 1 do
+                               
+ 2:      Yi:m/b2 −1,i , Ti , Rii = CAQR-HR(Ai:m/b2 −1,i )
+ 3:    Aggregate updates from line 5 of CAQR-HR into (m − ib2 )-by-b2 matrix Ȳri
+ 4:    for r ∈ [i, m/b2 − 1], c ∈ [i + 1, n/b2 − 1] do in parallel
+ 5:         Π(r, c) computesP       W̃rc = ȲriT · Arc
+ 6:         Allreduce Wc = r W̃rc so that processor column Π(:, c) owns Wc
+ 7:         Π(r, c) computes Arc = Arc − Ȳri · TiT · Wc
+ 8:         Set Ric = Aic
+ 9:    end for
+10: end for                                  
+                  Qn                       T) R
+Ensure: A =          i=1  (I  −  Y:,i Ti Y:,i
+
+
+
+
+5    Correctness and Stability
+In order to reconstruct the lower trapezoidal Householder vectors that constitute an orthonormal matrix (up
+to column signs), we can use an algorithm for LU decomposition without pivoting on an associated matrix
+(Algorithm 5). Lemma 5.1 shows by uniqueness that this LU decomposition produces the Householder
+vectors representing the orthogonal matrix in exact arithmetic. Given the explicit orthogonal factor, the
+LU method is cheaper in terms of both computation and communication than constructing the vectors via
+Householder-QR.
+Lemma 5.1. Given an orthonormal m × b matrix Q, let the compact QR decomposition of Q given by the
+Householder-QR algorithm (Algorithm 1) be
+                                                      
+                                            In         T
+                                     Q=        − Y T Y1 S,
+                                             0
+
+where Y is unit lower triangular, Y1 is the top b × b block of Y , and T is the
+                                                                               upper triangular b × b matrix
+                                                                           S
+satisfying T −1 +T T = Y T Y . Then S is a diagonal sign matrix, and Q−        has a unique LU decomposition
+                                                                            0
+given by                                        
+                                                S
+                                          Q−       = Y · (−T Y1T S).                                      (7)
+                                                0
+
+
+                                                        15
+Proof. Since Q is orthonormal, it has full rank and therefore has a unique QR decomposition with positive
+diagonal entries in the upper triangular matrix. This decomposition is Q = Q · In , so the Householder-QR
+algorithm must compute a decomposition that differs only by sign. Thus, S is a diagonal sign matrix. The
+uniqueness of T is guaranteed by [20, Example 2.4].
+    We obtain Equation (7) by rearranging the Householder QR decomposition. Since Y is unit lower
+triangular and T , Y1T , and S are all upper triangular, we have
+                                                                   an LU decomposition. Since Y is full
+                                                             S
+column rank and T , Y1T , and S are all nonsingular, Q −          has full column rank and therefore has a
+                                                              0
+unique LU decomposition with a unit lower triangular factor.
+
+    Unfortunately, given an orthonormal matrix Q, the sign matrix
+                                                             S produced by Householder-QR is not
+                                                            S
+known, so we cannot run a standard LU algorithm on Q −         . Lemma 5.2 shows that by running the
+                                                            0
+Modified-LU algorithm (Algorithm 5), we can cheaply compute the sign matrix S during the course of the
+algorithm.
+Lemma 5.2. In exact arithmetic, Algorithm 5 applied to an orthonormal m × b matrix Q computes the
+same Householder vectors Y and sign matrix S as the Householder-QR algorithm (Algorithm 1) applied to
+Q.
+Proof. Consider applying one step of Modified-LU (Algorithm 5) to the orthonormal matrix Q, where we
+first set S11 = − sgn(q11 ) and subtract it from q11 . Note that since all other entries of the first column
+are less than 1 in absolute value and the absolute value of the diagonal entry has been increased by 1,
+the diagonal entry is the maximum entry. Following the LU algorithm, all entries below the diagonal are
+scaled by the reciprocal of the diagonal element: for 2 ≤ i ≤ m,
+                                                           qi1
+                                             yi1 =                   ,                                   (8)
+                                                     q11 + sgn(q11 )
+where Y is the computed lower triangular factor. The Schur complement is updated as follows: for
+2 ≤ i ≤ m and 2 ≤ j ≤ b,
+                                                     qi1 q1j
+                                    q̃ij = qij −                 .                           (9)
+                                                 q11 + sgn(q11 )
+    Now consider applying one step of the Householder-QR algorithm (Algorithm 1). To match the LA-
+PACK notation, we let α = q11 , β = − sgn(α) · kq1 k = − sgn(α), and τ = β−α
+                                                                           β = 1 + α sgn(α), where we
+use the fact that the columns of Q have unit norm. Note that β = − sgn(α) = S11 , which matches the
+Modified-LU algorithm above. The Householder vector y is computed by setting the diagonal entry to 1
+                                        1       1
+and scaling the other entries of q1 by α−β = α+sgn(α) . Thus, computing the Householder vector matches
+computing the column of the lower triangular matrix from Modified-LU in Equation (8) above.
+    Next, we consider the update of the trailing matrix: Q̃ = (I − τ yy T )Q. Since Q has orthonormal
+columns, the dot product of the Householder vector with the jth column is given by
+                                     m                    m
+                             T
+                                     X                    X qi1
+                            y qj =       yi qij = q1j +            qij
+                                                        α + sgn(α)
+                                   i=1              i=2
+                                                                       
+                                           q11 q1j               α
+                                 = q1j −             = 1−                 q1j .
+                                         α + sgn(α)          α + sgn(α)
+The identity                                                               
+                                                                   α
+                                   (1 + α sgn(α)) 1 −                           =1
+                                                               α + sgn(α)
+implies τ y T qj = q1j . Then the trailing matrix update (2 ≤ i ≤ m and 2 ≤ j ≤ b) is given by
+                                                                         qi1 q1j
+                                 q̃ij = qij − yi (τ y T qj ) = qij −              ,
+                                                                       α + sgn(α)
+
+                                                          16
+which matches the Schur complement update from Modified-LU in Equation (9) above.
+    Finally, consider the jth element of first row of the trailing matrix (j ≥ 2): q̃ij = qij − y1 (τ y T qj ) = 0.
+Note that the computation of the first row is not performed in the Modified-LU algorithm. The correspond-
+ing row is not changed since the diagonal element is Y11 = 1. However, in the case of Householder-QR,
+since the first row of the trailing matrix is zero, and because the Householder transformation preserves
+column norms, the updated (m − 1) × (b − 1) trailing matrix is itself an orthonormal matrix. Thus, by
+induction, the rest of the two algorithms perform the same computations.
+
+   In order to bound the error in the decomposition of a general matrix using Householder reconstruction,
+we will use Lemma 5.4 below as well as the stability bounds on the TSQR or “AllReduce” algorithm
+provided in [24]. We restate those results here.
+
+Lemma 5.3 ([24]). Let R̂ be the computed upper triangular factor of m × b matrix A obtained via the
+AllReduce algorithm using a binary tree of height L (m/2L ≥ b). Then there exists an orthonormal matrix
+Q such that
+                                    kA − QR̂kF ≤ f1 (m, b, L, ε)kAkF
+and
+                                         kQ − Q̂kF ≤ f2 (m, b, L, ε),
+                                                                                 √
+where f1 (m, b, L, ε) ≃ bγc· mL + Lbγc·2b and f2 (m, b, L, ε) ≃ bγc· mL + Lbγc·2b    b, for bγc· mL  1 and
+                            2                                         2                         2
+bγc·2b  1, where c is a small constant.
+
+    The following lemma shows that the computation performed in Algorithm 5 is more stable than general
+LU decomposition. Because it is performed on an orthonormal matrix, the growth factor in the upper
+triangular factor is bounded by 2, and we can bound the Frobenius norms of both computed factors by
+functions of the number of columns. Further, we can stably compute the T̃ factor (needed to apply a
+blocked Householder update) from the upper triangular LU factor, a computationally cheaper method
+than using the Householder vectors themselves.
+
+Lemma 5.4. In floating point arithmetic, given an orthonormal m × b matrix Q, Algorithm 5 computes
+factors S, Ỹ , and T̃ such that
+                                                       
+                                          I
+                                 QS −        − Ỹ T̃ Ỹ1T     ≤ f3 (b, ε).
+                                          0                 F
+
+where                                                              √  
+                                                               2
+                                        f3 (b, ε) = 2γb        b + 1+ 2 b
+
+and Y1 is given by the first b rows of Y .
+
+Proof. This result follows from the standard error analysis of LU decomposition and triangular solve with
+multiple right hand sides, and the properties of the computed lower
+                                                                      and upper triangular factors.
+                                                               S
+    First, we use the fact that for LU decomposition of Q −        into triangular factors Ỹ and Ũ , we have
+                                                               0
+(see [25, Section 9.3])                   
+                                           S
+                                     Q−        − Ỹ Ũ   ≤ γb kỸ kF kŨ kF .
+                                           0           F
+
+Second, we compute T̃ = (Ũ S)Y1−T using the standard algorithm for triangular solve with multiple right
+hand sides to obtain (see [25, Section 8.1])
+
+                              Ũ − T̃ Ỹ1T S       = Ũ S − T̃ Ỹ1T        ≤ γb kT̃ kF kỸ1T kF .
+                                               F                       F
+
+
+
+
+                                                            17
+     Finally, we bound the norms of the computed triangular factors in exact arithmetic. At each step
+of the Modified-LU algorithm, the trailing matrix is an orthogonal matrix (before modifying the diagonal
+element). Each column of Ỹ is computed by scaling down elements of a unit vector and setting the
+                                                                                                √ diagonal
+element to 1. Thus, the sum of √ squares of elements in a column is bounded by 2, and kỸ kF ≤ 2b. Note
+that this also implies kỸ1 kF ≤ 2b. Each row of Ũ is computed by increasing the absolute value of the
+diagonal element by 1, but leaving the other elements to the right of the diagonal unchanged. The sum
+of squares of elements in a row of a matrix with orthonormal columns √   is at most 1. Thus, the sum of
+squares of elements in a row of Ũ is bounded by 4, and kŨ kF ≤ 2 b. From [22, Theorem 13], we have
+kT̃ kF < b + 1.
+     Therefore, altogether we have
+
+                                                             
+                       I             T             S            T
+                QS −      − Ỹ T̃ Ỹ1      = Q−      − Ỹ T̃ Ỹ1 S
+                       0                 F
+                                                   0                   F
+                                                  
+                                                   S                              
+                                           =   Q−      − Ỹ Ũ + Ỹ Ũ − T̃ Ỹ1T S
+                                                   0                                  F
+                                                  
+                                                   S
+                                           ≤   Q−      − Ỹ Ũ      + kỸ kF Ũ − T̃ Ỹ1T S
+                                                   0              F                         F
+
+                                               ≤ γb kỸ kF kŨ kF + γb kỸ kF kT̃ kF kỸ1T kF
+                                                    √                  
+                                               ≤ γb      8b + 2b(b + 1) .
+
+
+
+Theorem 5.5. Let R̂ be the computed upper triangular factor of m × b matrix A obtained via the TSQR
+algorithm using a binary tree of height L (m/2L ≥ b), and let Q̃ = I − Ỹ T̃ Ỹ1T and R̃ = S R̂ where Ỹ , T̃ ,
+and S are the computed factors obtained from the Householder reconstruction algorithm. Then
+
+                                       kA − Q̃R̃kF ≤ F1 (m, b, L, ε)kAkF
+
+and
+                                          kI − Q̃T Q̃kF ≤ F2 (m, b, L, ε)
+where                                                            √                  √  
+                    F1 (m, b, L, ε) ≃ (bγc· mL + Lbγc·2b )(1 +       b) + 2γb b2 + 1 + 2 b
+                                           2
+
+and                                                          √              √  
+                      F2 (m, b, L, ε) ≃ 2(bγc· mL + Lbγc·2b ) b + 4γb b2 + 1 + 2 b
+                                                2
+
+for bγc· mL  1 and bγc·2b  1.
+        2
+
+Proof. From Lemmas 5.3 and 5.4, there exists an exactly orthonormal matrix Q such that
+
+                   kA − Q̃R̃kF = kA − QR̂ − (Q − Q̂)R̂ − (Q̂ − Q̃S)R̂kF
+                                  ≤ kA − QR̂kF + kQ − Q̂kF kRkF + kQ̂ − Q̃SkF kRkF
+                                  ≤ f1 (m, b, L, ε)kAkF + f2 (m, b, L, ε)kR̂kF + f3 (b, ε)kR̂kF
+                                  ≤ F1 (m, b, L, ε)kAkF .
+
+The approximation of F1 also uses [24, Lemma 1]: kR̂kF ≃ kAkF assuming bγc· mL  1 and bγc·2b  1.
+                                                                                            2
+
+
+
+
+                                                          18
+    Further, since Q is exactly orthonormal, we have
+
+                         kI − Q̃T Q̃kF = kQT (Q − Q̃S) + (Q − Q̃S)T Q̃kF
+                                                                    
+                                       ≤ kQ − Q̃SkF 1 + kQ̃kF
+                                                                                  
+                                       ≤ kQ − Q̂kF + kQ̂ − Q̃SkF           1 + kQ̃kF
+                                                                                
+                                       ≤ (f2 (m, b, L, ε) + f3 (b, ε)) 1 + kQ̃kF
+                                       ≤ F2 (m, b, L, ε).
+
+
+
+
+6     Numerical experiments
+In this section we present numerical results of TSQR-HR. Experiments were conducted on two represen-
+tative sets of test matrices. The first set is used to check the stability of the algorithm on single panels
+represented by tall and skinny matrices, while the second set focuses on the factorization of full matrices
+panel by panel.
+
+6.1   Tall and Skinny Matrices
+In this section, we use matrices which are formed by A = Q · Rρ , where Q and R are computed via QR
+             of an m × b matrix with i.i.d. entries chosen from a normal distribution. Rρ is obtained by
+decomposition
+setting the n2 -th diagonal element of an upper triangular matrix R to a small parameter value ρ. This
+experimental setup is used to vary the condition number of the matrix and demonstrate instability of the
+cheaper method described in Section 4.2.
+    As can be seen from Table 3, for all test cases both the orthogonality and factorization errors of are
+of order 10−15 for TSQR-HR, which is close to  = 2−52 of double precision. This demonstrates the
+numerical stability of this approach on tall and skinny matrices. Table 3 shows a comparison between
+three approaches: TSQR-HR, Yamamoto’s approach described in Section 3.3, and LU(A − R) described
+in Section 4.2. While Yamamoto’s approach is as stable as TSQR-HR, the LU(A − R) method provides
+unsatisfactory backward errors which grow with the condition number of the matrix.
+
+6.2   Square Matrices
+We now present numerical results for the QR factorization of square matrices using a panel-by-panel
+factorization. The matrices are generated similarly to [26], where the set is chosen from well-known
+anomalous matrices. Most are of size 1000-by-1000 (except the ARC130 and FS 541 1 matrices, which are
+respectively of order 130 and 541), with various condition numbers, some of them being very ill-conditioned
+(i.e. having a condition number much larger than the inverse of machine precision). We tried several panel
+sizes ranging from 2 to 256 columns and report only the largest errors and their associated panel widths.
+     Results from Table 5 show that TSQR-HR is numerically stable in terms of backward errors when
+computing the QR factorization of full matrices, regardless of the condition number of the matrix, as
+suggested by Theorem 5.5. Again, Yamamoto’s approach displays similar results. To the contrary, the
+alternative approach of LU(A − R) does not yield numerically stable results in practice, confirming what
+was observed on tall and skinny matrices. Altogether, these two sets of experiments demonstrate the
+numerical stability of the proposed approach on representative matrices.
+
+
+
+
+                                                      19
+                     Q − I (T from Algorithm 5)           Yamamoto’s approach              A − R (T −1 from Y T Y )
+   ρ         κ      norm-wise col-wise ortho.         norm-wise col-wise ortho.         norm-wise col-wise ortho.
+ 1e-01    5.1e+02    2.2e-15     2.7e-15 9.3e-15       2.5e-15  3.1e-15 9.2e-15          3.8e-14    1.7e-14 5.5e-15
+ 1e-02    5.0e+03    2.3e-15     2.9e-15 1.0e-14       2.4e-15  3.1e-15 1.1e-14          3.2e-13    1.1e-13 6.2e-15
+ 1e-03    5.0e+04    2.2e-15     2.6e-15 8.4e-15       2.6e-15  3.4e-15 1.1e-14          4.2e-12    1.7e-12 5.6e-15
+ 1e-04    4.9e+05    2.2e-15     2.6e-15 7.7e-15       2.3e-15  2.8e-15 8.7e-15          3.8e-11    1.7e-11 5.4e-15
+ 1e-05    5.1e+06    2.3e-15     2.9e-15 8.7e-15       3.2e-15  4.2e-15 1.0e-14          3.9e-10    1.4e-10 5.3e-15
+ 1e-06    5.0e+07    2.3e-15     3.0e-15 9.1e-15       3.0e-15  3.9e-15 1.0e-14          3.6e-09    1.5e-09 6.1e-15
+ 1e-07    5.0e+08    2.4e-15     3.4e-15 1.1e-14       2.7e-15  3.7e-15 9.9e-15          4.2e-08    2.1e-08 5.0e-15
+ 1e-08    5.1e+09    2.2e-15     2.8e-15 8.6e-15       2.5e-15  3.1e-15 8.9e-15          3.8e-07    1.5e-07 5.8e-15
+ 1e-09    5.0e+10    2.3e-15     3.1e-15 9.9e-15       3.9e-15  5.1e-15 1.3e-14          3.6e-06    2.0e-06 5.4e-15
+ 1e-10    5.0e+11    2.1e-15     2.6e-15 7.1e-15       2.6e-15  3.4e-15 9.9e-15          3.3e-05    1.2e-05 6.3e-15
+ 1e-11    4.9e+12    2.5e-15     3.4e-15 1.0e-14       2.4e-15  3.1e-15 1.0e-14          3.1e-04    1.2e-04 5.9e-15
+ 1e-12    5.1e+13    2.2e-15     2.9e-15 8.5e-15       2.6e-15  3.3e-15 1.2e-14          3.7e-03    1.6e-03 5.8e-15
+ 1e-13    5.0e+14    2.2e-15     2.7e-15 8.8e-15       3.0e-15  3.9e-15 1.0e-14          4.0e-02    1.4e-02 4.7e-15
+ 1e-14    3.5e+15    2.3e-15     3.1e-15 1.0e-14       2.3e-15  2.9e-15 9.4e-15          2.7e-01    9.7e-02 4.9e-15
+ 1e-15    5.0e+15    2.4e-15     3.1e-15 9.7e-15       2.8e-15  3.7e-15 9.4e-15          3.5e-01    1.3e-01 6.3e-15
+
+Table 3: Error on tall and skinny matrices (m = 1000, n = 200) for three approaches. The label “norm-
+wise” corresponds to kA − QRk2 , “col-wise” corresponds to maxi kAi − (QR)i k2 , and “ortho.” corresponds
+to kI − QT Qk2 .
+
+
+    Id    Matrix type                                                                    Size            κ
+    1.    A = 2 ∗ rand(m) − 1                                                        1000-by-1000   2.106e + 03
+                              i
+    2.    A = diag((10 ∗ eps) m ) ∗ rand(m)                                          1000-by-1000   7.731e + 17
+    3.    Golub-Klema-Stewart: A(i, i) = √1i , A(i, j > i) = √1j , A(i, j < i) = 0   1000-by-1000   2.242e + 20
+    4.    Break 1 distribution: A = gallery(0 randsvd0 , n, 1e9, 2)                  1000-by-1000    1.00e + 09
+    5.    Break 9 distribution: A = gallery(0 randsvd0 , n, 1e9, 1)                  1000-by-1000    1.00e + 09
+          A = orth(rand(n)) · diag([100, 10, linspace(1e − 8, 1e − 2, n − 2)])
+    6.                                                                               1000-by-1000    1.00e + 10
+          A = A · orth(rand(n))
+          v = linspace(1, 1e − 3, n); v(51 : end) = 0;
+    7.                                                                               1000-by-1000   8.464e + 04
+          A = orth(rand(n)) · diag(v) · orth(rand(n)) + 0.1 ∗ v(50) ∗ rand(n)
+     8.   U ΣV T with exponential distribution                                       1000-by-1000   4.155e + 19
+     9.   The devil’s stairs matrix                                                  1000-by-1000   2.275e + 19
+    10.   KAHAN matrix, a trapezoidal matrix                                         1000-by-1000   5.642e + 56
+    11.   Matrix ARC130 from Matrix Market                                            130-by-130    6.054e + 10
+    12.   Matrix FS 541 1 from Matrix Market                                          541-by-541    4.468e + 03
+    13.   BAART Test problem: Fredholm integral equation of the first kind           1000-by-1000   5.251e + 18
+          BLUR Test problem: digital image deblurring.
+    14.                                                                               961-by-961    3.075e + 01
+          A is a symmetric, doubly block Toeplitz matrix
+    15.   DERIV2 Test problem: computation of the second derivative                  1000-by-1000    1.216e + 06
+    16.   Matrix Ex1-CMRS                                                            1000-by-500     1.398e + 17
+    17.   Matrix Ex2-RST                                                             1024-by-512     3.276e + 16
+    18.   FOXGOOD Test problem: severely ill-posed problem                           1000-by-1000    5.742e + 20
+    19.   GRAVITY Test problem: 1-D gravity surveying model problem                  1000-by-1000    8.797e + 20
+    20.   HEAT Test problem: inverse heat equation                                   1000-by-1000   1.070e + 232
+    21.   PARALLAX Stellar parallax problem with 28 fixed, real observations          26-by-1000     4.629e + 14
+          PHILLIPS Test problem: discretization of the ‘famous’ first-kind
+    22.                                                                              1000-by-1000   2.641e + 10
+          Fredholm integral equation deviced by D. L. Phillips
+    23.   SHAW Test problem: one-dimensional image restoration model                 1000-by-1000   2.441e + 21
+    24.   SPIKES Test problem with a ”spiky” solution                                1000-by-1000   5.796e + 21
+    25.   TOMO is a 2D tomography test problem                                        961-by-961    1.091e + 17
+
+                     Table 4: Description of the full matrices used in the experiments.
+
+
+                                                         20
+                 Q − I (T from Algorithm 5)                              Yamamoto’s approach                                A − R (T −1 from Y T Y )
+Id   norm-wise error column-wise error orthogonality      norm-wise error column-wise error orthogonality    norm-wise error column-wise error orthogonality
+ 1    4.3e-15 (256)      3.7e-15 (256)     2.8e-14 (2)     4.7e-15 (256)     4.4e-15 (256)    2.8e-14 (2)     3.5e-15 (256)       3.5e-15 (256)       2.8e-14 (2)
+ 2    2.0e-15 (256)       6.6e-15 (64)     2.6e-14 (2)     2.6e-15 (256)     7.4e-15 (256)    2.6e-14 (2)     2.7e-15 (256)       9.0e-15 (256)       3.1e-14 (2)
+ 3     0.0e+00 (2)        0.0e+00 (2)      0.0e+00 (2)      0.0e+00 (2)       0.0e+00 (2)     0.0e+00 (2)      0.0e+00 (2)         0.0e+00 (2)       0.0e+00 (2)
+ 4    1.0e-14 (256)      5.5e-15 (256)     2.8e-14 (2)     1.1e-14 (256)     6.3e-15 (256)    2.8e-14 (2)     4.4e-14 (256)       4.4e-14 (256)       2.8e-14 (2)
+ 5    9.9e-15 (256)      5.1e-15 (256)     2.9e-14 (2)     1.0e-14 (256)     6.2e-15 (256)    2.8e-14 (2)     4.2e-14 (256)       3.0e-14 (256)       2.8e-14 (2)
+ 6    1.4e-15 (256)      5.9e-15 (256)     2.8e-14 (2)     2.2e-15 (128)     6.9e-15 (256)    2.8e-14 (2)     1.4e-15 (256)       1.8e-14 (256)       2.8e-14 (2)
+ 7    1.4e-15 (256)       4.6e-15 (64)     2.7e-14 (2)     3.5e-15 (256)     7.7e-15 (256)    2.8e-14 (2)     2.3e-15 (256)       5.8e-15 (256)       2.8e-14 (2)
+ 8    2.0e-15 (256)       4.3e-15 (64)     2.8e-14 (2)     3.8e-15 (256)     7.0e-15 (256)    2.8e-14 (2)     1.9e-15 (256)       1.4e-14 (256)       2.8e-14 (2)
+ 9    2.4e-15 (256)      5.0e-15 (256)     2.8e-14 (2)     2.7e-15 (256)     5.4e-15 (256)    2.8e-14 (2)     2.9e-15 (256)       1.5e-14 (256)       2.8e-14 (2)
+10     0.0e+00 (2)        0.0e+00 (2)      0.0e+00 (2)      0.0e+00 (2)       0.0e+00 (2)     0.0e+00 (2)      0.0e+00 (2)         0.0e+00 (2)       0.0e+00 (2)
+11     8.8e-19 (16)       1.3e-15 (16)     2.1e-15 (2)      1.1e-18 (16)      1.8e-15 (16)   3.9e-15 (16)      3.9e-19 (32)       8.7e-16 (32)       1.7e-15 (2)
+12     5.8e-16 (64)        1.3e-15 (2)    1.8e-15 (256)     8.4e-16 (16)      1.9e-15 (32)   2.8e-15 (64)     6.0e-16 (256)       1.3e-15 (32)        1.7e-15 (2)
+13     1.6e-15 (32)      6.2e-15 (256)     2.9e-14 (2)      2.0e-15 (32)     7.3e-15 (256)    2.8e-14 (2)     3.0e-07 (256)       1.5e-06 (256)       2.8e-14 (2)
+14     1.0e-15 (32)       1.5e-15 (16)     4.7e-15 (2)     1.6e-15 (256)     2.8e-15 (256)   6.8e-15 (128)     8.2e-16 (16)       1.5e-15 (16)       3.9e-15 (2)
+15    2.8e-15 (256)      8.7e-15 (256)     4.6e-14 (2)     1.0e-14 (256)     1.6e-14 (256)    4.8e-14 (2)     1.0e-12 (256)       5.3e-12 (256)       5.6e-14 (2)
+16    1.8e-15 (256)      5.7e-15 (256)     4.9e-14 (2)     1.7e-15 (256)     5.7e-15 (256)    4.0e-14 (2)     4.3e-07 (256)       2.3e-06 (256)       3.3e-14 (2)
+17     3.7e-15 (32)       1.1e-14 (16)     5.0e-14 (2)      3.0e-15 (16)      9.8e-15 (32)    3.8e-14 (2)     1.4e-14 (256)       2.3e-14 (256)       4.5e-14 (2)
+18    2.4e-15 (256)       6.4e-15 (16)     2.8e-14 (2)     3.5e-15 (256)     8.0e-15 (256)    2.8e-14 (2)     8.2e-04 (256)       5.7e-03 (256)       2.8e-14 (2)
+19    2.3e-15 (256)       4.8e-15 (64)     2.9e-14 (2)     3.1e-15 (256)     7.1e-15 (256)    2.8e-14 (2)     2.1e-03 (256)       1.1e-02 (256)       2.8e-14 (2)
+20    2.6e-15 (256)      4.5e-15 (256)     3.9e-14 (2)     2.6e-15 (256)     5.1e-15 (256)    4.0e-14 (2)     3.8e-02 (256)       1.7e-01 (256)       3.4e-14 (2)
+21     8.8e-16 (16)       1.9e-15 (32)     2.6e-15 (16)     1.1e-15 (32)      2.3e-15 (32)   2.5e-15 (32)      1.1e-11 (32)       1.8e-10 (32)       2.3e-15 (16)
+22     1.0e-15 (32)       4.9e-15 (32)     3.7e-14 (2)     1.2e-15 (256)     5.0e-15 (256)    3.1e-14 (2)     5.2e-11 (256)       1.9e-10 (256)       3.4e-14 (2)
+23    2.5e-15 (256)       5.3e-15 (64)     2.8e-14 (2)     2.8e-15 (256)     7.1e-15 (256)    2.9e-14 (2)     7.0e-04 (256)       5.2e-03 (256)       2.8e-14 (2)
+24     7.2e-16 (32)      3.8e-15 (256)     2.8e-14 (2)     1.2e-15 (256)     4.7e-15 (256)    2.8e-14 (2)     2.2e-03 (256)       2.6e-02 (256)       2.8e-14 (2)
+25    2.2e-15 (256)      4.3e-15 (256)     2.2e-14 (2)     2.3e-15 (256)     5.0e-15 (256)    2.2e-14 (2)     2.3e-15 (256)       1.2e-14 (256)       2.3e-14 (2)
+
+
+ Table 5: Error of full matrices (n = 1000). The label “norm-wise” corresponds to kA − QRk2 , “col-wise”
+ corresponds to maxi kAi − (QR)i k2 , and “ortho.” corresponds to kI − QT Qk2 . Descriptions of the matrices
+ can be found in Table 4.
+
+ 7       Performance
+ Having established the stability of our algorithm, we now analyze its experimental performance. We
+ demonstrate that for tall and skinny matrices TSQR-HR achieves better parallel scalability than library
+ implementations (ScaLAPACK and Elemental) of Householder-QR. Further, we show that for square
+ matrices CAQR-HR-Agg outperforms our implementation of CAQR, and library implementations of 2D-
+ Householder-QR.
+
+ 7.1       Architecture
+ The experimental platform is “Hopper,” which is a Cray XE6 supercomputer, built from dual-socket 12-core
+ “Magny-Cours” Opteron compute nodes. We used the Cray LibSci BLAS routines. This machine is located
+ at the NERSC supercomputing facility. Each node can be viewed as a four-chip compute configuration due
+ to NUMA domains. Each of these four chips have six super-scalar, out-of-order cores running at 2.1 GHz
+ with private 64 KB L1 and 512 KB L2 caches. Nodes are connected through Cray’s “Gemini” network,
+ which has a 3D torus topology. Each Gemini chip, which is shared by two Hopper nodes, is capable of
+ 9.8 GB/s bandwidth.
+
+ 7.2       Parallel Scalability
+ In this section, we give performance results based on a C++/MPI/LAPACK implementation of TSQR
+ and TSQR-HR, as well as two library implementations of 2D-Householder-QR, Elemental (version 0.80)
+ and ScaLAPACK (native LibSci installation on Hopper, October 2013). Our implementations aim to do
+ minimal communication and arithmetic, and do not employ low-level tuning or overlap between commu-
+ nication and computation. All the benchmarks use one MPI process per core, despite the fact that is
+ favorable on Hopper to use one process per socket and six threads per process. This decision was made
+ because we observed that some of the many LAPACK routines used throughout our codes (geqrf, ormqr,
+ tpqrt, tmpqrt, etc.) were not threaded.
+
+
+                                                                              21
+                QR weak scaling on Hopper (15K-by-15K to 131K-by-131K)                QR weak scaling on Hopper (15K-by-15K to 131K-by-131K)
+
+                20  CAQR-HR-Agg                                                       20  CAQR-HR-Agg
+                        CAQR-HR                                                               CAQR-HR
+                     Elemental QR                                                          Elemental QR
+                   ScaLAPACK QR                                                          ScaLAPACK QR
+                15         CAQR                                                       15         CAQR
+    Teraflops
+
+
+
+
+                                                                          Teraflops
+                10                                                                    10
+
+
+                 5                                                                     5
+
+
+                 0                                                                     0
+                  144    288     576    1152    2304    4608   9216                     144     288    576    1152    2304    4608   9216
+                                       #cores                                                                #cores
+
+                 (a) Tall-skinny QR performance on Cray XE6                                (b) Square QR performance on Cray XE6
+
+
+
+    First, we study the performance of QR factorization of tall-skinny matrices using a 1D processor grid.
+Figure 1(a) gives the strong scaling performance for a matrix of size 122,880-by-32. We also tested a range
+of reasonable panel sizes that are not detailed here and observed similar performance trends. We observe
+from Figure 1(a) that TSQR-HR takes roughly twice the execution time of TSQR, which is in line with
+our theoretical cost analysis. Figure 1(a) also gives the time to solution of Elemental and ScaLAPACK,
+which both use the Householder-QR algorithm, albeit with different matrix blocking and collectives. We
+see that TSQR obtains a performance benefit over Householder-QR due to the lower synchronization cost
+and TSQR-HR preserves the scaling behavior with roughly a factor of two overhead.
+    Second, we study the parallel scaling of QR factorization on square matrices. In Figure 1(b), we compare
+our implementation of CAQR (with a simple binary tree update, no pipelining or other optimizations),
+CAQR-HR, and CAQR-HR-Agg, with Elemental and ScaLAPACK, which use 2D-Householder-QR. We
+tuned the block sizes of all the codes (the CAQR-HR-Agg required tuning two block sizes), though fewer
+data points were collected for larger scale runs, due to timing and allocation constraints.
+    Comparing the performance of CAQR-HR-Agg and CAQR-HR in Figure 1(b), we observe that signifi-
+cant benefit is obtained from aggregating the trailing matrix update. By combining the aggregated update
+and lower synchronization cost of TSQR, CAQR-HR-Agg outperforms ScaLAPACK and Elemental and
+achieves better parallel scalability. On the other hand, the CAQR performance is relatively poor due to
+the overhead of the implicit tree trailing update. We also note that for Elemental, ScaLAPACK, and all of
+our QR implementations, it was often better to utilize a rectangular processor grid with more rows than
+columns. Having more processes in each column of the processor grid accelerates the computation of each
+tall-skinny panel.
+
+
+8               Conclusion
+In this paper, we introduce a method for recovering the Householder basis-kernel representation from any
+matrix with orthonormal columns in a stable and efficient manner. Our method was motivated by the
+desire to combine the efficiency of the TSQR algorithm with that of the trailing matrix updates within
+Householder-QR in the context of computing the QR factorization of general matrices.
+    We argue using a performance cost model that the savings from combining the approaches outweigh
+the extra cost required to reconstruct the Householder vectors for each panel factorization, observing
+asymptotic improvements over both existing approaches. We also demonstrate that our algorithm is
+practical, attaining speed-ups of up to 1.5× for CAQR-HR-Agg over the standard 2D-Householder-QR
+algorithm, and we conjecture that larger speed-ups may be achieved on future architectures, which are
+becoming increasingly more synchronization and communication bound.
+    Our approach provides a promising direction for heterogenous architectures (as suggested in [11]), where
+
+                                                                         22
+synchronization-avoidance and high granularity computation have even more pervasive effects on perfor-
+mance efficiency. Furthermore, because our approach recovers the standard representation of orthogonal
+matrices (as is used in libraries like LAPACK), we are able to re-use the existing software infrastructure
+and maintain performance portability.
+    Finally, we conjecture that the Householder reconstruction technique will enable the design of a QR
+algorithm which is as stable as Householder QR and reduces the bandwidth cost asymptotically compared
+to parallel CAQR. We aim to reduce the asymptotic bandwidth cost for QR as done by Tiskin [27], except
+in a more practical manner, following the communication-optimal parallel algorithm for LU [28].
+
+
+9    Acknowledgements
+We would like to thank Yusaku Yamamoto for sharing his slides from SIAM ALA 2012 with us. We also
+thank Jack Poulson for help configuring Elemental.
+    Solomonik was supported by a Department of Energy Computational Science Graduate Fellowship,
+grant number DE-FG02-97ER25308. This research used resources of the National Energy Research Sci-
+entific Computing Center (NERSC), which is supported by the Office of Science of the U.S. Department
+of Energy under Contract No. DE-AC02-05CH11231. We also acknowledge DOE grants DE-SC0004938,
+DE-SC0005136, DE-SC0003959, DE-SC0008700, DE-SC0010200, AC02-05CH11231, and DARPA grant
+HR0011-12-2-0016.
+
+
+References
+ [1] J. Demmel, L. Grigori, M. Hoemmen, and J. Langou, “Communication-optimal parallel and sequential
+     QR and LU factorizations,” SIAM Journal on Scientific Computing, vol. 34, no. 1, pp. A206–A239,
+     2012.
+ [2] G. H. Golub, R. J. Plemmons, and A. Sameh, “Parallel block schemes for large-scale least-squares com-
+     putations,” in High-speed computing: scientific applications and algorithm design, R. B. Wilhelmson,
+     Ed. Champaign, IL, USA: University of Illinois Press, 1988, pp. 171–179.
+ [3] G. Ballard, J. Demmel, O. Holtz, and O. Schwartz, “Minimizing communication in numerical linear
+     algebra,” SIAM Journal on Matrix Analysis and Applications, vol. 32, no. 3, pp. 866–901, 2011.
+ [4] F. Song, H. Ltaief, B. Hadri, and J. Dongarra, “Scalable tile communication-avoiding QR factorization
+     on multicore cluster systems,” in Proceedings of the 2010 ACM/IEEE International Conference for
+     High Performance Computing, Networking, Storage and Analysis, ser. SC ’10. Washington, DC,
+     USA: IEEE Computer Society, 2010, pp. 1–11.
+ [5] M. Anderson, G. Ballard, J. Demmel, and K. Keutzer, “Communication-avoiding QR decomposition
+     for GPUs,” in Proceedings of the 2011 IEEE International Parallel & Distributed Processing Sympo-
+     sium, ser. IPDPS ’11. Washington, DC, USA: IEEE Computer Society, 2011, pp. 48–58.
+ [6] E. Agullo, C. Coti, J. Dongarra, T. Herault, and J. Langem, “QR factorization of tall and skinny
+     matrices in a grid computing environment,” in Parallel Distributed Processing (IPDPS), 2010 IEEE
+     International Symposium on, 2010, pp. 1–11.
+ [7] E. Anderson, Z. Bai, C. Bischof, J. Demmel, J. Dongarra, J. D. Croz, A. Greenbaum, S. Hammarling,
+     A. McKenney, S. Ostrouchov, and D. Sorensen, LAPACK Users’ Guide. Philadelphia, PA, USA:
+     SIAM, 1992.
+ [8] L. S. Blackford, J. Choi, A. Cleary, E. D’Azevedo, J. Demmel, I. Dhillon, J. Dongarra, S. Hammar-
+     ling, G. Henry, A. Petitet, K. Stanley, D. Walker, and R. C. Whaley, ScaLAPACK Users’ Guide.
+     Philadelphia, PA, USA: SIAM, May 1997.
+
+                                                   23
+ [9] J. Poulson, B. Marker, R. A. van de Geijn, J. R. Hammond, and N. A. Romero, “Elemental: A new
+     framework for distributed memory dense matrix computations,” ACM Trans. Math. Softw., vol. 39,
+     no. 2, pp. 13:1–13:24, Feb. 2013.
+[10] R. Schreiber and C. Van Loan, “A storage-efficient WY representation for products of Householder
+     transformations,” SIAM Journal on Scientific and Statistical Computing, vol. 10, no. 1, pp. 53–57,
+     1989.
+[11] Y. Yamamoto, “Aggregation of the compact WY representations generated by the TSQR algorithm,”
+     2012, Conference talk presented at SIAM Applied Linear Algebra.
+[12] A. Farley, “Broadcast time in communication networks,” SIAM Journal on Applied Mathematics,
+     vol. 39, no. 2, pp. 385–390, 1980.
+[13] R. Thakur, R. Rabenseifner, and W. Gropp, “Optimization of collective communication operations
+     in MPICH,” International Journal of High Performance Computing Applications, vol. 19, no. 1, pp.
+     49–66, 2005.
+[14] E. Chan, M. Heimlich, A. Purkayastha, and R. van de Geijn, “Collective communication: theory,
+     practice, and experience,” Concurrency and Computation: Practice and Experience, vol. 19, no. 13,
+     pp. 1749–1783, 2007.
+[15] G. Golub and C. Van Loan, Matrix Computations, ser. Johns Hopkins Studies in the Mathematical
+     Sciences. Johns Hopkins University Press, 2012.
+[16] C. Puglisi, “Modification of the Householder method based on compact WY representation,” SIAM
+     Journal on Scientific and Statistical Computing, vol. 13, no. 3, pp. 723–726, 1992.
+[17] J. Demmel, L. Grigori, M. F. Hoemmen, and J. Langou, “Communication-optimal parallel and se-
+     quential QR and LU factorizations,” EECS Department, University of California, Berkeley, Tech. Rep.
+     UCB/EECS-2008-89, Aug 2008.
+[18] G. Ballard, J. Demmel, L. Grigori, M. Jacquelin, H. D. Nguyen, and E. Solomonik, “Reconstructing
+     Householder vectors from tall-skinny QR,” EECS Department, University of California, Berkeley,
+     Tech. Rep., 2013.
+[19] M. Hoemmen, “A communication-avoiding, hybrid-parallel, rank-revealing orthogonalization
+     method,” in Parallel Distributed Processing Symposium (IPDPS), 2011 IEEE International, 2011,
+     pp. 966–977.
+[20] X. Sun and C. Bischof, “A basis-kernel representation of orthogonal matrices,” SIAM Journal on
+     Matrix Analysis and Applications, vol. 16, no. 4, pp. 1184–1196, 1995.
+[21] R. Schreiber and B. Parlett, “Block reflectors: Theory and computation,” SIAM Journal on Numerical
+     Analysis, vol. 25, no. 1, pp. 189–205, 1988.
+[22] C. H. Bischof and X. Sun, “On orthogonal block elimination,” Argonne National Laboratory, Argonne,
+     IL, Tech. Rep. MCS-P450-0794, 1994.
+[23] Y. Yamamoto, 2012, Personal communication.
+[24] D. Mori, Y. Yamamoto, and S.-L. Zhang, “Backward error analysis of the AllReduce algorithm for
+     Householder QR decomposition,” Japan Journal of Industrial and Applied Mathematics, vol. 29, no. 1,
+     pp. 111–130, 2012.
+[25] N. J. Higham, Accuracy and Stability of Numerical Algorithms, 2nd ed.     Philadelphia, PA: SIAM,
+     2002.
+
+                                                  24
+[26] J. Demmel, L. Grigori, M. Gu, and H. Xiang, “Communication avoiding rank revealing QR fac-
+     torization with column pivoting,” EECS Department, University of California, Berkeley, Tech. Rep.
+     UCB/EECS-2013-46, May 2013.
+
+[27] A. Tiskin, “Communication-efficient parallel generic pairwise elimination,” Future Generation Com-
+     puter Systems, vol. 23, no. 2, pp. 179 – 188, 2007.
+
+[28] E. Solomonik and J. Demmel, “Communication-optimal 2.5D matrix multiplication and LU factoriza-
+     tion algorithms,” in Springer Lecture Notes in Computer Science, Proceedings of Euro-Par, Bordeaux,
+     France, Aug 2011.
+
+
+A     Improved CAQR
+In this Appendix, we show how the CAQR algorithm can be improved via a more efficient trailing matrix
+update algorithm. The main idea of this approach is to use a recursive halving and recursive doubling
+approach over the columns of the trailing matrix while applying the TSQR tree. This task can be achieved
+via a butterfly communication network which performs the update and scatters the data, followed by
+an inverted butterfly network which collects the scattered data via recursive doubling. Performing the
+trailing matrix update in this manner also requires replicating the TSQR tree as a butterfly (Householder
+data replicated 2k times at the kth level). The Householder tree data may be replicated explicitly via
+communication or can be computed redundantly during the factorization phase via a butterfly network
+TSQR (see Algorithm 9) for no extra parallel cost. We arrived at this algorithm only after implementing
+and evaluating CAQR with a simple binary tree network for the TSQR and the trailing matrix update.
+We plan to implement and study the performance of this trailing matrix update in the context of CAQR,
+as it alleviates important algorithmic bottlenecks on which we elaborate below.
+    Algorithm 9 demonstrates how TSQR can be done via butterfly tree network. The main difference
+between the butterfly algorithm and the binary tree TSQR is the fact that the butterfly algorithm com-
+putes and stores each Yi,k redundantly on 2k processors on level k. Algorithm 10 uses the redundantly
+stored representation produced by Algorithm 9 to perform the trailing matrix update more efficiently. In
+particular, at each level of the first butterfly network in Algorithm 10, the working part of the columns of
+the trailing matrix are partitioned in half and scattered amongst pairs of processor rows. In the binary
+tree application method (Algorithm 3), half the processors were assigned work at each successive level
+of the tree. In our butterfly algorithm, all the processors are assigned half the work at each successive
+level of the butterfly. As a result, the number of columns each processor works on reduces in half at each
+successive level in the butterfly. We note that Algorithm 10 is different from the butterfly algorithm for
+the trailing matrix application presented in [19], which applies the redundant copies of Yi,k to the columns
+of the trailing matrix redundantly.
+    The benefit achieved by Algorithm 10 over Algorithm 3 is reflected both in communication bandwidth
+and computational cost. The number of words moved by each processor in Algorithm 10 is given to leading
+order by
+                                                  log
+                                                  Xp
+                                                2     nb/2i = 2nb.
+                                                i=1
+We note that this is a factor of log p smaller than the bandwidth cost associated with Algorithm 3. Further,
+excluding the cost of the initial application on line 1 (which also occurs in Algorithm 3), the computational
+cost of the algorithm is given by
+                                            log
+                                            Xp
+                                                O(nb2 /2i ) = O(nb2 ),
+                                          i=1
+
+which compares favorably to Algorithm 3 which has a cost of O(nb2 log p). The reduction in bandwidth cost
+                                                                                       2                 2
+yielded by this algorithm leads directly to a reduction in bandwidth cost from O( mn+n
+                                                                                     √ log p ) to O( mn+n
+                                                                                       p
+                                                                                                      √
+                                                                                                        p )
+
+
+                                                      25
+                               √
+(where we assume pr = pc = p). Further, the reduction in floating point cost makes it possible to select
+a block size for CAQR which is a factor of log p larger without incurring any overhead in leading order
+computational cost. Previously, the block size was made smaller due to the O(n2 b log p) computational
+term associated with using Algorithm 3 for the trailing matrix update. Raising the block size by a factor of
+log p yields a reduction in the latency cost of CAQR by the same factor. The overall cost of the improved
+CAQR algorithm (using Algorithms 9 and 10) is given to leading order for nearly square matrices by
+
+                             2mn2 − 2n3 /3          2mn + 2n2
+                                                            
+                                                                        √
+                                                                 + α · 7 p log2 p) .
+                                                                                  
+                       γ·                     +β·       √
+                                    p                     p
+
+Therefore, it is possible for CAQR to achieve the same asymptotic costs as CAQR-HR; however, it is not
+possible to aggregate the update to obtain the practical benefits harvested by CAQR-HR-Agg. Further,
+the reconstruction of Householder vectors requires less software engineering to be incorporated into high
+performance numerical linear algebra libraries.
+
+Algorithm 9 [{Yi,k }, R] = Butterfly-TSQR(A)
+Require: Number of processors, p, is a power of two and i is the processor index
+Require: A is m × b matrix distributed in block row layout; Ai is processor i’s block
+ 1: [Yi,0 , R̄i ] = Householder-QR(Ai )
+ 2: for k = 1 to log p do
+ 3:     % Determine my neighbor in this level of the butterfly
+ 4:     j = 2k b 2ik c + (i + 2k−1 mod 2k )
+ 5:     if i < j then
+ 6:           Send R̄i from processor j
+ 7:           Receive R̄j from processor j  
+                                               R̄i
+ 8:           [Yi,k , R̄i ] = Householder-QR
+                                               R̄j
+ 9:     else
+10:           Receive R̄j from processor j
+11:           Send R̄i to processor j         
+                                               R̄j
+12:           [Yi,k , R̄i ] = Householder-QR
+                                               R̄i
+13:     end if
+14: end for
+15: R = R̄i
+Ensure: A = QR with Q implicitly represented by {Yi,k }
+Ensure: R is stored redundantly on all processors, Y0,0 is stored by processor 0, and Yi,k for i > 0 is stored
+    redundantly on processor j for each j + 2k−1 = i mod 2k
+
+
+
+B     Householder-QR with Hints
+The idea in this section is to interpret computing the LU decomposition of A − R (discussed in Section
+4.2) as performing Householder-QR on A, but we will use the information in R as “hints” to avoid parts
+of the computation (particularly the communication-expensive parts).
+    Let A(i) be the partially factored matrix whose first i columns form an upper triangular matrix. Since
+Y is a lower triangular matrix (the height of the nonzero part of the Householder vectors decreases as
+the algorithm progresses), the ith row of the trailing matrix is not updated after the ith Householder
+reflection is applied. This implies that the ith row of A(i) is equal to the ith row of the final output; that
+is, A(i) (i, :) = R(i, :).
+
+
+                                                     26
+Algorithm 10 [B] = Scatter-Apply-TSQR-QT ({Yi,k }, A)
+Require: Number of processors, p, is a power of two and i is the processor index
+Require: A is m × n matrix distributed in block row layout; Ai is processor i’s block
+Require: {Yi,k } is the implicit representation of b Householder vectors computed via a butterfly TSQR.
+ 1: Bi = Apply-Householder-QT (Yi,0 , Ai )
+ 2: Let B̄i be the first b rows of Bi
+ 3: % Butterfly network recursive-halving TSQR
+ 4: for k = 1 to log p do
+ 5:    % Determine my neighbor in this level of the butterfly
+ 6:    j = 2k b 2ik c + (i + 2k−1 mod 2k )
+ 7:    % Subdivide columns via recursive halving
+ 8:    Let B̄i = [B̄i1 , B̄i2 ] where each block is b-by-n/2k
+ 9:    if i < j then
+10:        % Send half my columns to my neighbor and receive half of his
+11:        Send B̄i2 to processor j
+12:        Receive B̄j1 from processor j
+13:        %
+            Apply the Householder vectorsto stacked        blocks to compute input to next level of butterfly
+                                                              
+              B̄i                                        B̄
+14:             k   = Apply-Householder-QT Yi,k , i1
+             B̄j1                                        B̄j1
+15:        % Lower rows are not acted on at further levels in butterfly, so can be returned immediately
+16:        Send B̄j1 k back to processor j
+
+17:    else
+18:        Receive B̄j2 from processor j
+19:        Send
+            B̄i1 to processor j                           
+              B̄i                             T Y , B̄i2
+20:             k   =  Apply-Householder-Q         i,k
+             B̄i2                                        B̄j2
+21:                                     k
+           Receive updated rows B̄i1 back from processor j
+22:    end if
+23: end for
+24: % Propagate computed B back to origins via recursive doubling
+25: for k = log p down to 1 do
+26:    % Determine my neighbor in this level of the butterfly
+27:    j = 2k b 2ik c + (i + 2k−1 mod 2k )
+28:    if i < j then
+29:        % Collect upper rows
+30:        Receive B̄j from processor j
+31:        B̄i = [B̄i , B̄j ]
+32:    else
+33:        % Collect lower rows
+34:        Send B̄i to processor j
+35:        B̄i = [B̄i1k , B̄ k ]
+                            i2
+36:    end if
+37: end for
+38: Set the first b rows of Bi to B̄i
+Ensure: B = QT A where Q is the orthogonal matrix implicitly represented by {Yi,k }
+
+
+
+
+                                                       27
+Algorithm 11 [Y, S] = Householder-QR-with-Hints(A, R)
+Require: A is m × b, R is upper triangular such that R = QT A for some orthogonal Q
+ 1: S = I
+ 2: for i = 1 to b do
+    % Compute the Householder vector to annihilate sub-diagonal entries in the ith column
+ 3:    α = A(i, i)
+    % Compute column norm from diagonal entry of R
+ 4:    β = R(i, i)
+ 5:    if sgn(β) = sgn(α)) then
+ 6:         S(i, i) = −1
+ 7:         β = −β
+ 8:    end if
+ 9:    τ (i) = β−αβ
+                                1
+10:    A(i + 1 : m, i) = A(i,i)−β     · A(i + 1 : m, i)
+    % Apply the Householder transformation to the trailing matrix
+    % Compute z from the ith row of R
+11:    z = A(i, i + 1 : n) − S(i, i) · R(i, i + 1 : n)
+12:    A(i + 1 : m, i + 1 : n) = A(i + 1 : m, i + 1 : n) − A(i + 1 : m, i) · z
+13: end for
+                  Qn                T
+                                       
+Ensure: A =         i=1 (I − τi yi yi ) SR
+Ensure: Y (the Householder vectors) has implicit unit diagonal and overwrites the strict lower triangle
+    of A; τ is an array of length b with τi = 2/(yiT yi )
+
+
+   In order to compute the Householder vector yi , we must compute the norm of A(i−1) (i : m, i) and scale
+each entry below the diagonal by the reciprocal of the norm. Computing this norm requires a reduction,
+but we can avoid this calculation because the norm is given by the absolute value of the diagonal entry
+R(i, i).
+   Further, after the Householder vector yi is computed, the orthogonal reflector is applied to the trailing
+matrix in the form of a rank-one update. This update is given by
+                                                                        
+                   A(i) = I − τi yi yiT A(i−1) = A(i−1) − yi τ yiT A(i−1) = A(i−1) − yi zi
+                                       
+                                                                                                       (10)
+
+where zi is the ith row of Z, yi is the ith column of Y , and τi = yT2y . Note that the ith entry of yi , or
+                                                                              i   i
+Y (i, i), is always 1. Then by Equation (10), we have
+
+                        R(i, :) = A(i) (i, :) = A(i−1) (i, :) − yi (i) · zi = A(i−1) (i, :) − zi
+
+so that zi = A(i−1) (i, :)−R(i, :). This implies that zi can be computed via subtraction rather than from the
+formula zi = τ yiT A(i−1) , thereby avoiding the matrix-vector product. Algorithm 11 shows the Householder-
+QR-with-Hints algorithm which incorporates the cheaper means of computing column norms and vectors
+zi . Close comparison of Algorithm 11 with Algorithm 1 will show the computational savings from lines 4
+and 11, where hints from R are used to compute the relevant quantities more cheaply.
+
+
+
+
+                                                          28
+

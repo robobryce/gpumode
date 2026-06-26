@@ -1,0 +1,547 @@
+<h1 id="cost-report-2026-06-25-22-03-01-qr_v2">Cost Report:
+2026-06-25-22-03-01-qr_v2</h1>
+<h2 id="executive-summary">Executive Summary</h2>
+<p>This was an inexpensive run in absolute terms: a 3-worker parallel
+tree-search optimize over <code>linalg/qr_v2</code>, ≈17.8 h of
+wall-clock (2026-06-25 22:00 → 2026-06-26 15:51 UTC) on a single shared
+B200, costing roughly <strong>$1.3K</strong> in inference at Claude Opus
+4.8 list rates and burning <strong>≈1.35B tokens</strong>. As with every
+run of this shape, the cost is dominated by <strong>inference, not GPU
+time</strong> — the fleet read 1.25B cached-context tokens and wrote
+105M new cache tokens, so ≈98 % of the spend is cache traffic; the
+actual GPU benchmark/build work was only ≈2.1 h of device time, and
+output generation was a rounding error (≈$28). Because this is a single
+experiment with no cross-run comparison, treat the figures as a
+standalone profile rather than a benchmark — there is no second run here
+to normalize against.</p>
+<p><strong>Key takeaways</strong></p>
+<ul>
+<li><strong>Inference dominated, GPU did not.</strong> ≈$1.3K inference
+vs. ≈2.1 h of measured GPU build/benchmark time; the spend tracks token
+volume, not device hours.</li>
+<li><strong>Cache reads + cache writes are ≈98 % of the bill.</strong>
+Cache write $657 (50 %) + cache read $623 (47 %); uncached input ($3)
+and output ($28) are negligible.</li>
+<li><strong>Cache hit rate was 92.2 % — healthy.</strong> The prompt
+prefix (SKILL.md + brief context) is being reused well rather than
+re-read cold each trial, so there is no low-hanging cache-restructuring
+win. Cache <em>creation</em> ($657), not cache <em>read</em>, is the
+single largest cost line.</li>
+<li><strong>Heavy de-duplication was required.</strong> The raw
+<code>usage</code> sums double-count streamed/resumed records ≈2×;
+deduping by message id halves the apparent cost from ≈$2.6K to ≈$1.3K.
+The figures below are all deduped.</li>
+<li><strong>Walltime was GPU-light and stall-light.</strong> Only ≈2.1 h
+of device hold and ≈0.9 h of lock-wait across the 17.8 h calendar — the
+rest is inference latency and brief-internal reasoning, not benchmark
+queueing (a 3-on-1 fleet contends far less than the prior 4-on-1
+run).</li>
+</ul>
+<p><strong>One-liner:</strong> ≈17.8 h wall-clock, ≈$1.3K inference
+(Opus 4.8 list rates), ≈1.35B tokens in/out (1.25B cache-read, 105M
+cache-create, 0.6M uncached input, 1.1M output), 3 compactions. The cost
+is in line with <code>environment.md</code>’s timeout envelope —
+per-call GPU budgets bounded device time to ≈2.1 h despite 52 branches,
+so no single trial ran away on the GPU.</p>
+<h2 id="token-totals">Token Totals</h2>
+<p><strong><code>1.35B tokens</code></strong> across every session
+(manager + 3 workers + ≈67 utility/report sub-agents), deduplicated by
+assistant message id.</p>
+<table>
+<thead>
+<tr class="header">
+<th>Token type</th>
+<th style="text-align: right;">Tokens</th>
+<th style="text-align: right;">Share</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Input (uncached)</td>
+<td style="text-align: right;">0.6M</td>
+<td style="text-align: right;">0.05 %</td>
+</tr>
+<tr class="even">
+<td>Cached input</td>
+<td style="text-align: right;">1.25B</td>
+<td style="text-align: right;">92.09 %</td>
+</tr>
+<tr class="odd">
+<td>Output</td>
+<td style="text-align: right;">1.1M</td>
+<td style="text-align: right;">0.08 %</td>
+</tr>
+<tr class="even">
+<td>Cache creation</td>
+<td style="text-align: right;">105.2M</td>
+<td style="text-align: right;">7.78 %</td>
+</tr>
+<tr class="odd">
+<td><strong>Total</strong></td>
+<td style="text-align: right;"><strong>1.35B</strong></td>
+<td style="text-align: right;"><strong>100 %</strong></td>
+</tr>
+</tbody>
+</table>
+<p>These figures are the deduplicated sum across the manager session
+JSONL (<code>ad61ef45-…jsonl</code>) and its 70 sub-agent JSONLs (worker
+briefs plus report/audit/consult sub-agents). The harness reports the
+three input fields disjointly, so <code>Input</code> above is the
+genuinely uncached portion (net of cache reads and cache writes).
+Deduplication is material here: raw <code>usage</code> sums total ≈2.54B
+tokens because ≈50 % of assistant records are streamed/resumed
+duplicates (7,221 raw rows → 3,590 unique message ids); the table
+reflects the deduped 1.35B. The run is effectively all-Opus-4.8 (99.8 %
+of tokens); a 0.16 % slice ran on <code>claude-haiku-4-5</code> (utility
+sub-agents).</p>
+<h2 id="walltime-breakdown">Walltime Breakdown</h2>
+<p>Per-branch <code>duration_seconds</code> is the span of each brief
+from the fleet log. The three workers ran concurrently on one shared
+B200, so these spans <strong>overlap</strong> — they sum to ≈20.7 h of
+per-brief time across 52 branches, but real wall-clock was ≈17.8 h.
+Build vs. bench call counts are not recorded per branch (the data CSV’s
+cost columns were left blank — see the footnote); the run-wide split is
+derived from the <code>[autocuda run] released lock=…</code> lines in
+the session JSONLs and reported as a fleet total.</p>
+<table>
+<thead>
+<tr class="header">
+<th>Branch</th>
+<th style="text-align: right;">Duration</th>
+<th style="text-align: right;">Build calls</th>
+<th style="text-align: right;">Bench calls</th>
+<th style="text-align: right;">Other tool calls</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>worker-0-brief-7</code></td>
+<td style="text-align: right;">11,918 s (3.31 h)</td>
+<td style="text-align: right;">—</td>
+<td style="text-align: right;">—</td>
+<td style="text-align: right;">—</td>
+</tr>
+<tr class="even">
+<td><code>worker-0-brief-0</code></td>
+<td style="text-align: right;">7,632 s (2.12 h)</td>
+<td style="text-align: right;">—</td>
+<td style="text-align: right;">—</td>
+<td style="text-align: right;">—</td>
+</tr>
+<tr class="odd">
+<td><code>worker-2-brief-12</code></td>
+<td style="text-align: right;">5,821 s (1.62 h)</td>
+<td style="text-align: right;">—</td>
+<td style="text-align: right;">—</td>
+<td style="text-align: right;">—</td>
+</tr>
+<tr class="even">
+<td><code>worker-0-brief-4</code></td>
+<td style="text-align: right;">5,273 s (1.46 h)</td>
+<td style="text-align: right;">—</td>
+<td style="text-align: right;">—</td>
+<td style="text-align: right;">—</td>
+</tr>
+<tr class="odd">
+<td><code>worker-1-brief-12</code></td>
+<td style="text-align: right;">4,656 s (1.29 h)</td>
+<td style="text-align: right;">—</td>
+<td style="text-align: right;">—</td>
+<td style="text-align: right;">—</td>
+</tr>
+<tr class="even">
+<td><code>worker-1-brief-0</code></td>
+<td style="text-align: right;">4,787 s (1.33 h)</td>
+<td style="text-align: right;">—</td>
+<td style="text-align: right;">—</td>
+<td style="text-align: right;">—</td>
+</tr>
+<tr class="odd">
+<td><code>worker-1-brief-1</code></td>
+<td style="text-align: right;">4,299 s (1.19 h)</td>
+<td style="text-align: right;">—</td>
+<td style="text-align: right;">—</td>
+<td style="text-align: right;">—</td>
+</tr>
+<tr class="even">
+<td><code>worker-2-brief-11</code></td>
+<td style="text-align: right;">3,708 s (1.03 h)</td>
+<td style="text-align: right;">—</td>
+<td style="text-align: right;">—</td>
+<td style="text-align: right;">—</td>
+</tr>
+<tr class="odd">
+<td><code>worker-1-brief-9</code></td>
+<td style="text-align: right;">3,435 s (0.95 h)</td>
+<td style="text-align: right;">—</td>
+<td style="text-align: right;">—</td>
+<td style="text-align: right;">—</td>
+</tr>
+<tr class="even">
+<td><code>worker-2-brief-8</code></td>
+<td style="text-align: right;">3,140 s (0.87 h)</td>
+<td style="text-align: right;">—</td>
+<td style="text-align: right;">—</td>
+<td style="text-align: right;">—</td>
+</tr>
+<tr class="odd">
+<td><code>worker-0-brief-1</code></td>
+<td style="text-align: right;">2,800 s (0.78 h)</td>
+<td style="text-align: right;">—</td>
+<td style="text-align: right;">—</td>
+<td style="text-align: right;">—</td>
+</tr>
+<tr class="even">
+<td><code>worker-2-brief-13</code></td>
+<td style="text-align: right;">2,744 s (0.76 h)</td>
+<td style="text-align: right;">—</td>
+<td style="text-align: right;">—</td>
+<td style="text-align: right;">—</td>
+</tr>
+</tbody>
+</table>
+<p><em>(52 branches total; 28 had zero recorded duration — empty or
+no-commit briefs. Top 12 by span shown.)</em></p>
+<p><strong>Fleet GPU/build time, from <code>released lock</code> lines
+(deduped by lock+timestamp):</strong></p>
+<table>
+<colgroup>
+<col style="width: 21%" />
+<col style="width: 28%" />
+<col style="width: 28%" />
+<col style="width: 21%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Lock mode</th>
+<th style="text-align: right;">Calls</th>
+<th style="text-align: right;">Summed <code>ran</code></th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>shared</code> (builds, <code>lock=build</code>)</td>
+<td style="text-align: right;">117</td>
+<td style="text-align: right;">4,140 s = 1.15 h</td>
+<td>torch CUDA extension recompiles</td>
+</tr>
+<tr class="even">
+<td><code>exclusive</code> (<code>lock=gpu-0</code>:
+bench/profile/validate)</td>
+<td style="text-align: right;">57</td>
+<td style="text-align: right;">3,536 s = 0.98 h</td>
+<td>the GPU-bound work</td>
+</tr>
+<tr class="odd">
+<td><strong>Total measured device work</strong></td>
+<td style="text-align: right;"><strong>174</strong></td>
+<td style="text-align: right;"><strong>7,676 s = 2.13 h</strong></td>
+<td></td>
+</tr>
+<tr class="even">
+<td>Lock-wait (acquired <code>wait=</code>)</td>
+<td style="text-align: right;">72</td>
+<td style="text-align: right;">3,309 s = 0.92 h</td>
+<td>queueing on the shared B200 (floor)</td>
+</tr>
+</tbody>
+</table>
+<p>The <code>acquired</code> lines survive truncation less often than
+<code>released</code> (72 vs. 174 distinct events), so the
+<strong>lock-wait figure is a floor</strong>; the <code>ran</code>-based
+device-hold time (2.13 h) is the more complete record. Even as a floor,
+GPU contention is small on this 3-on-1 run.</p>
+<h2 id="tool-call-distribution">Tool Call Distribution</h2>
+<p>One row per <code>(group, tool)</code>. Tool-call counts are not in
+the data CSV (the cost columns were left blank to compute spend directly
+from the JSONLs), so this is parsed from every assistant
+<code>tool_use</code> block across the manager + sub-agent JSONLs
+(deduped by tool_use id) and reported as a fleet total. Sorted by
+descending count.</p>
+<table>
+<thead>
+<tr class="header">
+<th>Branch</th>
+<th>Tool</th>
+<th style="text-align: right;">Count</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>fleet (all sessions)</td>
+<td>Bash</td>
+<td style="text-align: right;">2,068</td>
+</tr>
+<tr class="even">
+<td>fleet (all sessions)</td>
+<td>Read</td>
+<td style="text-align: right;">638</td>
+</tr>
+<tr class="odd">
+<td>fleet (all sessions)</td>
+<td>Edit</td>
+<td style="text-align: right;">546</td>
+</tr>
+<tr class="even">
+<td>fleet (all sessions)</td>
+<td>WebFetch</td>
+<td style="text-align: right;">302</td>
+</tr>
+<tr class="odd">
+<td>fleet (all sessions)</td>
+<td>WebSearch</td>
+<td style="text-align: right;">165</td>
+</tr>
+<tr class="even">
+<td>fleet (all sessions)</td>
+<td>SendMessage</td>
+<td style="text-align: right;">83</td>
+</tr>
+<tr class="odd">
+<td>fleet (all sessions)</td>
+<td>Agent</td>
+<td style="text-align: right;">70</td>
+</tr>
+<tr class="even">
+<td>fleet (all sessions)</td>
+<td>Write</td>
+<td style="text-align: right;">11</td>
+</tr>
+<tr class="odd">
+<td>fleet (all sessions)</td>
+<td>Monitor</td>
+<td style="text-align: right;">8</td>
+</tr>
+<tr class="even">
+<td>fleet (all sessions)</td>
+<td>TaskStop</td>
+<td style="text-align: right;">7</td>
+</tr>
+<tr class="odd">
+<td>fleet (all sessions)</td>
+<td>Skill</td>
+<td style="text-align: right;">5</td>
+</tr>
+<tr class="even">
+<td>fleet (all sessions)</td>
+<td>TaskUpdate</td>
+<td style="text-align: right;">4</td>
+</tr>
+<tr class="odd">
+<td>fleet (all sessions)</td>
+<td>CronCreate</td>
+<td style="text-align: right;">2</td>
+</tr>
+<tr class="even">
+<td>fleet (all sessions)</td>
+<td>CronList</td>
+<td style="text-align: right;">2</td>
+</tr>
+<tr class="odd">
+<td>fleet (all sessions)</td>
+<td>CronDelete</td>
+<td style="text-align: right;">2</td>
+</tr>
+<tr class="even">
+<td>fleet (all sessions)</td>
+<td>TaskCreate</td>
+<td style="text-align: right;">2</td>
+</tr>
+</tbody>
+</table>
+<p><code>Bash</code> dominates (2,068 calls) because every build /
+validate / benchmark / profile invocation goes through the harness shell
+scripts. The <code>Read</code> (638) : <code>Edit</code> (546) ratio is
+healthy — ≈1.2 reads per edit means the fleet is editing the kernel
+about as often as it inspects it, not re-reading the same files between
+trials (consistent with the 92.2 % cache hit rate).
+<strong><code>WebFetch</code> (302) + <code>WebSearch</code> (165) = 467
+combined is comparatively high</strong> — ≈23 % of the non-Bash,
+non-edit/read tool calls — meaning the agents reached to the web for
+QR/Householder/Blackwell references more than a pure training-data run
+would; that compounds inference latency, though at this token volume the
+cost impact is modest. The low <code>Skill</code> count (5) reflects
+that the skill prose is loaded once and cached, not re-invoked per
+trial.</p>
+<h2 id="inference-breakdown">Inference Breakdown</h2>
+<p>The fleet ran as one Claude Code steering session
+(<code>ad61ef45-…jsonl</code>) plus its sub-agent JSONLs; the harness
+does not split tokens per fleet <em>branch</em>, so rows here are
+grouped by <strong>role</strong> (manager vs. all worker/utility
+sub-agents) rather than per worker-brief branch — the honest mapping for
+a single combined session. The three input fields Anthropic reports are
+disjoint; <strong>Cache hit % =
+<code>cached / (input + cache_creation + cached) × 100</code></strong>.</p>
+<table>
+<colgroup>
+<col style="width: 9%" />
+<col style="width: 12%" />
+<col style="width: 12%" />
+<col style="width: 12%" />
+<col style="width: 12%" />
+<col style="width: 12%" />
+<col style="width: 12%" />
+<col style="width: 12%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Branch</th>
+<th style="text-align: right;">Input tokens</th>
+<th style="text-align: right;">Output tokens</th>
+<th style="text-align: right;">Cached input tokens</th>
+<th style="text-align: right;">Cache creation tokens</th>
+<th style="text-align: right;">Cache hit %</th>
+<th style="text-align: right;">Compactions</th>
+<th style="text-align: right;">Estimated USD</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>manager</td>
+<td style="text-align: right;">73,051</td>
+<td style="text-align: right;">632,096</td>
+<td style="text-align: right;">181,601,268</td>
+<td style="text-align: right;">22,964,509</td>
+<td style="text-align: right;">88.31 %</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">$107.83</td>
+</tr>
+<tr class="even">
+<td>sub-agents (workers + utility, 70 sessions)</td>
+<td style="text-align: right;">541,103</td>
+<td style="text-align: right;">495,812</td>
+<td style="text-align: right;">1,063,883,811</td>
+<td style="text-align: right;">82,234,152</td>
+<td style="text-align: right;">92.78 %</td>
+<td style="text-align: right;">3</td>
+<td style="text-align: right;">$1,203.67</td>
+</tr>
+<tr class="odd">
+<td><strong>Total</strong></td>
+<td style="text-align: right;"><strong>614,154</strong></td>
+<td style="text-align: right;"><strong>1,127,908</strong></td>
+<td style="text-align: right;"><strong>1,245,485,079</strong></td>
+<td style="text-align: right;"><strong>105,198,661</strong></td>
+<td style="text-align: right;"><strong>92.17 %</strong></td>
+<td style="text-align: right;"><strong>3</strong></td>
+<td style="text-align: right;"><strong>$1,311.50</strong></td>
+</tr>
+</tbody>
+</table>
+<p>The fleet-wide cache hit rate is <strong>92.2 %</strong>, well above
+the 50 % line that would flag a re-read problem — the agents reuse the
+cached SKILL.md + brief prefix efficiently, so there is no
+cache-restructuring lever to pull here. Unlike the prior
+<code>06-22</code> run (where the long-lived manager was the single most
+expensive session), here the <strong>sub-agents carry ≈92 % of the
+cost</strong> ($1,204): they hold the bulk of the cached-context reads
+(1.06B) and do nearly all the cache <em>creation</em> (82.2M of 105.2M)
+as each brief/restart writes a fresh prefix. The manager is cheap ($108)
+because it stayed lean — 0 compactions and only 632K output across the
+whole 17.8 h of steering; the 3 compactions all occurred in long-running
+sub-agent sessions. Per-token-type cost: cache <strong>creation</strong>
+is the largest line at $657 (82.2M write tokens × $6.25/Mtok being 1.25×
+the input rate), edging out cache <strong>read</strong> at $623 (1.25B ×
+$0.50/Mtok); uncached input ($3) and output ($28) are immaterial.</p>
+<h2 id="cost-optimization-opportunities">Cost-Optimization
+Opportunities</h2>
+<ul>
+<li><strong>Cache creation is the single biggest cost line (105M tokens,
+$657).</strong> Each new brief and each sub-agent/worker restart writes
+a fresh cache prefix at 1.25× the input rate. 52 branches (24
+substantive + 28 zero-trial) plus ≈67 utility sub-agents means a lot of
+prefix re-writes; consolidating related objectives into fewer,
+longer-lived briefs — and cutting the 28 zero-trial briefs — would
+amortize the write premium. This is the highest- leverage inference
+lever on the run.</li>
+<li><strong>Web tool usage is on the higher side (467 WebFetch+WebSearch
+calls).</strong> The agents reached to the web for references more than
+a pure-training-data run; each fetch adds a large uncached chunk to the
+next prompt (feeding cache-creation cost) and adds latency. Tightening
+the skill prose to lean on built-in CUDA/Householder knowledge for the
+common cases would trim both.</li>
+<li><strong>Cache hit rate is already high (92.2 %) — no
+action.</strong> This is normally the top cost lever on a long run, but
+here it is healthy; do not restructure the skill prose for caching.</li>
+<li><strong>Bench/build device time is tiny (2.1 h) and not a cost
+driver.</strong> The ≤180 s bench and ≤600 s profile budgets bounded GPU
+time well; the ≈0.9 h of lock-wait is wall-clock, not inference, and is
+small on a 3-on-1 fleet — no GPU-side cost action needed.</li>
+<li><strong>Per-worker view (optimize-tree).</strong> The harness
+emitted one combined steering session, so per-worker-branch token
+attribution isn’t available from the CSV; at the role level no group
+exceeds the other by the 2× runaway threshold in a way that indicates a
+stuck loop — the sub-agent aggregate is large because it is ≈70
+sessions, not one runaway. (Pass
+<code>--harness-jsonl &lt;branch&gt;=&lt;path&gt;</code> per worker
+session in a future <code>report data cost</code> run to get a true
+per-worker split.)</li>
+</ul>
+<h2 id="analysis">Analysis</h2>
+<p>The cost shape is the familiar <strong>context-heavy,
+GPU-light</strong> agentic search: 1.25B cache-read tokens against just
+1.1M output tokens means the fleet spent its budget <em>re-reading its
+own accumulated context</em> far more than generating new text or
+running the device. At Opus 4.8 list rates this lands at ≈$1.3K, of
+which ≈98 % is cache traffic (write $657 + read $623). The GPU — the
+nominal object of the experiment — accounts for only ≈2.1 h of measured
+device work, well inside <code>environment.md</code>’s per-call budgets,
+so no single trial ran away on hardware. The ≈0.9 h of lock-wait
+confirms the documented contention on the shared B200 is mild at 3-on-1
+(the prior 4-on-1 run paid ≈9.5 h of lock-wait); that queueing is free
+in inference terms (agent idle time, attributed to neither inference nor
+billed GPU).</p>
+<p>The most important methodological note is
+<strong>de-duplication</strong>. The raw <code>usage</code> blocks in
+these JSONLs double-count streamed/resumed assistant records almost
+exactly 2× (7,221 raw rows → 3,590 unique message ids), which would have
+inflated the headline from ≈$1.3K to ≈$2.6K. Every figure in this report
+is deduped by message id; an analyst pulling raw sums from the same
+files should expect roughly double these numbers. This is also why a
+direct comparison to the <code>06-22</code> report (which reported
+≈$3.3K on a 56 h / 4-worker run) should be read carefully: this run is
+genuinely cheaper (shorter, one fewer worker, fewer branches), but the
+cache-traffic <em>fraction</em> (≈98 %) and high hit rate (≈92 %) are
+the same structural signature.</p>
+<p>Where did the cost concentrate? Not on the manager (a lean $108) but
+across the <strong>≈70 sub-agent sessions</strong> ($1,204 combined).
+That inverts the prior run’s pattern and is the right shape: the manager
+here stayed terse (632K output, 0 compactions) while the workers and the
+many report/audit/consult helpers did the token-heavy work — reading
+large profiles, web references, and accumulated branch context. The 3
+compactions all landed in long sub-agent sessions, consistent with
+workers (not the manager) hitting the context window on the heavy-shape
+briefs.</p>
+<p><strong>Recommendations.</strong> (1) Cut
+<strong>cache-creation</strong> volume — the largest line at $657 — by
+consolidating objectives into fewer, longer-lived briefs and eliminating
+the 28 zero-trial briefs; each brief/restart pays a fresh 1.25×
+cache-write premium. (2) Reduce <strong>web tool reliance</strong> (467
+fetch/search calls) by tightening skill prose to lean on built-in CUDA
+knowledge for routine QR/Householder reasoning, trimming both the
+uncached input that feeds cache-creation and the added latency. (3) For
+a future run, pass
+<code>--harness-jsonl &lt;branch&gt;=&lt;path&gt;</code> per worker
+session to <code>report data cost</code> so per-worker spend is
+attributed in the CSV and a runaway worker (if any) is named
+automatically — this run’s single combined session forced a role-level
+rollup instead.</p>
+<hr />
+<p><em>Footnote — pricing is approximate and not authoritative.
+Estimated USD uses <strong>Claude Opus 4.8</strong>
+(<code>claude-opus-4-8</code>), the model on which 99.8 % of the run’s
+tokens were generated (a 0.16 % slice ran on
+<code>claude-haiku-4-5</code>, priced at the Opus rate here for
+simplicity, an immaterial overestimate). Per-1M-token list rates
+applied: input <strong>$5.00</strong>, output <strong>$25.00</strong>,
+cache read <strong>$0.50</strong> (≈0.1× input), cache write 5-minute
+<strong>$6.25</strong> (1.25× input). The data CSV’s
+<code>estimated_cost_usd</code> column was left blank — the
+<code>report data cost</code> step populates per-branch tokens only when
+a <code>--harness-jsonl &lt;branch&gt;=&lt;path&gt;</code> matches a
+branch leaf, and this run wrote one combined steering session
+(<code>ad61ef45-4766-4ffe-b847-6fc766eb426d.jsonl</code>) rather than
+per-branch JSONLs; all costs above are computed directly in this report
+from the deduplicated <code>usage</code> blocks of that session and its
+70 sub-agent JSONLs.</em></p>

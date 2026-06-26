@@ -1,0 +1,1 @@
+- [qr-v2-b200-run-strategy](qr-v2-b200-run-strategy.md) — qr_v2 B200 run 2026-06-25: CholeskyQR3+ORHR_COL is the big lever; leaderboard #1=1292us, target <1000us
