@@ -1,4 +1,3 @@
-from concurrent.futures import ThreadPoolExecutor
 import torch
 from torch.utils.cpp_extension import load_inline
 from task import input_t, output_t
@@ -5991,17 +5990,16 @@ def _compile_lu():
         ["-lcublas", "-lcublasLt", "-lcusolver"])
 
 
-# The two extensions are NOT merged into one load_inline: each TU takes ~28s to
-# compile (sm_100, -O3), and the ThreadPoolExecutor(2) overlaps the two ninja
-# subprocesses (each releases the GIL) so the cold wall is max(t_ext, t_lu) ~= 28s.
-# A single merged TU would compile serially (~56s, a 2x build regression) -- the
-# symbols don't collide, but the parallelism is the point. They write to disjoint
+# The two extensions are compiled SERIALLY. They were previously overlapped with a
+# ThreadPoolExecutor(2) to halve the cold build wall (max(t_ext, t_lu) ~= 28s vs ~56s
+# serial), but concurrent compilation at import time could deadlock against the Python
+# import lock when submission.py is imported in-process, so it is now serial for
+# robustness. Build wall-time is NOT benchmarked (eval.py times only custom_kernel),
+# and the produced cubins are byte-identical, so this has ZERO effect on measured
+# performance -- only the one-time cold compile is ~2x longer. They write to disjoint
 # cache subdirs (distinct extension names) so there is no ninja race.
-with ThreadPoolExecutor(max_workers=2) as _compile_pool:
-    _ext_future = _compile_pool.submit(_compile_ext)
-    _lu_future = _compile_pool.submit(_compile_lu)
-    _ext = _ext_future.result()
-    _lu = _lu_future.result()
+_ext = _compile_ext()
+_lu = _compile_lu()
 
 
 _MINV_NT = 512   # build_Minv threads/CTA: sweet spot for both inner (32-wide) and outer (128-wide) blk2 reflectors
