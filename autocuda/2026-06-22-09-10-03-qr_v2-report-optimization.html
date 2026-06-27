@@ -1,0 +1,404 @@
+<h1 id="optimization-report-2026-06-22-09-10-03-qr_v2">Optimization
+Report: <code>2026-06-22-09-10-03-qr_v2</code></h1>
+<p>Scope: the single <code>linalg/qr_v2</code> optimize-tree run tagged
+<code>2026-06-22-09-10-03-qr_v2</code> on NVIDIA B200 (sm_100), 4
+workers, 171 brief-branches. Baseline is <code>torch.geqrf</code> — a
+serial cuSOLVER loop over the batch (~93k tiny launches, tensor cores
+idle), geomean <strong>131,465 µs</strong> over the 12 benchmark shapes.
+The shipped best is commit <code>c508b154</code> at <strong>2,040.9
+µs</strong>, leaderboard-ACCEPTED (22/22).</p>
+<h2 id="executive-summary">Executive Summary</h2>
+<p>This run found <strong>one decisive structural win and then a long
+stack of refinements grafted onto it</strong>: replacing the serial
+<code>torch.geqrf</code> loop with a custom batch-major blocked
+compact-WY Householder QR kernel is what broke the problem open (10.8×
+in a single commit), and every fast result descends from that one
+lineage. The search was broad in <em>tactics</em> but narrow in
+<em>strategy</em> — all four workers converged onto the same
+blocked-kernel basin and spent their budget deepening it (panel fusion →
+on-chip T → tensor-core trailing → two-level n512 → CUDA-graph host
+stack), rather than exploring genuinely different algorithms. The two
+highest-leverage marginal jumps are the blocked kernel itself and the
+on-chip-W fused trailing update; the end-to-end champion at the top of
+the stack is a <em>host-dispatch</em> lever (graph capture + zero-copy
+output pool), not a compute one.</p>
+<table>
+<colgroup>
+<col style="width: 50%" />
+<col style="width: 50%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Metric</th>
+<th>Value</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Overall best speedup (vs baseline)</td>
+<td><strong>64.42×</strong> (commit <code>c508b154</code>, 2,040.9
+µs)</td>
+</tr>
+<tr class="even">
+<td>Baseline</td>
+<td>131,465 µs geomean (<code>torch.geqrf</code> serial cuSOLVER
+loop)</td>
+</tr>
+<tr class="odd">
+<td>Best result</td>
+<td>2,040.9 µs geomean (board-ACCEPTED 22/22)</td>
+</tr>
+<tr class="even">
+<td>Distinct techniques identified</td>
+<td>12</td>
+</tr>
+<tr class="odd">
+<td>Unique trials kept / total</td>
+<td>588 kept / 606 (18 failed)</td>
+</tr>
+<tr class="even">
+<td>Observations folded in</td>
+<td>12,216 attempts</td>
+</tr>
+<tr class="odd">
+<td>Brief-branches / workers</td>
+<td>171 / 4</td>
+</tr>
+<tr class="even">
+<td>Largest single marginal lever</td>
+<td>Fused trailing update (W on-chip), 13.91×
+(<code>0a9b49da</code>)</td>
+</tr>
+<tr class="odd">
+<td>Most-rediscovered technique</td>
+<td>Tensor-core trailing precision (tf32x3/fp16x3), all 4 workers,
+~1,900 attempts</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Key takeaways</strong></p>
+<ul>
+<li><strong>The custom blocked Householder kernel is the lever.</strong>
+Swapping the serial <code>torch.geqrf</code> loop for a Triton
+batch-major blocked QR jumped to 10.76× in one commit
+(<code>7f5cdc08</code>); fusing the panel, the T-formation, the trailing
+update, then adding tensor cores and graph capture carried it the rest
+of the way to 64×.</li>
+<li><strong>The biggest <em>genuine</em> marginal is the on-chip-W fused
+trailing update</strong> (<code>0a9b49da</code>, 13.91×) — it keeps
+<code>W = Vᵀ·A</code> and <code>Y·T</code> in registers so the trailing
+update never round-trips to HBM. The 23.46× on the router row
+(<code>dcf3bde4</code>) is larger but is an attribution artifact (it
+measures the router grafting in the blocked kernel, not dispatch
+logic).</li>
+<li><strong>The end-to-end champion is a host-overhead win, not
+compute.</strong> The shipped best <code>c508b154</code> is fp16x3
+precision grafted onto <code>d262aa42</code> (CUDA-graph capture +
+rotating output-buffer pool + zero-input-copy); its marginal over the
+capture stack is ~1.004×. The compute speedup lives entirely in the
+blocked kernel + fused trailing + tensor-core GEMM beneath it.</li>
+<li><strong>Tensor-core trailing precision was rediscovered by all four
+workers</strong> — ~135 rows / ~1,900 attempts across every worker
+independently landed a tf32x3 (and later fp16x3) tensor-core trailing
+GEMM. Independent rediscovery at that scale is a strong “this is real”
+signal.</li>
+<li><strong>The search was a single deep basin, not a diverse
+frontier.</strong> Every alternative algorithm tried — megakernel,
+two-level nested panel, CholeskyQR2/3, TSQR, tcgen05/TMEM trailing, FP4
+— was killed or shelved, and the whole fast lineage stacks on one
+blocked-QR kernel. Treat the peak step-speedups as ranking signals, not
+a precise decomposition: they are single-trial measurements taken under
+multi-worker GPU contention.</li>
+</ul>
+<h2 id="most-impactful-optimization-techniques">Most Impactful
+Optimization Techniques</h2>
+<table>
+<colgroup>
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Technique</th>
+<th>Peak contribution</th>
+<th>Prevalence</th>
+<th>Representative commits</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Per-shape router / dispatch</td>
+<td>23.46x</td>
+<td>~135 rows, ~2,000 attempts, all 4 workers</td>
+<td><code>dcf3bde4</code>, <code>799076e3</code>,
+<code>e82f26d2</code></td>
+</tr>
+<tr class="even">
+<td>Fused trailing update (W on-chip)</td>
+<td>13.91x</td>
+<td>~53 rows, ~1,380 attempts, all 4 workers</td>
+<td><code>0a9b49da</code>, <code>8772d3b5</code>,
+<code>76472eb1</code></td>
+</tr>
+<tr class="odd">
+<td>Custom blocked Householder QR (batch-major)</td>
+<td>10.76x</td>
+<td>~22 rows, ~500 attempts, all 4 workers</td>
+<td><code>7f5cdc08</code>, <code>da6e702d</code>,
+<code>2b4421ed</code></td>
+</tr>
+<tr class="even">
+<td>Fused panel factorization (geqr2)</td>
+<td>7.59x</td>
+<td>5 rows, ~6 attempts, 3 workers</td>
+<td><code>fa6bbfb8</code>, <code>a67c5449</code></td>
+</tr>
+<tr class="odd">
+<td>On-chip T-formation (compact-WY / dlarft)</td>
+<td>3.90x</td>
+<td>~90 rows, ~1,285 attempts, all 4 workers</td>
+<td><code>82903fd3</code>, <code>3845efa8</code>,
+<code>76472eb1</code></td>
+</tr>
+<tr class="even">
+<td>Adaptive occupancy / num_warps / BLK tuning</td>
+<td>2.36x</td>
+<td>~140 rows, ~1,900 attempts, all 4 workers</td>
+<td><code>ec6a0c0f</code>, <code>c1acc6a1</code>,
+<code>3c883142</code></td>
+</tr>
+<tr class="odd">
+<td>CholeskyQR3 / CholeskyQR2 + orhr_col</td>
+<td>2.54x</td>
+<td>~45 rows, ~54 attempts, gated off (candidate)</td>
+<td><code>be8512c0</code>, <code>868fe89d</code></td>
+</tr>
+<tr class="even">
+<td>Tensor-core trailing precision (tf32x3 → fp16x3)</td>
+<td>2.41x</td>
+<td>~135 rows, ~1,900 attempts, all 4 workers</td>
+<td><code>4110e701</code>, <code>98e89d90</code>,
+<code>abbeb37a</code></td>
+</tr>
+<tr class="odd">
+<td>Two-level n512 panel (IB/NB nesting)</td>
+<td>2.21x</td>
+<td>~76 rows, ~2,000 attempts, all 4 workers</td>
+<td><code>da6e702d</code>, <code>8ff5c02a</code></td>
+</tr>
+<tr class="even">
+<td>baddbmm / rank-k trailing fusion</td>
+<td>1.15x</td>
+<td>~15 rows, ~16 attempts, multiple workers</td>
+<td><code>192bf1b9</code>, <code>304…</code></td>
+</tr>
+<tr class="odd">
+<td>CUDA-graph capture (+ rotating buffer pool, zero-copy)</td>
+<td>1.01x marginal (<strong>64.42× end-to-end champion</strong>)</td>
+<td>~27 rows, ~84 attempts, all 4 workers</td>
+<td><code>c508b154</code>, <code>d262aa42</code>,
+<code>76204dd5</code></td>
+</tr>
+<tr class="even">
+<td>Megakernel (one block/matrix)</td>
+<td>n/a (shelved, never net-best)</td>
+<td>~39 rows, ~46 attempts, all 4 workers</td>
+<td><code>da6e702d</code>, <code>c6e5612a</code>,
+<code>ea501a28</code></td>
+</tr>
+</tbody>
+</table>
+<p><strong>Per-shape router / dispatch</strong> posts the largest single
+marginal but the magnitude is an attribution artifact: the 23.46× of
+<code>dcf3bde4</code> (“combine custom small-n n≤256 with the in-run
+batch-major backend for n&gt;256”) is measured against a parent still
+doing a slow per-shape path, so the jump is really the <em>router
+grafting in the blocked kernel</em>, not dispatch logic itself. As a
+standalone mechanism the router is a Python dispatch table keyed on
+<code>(n, batch)</code> that sends each shape to its best backend. It
+mattered because the 12 shapes have wildly different optima —
+n=512/B=640 wants the blocked kernel, tiny n=32 wants a warp-per-matrix
+path, large-n low-batch wants different tiling/precision — and it is the
+connective tissue every other technique plugs into
+(<code>799076e3</code> rerouted tiny shapes to the backend after proving
+the custom small-n kernel was slower everywhere). Its value is entirely
+in what it routes to, not in the routing.</p>
+<p><strong>Fused trailing update (W on-chip)</strong> is the highest
+<em>genuine</em> marginal lever (<code>0a9b49da</code>, 13.91×). It
+rewrites the blocked QR’s trailing-matrix update so each Triton program
+owns a full-height column strip and keeps <code>W = Vᵀ·A</code> and
+<code>Y·T</code> resident in registers across two row sweeps — the
+<code>Y·T</code> product never round-trips to HBM. On the dominant
+n=512/1024 shapes this is an HBM-bandwidth win (the trailing update is
+the bulk of the FLOPs and was memory-bound on the intermediate). It
+stacks directly on the custom blocked kernel and was deepened by all
+four workers (<code>8772d3b5</code> replaced the serial per-k
+<code>V</code> re-read in the wide-T build with a single tensor-core
+Gram product; <code>76472eb1</code> made the wide-T recurrence-free).
+The crucial leaderboard constraint here was that the fused single-kernel
+form is board-legal whereas a two-stream variant was rejected —
+<code>0a9b49da</code>’s one-kernel-per-strip formulation is what made
+the fusion shippable.</p>
+<p><strong>Custom blocked Householder QR (batch-major)</strong> is the
+foundation the entire fast lineage rests on (<code>7f5cdc08</code>,
+10.76× <em>from baseline</em> in one commit, 285 new lines in
+<code>submission.py</code>). It is a right-looking blocked QR that
+processes each width-32 column panel across the whole batch in one
+Triton launch — <code>panel_factor</code> + <code>build_T</code> + a
+race-free two-kernel BLAS-3 trailing update — collapsing the baseline’s
+~93k tiny serial cuSOLVER launches into a handful of batched,
+tensor-core-eligible kernels. It attacks the baseline’s core pathology
+(serial, latency-bound, tensor cores idle). This is the run’s defining
+structural decision; every other technique in the table is a graft onto
+it.</p>
+<p><strong>Fused panel factorization (geqr2)</strong> and
+<strong>on-chip T-formation</strong> are the two fusions that took the
+blocked kernel from ~11× to ~16×. <code>fa6bbfb8</code> collapsed the
+~30k tiny gemv launches of the panel factorization into one Triton
+kernel per matrix with an on-chip column loop (7.59× marginal, B=640
+n=512 then 28.7× over baseline); <code>82903fd3</code> folded the
+compact-WY <code>T</code>-matrix formation (the <code>dlarft</code>
+recurrence) into the panel kernel from resident <code>V</code>,
+eliminating a ~500-call Python gemv loop and a <code>Vmask</code>
+reconstruction (3.90× marginal, geomean to 8,157 µs / 16.1×). Both are
+latency/launch-overhead kills on the panel, which is the serial part of
+blocked QR. The panel fusion was reached by a single worker lineage
+(high-impact but lightly corroborated); the T-formation fusion was
+deepened by all four.</p>
+<p><strong>Tensor-core trailing precision (tf32x3 → fp16x3)</strong> is
+the most independently rediscovered technique — ~135 rows / ~1,900
+attempts across all four workers (<code>4110e701</code> splices a tf32x3
+tensor-core trailing update; <code>98e89d90</code> register-tiles the
+group-B trailing GEMM; <code>abbeb37a</code> carries the late
+tf32x3→fp16x3 sweep under graph capture). It targets tensor-core
+utilization on the trailing GEMM, the kernel’s largest FLOP sink, using
+3-pass tf32 (tf32x3) — and later 3-pass fp16 (fp16x3, ~30-bit effective
+mantissa) — to keep FP32-equivalent accuracy for QR’s orthogonality. Its
+individual marginal is modest (~2.4×) because it lands on a kernel the
+panel/trailing fusions already sped up, but its prevalence is the
+signal: four independent workers converging on the <em>same</em>
+precision ladder (1-pass fails the diff-guard, 3-pass is the safe floor)
+means it is robustly real. fp16x3 specifically only pays once the
+host-dispatch stack amortizes per-kernel launch — that is why it lands
+last, as the <code>c508b154</code> graft.</p>
+<p><strong>CUDA-graph capture (+ rotating buffer pool,
+zero-copy)</strong> is the end-to-end champion
+(<code>c508b154</code>/<code>d262aa42</code>, 64.42×) yet has a
+near-1.0× marginal, which is the whole point: it is a host-side lever,
+not a compute one. <code>76204dd5</code> added a rotating output-buffer
+pool so the dominant n=512 shape could enter capture without the replay
+clone that previously made it a loss; <code>d262aa42</code> then added
+zero-input-copy replay for the count==1 shapes (n=512+n=1024, ~62% of
+the geomean weight), giving the “−5.3% host-dispatch stack” relative to
+the pre-capture kernel; <code>c508b154</code> grafted the fp16x3
+precision change on top. It stacks last, on top of everything above, and
+was reached only because the kernel underneath it was already fast
+enough that host dispatch became the residual cost.</p>
+<h2 id="failed-optimization-techniques">Failed Optimization
+Techniques</h2>
+<p><strong>Reduced-precision trailing updates without
+re-orthogonalization</strong> were the most-repeated correctness
+dead-end. One-pass tf32 on the trailing dots (<code>e37e3991</code> for
+n=1024, <code>81df4e28</code> on all three trailing GEMMs) failed the
+ranked ill-conditioned shapes (n=512 scaled-residual 24.3 vs allowed ~1;
+rankdef/nearrank/clustered all below tolerance), and the NVFP4/MXFP4
+emulation (<code>198ace1e</code> — explicitly the #1 holder’s
+<code>submission_nvfp4.py</code> path) failed by ~16% relative-Frobenius
+GEMM error from e2m1’s single mantissa bit (n=4096 dense raw fp4
+scaled-factor 281 vs allowed ~14). Even a 2-MMA tf32 split
+(<code>000681b5</code>) and the late fp16x2→fp16 (2-MMA→1-MMA) joint
+reductions (<code>f96bf304</code>, <code>28b31254</code>) tripped the
+diff-guard on timed n=512 ill-conditioned shapes. QR’s orthogonality is
+too precision-sensitive for single- or even double-pass low precision
+<em>without</em> a re-orthogonalization step; the 3-pass tf32x3/fp16x3
+is the accuracy floor the run settled on, and the fp4 attempt skipped
+the correction step that makes fp4 viable for the actual #1.</p>
+<p><strong>Multi-CTA and two-level nested panel factorization</strong>
+failed structurally. The multi-CTA panel (<code>0a9b49da</code>’s
+sibling <code>qr_panel_mcta</code>, grid <code>(G,B)</code> with a
+per-matrix barrier) produced wrong reflectors (residual ~800) where it
+engaged; the two-level NB=32/IB=8 nestings (<code>da184f5e</code>,
+<code>737bbcca</code>, <code>43380c48</code>, <code>59ef9e50</code>) hit
+NaN/Inf, broke the wide-T build, or hit a hard Triton wall —
+<code>tl.dot</code> requires K≥16, and the IB=8 inner Gram/trailing dots
+have K=8 and cannot use tensor cores at all. The panel carries a serial
+column dependency that resists CTA-level parallelism without a correct
+cross-CTA reduction, which none of these landed. (A coarser two-level
+IB16/NB32 <em>did</em> eventually land in the broader effort, but the
+aggressive nestings here all failed.)</p>
+<p><strong>The geqrt3 recursive-WY panel</strong> was a confirmed
+structural dead end (<code>94bd91fd</code> math-correct but OOM’d shared
+memory at MAXH≥1024; <code>7ff6415d</code> OOM’d even at MAXH≤512 once
+tf32x3 splitting added scratch; the line closed at
+<code>dce59729</code>). The recursion’s shared-memory footprint forces
+one block per SM, starving the tensor-core trailing update of occupancy
+— it makes the panel “cleaner” at the cost of the part that dominates
+runtime. A textbook case of optimizing the wrong sub-kernel.</p>
+<p><strong>Hand-CUDA / tcgen05 trailing substitutions</strong> were
+correct-but-slower. A register-blocked custom-CUDA panel replacing the
+Triton <code>_panel_factor_kernel</code> (<code>34b4ecd0</code>)
+regressed and raced (n=512 panel 441 µs vs Triton 264 µs, grid-starved
+at 0.86 waves/SM); a smem-resident hand-CUDA fused trailing
+(<code>000681b5</code>) was fully correct but ran FP32 CUDA-core GEMMs
+~5× slower than Triton’s tf32 tensor cores; and the gated tcgen05/TMEM
+trailing probe (<code>32e1c1d1</code>/<code>93a3254b</code>) — although
+it structurally escaped the register wall — benchmarked 10–14×
+<em>slower</em> than <code>torch.bmm</code> everywhere because the
+K-tiled mbarrier round-trip dominates, killing the entire tcgen05
+trailing line. The production trailing already runs <code>tl.dot</code>
+tensor cores at bmm-class throughput, leaving these substitutions
+nothing to gain.</p>
+<p><strong>External-library batched backends</strong>
+(<code>geqrfBatched</code> via <code>load_inline</code>) were a minor
+dead end: a per-shape <code>geqrfBatched</code> route for n=512
+(<code>3b374e81</code>) showed a 1.10× <em>local</em> number that was a
+cuSOLVER-degradation artifact rather than a real win, and a
+<code>load_inline</code> shim collided with the auto-generated pybind
+module (<code>8b1b634e</code>). These add device-pointer-array setup and
+build/portability risk while offering no win over the custom kernel that
+had already left the library path entirely.</p>
+<h2 id="unexplored-areas">Unexplored Areas</h2>
+<p><strong>NVFP4/FP4 tensor cores with re-orthogonalization</strong> —
+the single highest-value gap, because it is how the actual #1 holder
+wins (NVFP4 + re-orthogonalization, far below 2,040 µs). The run tried
+NVFP4 exactly once (<code>198ace1e</code>) and it failed the diff-guard
+precisely because it was used <em>raw</em>, without the correction step.
+Nobody implemented the gated “fp4-fast-GEMM + cheap re-orthogonalize,
+fall back on ill-conditioned” combination. The shipped best (2,040.9 µs)
+is several-fold off #1, and this is the lever that closes it.</p>
+<p><strong>BF16 trailing with iterative refinement</strong> — only
+tf32x3 and fp16x3 (both 3-pass, safe) and a failed raw fp4 were tried
+for the trailing GEMM. BF16 with a single correction sweep — the same
+re-orthogonalization idea that makes fp4 safe, applied one precision
+tier up — was never benchmarked, and could roughly halve trailing cost
+on the dominant n=512/1024 shapes (the bulk of the geomean weight) if
+guarded on conditioning. It sits in the unexplored gap between the safe
+3-pass floor and the failed 1-pass attempts.</p>
+<p><strong>The serial panel bottleneck on low-batch large-n (n=2048 B=8,
+n=4096 B=2)</strong> — these shapes run the one-program-per-matrix panel
+at 2–8 CTA occupancy (88 idle SMs at n=1024 per <code>76204dd5</code>’s
+profile). Every aggressive parallelization attempt failed: multi-CTA
+panel produced wrong reflectors, and the barrier-free TSQR/CAQR panel
+prototypes (<code>f1c1d1c3</code> and siblings) were measured
+grid-starved (0.41 waves, 20.8% SM, 1.08% DRAM) and never landed a net
+win. A <em>correct</em> TSQR leaf with a log-depth reduction tree to
+fill the idle SMs is the obvious untried attack on the kernel’s
+remaining compute floor for these shapes.</p>
+<p><strong>CUTLASS / CuTe-DSL kernels</strong> — the entire run was
+Triton + inline NVRTC CUDA. No CUTLASS collective or CuTe-DSL blocked-QR
+was benchmarked, despite the B200 (sm_100) trailing GEMM being a CUTLASS
+sweet spot where its collective-builder pipelines typically beat
+hand-Triton tensor-core code. The trailing update specifically — the
+largest FLOP sink, where tf32x3/fp16x3 are the current best — is where a
+CUTLASS path would most plausibly pay off, and it was never tried even
+once.</p>
+<p><strong>A persistent / cross-shape graph capture</strong> — capture
+is currently per-shape-key with kernel relaunch between panels, and the
+zero-copy win only covers the count==1 shapes (a count==2 extension was
+measured neutral and disabled, <code>7bd89b80</code>). A single
+cooperative-grid persistent kernel spanning the panel sequence (no
+relaunch), or a capture spanning the batch dimension, was never
+attempted and would attack the residual launch overhead that per-shape
+graph capture only partially removes.</p>

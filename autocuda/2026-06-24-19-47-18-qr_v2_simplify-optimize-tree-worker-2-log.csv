@@ -1,0 +1,3 @@
+timestamp,agent_id,brief_id,iteration,linalg/qr_v2,diff_lines,status,commit,description
+2026-06-24T19:52:11.239834,2,,N/A,131112.382,0,baseline,14847528b548bccbeb3df09e529f075bdef2bece,"baseline: torch.geqrf (main), 6-line submission"
+2026-06-24T19:58:55.135796,2,,N/A,1763.155,9057,optimized,e34e57da597f23e950c1fdf8a58988be6a769ec1,"optimized peak: qr_v2 winning kernel (9057-line diff, 74.4x vs baseline)"

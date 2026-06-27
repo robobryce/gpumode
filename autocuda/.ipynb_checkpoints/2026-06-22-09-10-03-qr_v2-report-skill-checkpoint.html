@@ -1,0 +1,356 @@
+<h1 id="skill-report-2026-06-22-09-10-03-qr_v2">Skill Report:
+2026-06-22-09-10-03-qr_v2</h1>
+<h2 id="executive-summary">Executive Summary</h2>
+<p>The automated audit of the <code>2026-06-22-09-10-03-qr_v2</code> run
+produced <strong>221 candidate rows</strong>, of which <strong>172 are
+missing-harness coverage gaps</strong> (the four worker sub-agent
+session JSONLs were never passed to the data step — only the manager
+session was scanned) and <strong>49 are real signals from the manager
+session</strong>. After triaging every non-coverage row against the
+cited harness context, <strong>zero confirmed autocuda <em>skill</em>
+implementation bugs</strong> survive: the 20
+<code>autocuda_cli_contract</code> rows are all <code>--help</code> /
+log-tail probes (the scanner matched the literal <code>error:</code> /
+<code>invalid choice</code> strings inside help text, not actual command
+rejections), the 16 <code>autocuda_exception</code> “tracebacks” come
+from the agent manually running <code>python eval.py</code> from a
+worktree without <code>utils.py</code> on <code>PYTHONPATH</code> (a
+setup/usage issue, not an autocuda crash), and 9 of the 9
+<code>explicit_skill_issue</code> rows are worker optimization outcomes
+or the manager’s own self-reflection. The single behaviorally real
+finding is the <strong>operator-confirmation gate</strong> (4 rows, one
+incident): mid-run the manager paused to ask the operator which worker
+to redirect instead of continuing the never-stop loop.</p>
+<p>Key takeaways:</p>
+<ul>
+<li><strong>No skill code bug.</strong> No SKILL.md instruction or
+skill→CLI contract caused a failure in this run; the implicated skill is
+<code>optimize-tree</code>, and its contract held.</li>
+<li><strong>Coverage is the dominant gap.</strong> 172/221 rows (78%)
+are missing-harness placeholders for the four workers’ brief branches;
+the audit only saw the manager’s <code>optimize-tree</code> session, so
+worker-side skill friction is unmeasured.</li>
+<li><strong>The CLI-contract cluster is a false-positive class.</strong>
+All 20 rows are the manager discovering the CLI surface
+(<code>autocuda log optimize-tree --help</code>,
+<code>autocuda brief</code> → “invalid choice”,
+<code>autocuda run --help</code>); each was immediately self-corrected.
+At most this is a CLI <em>discoverability</em> nit, not a contract
+break.</li>
+<li><strong>The “critical” exception cluster is a project-harness/usage
+issue, not autocuda.</strong> 16 rows are one recurring
+<code>ModuleNotFoundError: No module named 'utils'</code> from
+<code>eval.py</code> when the manager validated a kernel from a scratch
+worktree’s problem dir without the set-root on <code>PYTHONPATH</code>;
+the agent diagnosed <code>env.sh</code>’s <code>PYTHONPATH</code> logic
+and fixed its own invocation. Severity downgraded from critical to
+low.</li>
+<li><strong>One genuine confirmation gate.</strong> At
+<code>2026-06-24T14:51:18Z</code> the manager answered an operator
+question and ended its turn with “Want me to redirect a second worker…
+or keep…?”, and explicitly acknowledged it had under-prioritized
+replying — a mild stop-for-confirmation against the never-stop
+directive.</li>
+</ul>
+<h2 id="skill-issue-candidates">Skill Issue Candidates</h2>
+<table style="width:100%;">
+<colgroup>
+<col style="width: 16%" />
+<col style="width: 16%" />
+<col style="width: 16%" />
+<col style="width: 16%" />
+<col style="width: 16%" />
+<col style="width: 16%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Branch</th>
+<th>Skill</th>
+<th>Severity</th>
+<th>Category</th>
+<th>Evidence</th>
+<th>Recommendation</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>manager</td>
+<td>optimize-tree</td>
+<td>low</td>
+<td>operator_confirmation_gate</td>
+<td>L8601 (assistant)
+<code>…continuing the loop. Want me to also redirect a second worker… or keep W0/W1/W3 on their current re-audits…?</code>
+— agent also admits “I’d been treating your messages as steering…
+under-prioritized replying.”</td>
+<td>Tighten the optimize-tree never-stop section so the original launch
+instruction is the standing greenlight; answer operator questions
+inline, then continue the loop without a new gate.</td>
+</tr>
+<tr class="even">
+<td>manager</td>
+<td>optimize-tree</td>
+<td>low</td>
+<td>autocuda_cli_contract</td>
+<td>L6847 (tool_result)
+<code>autocuda: error: argument namespace: invalid choice: 'brief'</code>
+— agent typed <code>autocuda brief …</code> to discover the post-brief
+command, then found <code>autocuda log optimize-tree brief</code>.
+(bug_0178–0183)</td>
+<td>Optional: cross-reference the exact
+<code>autocuda log optimize-tree brief</code> invocation in the
+optimize-tree SKILL.md so the agent does not guess
+<code>autocuda brief</code>. No contract break.</td>
+</tr>
+<tr class="odd">
+<td>manager</td>
+<td>optimize-tree</td>
+<td>info (false positive)</td>
+<td>autocuda_cli_contract</td>
+<td>L1168 (tool_result) — output of
+<code>autocuda log optimize-tree --help</code>; the matched
+<code>error: the following arguments are required</code> is the help
+text’s usage example, not a rejection. (bug_0172–0176)</td>
+<td>None — drop from skill-bug scope. Scanner matched
+<code>error:</code> inside <code>--help</code> output.</td>
+</tr>
+<tr class="even">
+<td>manager</td>
+<td>optimize-tree</td>
+<td>info (false positive)</td>
+<td>autocuda_cli_contract</td>
+<td>L9645 (tool_result) — <code>autocuda log</code> manager-log tail +
+<code>autocuda run --help</code> usage; matched strings
+(<code>brief_stop</code>, <code>run_kind</code>,
+<code>error: the following arguments are required</code>) are log-row
+descriptions and help text. (bug_0212–0220)</td>
+<td>None — drop from skill-bug scope.</td>
+</tr>
+<tr class="odd">
+<td>manager</td>
+<td>optimize-tree</td>
+<td>low</td>
+<td>autocuda_exception</td>
+<td>L9196 &amp; L9201 (tool_result)
+<code>Traceback … from utils import clear_l2_cache, set_seed / ModuleNotFoundError: No module named 'utils'</code>
+— manual <code>python eval.py test .</code> from a scratch worktree
+problem dir; <code>utils.py</code> is at the set root
+(<code>problems/linalg/</code>), not on <code>PYTHONPATH</code>. Wrapped
+by <code>autocuda run exclusive --</code> (GPU lock only).
+(bug_0196–0211)</td>
+<td>Not an autocuda crash. Document the correct validate invocation (run
+from set root, or export <code>PYTHONPATH</code> per
+<code>env.sh</code>) as a setup prerequisite in optimize-tree / discover
+so the manager does not have to re-derive it.</td>
+</tr>
+<tr class="even">
+<td>manager</td>
+<td>optimize-tree</td>
+<td>info (false positive)</td>
+<td>explicit_skill_issue</td>
+<td>L4059 (assistant) — worker FP4 result: “raw FP4 7.4× slower”,
+“Triton <code>_fp4_mm</code> path fails to compile at K=1024
+(TMEM-promote MLIR bug)”. This is a Triton/MLIR compiler bug + normal
+negative optimization result. (bug_0177)</td>
+<td>None — normal optimization failure, not a skill issue. Excluded per
+the skill’s “do not blame the skill for normal failures”
+constraint.</td>
+</tr>
+<tr class="odd">
+<td>manager</td>
+<td>optimize-tree</td>
+<td>info (not a skill bug)</td>
+<td>explicit_skill_issue</td>
+<td>L7268 / L7279 (assistant) — “My repeated ‘graft d60e14e6’ direction
+was wrong — I was leaning on a cross-tag shortcut <strong>that the skill
+forbids</strong> and that doesn’t exist in this tree.” The skill’s
+no-peek/no-cross-tag rule was <em>correct</em>; the agent’s own stored
+brief instruction was wrong and it self-corrected. (bug_0184–0185)</td>
+<td>Skill was right. Optionally surface the no-peek / same-tag-only
+constraint more prominently so the manager does not store cross-tag
+grafts in memory.</td>
+</tr>
+<tr class="even">
+<td>manager</td>
+<td>optimize-tree</td>
+<td>info (false positive)</td>
+<td>explicit_skill_issue</td>
+<td>L8538 / L8547 (assistant) — manager re-reading the
+operating-rules/never-stop sections and reporting alignment (“Diversity
+strong, effective_directions 12.74”, “Combining is the engine”). The
+“submit bug” referenced is the <strong>project’s own
+<code>harness/submit.sh</code></strong> ($REPO_DIR resolved from
+BASH_SOURCE, not cwd), not an autocuda skill. (bug_0186–0191)</td>
+<td>None for autocuda skills. The submit-integrity bug lives in the
+project harness (<code>harness/submit.sh</code> / <code>env.sh</code>),
+outside this audit’s blame scope.</td>
+</tr>
+<tr class="odd">
+<td>autocuda/optimize/2026-06-22-09-10-03-qr_v2/worker-0…worker-3 (172
+brief branches)</td>
+<td>optimize-tree</td>
+<td>info</td>
+<td>missing_harness</td>
+<td>No harness JSONL was available for automated skill issue scanning.
+Branches span <code>worker-0-brief-0</code> …
+<code>worker-3-brief-9</code> across all four workers. See CSV
+<code>bug_0000</code>–<code>bug_0171</code> for the full per-branch
+list.</td>
+<td>Pass <code>--harness-jsonl BRANCH=PATH</code> for each worker
+session (export the worker sub-agent JSONLs into
+<code>autocuda/harness-records/</code>) and re-run
+<code>autocuda report data skill</code> to close the coverage gap.</td>
+</tr>
+</tbody>
+</table>
+<p>Detailed excerpts and triage rationale are in <strong>Root
+Causes</strong> below; the per-branch coverage rows are enumerated in
+the CSV.</p>
+<h2 id="root-causes">Root Causes</h2>
+<p>Grouped by the cause the candidates point to:</p>
+<ul>
+<li><p><strong>Coverage gap — missing worker harness mapping (172 rows,
+info).</strong> The data step was given only the manager Claude Code
+session (<code>…/cff4df73-…jsonl</code>). The four
+<code>optimize-tree-worker</code> sub-agents that executed
+<code>explore-brief</code> for each of the 172 brief branches were not
+passed, so every <code>worker-N-brief-M</code> branch produced a
+<code>missing_harness</code> placeholder. This is the largest single
+contributor to the row count and the only thing preventing a complete
+audit. Not a bug — a data-collection gap.</p></li>
+<li><p><strong>CLI-discoverability false positives —
+<code>optimize-tree</code> SKILL.md (20 rows; 18 false positives, 2
+minor).</strong> The scanner’s keyword match on <code>error:</code> /
+<code>invalid choice</code> /
+<code>the following arguments are required</code> fires on three
+distinct <em>probes</em>, not rejections: (1)
+<code>autocuda log optimize-tree --help</code> output (L1168), whose
+usage example literally contains “error: the following arguments are
+required”; (2) <code>autocuda log</code> manager-log tails and
+<code>autocuda run --help</code> (L9645); and (3) the one substantive
+case, L6847, where the manager guessed <code>autocuda brief</code> (got
+“invalid choice”) before finding
+<code>autocuda log optimize-tree brief</code>. The only actionable item
+is that the <code>brief</code> subcommand path could be spelled out in
+the SKILL.md so the agent does not guess. No CLI contract was actually
+violated.</p></li>
+<li><p><strong>Setup prerequisite — validate invocation /
+<code>PYTHONPATH</code> (16 rows, downgraded critical→low).</strong> The
+recurring <code>ModuleNotFoundError: No module named 'utils'</code>
+(L9196, L9201) is <code>eval.py</code> failing its
+<code>from utils import …</code> because the manager ran
+<code>python eval.py test .</code> from a scratch worktree’s
+<code>problems/linalg/qr_v2/</code> dir, where <code>utils.py</code> (at
+the set root <code>problems/linalg/</code>) was not on
+<code>PYTHONPATH</code>. <code>env.sh</code> normally exports
+<code>PYTHONPATH="$PROBLEM_DIR:$EVAL_DIR:$UTILS_DIR…"</code>; the bare
+<code>python eval.py</code> bypassed it. The traceback is from the
+problem’s <code>eval.py</code>, merely wrapped by
+<code>autocuda run exclusive --</code> (a GPU-lock shim) — autocuda
+itself did not raise. This is a setup/usage prerequisite the manager had
+to rediscover mid-run, so it belongs in the discover/optimize-tree setup
+notes, but it is not an autocuda exception.</p></li>
+<li><p><strong>Manager self-correction &amp; reflection, not skill
+defects (9 <code>explicit_skill_issue</code> rows).</strong> bug_0177 is
+a worker’s FP4 negative result plus an upstream Triton/MLIR compile bug
+(normal optimization failure). bug_0184–0185 are the manager admitting
+its <em>own</em> repeated “graft d60e14e6” instruction violated the
+skill’s no-cross-tag-peek rule — the rule was correct, the agent was
+wrong, and it fixed its memory. bug_0186–0191 are the manager re-reading
+the operating rules and confirming alignment; the “submit bug” it fixed
+is in the <strong>project’s <code>harness/submit.sh</code></strong>
+($REPO_DIR via BASH_SOURCE), not any autocuda skill. None implicate
+skill instructions or the skill→CLI contract.</p></li>
+<li><p><strong>Confirmation-gate behavior — <code>optimize-tree</code>
+never-stop section (4 rows, one incident, low).</strong> At L8601 the
+manager, after answering an operator’s “did you read the report?”
+question, ended its turn with an open choice (“Want me to redirect a
+second worker… or keep…?”) and acknowledged it had been “treating your
+messages as steering… under-prioritized replying.” In an autonomous
+never-stop run this is a (mild) stop-for-confirmation: the operator’s
+original launch instruction should have been treated as the standing
+greenlight to keep dispatching briefs. This is the only behavioral
+finding attributable to skill guidance.</p></li>
+</ul>
+<h2 id="fix-plan">Fix Plan</h2>
+<p>Concrete edits, smallest-impact first. None require changing kernel
+or skill files in <em>this</em> repo (the report is read-only); these
+are recommendations for the autocuda skill maintainer.</p>
+<ol type="1">
+<li><p><strong>Close the coverage gap (data, not skill).</strong> Export
+the four worker sub-agent session JSONLs into
+<code>autocuda/harness-records/</code> and re-run:</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="bu">eval</span> <span class="st">&quot;</span><span class="va">$(</span><span class="ex">autocuda</span> report data skill <span class="at">--tag</span> 2026-06-22-09-10-03-qr_v2 <span class="dt">\</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a>    <span class="at">--harness-jsonl</span> <span class="op">&lt;</span>worker-branch<span class="op">&gt;</span>=<span class="op">&lt;</span>jsonl-path<span class="op">&gt;</span> ...<span class="va">)</span><span class="st">&quot;</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="ex">autocuda</span> schema check report-skill-csv <span class="at">--output</span> 2026-06-22-09-10-03-qr_v2</span></code></pre></div>
+<p>Validation: the regenerated CSV has &lt; 172
+<code>missing_harness</code> rows and the schema check passes.</p></li>
+<li><p><strong>optimize-tree SKILL.md — spell out the brief-post
+command.</strong> Add the exact
+<code>autocuda log optimize-tree brief --agent-id &lt;id&gt; …</code>
+invocation (and note that
+<code>autocuda log optimize-tree {baseline,brief,iteration,start,stop}</code>
+is the lifecycle surface) so the agent does not guess
+<code>autocuda brief</code>. Validation:
+<code>autocuda log optimize-tree brief --help</code> matches the
+SKILL.md example verbatim.</p></li>
+<li><p><strong>discover / optimize-tree SKILL.md — document the validate
+prerequisite.</strong> State that ad-hoc <code>python eval.py …</code>
+must run from the set-root dir (or with <code>PYTHONPATH</code> set as
+<code>env.sh</code> does, because <code>utils.py</code> lives at
+<code>problems/&lt;set&gt;/</code>), so a manager validating a worktree
+commit does not hit
+<code>ModuleNotFoundError: No module named 'utils'</code>. Validation: a
+from-set-root <code>python eval.py test &lt;problem-dir&gt;</code> (or
+<code>PYTHONPATH=&lt;set-root&gt; …</code>) runs without the import
+error.</p></li>
+<li><p><strong>optimize-tree never-stop section — treat the launch
+instruction as a standing greenlight.</strong> Add explicit guidance:
+answer operator questions inline, then immediately resume dispatching
+briefs; do not end a turn on an open “should I…?” choice unless the
+operator has paused the run. Validation: a never-stop transcript review
+shows no turn ending in an operator-directed choice while the run is
+active.</p></li>
+<li><p><strong>report-skill data step (CLI) — reduce help/log-tail false
+positives (optional).</strong> The <code>autocuda_cli_contract</code>
+and <code>autocuda_exception</code> heuristics fired on
+<code>--help</code> output, log-row description text, and a
+problem-script traceback wrapped by <code>autocuda run</code>. Consider
+excluding lines that are clearly <code>--help</code> usage blocks or
+<code>autocuda log</code> CSV tails, and distinguishing a traceback
+whose top frame is the autocuda package from one whose top frame is the
+problem’s <code>eval.py</code>. Validation: re-running the data step
+over this manager JSONL yields fewer than the current 36 (20 CLI + 16
+exception) non-coverage candidates, with the genuine confirmation gate
+retained.</p></li>
+</ol>
+<h2 id="verification">Verification</h2>
+<ul>
+<li><strong><code>autocuda schema check report-skill-csv --output 2026-06-22-09-10-03-qr_v2</code></strong>
+— PASS
+(<code>OK — …2026-06-22-09-10-03-qr_v2-report-skill.csv matches the built-in report-skill schema</code>).
+The data CSV (221 rows) was pre-built with the manager harness JSONL and
+not rebuilt for this report.</li>
+<li><strong><code>autocuda schema check report-skill-markdown --output 2026-06-22-09-10-03-qr_v2</code></strong>
+— run after writing this file (see summary printout).</li>
+<li><strong>Source harness review.</strong> Triage read the cited
+records directly in the manager session
+<code>…/cff4df73-32b1-46cb-8e5a-58ad5f4046ff.jsonl</code> (9,777 lines):
+L1168, L4059, L6847, L7268/7279, L8538/8547, L8601, L9196/9201, L9645.
+An independent direct scan of the session for confirmation gates and
+skill-contradiction language (<code>SKILL.md</code>, “stale”,
+“contradict”, “should have”, “skill says”, “instruction is wrong”)
+surfaced <strong>no additional</strong> skill bug — the 176 “stale” and
+26 “contradict” hits all refer to stale <em>leaderboard numbers / parent
+commits</em> and contradictory <em>standings</em>, not skill
+instructions, and the lone “skill forbids”/“instruction is wrong” pair
+is the same self-corrected cross-tag-graft incident
+(bug_0184–0185).</li>
+<li><strong>Evidence gaps that remain.</strong> The four worker
+sub-agent sessions (172 <code>worker-N-brief-M</code> branches) were not
+available, so worker-side skill friction (build/validate/profile loops
+inside <code>explore-brief</code>) is unaudited. The project-harness
+submit-integrity bug (<code>harness/submit.sh</code>) and the upstream
+Triton/MLIR FP4 compile bug are noted for completeness but are out of
+scope for an autocuda-skill audit.</li>
+</ul>
