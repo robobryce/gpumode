@@ -1,0 +1,494 @@
+====== WARP STALL REASONS (cyc per issued instr), ID=2 ======
+    1.958 cyc  ( 30.1% of 6.50)  wait (fixed-latency exec dep / MMA)
+    1.059 cyc  ( 16.3% of 6.50)  math_pipe_throttle
+    1.000 cyc  ( 15.4% of 6.50)  selected (= issued)
+    0.579 cyc  (  8.9% of 6.50)  mio_throttle (smem/LSU queue)
+    0.549 cyc  (  8.4% of 6.50)  not_selected
+    0.479 cyc  (  7.4% of 6.50)  long_scoreboard (global/L1 mem latency)
+    0.321 cyc  (  4.9% of 6.50)  dispatch_stall
+    0.291 cyc  (  4.5% of 6.50)  short_scoreboard (smem latency)
+    0.209 cyc  (  3.2% of 6.50)  barrier (__syncthreads wait)
+    0.046 cyc  (  0.7% of 6.50)  no_instruction (icache/fetch)
+    0.011 cyc  (  0.2% of 6.50)  branch_resolving
+    0.004 cyc  (  0.1% of 6.50)  lg_throttle (global LSU queue)
+    0.000 cyc  (  0.0% of 6.50)  drain
+    0.000 cyc  (  0.0% of 6.50)  membar
+    0.000 cyc  (  0.0% of 6.50)  misc
+    0.000 cyc  (  0.0% of 6.50)  sleeping
+    0.000 cyc  (  0.0% of 6.50)  tex_throttle
+  --- SUM = 6.506  (Warp Cycles Per Issued Instr reported = 6.50)
+
+====== SPEED OF LIGHT / PIPES ======
+     56.227809 %          sm__throughput.avg.pct_of_peak_sustained_elapsed
+     68.886577 %          gpu__compute_memory_throughput.avg.pct_of_peak_sustained_elapsed
+          None None       dram__throughput.avg.pct_of_peak_sustained_elapsed
+     68.886577 %          l1tex__throughput.avg.pct_of_peak_sustained_elapsed
+     27.396289 %          lts__throughput.avg.pct_of_peak_sustained_elapsed
+     56.227809 %          sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed
+     57.373469 %          sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_active
+             0 %          sm__pipe_fp64_cycles_active.avg.pct_of_peak_sustained_elapsed
+     11.683067 %          sm__pipe_fma_cycles_active.avg.pct_of_peak_sustained_elapsed
+          None None       smsp__inst_executed_pipe_tensor.avg.pct_of_peak_sustained_active
+
+====== COALESCING (sectors/request) & HIT RATES ======
+          None None     l1tex__average_t_sectors_per_request_pipe_lsu_mem_global_op_ld.ratio
+          None None     l1tex__average_t_sectors_per_request_pipe_lsu_mem_global_op_st.ratio
+      0.220173 %        l1tex__t_sector_hit_rate.pct
+     68.354210 %        lts__t_sector_hit_rate.pct
+       1670403          l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_st.sum
+       1538874          l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld.sum
+
+====== Search header for any tensor/hmma & sectors_per_request columns actually present ======
+   [           0 %     ] SM_A.TriageCompute.sm__mem_tensor_cycles_active_realtime.avg.pct_of_peak_sustained_elapsed
+   [           0 %     ] SM_C.TriageCompute.smsp__pipe_tensor_subpipe_dmma_cycles_active.avg.pct_of_peak_sustained_elapsed
+   [   33.592940 %     ] TPC.TriageCompute.sm__pipe_tensor_cycles_active_realtime.avg.pct_of_peak_sustained_elapsed
+   [   33.592940 %     ] TPC.TriageCompute.sm__pipe_tensor_subpipe_hmma_cycles_active_realtime.avg.pct_of_peak_sustained_elapsed
+   [           0 %     ] TPC.TriageCompute.sm__pipe_tensor_subpipe_imma_cycles_active_realtime.avg.pct_of_peak_sustained_elapsed
+   [           0 %     ] sm__inst_executed_pipe_tensor_subpipe_dmma.avg.pct_of_peak_sustained_active
+   [           0 %     ] sm__inst_executed_pipe_tensor_subpipe_dmma.avg.pct_of_peak_sustained_elapsed
+   [   57.373469 %     ] sm__inst_executed_pipe_tensor_subpipe_hmma.avg.pct_of_peak_sustained_active
+   [   56.227809 %     ] sm__inst_executed_pipe_tensor_subpipe_hmma.avg.pct_of_peak_sustained_elapsed
+   [           0 %     ] sm__inst_executed_pipe_tensor_subpipe_imma.avg.pct_of_peak_sustained_active
+   [           0 %     ] sm__inst_executed_pipe_tensor_subpipe_imma.avg.pct_of_peak_sustained_elapsed
+   [           0 %     ] sm__mem_tensor_cycles_active.avg.pct_of_peak_sustained_active
+   [           0 %     ] sm__mem_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed
+   [           0 %     ] sm__mem_tensor_cycles_active.max.pct_of_peak_sustained_active
+   [           0 %     ] sm__mem_tensor_cycles_active.max.pct_of_peak_sustained_elapsed
+   [           0 %     ] sm__mem_tensor_cycles_active.min.pct_of_peak_sustained_active
+   [           0 %     ] sm__mem_tensor_cycles_active.min.pct_of_peak_sustained_elapsed
+   [           0 %     ] sm__mem_tensor_cycles_active.sum.pct_of_peak_sustained_active
+   [           0 %     ] sm__mem_tensor_cycles_active.sum.pct_of_peak_sustained_elapsed
+   [           0       ] sm__ops_path_tensor_op_hmma_src_bf16_dst_fp32_sparsity_off.avg
+   [           0 %     ] sm__ops_path_tensor_op_hmma_src_bf16_dst_fp32_sparsity_off.avg.pct_of_peak_sustained_elapsed
+   [        2048       ] sm__ops_path_tensor_op_hmma_src_bf16_dst_fp32_sparsity_off.avg.peak_sustained
+   [           0       ] sm__ops_path_tensor_op_hmma_src_bf16_dst_fp32_sparsity_off.avg.per_cycle_elapsed
+   [           0       ] sm__ops_path_tensor_op_hmma_src_bf16_dst_fp32_sparsity_off.avg.per_second
+   [           0       ] sm__ops_path_tensor_op_hmma_src_bf16_dst_fp32_sparsity_off.max
+   [           0 %     ] sm__ops_path_tensor_op_hmma_src_bf16_dst_fp32_sparsity_off.max.pct_of_peak_sustained_elapsed
+   [        2048       ] sm__ops_path_tensor_op_hmma_src_bf16_dst_fp32_sparsity_off.max.peak_sustained
+   [           0       ] sm__ops_path_tensor_op_hmma_src_bf16_dst_fp32_sparsity_off.max.per_cycle_elapsed
+   [           0       ] sm__ops_path_tensor_op_hmma_src_bf16_dst_fp32_sparsity_off.max.per_second
+   [           0       ] sm__ops_path_tensor_op_hmma_src_bf16_dst_fp32_sparsity_off.min
+   [           0 %     ] sm__ops_path_tensor_op_hmma_src_bf16_dst_fp32_sparsity_off.min.pct_of_peak_sustained_elapsed
+   [        2048       ] sm__ops_path_tensor_op_hmma_src_bf16_dst_fp32_sparsity_off.min.peak_sustained
+   [           0       ] sm__ops_path_tensor_op_hmma_src_bf16_dst_fp32_sparsity_off.min.per_cycle_elapsed
+   [           0       ] sm__ops_path_tensor_op_hmma_src_bf16_dst_fp32_sparsity_off.min.per_second
+   [           0       ] sm__ops_path_tensor_op_hmma_src_bf16_dst_fp32_sparsity_off.sum
+   [           0 %     ] sm__ops_path_tensor_op_hmma_src_bf16_dst_fp32_sparsity_off.sum.pct_of_peak_sustained_elapsed
+   [      303104       ] sm__ops_path_tensor_op_hmma_src_bf16_dst_fp32_sparsity_off.sum.peak_sustained
+   [522279184067592       ] sm__ops_path_tensor_op_hmma_src_bf16_dst_fp32_sparsity_off.sum.peak_sustained_elapsed.per_second
+   [           0       ] sm__ops_path_tensor_op_hmma_src_bf16_dst_fp32_sparsity_off.sum.per_cycle_elapsed
+   [           0       ] sm__ops_path_tensor_op_hmma_src_bf16_dst_fp32_sparsity_off.sum.per_second
+   [           0       ] sm__ops_path_tensor_op_hmma_src_bf16_dst_fp32_sparsity_on.avg
+   [           0 %     ] sm__ops_path_tensor_op_hmma_src_bf16_dst_fp32_sparsity_on.avg.pct_of_peak_sustained_elapsed
+   [     3640.89       ] sm__ops_path_tensor_op_hmma_src_bf16_dst_fp32_sparsity_on.avg.peak_sustained
+   [           0       ] sm__ops_path_tensor_op_hmma_src_bf16_dst_fp32_sparsity_on.avg.per_cycle_elapsed
+   [           0       ] sm__ops_path_tensor_op_hmma_src_bf16_dst_fp32_sparsity_on.avg.per_second
+   [           0       ] sm__ops_path_tensor_op_hmma_src_bf16_dst_fp32_sparsity_on.max
+   [           0 %     ] sm__ops_path_tensor_op_hmma_src_bf16_dst_fp32_sparsity_on.max.pct_of_peak_sustained_elapsed
+   [     3640.89       ] sm__ops_path_tensor_op_hmma_src_bf16_dst_fp32_sparsity_on.max.peak_sustained
+   [           0       ] sm__ops_path_tensor_op_hmma_src_bf16_dst_fp32_sparsity_on.max.per_cycle_elapsed
+   [           0       ] sm__ops_path_tensor_op_hmma_src_bf16_dst_fp32_sparsity_on.max.per_second
+   [           0       ] sm__ops_path_tensor_op_hmma_src_bf16_dst_fp32_sparsity_on.min
+   [           0 %     ] sm__ops_path_tensor_op_hmma_src_bf16_dst_fp32_sparsity_on.min.pct_of_peak_sustained_elapsed
+   [     3640.89       ] sm__ops_path_tensor_op_hmma_src_bf16_dst_fp32_sparsity_on.min.peak_sustained
+   [           0       ] sm__ops_path_tensor_op_hmma_src_bf16_dst_fp32_sparsity_on.min.per_cycle_elapsed
+   [           0       ] sm__ops_path_tensor_op_hmma_src_bf16_dst_fp32_sparsity_on.min.per_second
+   [           0       ] sm__ops_path_tensor_op_hmma_src_bf16_dst_fp32_sparsity_on.sum
+   [           0 %     ] sm__ops_path_tensor_op_hmma_src_bf16_dst_fp32_sparsity_on.sum.pct_of_peak_sustained_elapsed
+   [   538851.56       ] sm__ops_path_tensor_op_hmma_src_bf16_dst_fp32_sparsity_on.sum.peak_sustained
+   [928496327231274.62       ] sm__ops_path_tensor_op_hmma_src_bf16_dst_fp32_sparsity_on.sum.peak_sustained_elapsed.per_second
+   [           0       ] sm__ops_path_tensor_op_hmma_src_bf16_dst_fp32_sparsity_on.sum.per_cycle_elapsed
+   [           0       ] sm__ops_path_tensor_op_hmma_src_bf16_dst_fp32_sparsity_on.sum.per_second
+   [           0       ] sm__ops_path_tensor_op_hmma_src_fp16_dst_fp16_sparsity_off.avg
+   [           0 %     ] sm__ops_path_tensor_op_hmma_src_fp16_dst_fp16_sparsity_off.avg.pct_of_peak_sustained_elapsed
+   [        2048       ] sm__ops_path_tensor_op_hmma_src_fp16_dst_fp16_sparsity_off.avg.peak_sustained
+   [           0       ] sm__ops_path_tensor_op_hmma_src_fp16_dst_fp16_sparsity_off.avg.per_cycle_elapsed
+   [           0       ] sm__ops_path_tensor_op_hmma_src_fp16_dst_fp16_sparsity_off.avg.per_second
+   [           0       ] sm__ops_path_tensor_op_hmma_src_fp16_dst_fp16_sparsity_off.max
+   [           0 %     ] sm__ops_path_tensor_op_hmma_src_fp16_dst_fp16_sparsity_off.max.pct_of_peak_sustained_elapsed
+   [        2048       ] sm__ops_path_tensor_op_hmma_src_fp16_dst_fp16_sparsity_off.max.peak_sustained
+   [           0       ] sm__ops_path_tensor_op_hmma_src_fp16_dst_fp16_sparsity_off.max.per_cycle_elapsed
+   [           0       ] sm__ops_path_tensor_op_hmma_src_fp16_dst_fp16_sparsity_off.max.per_second
+   [           0       ] sm__ops_path_tensor_op_hmma_src_fp16_dst_fp16_sparsity_off.min
+   [           0 %     ] sm__ops_path_tensor_op_hmma_src_fp16_dst_fp16_sparsity_off.min.pct_of_peak_sustained_elapsed
+   [        2048       ] sm__ops_path_tensor_op_hmma_src_fp16_dst_fp16_sparsity_off.min.peak_sustained
+   [           0       ] sm__ops_path_tensor_op_hmma_src_fp16_dst_fp16_sparsity_off.min.per_cycle_elapsed
+   [           0       ] sm__ops_path_tensor_op_hmma_src_fp16_dst_fp16_sparsity_off.min.per_second
+   [           0       ] sm__ops_path_tensor_op_hmma_src_fp16_dst_fp16_sparsity_off.sum
+   [           0 %     ] sm__ops_path_tensor_op_hmma_src_fp16_dst_fp16_sparsity_off.sum.pct_of_peak_sustained_elapsed
+   [      303104       ] sm__ops_path_tensor_op_hmma_src_fp16_dst_fp16_sparsity_off.sum.peak_sustained
+   [522279184067592       ] sm__ops_path_tensor_op_hmma_src_fp16_dst_fp16_sparsity_off.sum.peak_sustained_elapsed.per_second
+   [           0       ] sm__ops_path_tensor_op_hmma_src_fp16_dst_fp16_sparsity_off.sum.per_cycle_elapsed
+   [           0       ] sm__ops_path_tensor_op_hmma_src_fp16_dst_fp16_sparsity_off.sum.per_second
+   [           0       ] sm__ops_path_tensor_op_hmma_src_fp16_dst_fp16_sparsity_on.avg
+   [           0 %     ] sm__ops_path_tensor_op_hmma_src_fp16_dst_fp16_sparsity_on.avg.pct_of_peak_sustained_elapsed
+   [     3640.89       ] sm__ops_path_tensor_op_hmma_src_fp16_dst_fp16_sparsity_on.avg.peak_sustained
+   [           0       ] sm__ops_path_tensor_op_hmma_src_fp16_dst_fp16_sparsity_on.avg.per_cycle_elapsed
+   [           0       ] sm__ops_path_tensor_op_hmma_src_fp16_dst_fp16_sparsity_on.avg.per_second
+   [           0       ] sm__ops_path_tensor_op_hmma_src_fp16_dst_fp16_sparsity_on.max
+   [           0 %     ] sm__ops_path_tensor_op_hmma_src_fp16_dst_fp16_sparsity_on.max.pct_of_peak_sustained_elapsed
+   [     3640.89       ] sm__ops_path_tensor_op_hmma_src_fp16_dst_fp16_sparsity_on.max.peak_sustained
+   [           0       ] sm__ops_path_tensor_op_hmma_src_fp16_dst_fp16_sparsity_on.max.per_cycle_elapsed
+   [           0       ] sm__ops_path_tensor_op_hmma_src_fp16_dst_fp16_sparsity_on.max.per_second
+   [           0       ] sm__ops_path_tensor_op_hmma_src_fp16_dst_fp16_sparsity_on.min
+   [           0 %     ] sm__ops_path_tensor_op_hmma_src_fp16_dst_fp16_sparsity_on.min.pct_of_peak_sustained_elapsed
+   [     3640.89       ] sm__ops_path_tensor_op_hmma_src_fp16_dst_fp16_sparsity_on.min.peak_sustained
+   [           0       ] sm__ops_path_tensor_op_hmma_src_fp16_dst_fp16_sparsity_on.min.per_cycle_elapsed
+   [           0       ] sm__ops_path_tensor_op_hmma_src_fp16_dst_fp16_sparsity_on.min.per_second
+   [           0       ] sm__ops_path_tensor_op_hmma_src_fp16_dst_fp16_sparsity_on.sum
+   [           0 %     ] sm__ops_path_tensor_op_hmma_src_fp16_dst_fp16_sparsity_on.sum.pct_of_peak_sustained_elapsed
+   [   538851.56       ] sm__ops_path_tensor_op_hmma_src_fp16_dst_fp16_sparsity_on.sum.peak_sustained
+   [928496327231274.62       ] sm__ops_path_tensor_op_hmma_src_fp16_dst_fp16_sparsity_on.sum.peak_sustained_elapsed.per_second
+   [           0       ] sm__ops_path_tensor_op_hmma_src_fp16_dst_fp16_sparsity_on.sum.per_cycle_elapsed
+   [           0       ] sm__ops_path_tensor_op_hmma_src_fp16_dst_fp16_sparsity_on.sum.per_second
+   [           0       ] sm__ops_path_tensor_op_hmma_src_fp16_dst_fp32_sparsity_off.avg
+   [           0 %     ] sm__ops_path_tensor_op_hmma_src_fp16_dst_fp32_sparsity_off.avg.pct_of_peak_sustained_elapsed
+   [        2048       ] sm__ops_path_tensor_op_hmma_src_fp16_dst_fp32_sparsity_off.avg.peak_sustained
+   [           0       ] sm__ops_path_tensor_op_hmma_src_fp16_dst_fp32_sparsity_off.avg.per_cycle_elapsed
+   [           0       ] sm__ops_path_tensor_op_hmma_src_fp16_dst_fp32_sparsity_off.avg.per_second
+   [           0       ] sm__ops_path_tensor_op_hmma_src_fp16_dst_fp32_sparsity_off.max
+   [           0 %     ] sm__ops_path_tensor_op_hmma_src_fp16_dst_fp32_sparsity_off.max.pct_of_peak_sustained_elapsed
+   [        2048       ] sm__ops_path_tensor_op_hmma_src_fp16_dst_fp32_sparsity_off.max.peak_sustained
+   [           0       ] sm__ops_path_tensor_op_hmma_src_fp16_dst_fp32_sparsity_off.max.per_cycle_elapsed
+   [           0       ] sm__ops_path_tensor_op_hmma_src_fp16_dst_fp32_sparsity_off.max.per_second
+   [           0       ] sm__ops_path_tensor_op_hmma_src_fp16_dst_fp32_sparsity_off.min
+   [           0 %     ] sm__ops_path_tensor_op_hmma_src_fp16_dst_fp32_sparsity_off.min.pct_of_peak_sustained_elapsed
+   [        2048       ] sm__ops_path_tensor_op_hmma_src_fp16_dst_fp32_sparsity_off.min.peak_sustained
+   [           0       ] sm__ops_path_tensor_op_hmma_src_fp16_dst_fp32_sparsity_off.min.per_cycle_elapsed
+   [           0       ] sm__ops_path_tensor_op_hmma_src_fp16_dst_fp32_sparsity_off.min.per_second
+   [           0       ] sm__ops_path_tensor_op_hmma_src_fp16_dst_fp32_sparsity_off.sum
+   [           0 %     ] sm__ops_path_tensor_op_hmma_src_fp16_dst_fp32_sparsity_off.sum.pct_of_peak_sustained_elapsed
+   [      303104       ] sm__ops_path_tensor_op_hmma_src_fp16_dst_fp32_sparsity_off.sum.peak_sustained
+   [522279184067592       ] sm__ops_path_tensor_op_hmma_src_fp16_dst_fp32_sparsity_off.sum.peak_sustained_elapsed.per_second
+   [           0       ] sm__ops_path_tensor_op_hmma_src_fp16_dst_fp32_sparsity_off.sum.per_cycle_elapsed
+   [           0       ] sm__ops_path_tensor_op_hmma_src_fp16_dst_fp32_sparsity_off.sum.per_second
+   [           0       ] sm__ops_path_tensor_op_hmma_src_fp16_dst_fp32_sparsity_on.avg
+   [           0 %     ] sm__ops_path_tensor_op_hmma_src_fp16_dst_fp32_sparsity_on.avg.pct_of_peak_sustained_elapsed
+   [     3640.89       ] sm__ops_path_tensor_op_hmma_src_fp16_dst_fp32_sparsity_on.avg.peak_sustained
+   [           0       ] sm__ops_path_tensor_op_hmma_src_fp16_dst_fp32_sparsity_on.avg.per_cycle_elapsed
+   [           0       ] sm__ops_path_tensor_op_hmma_src_fp16_dst_fp32_sparsity_on.avg.per_second
+   [           0       ] sm__ops_path_tensor_op_hmma_src_fp16_dst_fp32_sparsity_on.max
+   [           0 %     ] sm__ops_path_tensor_op_hmma_src_fp16_dst_fp32_sparsity_on.max.pct_of_peak_sustained_elapsed
+   [     3640.89       ] sm__ops_path_tensor_op_hmma_src_fp16_dst_fp32_sparsity_on.max.peak_sustained
+   [           0       ] sm__ops_path_tensor_op_hmma_src_fp16_dst_fp32_sparsity_on.max.per_cycle_elapsed
+   [           0       ] sm__ops_path_tensor_op_hmma_src_fp16_dst_fp32_sparsity_on.max.per_second
+   [           0       ] sm__ops_path_tensor_op_hmma_src_fp16_dst_fp32_sparsity_on.min
+   [           0 %     ] sm__ops_path_tensor_op_hmma_src_fp16_dst_fp32_sparsity_on.min.pct_of_peak_sustained_elapsed
+   [     3640.89       ] sm__ops_path_tensor_op_hmma_src_fp16_dst_fp32_sparsity_on.min.peak_sustained
+   [           0       ] sm__ops_path_tensor_op_hmma_src_fp16_dst_fp32_sparsity_on.min.per_cycle_elapsed
+   [           0       ] sm__ops_path_tensor_op_hmma_src_fp16_dst_fp32_sparsity_on.min.per_second
+   [           0       ] sm__ops_path_tensor_op_hmma_src_fp16_dst_fp32_sparsity_on.sum
+   [           0 %     ] sm__ops_path_tensor_op_hmma_src_fp16_dst_fp32_sparsity_on.sum.pct_of_peak_sustained_elapsed
+   [   538851.56       ] sm__ops_path_tensor_op_hmma_src_fp16_dst_fp32_sparsity_on.sum.peak_sustained
+   [928496327231274.62       ] sm__ops_path_tensor_op_hmma_src_fp16_dst_fp32_sparsity_on.sum.peak_sustained_elapsed.per_second
+   [           0       ] sm__ops_path_tensor_op_hmma_src_fp16_dst_fp32_sparsity_on.sum.per_cycle_elapsed
+   [           0       ] sm__ops_path_tensor_op_hmma_src_fp16_dst_fp32_sparsity_on.sum.per_second
+   [420847394.59       ] sm__ops_path_tensor_op_hmma_src_tf32_dst_fp32_sparsity_off.avg
+   [   56.227809 %     ] sm__ops_path_tensor_op_hmma_src_tf32_dst_fp32_sparsity_off.avg.pct_of_peak_sustained_elapsed
+   [        1024       ] sm__ops_path_tensor_op_hmma_src_tf32_dst_fp32_sparsity_off.avg.peak_sustained
+   [      575.77       ] sm__ops_path_tensor_op_hmma_src_tf32_dst_fp32_sparsity_off.avg.per_cycle_elapsed
+   [992115350111.73       ] sm__ops_path_tensor_op_hmma_src_tf32_dst_fp32_sparsity_off.avg.per_second
+   [   428212224       ] sm__ops_path_tensor_op_hmma_src_tf32_dst_fp32_sparsity_off.max
+   [   57.211796 %     ] sm__ops_path_tensor_op_hmma_src_tf32_dst_fp32_sparsity_off.max.pct_of_peak_sustained_elapsed
+   [        1024       ] sm__ops_path_tensor_op_hmma_src_tf32_dst_fp32_sparsity_off.max.peak_sustained
+   [      585.85       ] sm__ops_path_tensor_op_hmma_src_tf32_dst_fp32_sparsity_off.max.per_cycle_elapsed
+   [1009477368738.68       ] sm__ops_path_tensor_op_hmma_src_tf32_dst_fp32_sparsity_off.max.per_second
+   [   415236096       ] sm__ops_path_tensor_op_hmma_src_tf32_dst_fp32_sparsity_off.min
+   [   55.478105 %     ] sm__ops_path_tensor_op_hmma_src_tf32_dst_fp32_sparsity_off.min.pct_of_peak_sustained_elapsed
+   [        1024       ] sm__ops_path_tensor_op_hmma_src_tf32_dst_fp32_sparsity_off.min.peak_sustained
+   [      568.10       ] sm__ops_path_tensor_op_hmma_src_tf32_dst_fp32_sparsity_off.min.per_cycle_elapsed
+   [978887145443.57       ] sm__ops_path_tensor_op_hmma_src_tf32_dst_fp32_sparsity_off.min.per_second
+   [ 62285414400       ] sm__ops_path_tensor_op_hmma_src_tf32_dst_fp32_sparsity_off.sum
+   [   56.227809 %     ] sm__ops_path_tensor_op_hmma_src_tf32_dst_fp32_sparsity_off.sum.pct_of_peak_sustained_elapsed
+   [      151552       ] sm__ops_path_tensor_op_hmma_src_tf32_dst_fp32_sparsity_off.sum.peak_sustained
+   [261139592033796       ] sm__ops_path_tensor_op_hmma_src_tf32_dst_fp32_sparsity_off.sum.peak_sustained_elapsed.per_second
+   [    85214.37       ] sm__ops_path_tensor_op_hmma_src_tf32_dst_fp32_sparsity_off.sum.per_cycle_elapsed
+   [146833071816535.91       ] sm__ops_path_tensor_op_hmma_src_tf32_dst_fp32_sparsity_off.sum.per_second
+   [           0       ] sm__ops_path_tensor_op_hmma_src_tf32_dst_fp32_sparsity_on.avg
+   [           0 %     ] sm__ops_path_tensor_op_hmma_src_tf32_dst_fp32_sparsity_on.avg.pct_of_peak_sustained_elapsed
+   [     1820.44       ] sm__ops_path_tensor_op_hmma_src_tf32_dst_fp32_sparsity_on.avg.peak_sustained
+   [           0       ] sm__ops_path_tensor_op_hmma_src_tf32_dst_fp32_sparsity_on.avg.per_cycle_elapsed
+   [           0       ] sm__ops_path_tensor_op_hmma_src_tf32_dst_fp32_sparsity_on.avg.per_second
+   [           0       ] sm__ops_path_tensor_op_hmma_src_tf32_dst_fp32_sparsity_on.max
+   [           0 %     ] sm__ops_path_tensor_op_hmma_src_tf32_dst_fp32_sparsity_on.max.pct_of_peak_sustained_elapsed
+   [     1820.44       ] sm__ops_path_tensor_op_hmma_src_tf32_dst_fp32_sparsity_on.max.peak_sustained
+   [           0       ] sm__ops_path_tensor_op_hmma_src_tf32_dst_fp32_sparsity_on.max.per_cycle_elapsed
+   [           0       ] sm__ops_path_tensor_op_hmma_src_tf32_dst_fp32_sparsity_on.max.per_second
+   [           0       ] sm__ops_path_tensor_op_hmma_src_tf32_dst_fp32_sparsity_on.min
+   [           0 %     ] sm__ops_path_tensor_op_hmma_src_tf32_dst_fp32_sparsity_on.min.pct_of_peak_sustained_elapsed
+   [     1820.44       ] sm__ops_path_tensor_op_hmma_src_tf32_dst_fp32_sparsity_on.min.peak_sustained
+   [           0       ] sm__ops_path_tensor_op_hmma_src_tf32_dst_fp32_sparsity_on.min.per_cycle_elapsed
+   [           0       ] sm__ops_path_tensor_op_hmma_src_tf32_dst_fp32_sparsity_on.min.per_second
+   [           0       ] sm__ops_path_tensor_op_hmma_src_tf32_dst_fp32_sparsity_on.sum
+   [           0 %     ] sm__ops_path_tensor_op_hmma_src_tf32_dst_fp32_sparsity_on.sum.pct_of_peak_sustained_elapsed
+   [   269425.78       ] sm__ops_path_tensor_op_hmma_src_tf32_dst_fp32_sparsity_on.sum.peak_sustained
+   [464248163615637.31       ] sm__ops_path_tensor_op_hmma_src_tf32_dst_fp32_sparsity_on.sum.peak_sustained_elapsed.per_second
+   [           0       ] sm__ops_path_tensor_op_hmma_src_tf32_dst_fp32_sparsity_on.sum.per_cycle_elapsed
+   [           0       ] sm__ops_path_tensor_op_hmma_src_tf32_dst_fp32_sparsity_on.sum.per_second
+   [           0 %     ] sm__ops_path_tensor_op_imma_src_int8_sparsity_off.avg.pct_of_peak_sustained_elapsed
+   [           0 %     ] sm__ops_path_tensor_op_imma_src_int8_sparsity_off.max.pct_of_peak_sustained_elapsed
+   [           0 %     ] sm__ops_path_tensor_op_imma_src_int8_sparsity_off.min.pct_of_peak_sustained_elapsed
+   [           0 %     ] sm__ops_path_tensor_op_imma_src_int8_sparsity_off.sum.pct_of_peak_sustained_elapsed
+   [           0 %     ] sm__ops_path_tensor_op_imma_src_int8_sparsity_on.avg.pct_of_peak_sustained_elapsed
+   [           0 %     ] sm__ops_path_tensor_op_imma_src_int8_sparsity_on.max.pct_of_peak_sustained_elapsed
+   [           0 %     ] sm__ops_path_tensor_op_imma_src_int8_sparsity_on.min.pct_of_peak_sustained_elapsed
+   [           0 %     ] sm__ops_path_tensor_op_imma_src_int8_sparsity_on.sum.pct_of_peak_sustained_elapsed
+   [           0       ] sm__ops_path_tensor_op_utchmma_src_bf16_dst_fp32_sparsity_off.avg
+   [           0 %     ] sm__ops_path_tensor_op_utchmma_src_bf16_dst_fp32_sparsity_off.avg.pct_of_peak_sustained_elapsed
+   [        8192       ] sm__ops_path_tensor_op_utchmma_src_bf16_dst_fp32_sparsity_off.avg.peak_sustained
+   [           0       ] sm__ops_path_tensor_op_utchmma_src_bf16_dst_fp32_sparsity_off.avg.per_cycle_elapsed
+   [           0       ] sm__ops_path_tensor_op_utchmma_src_bf16_dst_fp32_sparsity_off.avg.per_second
+   [           0       ] sm__ops_path_tensor_op_utchmma_src_bf16_dst_fp32_sparsity_off.max
+   [           0 %     ] sm__ops_path_tensor_op_utchmma_src_bf16_dst_fp32_sparsity_off.max.pct_of_peak_sustained_elapsed
+   [        8192       ] sm__ops_path_tensor_op_utchmma_src_bf16_dst_fp32_sparsity_off.max.peak_sustained
+   [           0       ] sm__ops_path_tensor_op_utchmma_src_bf16_dst_fp32_sparsity_off.max.per_cycle_elapsed
+   [           0       ] sm__ops_path_tensor_op_utchmma_src_bf16_dst_fp32_sparsity_off.max.per_second
+   [           0       ] sm__ops_path_tensor_op_utchmma_src_bf16_dst_fp32_sparsity_off.min
+   [           0 %     ] sm__ops_path_tensor_op_utchmma_src_bf16_dst_fp32_sparsity_off.min.pct_of_peak_sustained_elapsed
+   [        8192       ] sm__ops_path_tensor_op_utchmma_src_bf16_dst_fp32_sparsity_off.min.peak_sustained
+   [           0       ] sm__ops_path_tensor_op_utchmma_src_bf16_dst_fp32_sparsity_off.min.per_cycle_elapsed
+   [           0       ] sm__ops_path_tensor_op_utchmma_src_bf16_dst_fp32_sparsity_off.min.per_second
+   [           0       ] sm__ops_path_tensor_op_utchmma_src_bf16_dst_fp32_sparsity_off.sum
+   [           0 %     ] sm__ops_path_tensor_op_utchmma_src_bf16_dst_fp32_sparsity_off.sum.pct_of_peak_sustained_elapsed
+   [     1212416       ] sm__ops_path_tensor_op_utchmma_src_bf16_dst_fp32_sparsity_off.sum.peak_sustained
+   [2089116736270368       ] sm__ops_path_tensor_op_utchmma_src_bf16_dst_fp32_sparsity_off.sum.peak_sustained_elapsed.per_second
+   [           0       ] sm__ops_path_tensor_op_utchmma_src_bf16_dst_fp32_sparsity_off.sum.per_cycle_elapsed
+   [           0       ] sm__ops_path_tensor_op_utchmma_src_bf16_dst_fp32_sparsity_off.sum.per_second
+   [           0       ] sm__ops_path_tensor_op_utchmma_src_bf16_dst_fp32_sparsity_on.avg
+   [           0 %     ] sm__ops_path_tensor_op_utchmma_src_bf16_dst_fp32_sparsity_on.avg.pct_of_peak_sustained_elapsed
+   [       16384       ] sm__ops_path_tensor_op_utchmma_src_bf16_dst_fp32_sparsity_on.avg.peak_sustained
+   [           0       ] sm__ops_path_tensor_op_utchmma_src_bf16_dst_fp32_sparsity_on.avg.per_cycle_elapsed
+   [           0       ] sm__ops_path_tensor_op_utchmma_src_bf16_dst_fp32_sparsity_on.avg.per_second
+   [           0       ] sm__ops_path_tensor_op_utchmma_src_bf16_dst_fp32_sparsity_on.max
+   [           0 %     ] sm__ops_path_tensor_op_utchmma_src_bf16_dst_fp32_sparsity_on.max.pct_of_peak_sustained_elapsed
+   [       16384       ] sm__ops_path_tensor_op_utchmma_src_bf16_dst_fp32_sparsity_on.max.peak_sustained
+   [           0       ] sm__ops_path_tensor_op_utchmma_src_bf16_dst_fp32_sparsity_on.max.per_cycle_elapsed
+   [           0       ] sm__ops_path_tensor_op_utchmma_src_bf16_dst_fp32_sparsity_on.max.per_second
+   [           0       ] sm__ops_path_tensor_op_utchmma_src_bf16_dst_fp32_sparsity_on.min
+   [           0 %     ] sm__ops_path_tensor_op_utchmma_src_bf16_dst_fp32_sparsity_on.min.pct_of_peak_sustained_elapsed
+   [       16384       ] sm__ops_path_tensor_op_utchmma_src_bf16_dst_fp32_sparsity_on.min.peak_sustained
+   [           0       ] sm__ops_path_tensor_op_utchmma_src_bf16_dst_fp32_sparsity_on.min.per_cycle_elapsed
+   [           0       ] sm__ops_path_tensor_op_utchmma_src_bf16_dst_fp32_sparsity_on.min.per_second
+   [           0       ] sm__ops_path_tensor_op_utchmma_src_bf16_dst_fp32_sparsity_on.sum
+   [           0 %     ] sm__ops_path_tensor_op_utchmma_src_bf16_dst_fp32_sparsity_on.sum.pct_of_peak_sustained_elapsed
+   [     2424832       ] sm__ops_path_tensor_op_utchmma_src_bf16_dst_fp32_sparsity_on.sum.peak_sustained
+   [4178233472540736       ] sm__ops_path_tensor_op_utchmma_src_bf16_dst_fp32_sparsity_on.sum.peak_sustained_elapsed.per_second
+   [           0       ] sm__ops_path_tensor_op_utchmma_src_bf16_dst_fp32_sparsity_on.sum.per_cycle_elapsed
+   [           0       ] sm__ops_path_tensor_op_utchmma_src_bf16_dst_fp32_sparsity_on.sum.per_second
+   [           0       ] sm__ops_path_tensor_op_utchmma_src_fp16_dst_fp16_sparsity_off.avg
+   [           0 %     ] sm__ops_path_tensor_op_utchmma_src_fp16_dst_fp16_sparsity_off.avg.pct_of_peak_sustained_elapsed
+   [        8192       ] sm__ops_path_tensor_op_utchmma_src_fp16_dst_fp16_sparsity_off.avg.peak_sustained
+   [           0       ] sm__ops_path_tensor_op_utchmma_src_fp16_dst_fp16_sparsity_off.avg.per_cycle_elapsed
+   [           0       ] sm__ops_path_tensor_op_utchmma_src_fp16_dst_fp16_sparsity_off.avg.per_second
+   [           0       ] sm__ops_path_tensor_op_utchmma_src_fp16_dst_fp16_sparsity_off.max
+   [           0 %     ] sm__ops_path_tensor_op_utchmma_src_fp16_dst_fp16_sparsity_off.max.pct_of_peak_sustained_elapsed
+   [        8192       ] sm__ops_path_tensor_op_utchmma_src_fp16_dst_fp16_sparsity_off.max.peak_sustained
+   [           0       ] sm__ops_path_tensor_op_utchmma_src_fp16_dst_fp16_sparsity_off.max.per_cycle_elapsed
+   [           0       ] sm__ops_path_tensor_op_utchmma_src_fp16_dst_fp16_sparsity_off.max.per_second
+   [           0       ] sm__ops_path_tensor_op_utchmma_src_fp16_dst_fp16_sparsity_off.min
+   [           0 %     ] sm__ops_path_tensor_op_utchmma_src_fp16_dst_fp16_sparsity_off.min.pct_of_peak_sustained_elapsed
+   [        8192       ] sm__ops_path_tensor_op_utchmma_src_fp16_dst_fp16_sparsity_off.min.peak_sustained
+   [           0       ] sm__ops_path_tensor_op_utchmma_src_fp16_dst_fp16_sparsity_off.min.per_cycle_elapsed
+   [           0       ] sm__ops_path_tensor_op_utchmma_src_fp16_dst_fp16_sparsity_off.min.per_second
+   [           0       ] sm__ops_path_tensor_op_utchmma_src_fp16_dst_fp16_sparsity_off.sum
+   [           0 %     ] sm__ops_path_tensor_op_utchmma_src_fp16_dst_fp16_sparsity_off.sum.pct_of_peak_sustained_elapsed
+   [     1212416       ] sm__ops_path_tensor_op_utchmma_src_fp16_dst_fp16_sparsity_off.sum.peak_sustained
+   [2089116736270368       ] sm__ops_path_tensor_op_utchmma_src_fp16_dst_fp16_sparsity_off.sum.peak_sustained_elapsed.per_second
+   [           0       ] sm__ops_path_tensor_op_utchmma_src_fp16_dst_fp16_sparsity_off.sum.per_cycle_elapsed
+   [           0       ] sm__ops_path_tensor_op_utchmma_src_fp16_dst_fp16_sparsity_off.sum.per_second
+   [           0       ] sm__ops_path_tensor_op_utchmma_src_fp16_dst_fp16_sparsity_on.avg
+   [           0 %     ] sm__ops_path_tensor_op_utchmma_src_fp16_dst_fp16_sparsity_on.avg.pct_of_peak_sustained_elapsed
+   [       16384       ] sm__ops_path_tensor_op_utchmma_src_fp16_dst_fp16_sparsity_on.avg.peak_sustained
+   [           0       ] sm__ops_path_tensor_op_utchmma_src_fp16_dst_fp16_sparsity_on.avg.per_cycle_elapsed
+   [           0       ] sm__ops_path_tensor_op_utchmma_src_fp16_dst_fp16_sparsity_on.avg.per_second
+   [           0       ] sm__ops_path_tensor_op_utchmma_src_fp16_dst_fp16_sparsity_on.max
+   [           0 %     ] sm__ops_path_tensor_op_utchmma_src_fp16_dst_fp16_sparsity_on.max.pct_of_peak_sustained_elapsed
+   [       16384       ] sm__ops_path_tensor_op_utchmma_src_fp16_dst_fp16_sparsity_on.max.peak_sustained
+   [           0       ] sm__ops_path_tensor_op_utchmma_src_fp16_dst_fp16_sparsity_on.max.per_cycle_elapsed
+   [           0       ] sm__ops_path_tensor_op_utchmma_src_fp16_dst_fp16_sparsity_on.max.per_second
+   [           0       ] sm__ops_path_tensor_op_utchmma_src_fp16_dst_fp16_sparsity_on.min
+   [           0 %     ] sm__ops_path_tensor_op_utchmma_src_fp16_dst_fp16_sparsity_on.min.pct_of_peak_sustained_elapsed
+   [       16384       ] sm__ops_path_tensor_op_utchmma_src_fp16_dst_fp16_sparsity_on.min.peak_sustained
+   [           0       ] sm__ops_path_tensor_op_utchmma_src_fp16_dst_fp16_sparsity_on.min.per_cycle_elapsed
+   [           0       ] sm__ops_path_tensor_op_utchmma_src_fp16_dst_fp16_sparsity_on.min.per_second
+   [           0       ] sm__ops_path_tensor_op_utchmma_src_fp16_dst_fp16_sparsity_on.sum
+   [           0 %     ] sm__ops_path_tensor_op_utchmma_src_fp16_dst_fp16_sparsity_on.sum.pct_of_peak_sustained_elapsed
+   [     2424832       ] sm__ops_path_tensor_op_utchmma_src_fp16_dst_fp16_sparsity_on.sum.peak_sustained
+   [4178233472540736       ] sm__ops_path_tensor_op_utchmma_src_fp16_dst_fp16_sparsity_on.sum.peak_sustained_elapsed.per_second
+   [           0       ] sm__ops_path_tensor_op_utchmma_src_fp16_dst_fp16_sparsity_on.sum.per_cycle_elapsed
+   [           0       ] sm__ops_path_tensor_op_utchmma_src_fp16_dst_fp16_sparsity_on.sum.per_second
+   [           0       ] sm__ops_path_tensor_op_utchmma_src_fp16_dst_fp32_sparsity_off.avg
+   [           0 %     ] sm__ops_path_tensor_op_utchmma_src_fp16_dst_fp32_sparsity_off.avg.pct_of_peak_sustained_elapsed
+   [        8192       ] sm__ops_path_tensor_op_utchmma_src_fp16_dst_fp32_sparsity_off.avg.peak_sustained
+   [           0       ] sm__ops_path_tensor_op_utchmma_src_fp16_dst_fp32_sparsity_off.avg.per_cycle_elapsed
+   [           0       ] sm__ops_path_tensor_op_utchmma_src_fp16_dst_fp32_sparsity_off.avg.per_second
+   [           0       ] sm__ops_path_tensor_op_utchmma_src_fp16_dst_fp32_sparsity_off.max
+   [           0 %     ] sm__ops_path_tensor_op_utchmma_src_fp16_dst_fp32_sparsity_off.max.pct_of_peak_sustained_elapsed
+   [        8192       ] sm__ops_path_tensor_op_utchmma_src_fp16_dst_fp32_sparsity_off.max.peak_sustained
+   [           0       ] sm__ops_path_tensor_op_utchmma_src_fp16_dst_fp32_sparsity_off.max.per_cycle_elapsed
+   [           0       ] sm__ops_path_tensor_op_utchmma_src_fp16_dst_fp32_sparsity_off.max.per_second
+   [           0       ] sm__ops_path_tensor_op_utchmma_src_fp16_dst_fp32_sparsity_off.min
+   [           0 %     ] sm__ops_path_tensor_op_utchmma_src_fp16_dst_fp32_sparsity_off.min.pct_of_peak_sustained_elapsed
+   [        8192       ] sm__ops_path_tensor_op_utchmma_src_fp16_dst_fp32_sparsity_off.min.peak_sustained
+   [           0       ] sm__ops_path_tensor_op_utchmma_src_fp16_dst_fp32_sparsity_off.min.per_cycle_elapsed
+   [           0       ] sm__ops_path_tensor_op_utchmma_src_fp16_dst_fp32_sparsity_off.min.per_second
+   [           0       ] sm__ops_path_tensor_op_utchmma_src_fp16_dst_fp32_sparsity_off.sum
+   [           0 %     ] sm__ops_path_tensor_op_utchmma_src_fp16_dst_fp32_sparsity_off.sum.pct_of_peak_sustained_elapsed
+   [     1212416       ] sm__ops_path_tensor_op_utchmma_src_fp16_dst_fp32_sparsity_off.sum.peak_sustained
+   [2089116736270368       ] sm__ops_path_tensor_op_utchmma_src_fp16_dst_fp32_sparsity_off.sum.peak_sustained_elapsed.per_second
+   [           0       ] sm__ops_path_tensor_op_utchmma_src_fp16_dst_fp32_sparsity_off.sum.per_cycle_elapsed
+   [           0       ] sm__ops_path_tensor_op_utchmma_src_fp16_dst_fp32_sparsity_off.sum.per_second
+   [           0       ] sm__ops_path_tensor_op_utchmma_src_fp16_dst_fp32_sparsity_on.avg
+   [           0 %     ] sm__ops_path_tensor_op_utchmma_src_fp16_dst_fp32_sparsity_on.avg.pct_of_peak_sustained_elapsed
+   [       16384       ] sm__ops_path_tensor_op_utchmma_src_fp16_dst_fp32_sparsity_on.avg.peak_sustained
+   [           0       ] sm__ops_path_tensor_op_utchmma_src_fp16_dst_fp32_sparsity_on.avg.per_cycle_elapsed
+   [           0       ] sm__ops_path_tensor_op_utchmma_src_fp16_dst_fp32_sparsity_on.avg.per_second
+   [           0       ] sm__ops_path_tensor_op_utchmma_src_fp16_dst_fp32_sparsity_on.max
+   [           0 %     ] sm__ops_path_tensor_op_utchmma_src_fp16_dst_fp32_sparsity_on.max.pct_of_peak_sustained_elapsed
+   [       16384       ] sm__ops_path_tensor_op_utchmma_src_fp16_dst_fp32_sparsity_on.max.peak_sustained
+   [           0       ] sm__ops_path_tensor_op_utchmma_src_fp16_dst_fp32_sparsity_on.max.per_cycle_elapsed
+   [           0       ] sm__ops_path_tensor_op_utchmma_src_fp16_dst_fp32_sparsity_on.max.per_second
+   [           0       ] sm__ops_path_tensor_op_utchmma_src_fp16_dst_fp32_sparsity_on.min
+   [           0 %     ] sm__ops_path_tensor_op_utchmma_src_fp16_dst_fp32_sparsity_on.min.pct_of_peak_sustained_elapsed
+   [       16384       ] sm__ops_path_tensor_op_utchmma_src_fp16_dst_fp32_sparsity_on.min.peak_sustained
+   [           0       ] sm__ops_path_tensor_op_utchmma_src_fp16_dst_fp32_sparsity_on.min.per_cycle_elapsed
+   [           0       ] sm__ops_path_tensor_op_utchmma_src_fp16_dst_fp32_sparsity_on.min.per_second
+   [           0       ] sm__ops_path_tensor_op_utchmma_src_fp16_dst_fp32_sparsity_on.sum
+   [           0 %     ] sm__ops_path_tensor_op_utchmma_src_fp16_dst_fp32_sparsity_on.sum.pct_of_peak_sustained_elapsed
+   [     2424832       ] sm__ops_path_tensor_op_utchmma_src_fp16_dst_fp32_sparsity_on.sum.peak_sustained
+   [4178233472540736       ] sm__ops_path_tensor_op_utchmma_src_fp16_dst_fp32_sparsity_on.sum.peak_sustained_elapsed.per_second
+   [           0       ] sm__ops_path_tensor_op_utchmma_src_fp16_dst_fp32_sparsity_on.sum.per_cycle_elapsed
+   [           0       ] sm__ops_path_tensor_op_utchmma_src_fp16_dst_fp32_sparsity_on.sum.per_second
+   [           0       ] sm__ops_path_tensor_op_utchmma_src_tf32_dst_fp32_sparsity_off.avg
+   [           0 %     ] sm__ops_path_tensor_op_utchmma_src_tf32_dst_fp32_sparsity_off.avg.pct_of_peak_sustained_elapsed
+   [        4096       ] sm__ops_path_tensor_op_utchmma_src_tf32_dst_fp32_sparsity_off.avg.peak_sustained
+   [           0       ] sm__ops_path_tensor_op_utchmma_src_tf32_dst_fp32_sparsity_off.avg.per_cycle_elapsed
+   [           0       ] sm__ops_path_tensor_op_utchmma_src_tf32_dst_fp32_sparsity_off.avg.per_second
+   [           0       ] sm__ops_path_tensor_op_utchmma_src_tf32_dst_fp32_sparsity_off.max
+   [           0 %     ] sm__ops_path_tensor_op_utchmma_src_tf32_dst_fp32_sparsity_off.max.pct_of_peak_sustained_elapsed
+   [        4096       ] sm__ops_path_tensor_op_utchmma_src_tf32_dst_fp32_sparsity_off.max.peak_sustained
+   [           0       ] sm__ops_path_tensor_op_utchmma_src_tf32_dst_fp32_sparsity_off.max.per_cycle_elapsed
+   [           0       ] sm__ops_path_tensor_op_utchmma_src_tf32_dst_fp32_sparsity_off.max.per_second
+   [           0       ] sm__ops_path_tensor_op_utchmma_src_tf32_dst_fp32_sparsity_off.min
+   [           0 %     ] sm__ops_path_tensor_op_utchmma_src_tf32_dst_fp32_sparsity_off.min.pct_of_peak_sustained_elapsed
+   [        4096       ] sm__ops_path_tensor_op_utchmma_src_tf32_dst_fp32_sparsity_off.min.peak_sustained
+   [           0       ] sm__ops_path_tensor_op_utchmma_src_tf32_dst_fp32_sparsity_off.min.per_cycle_elapsed
+   [           0       ] sm__ops_path_tensor_op_utchmma_src_tf32_dst_fp32_sparsity_off.min.per_second
+   [           0       ] sm__ops_path_tensor_op_utchmma_src_tf32_dst_fp32_sparsity_off.sum
+   [           0 %     ] sm__ops_path_tensor_op_utchmma_src_tf32_dst_fp32_sparsity_off.sum.pct_of_peak_sustained_elapsed
+   [      606208       ] sm__ops_path_tensor_op_utchmma_src_tf32_dst_fp32_sparsity_off.sum.peak_sustained
+   [1044558368135184       ] sm__ops_path_tensor_op_utchmma_src_tf32_dst_fp32_sparsity_off.sum.peak_sustained_elapsed.per_second
+   [           0       ] sm__ops_path_tensor_op_utchmma_src_tf32_dst_fp32_sparsity_off.sum.per_cycle_elapsed
+   [           0       ] sm__ops_path_tensor_op_utchmma_src_tf32_dst_fp32_sparsity_off.sum.per_second
+   [           0       ] sm__ops_path_tensor_op_utchmma_src_tf32_dst_fp32_sparsity_on.avg
+   [           0 %     ] sm__ops_path_tensor_op_utchmma_src_tf32_dst_fp32_sparsity_on.avg.pct_of_peak_sustained_elapsed
+   [        8192       ] sm__ops_path_tensor_op_utchmma_src_tf32_dst_fp32_sparsity_on.avg.peak_sustained
+   [           0       ] sm__ops_path_tensor_op_utchmma_src_tf32_dst_fp32_sparsity_on.avg.per_cycle_elapsed
+   [           0       ] sm__ops_path_tensor_op_utchmma_src_tf32_dst_fp32_sparsity_on.avg.per_second
+   [           0       ] sm__ops_path_tensor_op_utchmma_src_tf32_dst_fp32_sparsity_on.max
+   [           0 %     ] sm__ops_path_tensor_op_utchmma_src_tf32_dst_fp32_sparsity_on.max.pct_of_peak_sustained_elapsed
+   [        8192       ] sm__ops_path_tensor_op_utchmma_src_tf32_dst_fp32_sparsity_on.max.peak_sustained
+   [           0       ] sm__ops_path_tensor_op_utchmma_src_tf32_dst_fp32_sparsity_on.max.per_cycle_elapsed
+   [           0       ] sm__ops_path_tensor_op_utchmma_src_tf32_dst_fp32_sparsity_on.max.per_second
+   [           0       ] sm__ops_path_tensor_op_utchmma_src_tf32_dst_fp32_sparsity_on.min
+   [           0 %     ] sm__ops_path_tensor_op_utchmma_src_tf32_dst_fp32_sparsity_on.min.pct_of_peak_sustained_elapsed
+   [        8192       ] sm__ops_path_tensor_op_utchmma_src_tf32_dst_fp32_sparsity_on.min.peak_sustained
+   [           0       ] sm__ops_path_tensor_op_utchmma_src_tf32_dst_fp32_sparsity_on.min.per_cycle_elapsed
+   [           0       ] sm__ops_path_tensor_op_utchmma_src_tf32_dst_fp32_sparsity_on.min.per_second
+   [           0       ] sm__ops_path_tensor_op_utchmma_src_tf32_dst_fp32_sparsity_on.sum
+   [           0 %     ] sm__ops_path_tensor_op_utchmma_src_tf32_dst_fp32_sparsity_on.sum.pct_of_peak_sustained_elapsed
+   [     1212416       ] sm__ops_path_tensor_op_utchmma_src_tf32_dst_fp32_sparsity_on.sum.peak_sustained
+   [2089116736270368       ] sm__ops_path_tensor_op_utchmma_src_tf32_dst_fp32_sparsity_on.sum.peak_sustained_elapsed.per_second
+   [           0       ] sm__ops_path_tensor_op_utchmma_src_tf32_dst_fp32_sparsity_on.sum.per_cycle_elapsed
+   [           0       ] sm__ops_path_tensor_op_utchmma_src_tf32_dst_fp32_sparsity_on.sum.per_second
+   [           0 %     ] sm__ops_path_tensor_op_utcimma_src_int8_sparsity_off.avg.pct_of_peak_sustained_elapsed
+   [           0 %     ] sm__ops_path_tensor_op_utcimma_src_int8_sparsity_off.max.pct_of_peak_sustained_elapsed
+   [           0 %     ] sm__ops_path_tensor_op_utcimma_src_int8_sparsity_off.min.pct_of_peak_sustained_elapsed
+   [           0 %     ] sm__ops_path_tensor_op_utcimma_src_int8_sparsity_off.sum.pct_of_peak_sustained_elapsed
+   [           0 %     ] sm__ops_path_tensor_op_utcimma_src_int8_sparsity_on.avg.pct_of_peak_sustained_elapsed
+   [           0 %     ] sm__ops_path_tensor_op_utcimma_src_int8_sparsity_on.max.pct_of_peak_sustained_elapsed
+   [           0 %     ] sm__ops_path_tensor_op_utcimma_src_int8_sparsity_on.min.pct_of_peak_sustained_elapsed
+   [           0 %     ] sm__ops_path_tensor_op_utcimma_src_int8_sparsity_on.sum.pct_of_peak_sustained_elapsed
+   [           0 %     ] sm__ops_path_tensor_op_utcomma_src_fp4_dst_fp32_sparsity_off.avg.pct_of_peak_sustained_elapsed
+   [           0 %     ] sm__ops_path_tensor_op_utcomma_src_fp4_dst_fp32_sparsity_off.max.pct_of_peak_sustained_elapsed
+   [           0 %     ] sm__ops_path_tensor_op_utcomma_src_fp4_dst_fp32_sparsity_off.min.pct_of_peak_sustained_elapsed
+   [           0 %     ] sm__ops_path_tensor_op_utcomma_src_fp4_dst_fp32_sparsity_off.sum.pct_of_peak_sustained_elapsed
+   [           0 %     ] sm__ops_path_tensor_op_utcomma_src_fp4_dst_fp32_sparsity_on.avg.pct_of_peak_sustained_elapsed
+   [           0 %     ] sm__ops_path_tensor_op_utcomma_src_fp4_dst_fp32_sparsity_on.max.pct_of_peak_sustained_elapsed
+   [           0 %     ] sm__ops_path_tensor_op_utcomma_src_fp4_dst_fp32_sparsity_on.min.pct_of_peak_sustained_elapsed
+   [           0 %     ] sm__ops_path_tensor_op_utcomma_src_fp4_dst_fp32_sparsity_on.sum.pct_of_peak_sustained_elapsed
+   [           0 %     ] sm__ops_path_tensor_op_utcqmma_src_fp4_fp6_fp8_dst_fp16_sparsity_off.avg.pct_of_peak_sustained_elapsed
+   [           0 %     ] sm__ops_path_tensor_op_utcqmma_src_fp4_fp6_fp8_dst_fp16_sparsity_off.max.pct_of_peak_sustained_elapsed
+   [           0 %     ] sm__ops_path_tensor_op_utcqmma_src_fp4_fp6_fp8_dst_fp16_sparsity_off.min.pct_of_peak_sustained_elapsed
+   [           0 %     ] sm__ops_path_tensor_op_utcqmma_src_fp4_fp6_fp8_dst_fp16_sparsity_off.sum.pct_of_peak_sustained_elapsed
+   [           0 %     ] sm__ops_path_tensor_op_utcqmma_src_fp4_fp6_fp8_dst_fp16_sparsity_on.avg.pct_of_peak_sustained_elapsed
+   [           0 %     ] sm__ops_path_tensor_op_utcqmma_src_fp4_fp6_fp8_dst_fp16_sparsity_on.max.pct_of_peak_sustained_elapsed
+   [           0 %     ] sm__ops_path_tensor_op_utcqmma_src_fp4_fp6_fp8_dst_fp16_sparsity_on.min.pct_of_peak_sustained_elapsed
+   [           0 %     ] sm__ops_path_tensor_op_utcqmma_src_fp4_fp6_fp8_dst_fp16_sparsity_on.sum.pct_of_peak_sustained_elapsed
+   [           0 %     ] sm__ops_path_tensor_op_utcqmma_src_fp4_fp6_fp8_dst_fp32_sparsity_off.avg.pct_of_peak_sustained_elapsed
+   [           0 %     ] sm__ops_path_tensor_op_utcqmma_src_fp4_fp6_fp8_dst_fp32_sparsity_off.max.pct_of_peak_sustained_elapsed
+   [           0 %     ] sm__ops_path_tensor_op_utcqmma_src_fp4_fp6_fp8_dst_fp32_sparsity_off.min.pct_of_peak_sustained_elapsed
+   [           0 %     ] sm__ops_path_tensor_op_utcqmma_src_fp4_fp6_fp8_dst_fp32_sparsity_off.sum.pct_of_peak_sustained_elapsed
+   [           0 %     ] sm__ops_path_tensor_op_utcqmma_src_fp4_fp6_fp8_dst_fp32_sparsity_on.avg.pct_of_peak_sustained_elapsed
+   [           0 %     ] sm__ops_path_tensor_op_utcqmma_src_fp4_fp6_fp8_dst_fp32_sparsity_on.max.pct_of_peak_sustained_elapsed
+   [           0 %     ] sm__ops_path_tensor_op_utcqmma_src_fp4_fp6_fp8_dst_fp32_sparsity_on.min.pct_of_peak_sustained_elapsed
+   [           0 %     ] sm__ops_path_tensor_op_utcqmma_src_fp4_fp6_fp8_dst_fp32_sparsity_on.sum.pct_of_peak_sustained_elapsed
+   [           0 %     ] sm__ops_path_tensor_src_bf16_dst_fp32.avg.pct_of_peak_sustained_elapsed
+   [           0 %     ] sm__ops_path_tensor_src_bf16_dst_fp32.max.pct_of_peak_sustained_elapsed
+   [           0 %     ] sm__ops_path_tensor_src_bf16_dst_fp32.min.pct_of_peak_sustained_elapsed
+   [           0 %     ] sm__ops_path_tensor_src_bf16_dst_fp32.sum.pct_of_peak_sustained_elapsed
+   [           0 %     ] sm__ops_path_tensor_src_fp16_dst_fp16.avg.pct_of_peak_sustained_elapsed
+   [           0 %     ] sm__ops_path_tensor_src_fp16_dst_fp16.max.pct_of_peak_sustained_elapsed
+   [           0 %     ] sm__ops_path_tensor_src_fp16_dst_fp16.min.pct_of_peak_sustained_elapsed
+   [           0 %     ] sm__ops_path_tensor_src_fp16_dst_fp16.sum.pct_of_peak_sustained_elapsed
+   [           0 %     ] sm__ops_path_tensor_src_fp16_dst_fp32.avg.pct_of_peak_sustained_elapsed
+   [           0 %     ] sm__ops_path_tensor_src_fp16_dst_fp32.max.pct_of_peak_sustained_elapsed
+   [           0 %     ] sm__ops_path_tensor_src_fp16_dst_fp32.min.pct_of_peak_sustained_elapsed
+   [           0 %     ] sm__ops_path_tensor_src_fp16_dst_fp32.sum.pct_of_peak_sustained_elapsed
+   [           0 %     ] sm__ops_path_tensor_src_fp4_dst_fp32.avg.pct_of_peak_sustained_elapsed
+   [           0 %     ] sm__ops_path_tensor_src_fp4_dst_fp32.max.pct_of_peak_sustained_elapsed
+   [           0 %     ] sm__ops_path_tensor_src_fp4_dst_fp32.min.pct_of_peak_sustained_elapsed
+   [           0 %     ] sm__ops_path_tensor_src_fp4_dst_fp32.sum.pct_of_peak_sustained_elapsed
+   [           0 %     ] sm__ops_path_tensor_src_fp4_fp6_fp8_dst_fp16.avg.pct_of_peak_sustained_elapsed
+   [           0 %     ] sm__ops_path_tensor_src_fp4_fp6_fp8_dst_fp16.max.pct_of_peak_sustained_elapsed
+   [           0 %     ] sm__ops_path_tensor_src_fp4_fp6_fp8_dst_fp16.min.pct_of_peak_sustained_elapsed
+   [           0 %     ] sm__ops_path_tensor_src_fp4_fp6_fp8_dst_fp16.sum.pct_of_peak_sustained_elapsed
+   [           0 %     ] sm__ops_path_tensor_src_fp4_fp6_fp8_dst_fp32.avg.pct_of_peak_sustained_elapsed
+   [           0 %     ] sm__ops_path_tensor_src_fp4_fp6_fp8_dst_fp32.max.pct_of_peak_sustained_elapsed
+   [           0 %     ] sm__ops_path_tensor_src_fp4_fp6_fp8_dst_fp32.min.pct_of_peak_sustained_elapsed
+   [           0 %     ] sm__ops_path_tensor_src_fp4_fp6_fp8_dst_fp32.sum.pct_of_peak_sustained_elapsed
+   [           0 %     ] sm__ops_path_tensor_src_fp64.avg.pct_of_peak_sustained_elapsed
+   [           0 %     ] sm__ops_path_tensor_src_fp64.max.pct_of_peak_sustained_elapsed
+   [           0 %     ] sm__ops_path_tensor_src_fp64.min.pct_of_peak_sustained_elapsed
+   [           0 %     ] sm__ops_path_tensor_src_fp64.sum.pct_of_peak_sustained_elapsed
+   [           0 %     ] sm__ops_path_tensor_src_int8.avg.pct_of_peak_sustained_elapsed
+   [           0 %     ] sm__ops_path_tensor_src_int8.max.pct_of_peak_sustained_elapsed
+   [           0 %     ] sm__ops_path_tensor_src_int8.min.pct_of_peak_sustained_elapsed
+   [           0 %     ] sm__ops_path_tensor_src_int8.sum.pct_of_peak_sustained_elapsed
+   [    7.028476 %     ] sm__ops_path_tensor_src_tf32_dst_fp32.avg.pct_of_peak_sustained_elapsed
+   [    7.151474 %     ] sm__ops_path_tensor_src_tf32_dst_fp32.max.pct_of_peak_sustained_elapsed
+   [    6.934763 %     ] sm__ops_path_tensor_src_tf32_dst_fp32.min.pct_of_peak_sustained_elapsed
+   [    7.028476 %     ] sm__ops_path_tensor_src_tf32_dst_fp32.sum.pct_of_peak_sustained_elapsed
+   [   57.373469 %     ] sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_active
+   [   56.227809 %     ] sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed
+   [   58.377505 %     ] sm__pipe_tensor_cycles_active.max.pct_of_peak_sustained_active
+   [   57.211796 %     ] sm__pipe_tensor_cycles_active.max.pct_of_peak_sustained_elapsed
+   [   56.608490 %     ] sm__pipe_tensor_cycles_active.min.pct_of_peak_sustained_active
+   [   55.478105 %     ] sm__pipe_tensor_cycles_active.min.pct_of_peak_sustained_elapsed
+   [   57.373469 %     ] sm__pipe_tensor_cycles_active.sum.pct_of_peak_sustained_active
+   [   56.227809 %     ] sm__pipe_tensor_cycles_active.sum.pct_of_peak_sustained_elapsed
+   [           0 %     ] sm__pipe_tensor_subpipe_dmma_cycles_active.avg.pct_of_peak_sustained_active
+   [           0 %     ] sm__pipe_tensor_subpipe_dmma_cycles_active.avg.pct_of_peak_sustained_elapsed
+   [   57.373469 %     ] sm__pipe_tensor_subpipe_hmma_cycles_active.avg.pct_of_peak_sustained_active
+   [   56.227809 %     ] sm__pipe_tensor_subpipe_hmma_cycles_active.avg.pct_of_peak_sustained_elapsed
+   [           0 %     ] sm__pipe_tensor_subpipe_imma_cycles_active.avg.pct_of_peak_sustained_active
+   [           0 %     ] sm__pipe_tensor_subpipe_imma_cycles_active.avg.pct_of_peak_sustained_elapsed
+   [           0 %     ] smsp__mem_tensor_reads_op_ldt.sum.pct_of_peak_sustained_elapsed
+   [           0 %     ] smsp__mem_tensor_reads_op_utcmma_matrix_a_sp_sf.sum.pct_of_peak_sustained_elapsed
+   [           0 %     ] smsp__mem_tensor_reads_op_utcmma_matrix_c.sum.pct_of_peak_sustained_elapsed
+   [           0 %     ] smsp__mem_tensor_reads_op_utcshift.sum.pct_of_peak_sustained_elapsed
+   [           0 %     ] smsp__mem_tensor_writes_op_stt.sum.pct_of_peak_sustained_elapsed
+   [           0 %     ] smsp__mem_tensor_writes_op_utccp.sum.pct_of_peak_sustained_elapsed
+   [           0 %     ] smsp__mem_tensor_writes_op_utcmma.sum.pct_of_peak_sustained_elapsed
+   [           0 %     ] smsp__mem_tensor_writes_op_utcshift.sum.pct_of_peak_sustained_elapsed
