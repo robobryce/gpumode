@@ -1,0 +1,3 @@
+- [autocuda tests vs global commit hook](autocuda-tests-global-commit-hook.md) — why 8 autocuda init-brief/init-manager pytest fixtures fail locally but pass in CI, and how to run them cleanly
+- [autocuda export-overhaul PR fanout](autocuda-pr-fanout-export-overhaul.md) — 4 PRs (#341-344) reworking autocuda:export (session logs, gitleaks scrubbing, experiment-tag exports, incremental+daemon); two-remote PR flow (origin TRIAGE / fork ADMIN); relaunch-with-defensive-framing for the cyber false-positive
+- [aab deepseek double [1m] suffix](aab-deepseek-double-1m-suffix.md) — ~/.aab/.env DEEPSEEK_MODEL carries a [1m] the wrapper doubles; benign for Claude Code (strips all), but raw consumers 401 on the stray id

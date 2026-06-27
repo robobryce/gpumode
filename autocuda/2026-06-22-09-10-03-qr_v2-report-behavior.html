@@ -1,0 +1,1052 @@
+<h1 id="behavior-report-2026-06-22-09-10-03-qr_v2">Behavior Report —
+<code>2026-06-22-09-10-03-qr_v2</code></h1>
+<p><em>Single experiment, 4-worker <code>optimize-tree</code> run on one
+B200. 172 brief-branches across workers W0/W1/W2/W3, 2026-06-22 09:16 →
+2026-06-24 17:38 (≈56.4 h wall).</em></p>
+<h2 id="executive-summary">Executive Summary</h2>
+<p>This was a long, productive, and — given the conditions — strikingly
+reliable run. Across 56.4 h of walltime the fleet logged 332 trials over
+172 brief-branches (83 of which produced ≥1 trial; the other 89 were
+write-only or instantly-abandoned briefs). Sustained throughput was
+modest at ≈4.5 trials per active worker-hour, but that number is set
+almost entirely by the cost of a single CUDA iteration on this problem
+(build + validate-on-22-ranked-shapes + benchmark + nsys/ncu profile),
+not by agent stalling. The headline reliability story is that the run
+survived <strong>≈71 API-drop worker deaths and ≈33 manager
+respawns</strong> with zero lost work and <strong>zero genuine
+early-termination</strong> — the manager recovered every crashed worker
+losslessly from its branch + log, and a mid-run torch 2.11→2.12.1+cu130
+venv upgrade plus an end-of-run spin-down were both executed as clean,
+operator-directed pause/resume windows.</p>
+<p><strong>Key takeaways</strong></p>
+<ul>
+<li><strong>The fleet is remarkably balanced, not bottlenecked on one
+worker.</strong> Per-worker throughput is 4.67 / 4.47 / 4.55 / 3.89
+trials/active-h for W0/W1/W2/W3 — every worker is within
+<strong>0.86–1.04× of the fleet median</strong>. There is <em>no</em> 2×
+outlier; the large per-<em>brief</em> variance (CoV 3.49×) comes from
+brief <em>length</em>, not worker skill.</li>
+<li><strong>The 4th worker arrived 39 h late.</strong> W3 did not exist
+until 2026-06-24 00:27 — the run was a <strong>3-worker fleet for its
+first ~39 h</strong> and only reached 4 workers for the final ~17 h.
+Judged against the <em>intended</em> size per era, the fleet was at full
+strength <strong>82.6 % of the 3-worker era and 79.2 % of the 4-worker
+era</strong>.</li>
+<li><strong>Lock contention on the single GPU is a real, double-digit
+tax.</strong> Only one of four workers can hold the exclusive
+<code>gpu-0</code> lock (bench/profile/validate) at a time; captured
+lock-wait totals <strong>≈9.5 h ≈ 17 % of fleet walltime</strong> (a
+conservative floor — truncated logs imply the true figure is higher),
+with the worst single wait <strong>12.8 min</strong>. This, not agent
+idleness, is the dominant structural drag on a 4-on-1 fleet.</li>
+<li><strong>Worker deaths were frequent but invisible to the
+result.</strong> ≈71 distinct API-mid-response deaths (W0:27, W1:21,
+W2:21, W3:2), heaviest on 06-22/06-23, each recovered by the manager
+re-reading the branch and re-issuing the in-flight brief. Several
+“deaths” were stale duplicate notifications the manager correctly
+declined to act on.</li>
+<li><strong>No agent tried to quit the run.</strong> 34 messages are
+workers <em>correctly</em> declaring one brief exhausted and handing
+back to the manager (normal). The only halt-and-wait was W2 on brief-69
+correctly honoring a <em>direct user freeze</em> over a conflicting
+coordinator instruction — the right call, not a give-up.</li>
+</ul>
+<p><strong>One-line:</strong> 172 branches · 332 trials · 56.4 h wall ·
+mean ≈4.5 trials/active-worker-h (worst sustained worker 3.89) ·
+reliability verdict: <strong>high</strong> — frequent infrastructure
+failures, zero work lost, zero spurious termination.</p>
+<h2 id="fleet-behavior">Fleet Behavior</h2>
+<h3 id="worker-concurrency-over-time">Worker Concurrency Over Time</h3>
+<p>Active intervals were built by pairing each worker’s
+<code>brief_start</code> with its next <code>brief_stop</code>. Bucketed
+into 5-minute windows over the 56.4 h run:</p>
+<table>
+<thead>
+<tr class="header">
+<th>Active workers</th>
+<th>Windows</th>
+<th>Walltime</th>
+<th>Share</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>0 (fully idle)</td>
+<td>13</td>
+<td>1.08 h</td>
+<td>1.9 %</td>
+</tr>
+<tr class="even">
+<td>1</td>
+<td>9</td>
+<td>0.75 h</td>
+<td>1.3 %</td>
+</tr>
+<tr class="odd">
+<td>2</td>
+<td>68</td>
+<td>5.67 h</td>
+<td>10.0 %</td>
+</tr>
+<tr class="even">
+<td>3</td>
+<td>423</td>
+<td>35.25 h</td>
+<td>62.5 %</td>
+</tr>
+<tr class="odd">
+<td>4 (peak)</td>
+<td>164</td>
+<td>13.67 h</td>
+<td>24.2 %</td>
+</tr>
+</tbody>
+</table>
+<p>Peak concurrency was <strong>4</strong>, but reached only in the
+final ~17 h: <strong>worker W3’s first activity is 2026-06-24
+00:27</strong>, ~39 h into the run. So the raw “73.9 % under strength
+vs. 4” figure is misleading — for most of the run the <em>target</em>
+was 3, not 4. Splitting by era against the intended size:</p>
+<ul>
+<li><strong>3-worker era (start → 06-24 00:27, 39.25 h):</strong> at
+full strength (≥3) <strong>82.6 %</strong>, under-strength <strong>14.6
+%</strong>, fully idle <strong>2.8 %</strong>.</li>
+<li><strong>4-worker era (06-24 00:27 → end, 17.25 h):</strong> at full
+strength (≥4) <strong>79.2 %</strong>, under-strength <strong>20.8
+%</strong>, fully idle <strong>0 %</strong>.</li>
+</ul>
+<p>The longest fully-idle stretch is small (the idle windows are
+scattered single buckets, mostly clustered around the late-run
+maintenance/spin-down). The under-strength time is the aggregate cost of
+the death/respawn churn — each death drops the fleet by one worker until
+the manager notices and respawns (handoff median 82 s, below). The fleet
+never collapsed; it ran one-worker-down briefly and often, not many-down
+for long.</p>
+<h3 id="brief-cycle-timing-manager-worker-handoff">Brief-Cycle Timing
+(manager → worker handoff)</h3>
+<p>For each of the 206 manager-log brief rows, the handoff latency is
+the gap from the manager writing the brief to the matching worker
+emitting <code>brief_start</code> for that <code>brief_id</code>. Over
+the 170 briefs with a clean same-id match:</p>
+<ul>
+<li><strong>median 82 s, p95 616 s (~10 min), max 3103 s (51.7
+min).</strong></li>
+<li><strong>16 briefs exceeded 5 min.</strong> The 36 briefs without a
+clean same-id match are exactly the respawned/duplicated briefs (a
+crashed instance’s brief_start does not line up with the re-issued
+row).</li>
+</ul>
+<p>The slowest handoffs cluster on 06-23 when death churn peaked —
+e.g. W1 brief-23 (51.7 min, 06-23 10:10), W0 brief-19 (39.0 min, 06-23
+05:24), W2 brief-69 (29.1 min, 06-24 14:50, during the late-run freeze).
+These long handoffs are the manager waiting on a dead-worker respawn or
+on a busy GPU, not the worker ignoring a brief. <em>(Note: the gap from
+<code>brief_start</code> to the worker’s first logged trial is a
+separate ~20 min median — that is one build+validate+benchmark cycle,
+i.e. the cost of doing the work, not a handoff problem.)</em></p>
+<h3 id="lock-contention">Lock Contention</h3>
+<p><code>autocuda run slice</code> (build, <strong>shared</strong>
+<code>build</code> lock) and <code>autocuda run exclusive</code>
+(bench/profile/validate, <strong>exclusive</strong> <code>gpu-0</code>
+lock) emit paired acquire/release lines in the session logs.
+De-duplicated across replayed sessions (871 unique acquisitions: 231
+build/shared, 640 gpu-0/exclusive — all GPU locks are
+<code>gpu-0</code>, a single B200):</p>
+<table style="width:100%;">
+<colgroup>
+<col style="width: 16%" />
+<col style="width: 16%" />
+<col style="width: 16%" />
+<col style="width: 16%" />
+<col style="width: 16%" />
+<col style="width: 16%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Lock kind</th>
+<th>Acquisitions</th>
+<th>Total wait</th>
+<th>Median wait</th>
+<th>Max wait</th>
+<th>Total hold (<code>ran</code>)</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>build</code> / shared (builds)</td>
+<td>231</td>
+<td>2.61 h</td>
+<td>8.3 s</td>
+<td>447.5 s</td>
+<td>0.63 h</td>
+</tr>
+<tr class="even">
+<td><code>gpu-0</code> / exclusive (bench/profile/validate)</td>
+<td>640</td>
+<td>6.86 h</td>
+<td>0.0 s</td>
+<td><strong>768.0 s</strong></td>
+<td>15.41 h</td>
+</tr>
+<tr class="odd">
+<td><strong>Total</strong></td>
+<td>871</td>
+<td><strong>9.47 h</strong></td>
+<td>—</td>
+<td>768.0 s</td>
+<td>16.0 h</td>
+</tr>
+</tbody>
+</table>
+<p>The GPU was held under exclusive lock <strong>≈15.4 h ≈ 27 % of
+walltime</strong> — that is the structural source of contention: with 4
+workers and 1 GPU, three workers are blocked whenever one benchmarks or
+profiles. Most exclusive acquisitions got in instantly (median 0 s), so
+the <strong>9.47 h of wait is a long-tail phenomenon</strong> — when
+several workers finished editing at once they queued, the worst single
+wait being 12.8 min (06-23 18:50). Aggregate captured wait is
+<strong>≈17 % of the 56.4 h fleet walltime</strong>, and because the
+acquire line is the one most often truncated by “Output too large” the
+true figure is higher (release lines, which survive, are ~2× more
+numerous). <strong>Lock contention is a meaningful fraction of fleet
+time and the clearest scaling limit of running 4 workers on 1
+GPU.</strong> Per-worker attribution was not possible — the candidate
+session logs are manager/shared and all reference all four workers.</p>
+<h3 id="per-worker-reliability">Per-Worker Reliability</h3>
+<table style="width:100%;">
+<colgroup>
+<col style="width: 14%" />
+<col style="width: 14%" />
+<col style="width: 14%" />
+<col style="width: 14%" />
+<col style="width: 14%" />
+<col style="width: 14%" />
+<col style="width: 14%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Worker</th>
+<th>Briefs (non-empty)</th>
+<th>Trials</th>
+<th>Active h</th>
+<th>Trials/active-h</th>
+<th>vs median</th>
+<th>Deaths</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>W0</td>
+<td>47 (27)</td>
+<td>117</td>
+<td>25.0</td>
+<td>4.67</td>
+<td>1.04×</td>
+<td>27</td>
+</tr>
+<tr class="even">
+<td>W1</td>
+<td>50 (24)</td>
+<td>100</td>
+<td>22.4</td>
+<td>4.47</td>
+<td>0.99×</td>
+<td>21</td>
+</tr>
+<tr class="odd">
+<td>W2</td>
+<td>54 (24)</td>
+<td>88</td>
+<td>19.3</td>
+<td>4.55</td>
+<td>1.01×</td>
+<td>21</td>
+</tr>
+<tr class="even">
+<td>W3</td>
+<td>21 (8)</td>
+<td>27</td>
+<td>6.9</td>
+<td>3.89</td>
+<td>0.86×</td>
+<td>2</td>
+</tr>
+</tbody>
+</table>
+<p><strong>No worker is a 2× outlier in either direction.</strong> W3’s
+slightly lower 3.89 is the late-spawn settling in over a shorter window,
+not a defect. W0 took the most deaths (27) yet still posted the
+<em>highest</em> throughput — strong evidence the respawn recovery is
+genuinely lossless. The fleet is well-load-balanced; differences between
+workers are noise, not skill or reliability gaps.</p>
+<h2 id="throughput">Throughput</h2>
+<table>
+<thead>
+<tr class="header">
+<th>Branch</th>
+<th>Trials</th>
+<th>Duration</th>
+<th>Trials/hour</th>
+<th>Improvement %</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>worker-0-brief-37</code></td>
+<td>3</td>
+<td>25s</td>
+<td>293.39</td>
+<td>+0.00</td>
+</tr>
+<tr class="even">
+<td><code>worker-2-brief-11</code></td>
+<td>2</td>
+<td>1m36s</td>
+<td>37.39</td>
+<td>+0.00</td>
+</tr>
+<tr class="odd">
+<td><code>worker-0-brief-51</code></td>
+<td>2</td>
+<td>2m26s</td>
+<td>24.67</td>
+<td>+0.00</td>
+</tr>
+<tr class="even">
+<td><code>worker-1-brief-29</code></td>
+<td>2</td>
+<td>2m55s</td>
+<td>20.62</td>
+<td>+0.00</td>
+</tr>
+<tr class="odd">
+<td><code>worker-1-brief-14</code></td>
+<td>2</td>
+<td>3m34s</td>
+<td>16.83</td>
+<td>+0.00</td>
+</tr>
+<tr class="even">
+<td><code>worker-2-brief-63</code></td>
+<td>2</td>
+<td>4m15s</td>
+<td>14.10</td>
+<td>+0.00</td>
+</tr>
+<tr class="odd">
+<td><code>worker-1-brief-25</code></td>
+<td>2</td>
+<td>4m26s</td>
+<td>13.53</td>
+<td>+0.00</td>
+</tr>
+<tr class="even">
+<td><code>worker-0-brief-49</code></td>
+<td>2</td>
+<td>4m48s</td>
+<td>12.49</td>
+<td>+0.00</td>
+</tr>
+<tr class="odd">
+<td><code>worker-2-brief-19</code></td>
+<td>2</td>
+<td>4m52s</td>
+<td>12.33</td>
+<td>+0.00</td>
+</tr>
+<tr class="even">
+<td><code>worker-1-brief-27</code></td>
+<td>2</td>
+<td>5m22s</td>
+<td>11.18</td>
+<td>+0.00</td>
+</tr>
+<tr class="odd">
+<td><code>worker-3-brief-14</code></td>
+<td>2</td>
+<td>6m0s</td>
+<td>10.01</td>
+<td>+0.00</td>
+</tr>
+<tr class="even">
+<td><code>worker-0-brief-12</code></td>
+<td>5</td>
+<td>26m17s</td>
+<td>9.13</td>
+<td>+0.00</td>
+</tr>
+<tr class="odd">
+<td><code>worker-0-brief-48</code></td>
+<td>5</td>
+<td>26m25s</td>
+<td>9.08</td>
+<td>+0.00</td>
+</tr>
+<tr class="even">
+<td><code>worker-2-brief-68</code></td>
+<td>3</td>
+<td>13m33s</td>
+<td>8.86</td>
+<td>+0.00</td>
+</tr>
+<tr class="odd">
+<td><code>worker-2-brief-3</code></td>
+<td>5</td>
+<td>27m26s</td>
+<td>8.75</td>
+<td>+0.00</td>
+</tr>
+<tr class="even">
+<td><code>worker-2-brief-22</code></td>
+<td>2</td>
+<td>7m40s</td>
+<td>7.83</td>
+<td>+0.00</td>
+</tr>
+<tr class="odd">
+<td><code>worker-0-brief-50</code></td>
+<td>5</td>
+<td>32m34s</td>
+<td>7.37</td>
+<td>+0.00</td>
+</tr>
+<tr class="even">
+<td><code>worker-3-brief-17</code></td>
+<td>3</td>
+<td>17m3s</td>
+<td>7.04</td>
+<td>+0.00</td>
+</tr>
+<tr class="odd">
+<td><code>worker-0-brief-32</code></td>
+<td>2</td>
+<td>8m37s</td>
+<td>6.97</td>
+<td>+0.00</td>
+</tr>
+<tr class="even">
+<td><code>worker-2-brief-37</code></td>
+<td>4</td>
+<td>26m1s</td>
+<td>6.92</td>
+<td>+0.00</td>
+</tr>
+<tr class="odd">
+<td><code>worker-1-brief-12</code></td>
+<td>7</td>
+<td>52m57s</td>
+<td>6.80</td>
+<td>+0.00</td>
+</tr>
+<tr class="even">
+<td><code>worker-3-brief-19</code></td>
+<td>5</td>
+<td>36m5s</td>
+<td>6.65</td>
+<td>+0.00</td>
+</tr>
+<tr class="odd">
+<td><code>worker-2-brief-23</code></td>
+<td>2</td>
+<td>9m25s</td>
+<td>6.37</td>
+<td>+0.00</td>
+</tr>
+<tr class="even">
+<td><code>worker-0-brief-21</code></td>
+<td>2</td>
+<td>10m0s</td>
+<td>6.00</td>
+<td>+0.00</td>
+</tr>
+<tr class="odd">
+<td><code>worker-2-brief-5</code></td>
+<td>4</td>
+<td>32m12s</td>
+<td>5.59</td>
+<td>+0.00</td>
+</tr>
+<tr class="even">
+<td><code>worker-3-brief-11</code></td>
+<td>2</td>
+<td>10m51s</td>
+<td>5.53</td>
+<td>+0.00</td>
+</tr>
+<tr class="odd">
+<td><code>worker-0-brief-45</code></td>
+<td>2</td>
+<td>11m8s</td>
+<td>5.39</td>
+<td>+0.00</td>
+</tr>
+<tr class="even">
+<td><code>worker-0-brief-22</code></td>
+<td>3</td>
+<td>22m30s</td>
+<td>5.33</td>
+<td>+0.00</td>
+</tr>
+<tr class="odd">
+<td><code>worker-2-brief-15</code></td>
+<td>6</td>
+<td>56m46s</td>
+<td>5.29</td>
+<td>+0.00</td>
+</tr>
+<tr class="even">
+<td><code>worker-2-brief-4</code></td>
+<td>5</td>
+<td>45m33s</td>
+<td>5.27</td>
+<td>+0.00</td>
+</tr>
+<tr class="odd">
+<td><code>worker-0-brief-4</code></td>
+<td>11</td>
+<td>2.0h</td>
+<td>4.93</td>
+<td>+0.00</td>
+</tr>
+<tr class="even">
+<td><code>worker-2-brief-9</code></td>
+<td>4</td>
+<td>37m5s</td>
+<td>4.85</td>
+<td>+0.00</td>
+</tr>
+<tr class="odd">
+<td><code>worker-2-brief-41</code></td>
+<td>5</td>
+<td>50m25s</td>
+<td>4.76</td>
+<td>+0.00</td>
+</tr>
+<tr class="even">
+<td><code>worker-0-brief-0</code></td>
+<td>7</td>
+<td>1.3h</td>
+<td>4.71</td>
+<td>+0.00</td>
+</tr>
+<tr class="odd">
+<td><code>worker-1-brief-42</code></td>
+<td>4</td>
+<td>38m39s</td>
+<td>4.66</td>
+<td>+0.00</td>
+</tr>
+<tr class="even">
+<td><code>worker-0-brief-53</code></td>
+<td>2</td>
+<td>13m10s</td>
+<td>4.56</td>
+<td>+0.00</td>
+</tr>
+<tr class="odd">
+<td><code>worker-1-brief-5</code></td>
+<td>5</td>
+<td>54m41s</td>
+<td>4.39</td>
+<td>+0.00</td>
+</tr>
+<tr class="even">
+<td><code>worker-2-brief-40</code></td>
+<td>2</td>
+<td>14m2s</td>
+<td>4.28</td>
+<td>+0.00</td>
+</tr>
+<tr class="odd">
+<td><code>worker-3-brief-1</code></td>
+<td>2</td>
+<td>14m13s</td>
+<td>4.22</td>
+<td>+0.00</td>
+</tr>
+<tr class="even">
+<td><code>worker-0-brief-11</code></td>
+<td>5</td>
+<td>57m1s</td>
+<td>4.21</td>
+<td>+0.00</td>
+</tr>
+<tr class="odd">
+<td><code>worker-1-brief-0</code></td>
+<td>11</td>
+<td>2.4h</td>
+<td>4.09</td>
+<td>+0.00</td>
+</tr>
+<tr class="even">
+<td><code>worker-1-brief-2</code></td>
+<td>9</td>
+<td>2.0h</td>
+<td>3.95</td>
+<td>+0.00</td>
+</tr>
+<tr class="odd">
+<td><code>worker-0-brief-7</code></td>
+<td>5</td>
+<td>1.0h</td>
+<td>3.94</td>
+<td>+0.00</td>
+</tr>
+<tr class="even">
+<td><code>worker-1-brief-39</code></td>
+<td>3</td>
+<td>30m53s</td>
+<td>3.89</td>
+<td>+0.00</td>
+</tr>
+<tr class="odd">
+<td><code>worker-0-brief-56</code></td>
+<td>8</td>
+<td>1.8h</td>
+<td>3.83</td>
+<td>+0.00</td>
+</tr>
+<tr class="even">
+<td><code>worker-1-brief-15</code></td>
+<td>6</td>
+<td>1.4h</td>
+<td>3.69</td>
+<td>+0.00</td>
+</tr>
+<tr class="odd">
+<td><code>worker-1-brief-38</code></td>
+<td>4</td>
+<td>48m56s</td>
+<td>3.68</td>
+<td>+0.00</td>
+</tr>
+<tr class="even">
+<td><code>worker-2-brief-27</code></td>
+<td>2</td>
+<td>17m5s</td>
+<td>3.51</td>
+<td>+0.00</td>
+</tr>
+<tr class="odd">
+<td><code>worker-1-brief-10</code></td>
+<td>3</td>
+<td>34m37s</td>
+<td>3.47</td>
+<td>+0.00</td>
+</tr>
+<tr class="even">
+<td><code>worker-0-brief-14</code></td>
+<td>5</td>
+<td>1.2h</td>
+<td>3.46</td>
+<td>+0.00</td>
+</tr>
+<tr class="odd">
+<td><code>worker-1-brief-17</code></td>
+<td>4</td>
+<td>54m19s</td>
+<td>3.31</td>
+<td>+0.00</td>
+</tr>
+<tr class="even">
+<td><code>worker-1-brief-40</code></td>
+<td>2</td>
+<td>18m6s</td>
+<td>3.31</td>
+<td>+0.00</td>
+</tr>
+<tr class="odd">
+<td><code>worker-0-brief-1</code></td>
+<td>8</td>
+<td>2.2h</td>
+<td>3.19</td>
+<td>+0.00</td>
+</tr>
+<tr class="even">
+<td><code>worker-0-brief-43</code></td>
+<td>2</td>
+<td>18m47s</td>
+<td>3.19</td>
+<td>+0.00</td>
+</tr>
+<tr class="odd">
+<td><code>worker-1-brief-3</code></td>
+<td>3</td>
+<td>37m53s</td>
+<td>3.17</td>
+<td>+0.00</td>
+</tr>
+<tr class="even">
+<td><code>worker-1-brief-45</code></td>
+<td>2</td>
+<td>18m56s</td>
+<td>3.17</td>
+<td>+0.00</td>
+</tr>
+<tr class="odd">
+<td><code>worker-1-brief-1</code></td>
+<td>9</td>
+<td>2.6h</td>
+<td>3.10</td>
+<td>+0.00</td>
+</tr>
+<tr class="even">
+<td><code>worker-1-brief-31</code></td>
+<td>5</td>
+<td>1.3h</td>
+<td>3.10</td>
+<td>+0.00</td>
+</tr>
+<tr class="odd">
+<td><code>worker-1-brief-52</code></td>
+<td>2</td>
+<td>20m12s</td>
+<td>2.97</td>
+<td>+0.00</td>
+</tr>
+<tr class="even">
+<td><code>worker-2-brief-0</code></td>
+<td>7</td>
+<td>2.0h</td>
+<td>2.96</td>
+<td>+0.00</td>
+</tr>
+<tr class="odd">
+<td><code>worker-2-brief-10</code></td>
+<td>4</td>
+<td>1.0h</td>
+<td>2.88</td>
+<td>+0.00</td>
+</tr>
+<tr class="even">
+<td><code>worker-2-brief-18</code></td>
+<td>6</td>
+<td>1.7h</td>
+<td>2.88</td>
+<td>+0.00</td>
+</tr>
+<tr class="odd">
+<td><code>worker-0-brief-3</code></td>
+<td>4</td>
+<td>1.1h</td>
+<td>2.77</td>
+<td>+0.00</td>
+</tr>
+<tr class="even">
+<td><code>worker-0-brief-15</code></td>
+<td>2</td>
+<td>22m47s</td>
+<td>2.63</td>
+<td>+0.00</td>
+</tr>
+<tr class="odd">
+<td><code>worker-0-brief-17</code></td>
+<td>4</td>
+<td>1.2h</td>
+<td>2.59</td>
+<td>+0.00</td>
+</tr>
+<tr class="even">
+<td><code>worker-1-brief-43</code></td>
+<td>2</td>
+<td>23m36s</td>
+<td>2.54</td>
+<td>+0.00</td>
+</tr>
+<tr class="odd">
+<td><code>worker-2-brief-1</code></td>
+<td>4</td>
+<td>1.3h</td>
+<td>2.31</td>
+<td>+0.00</td>
+</tr>
+<tr class="even">
+<td><code>worker-1-brief-37</code></td>
+<td>4</td>
+<td>1.4h</td>
+<td>2.21</td>
+<td>+0.00</td>
+</tr>
+<tr class="odd">
+<td><code>worker-3-brief-20</code></td>
+<td>2</td>
+<td>27m7s</td>
+<td>2.21</td>
+<td>+0.00</td>
+</tr>
+<tr class="even">
+<td><code>worker-0-brief-54</code></td>
+<td>2</td>
+<td>28m18s</td>
+<td>2.12</td>
+<td>+0.00</td>
+</tr>
+<tr class="odd">
+<td><code>worker-0-brief-44</code></td>
+<td>13</td>
+<td>5.7h</td>
+<td>2.10</td>
+<td>+0.00</td>
+</tr>
+<tr class="even">
+<td><code>worker-2-brief-52</code></td>
+<td>8</td>
+<td>3.4h</td>
+<td>2.06</td>
+<td>+0.00</td>
+</tr>
+<tr class="odd">
+<td><code>worker-0-brief-9</code></td>
+<td>3</td>
+<td>1.0h</td>
+<td>1.99</td>
+<td>+0.00</td>
+</tr>
+<tr class="even">
+<td><code>worker-0-brief-46</code></td>
+<td>3</td>
+<td>1.1h</td>
+<td>1.82</td>
+<td>+0.00</td>
+</tr>
+<tr class="odd">
+<td><code>worker-2-brief-69</code></td>
+<td>2</td>
+<td>32m53s</td>
+<td>1.82</td>
+<td>+0.00</td>
+</tr>
+<tr class="even">
+<td><code>worker-2-brief-45</code></td>
+<td>2</td>
+<td>33m22s</td>
+<td>1.80</td>
+<td>+0.00</td>
+</tr>
+<tr class="odd">
+<td><code>worker-3-brief-5</code></td>
+<td>3</td>
+<td>1.1h</td>
+<td>1.80</td>
+<td>+0.00</td>
+</tr>
+<tr class="even">
+<td><code>worker-3-brief-0</code></td>
+<td>8</td>
+<td>4.0h</td>
+<td>1.76</td>
+<td>+0.00</td>
+</tr>
+<tr class="odd">
+<td><code>worker-0-brief-34</code></td>
+<td>2</td>
+<td>43m56s</td>
+<td>1.37</td>
+<td>+0.00</td>
+</tr>
+<tr class="even">
+<td><code>worker-1-brief-26</code></td>
+<td>5</td>
+<td>3.1h</td>
+<td>1.31</td>
+<td>+0.00</td>
+</tr>
+<tr class="odd">
+<td><code>worker-1-brief-4</code></td>
+<td>2</td>
+<td>46m32s</td>
+<td>1.29</td>
+<td>+0.00</td>
+</tr>
+<tr class="even">
+<td><code>worker-2-brief-21</code></td>
+<td>2</td>
+<td>54m4s</td>
+<td>1.11</td>
+<td>+0.00</td>
+</tr>
+<tr class="odd">
+<td><code>worker-2-brief-39</code></td>
+<td>3</td>
+<td>2.0h</td>
+<td>1.00</td>
+<td>+0.00</td>
+</tr>
+</tbody>
+</table>
+<p><em>83 branches with ≥1 trial shown (sorted by trials/hour). The
+remaining 89 branches logged 0 trials — briefs the manager wrote but a
+worker either never picked up (write-only, often superseded by a
+redirect) or abandoned before the first build.
+<code>Improvement %</code> is uniformly +0.00: tree-worker logs do not
+carry <code>pct_change</code>, so this column is structurally blank for
+every tree branch (the actual speedups — geomean 131465 µs → 2040.9 µs,
+~64× — live in the optimization report, not here).</em></p>
+<p>Single-experiment run, so there is no cross-<em>experiment</em>
+mean/stddev row. The cross-<em>branch</em> spread is the relevant
+variance signal: over the 83 active branches, trials/hour is
+<strong>mean 9.13, median 3.95, stddev 31.86 (CoV 3.49×)</strong>. That
+spread is an artifact of brief duration — a 25 s probe (brief-37) and a
+5.7 h benchmark marathon (brief-44, 13 trials) both appear, and short
+briefs inflate the per-hour rate without doing more work. Aggregated to
+the worker level the variance nearly vanishes (4.67 / 4.47 / 4.55 /
+3.89), which is the honest read on fleet consistency.</p>
+<h2 id="gaps-and-stalls">Gaps And Stalls</h2>
+<p>66 of 172 branches recorded a gap (a &gt;10 min quiet transition
+between trials), 154 gaps total. These are overwhelmingly
+<strong>benchmark/profile duration and GPU-lock queueing</strong>, not
+agent silence — the long-running shapes (n=2048/4096 and the B=640
+ranked validation sweep) take tens of minutes per benchmark, and only
+one worker can hold <code>gpu-0</code> at a time. The notable cases:</p>
+<ul>
+<li><strong><code>worker-0-brief-44</code> — 7 gaps, longest 142 min
+(8524 s), 13 trials over 5.7 h.</strong> The single largest gap in the
+run. This brief ran across the night of 06-23 → 06-24 and its 142-min
+gap overlaps a death-churn window; it is one in-flight brief spanning a
+worker death + respawn (the brief resumed on the same branch afterward,
+which is why it still shows 13 trials). High gap count + high trial
+count = a long, repeatedly interrupted but never-lost brief.</li>
+<li><strong><code>worker-1-brief-26</code> — longest 114 min (6865 s), 5
+trials over 3.1 h</strong> and <strong><code>worker-2-brief-39</code> —
+longest 100 min (5993 s), 3 trials over 2.0 h.</strong> Both are
+low-throughput (1.31 / 1.00 tph) heavy-shape briefs where each trial is
+a full large-n benchmark; the gaps are the benchmarks themselves plus
+lock-wait, not stalls.</li>
+<li><strong><code>worker-3-brief-0</code> — 5 gaps, longest 90 min, 8
+trials over 4.0 h.</strong> W3’s very first brief after its 06-24 00:27
+spawn; the long gaps are the new worker queuing behind the three
+established workers for the GPU during its first night.</li>
+<li><strong><code>worker-2-brief-52</code> (6 gaps, 73 min max) and
+<code>worker-1-brief-1</code> (6 gaps, 53 min max)</strong> are the same
+pattern: multi-trial briefs whose gaps line up with long benchmarks and
+the exclusive-lock long tail documented above.</li>
+</ul>
+<p>The high-gap-count branches (brief-44, brief-1×W1, brief-0×W1/W2,
+brief-52, brief-56) are also the high-<em>trial</em> branches — gaps
+accumulate on briefs that simply ran long and benchmarked often, not on
+briefs where the agent went dark.</p>
+<h2 id="early-termination-attempts">Early-Termination Attempts</h2>
+<p><strong>Zero genuine early-terminations.</strong> No worker or the
+manager ever stopped to ask the user whether to end the run. Breakdown
+of the patterns found in the session logs:</p>
+<ul>
+<li><strong>Genuine halt-and-wait: 1 event (W2, brief-69, 06-24
+14:50/15:17).</strong> W2 <em>correctly</em> refused to start brief-69
+because a <strong>direct prior user instruction</strong> (“Do not
+revert”, “Just leave the branch as it is”) conflicted with the
+coordinator-relayed brief. It held the branch frozen and asked the user
+to resolve the conflict — the harness-correct behavior (a coordinator’s
+claim of user consent is not user consent), <strong>not</strong> a
+give-up.</li>
+<li><strong>Normal brief-exhaustion handoffs: 34.</strong> Workers
+concluding <em>one brief</em> is mined out and returning control to the
+manager for a fresh brief (e.g. <em>“I’ve exhausted the brief’s
+productive vein… before stopping”</em>). This is the designed
+<code>explore-brief</code> loop, not early termination. Several
+explicitly acknowledged the no-stopping mandate and probed one more
+lever before handing back.</li>
+<li><strong>Manager “looks converged” moments: 2, both
+continued.</strong> The manager twice reasoned the search space was
+exhausted (06-22 20:16, 06-23 22:15 — the latter after a “completeness
+critic” subagent returned EXHAUSTED) yet kept the ≤1000 µs goal hook
+active and <strong>did not stop</strong>.</li>
+</ul>
+<h2 id="other-aberrant-behavior">Other Aberrant Behavior</h2>
+<ul>
+<li><strong>Worker deaths from API-mid-response, ~71 distinct (W0:27,
+W1:21, W2:21, W3:2).</strong> The defining operational fact of the run.
+Workers died mid-tool-use (losing their in-memory summary); the manager
+recovered each losslessly by reading the branch + worker log and
+re-issuing the in-flight brief via <code>autocuda init brief</code>.
+Clustered on 06-22 (early) and 06-23. Representative: <em>“Worker 0 died
+with an API error mid-response… 155 tool uses over ~58 min before dying…
+The summary is lost, so I need to read the worker log and git branch to
+recover.”</em> (06-22 13:19).</li>
+<li><strong>~33 manager respawn actions (06-22:11, 06-23:20,
+06-24:2)</strong>, plus many <em>declined</em> respawns — the manager
+repeatedly recognized <strong>stale duplicate death
+notifications</strong> and correctly took “no action, no respawn” to
+avoid double-spawning a live worker. Good defensive behavior under a
+noisy failure signal.</li>
+<li><strong>Dangling-brief bookkeeping (manager-authored balancing
+<code>brief_stop</code> rows).</strong> When a crashed instance left a
+<code>brief_start</code> with no <code>brief_stop</code>, the manager
+emitted a compensating stop so start/stop counts reconciled — e.g. W0
+brief-4 (06-22 19:14). This is why worker logs show <em>more</em> stops
+than starts (W0 57 vs 54, W2 60 vs 55, etc.); it is correct bookkeeping,
+not a logging error, but it does mean raw start/stop counts must be
+paired carefully.</li>
+<li><strong>Duplicate brief_ids per worker (respawn
+fingerprints):</strong> W0 restarted brief-44 <strong>5×</strong>,
+brief-4/23/48 2× each; W2 brief-18/39 2×; W3 brief-0/19 2×. Each
+duplicate is a death
+<ul>
+<li>respawn of the same in-flight brief, consistent with the death
+log.</li>
+</ul></li>
+<li><strong>Late fleet expansion.</strong> W3 was added ~39 h in (first
+activity 06-24 00:27) rather than at launch — the run effectively
+changed its target worker count mid-stream. Worth flagging for any
+apples-to-apples throughput comparison with other runs.</li>
+<li><strong>89 zero-trial briefs.</strong> Slightly over half of all
+briefs produced no trial. Most are manager briefs superseded by a
+redirect before a worker engaged, or picked up and abandoned at build
+time; a few coincide with a death between brief-write and first build.
+Not a correctness problem, but it inflates the branch count well above
+the number of <em>substantive</em> explorations (83).</li>
+</ul>
+<h2 id="analysis">Analysis</h2>
+<p>The run’s behavior is best summarized as <strong>a slow-but-steady,
+infrastructure-stressed fleet that never actually lost ground.</strong>
+Sustained throughput sits at ≈4.5 trials per active worker-hour and is
+essentially flat across W0/W1/W2 — the differences are noise. That rate
+is governed by the per-iteration cost of this specific problem: every
+kept or discarded trial pays for a build, a validate over 22
+ranked/ill-conditioned shapes, a benchmark, and frequently an nsys/ncu
+profile, and the heavy shapes (n=2048/4096, B=640) make a single
+benchmark a tens-of-minutes affair. The per-<em>brief</em> trials/hour
+CoV of 3.49× looks alarming until you see it is entirely a function of
+brief <em>length</em> — 25-second probes and 5.7-hour marathons share
+one column — and collapses to near-zero once aggregated per worker. The
+variance is <em>not</em> driven by an outlier worker.</p>
+<p><strong>Where did the time actually go?</strong> Two places, both
+structural rather than behavioral. First, the <strong>exclusive GPU
+lock</strong>: the single B200 was held under exclusive lock ≈15.4 h
+(≈27 % of walltime) and the fleet paid ≈9.5 h (≈17 %, a floor) waiting
+to acquire it, with a 12.8-min worst case. With four workers and one GPU
+this is unavoidable — three workers idle whenever one benchmarks — and
+it is the clearest reason the gaps in <code>Gaps And Stalls</code> line
+up with the heavy-shape, high-trial briefs (brief-44, brief-26,
+brief-39, brief-52). Second, the <strong>death/respawn churn</strong>:
+≈71 deaths cost the fleet its under-strength time (14.6 % of the
+3-worker era, 20.8 % of the 4-worker era) and stretched the slowest
+manager→worker handoffs to 30–52 min on 06-23 when the manager was
+waiting on respawns. Crucially, neither bottleneck is the agent stalling
+— the median handoff is 82 s and the fully-idle time is &lt;2 % of the
+run.</p>
+<p>The reliability engineering is the standout. A 56-hour run that
+absorbs ≈71 API-drop deaths, a torch major-version venv swap, and a
+deliberate spin-down — all without losing a single brief’s work and
+without one spurious “should I stop?” — is the behavior you want from an
+autonomous harness. The manager’s lossless recovery (read branch + log,
+re-issue brief), its restraint on stale death notifications, and its
+correct handling of the venv window (drain → snapshot for rollback →
+upgrade on idle GPU → verify 22/22 → resume) all held up. The one halt
+(W2/brief-69) was the agent <em>correctly</em> prioritizing a direct
+user instruction over a conflicting relay — a feature, not a fault.</p>
+<p><strong>Recommendations.</strong> 1. <strong>Attack the GPU lock, not
+the agent.</strong> ≈17–27 % of walltime is GPU serialization on a
+4-on-1 fleet. The highest-leverage next change is either fewer workers
+per GPU (3-on-1 showed 82.6 % full-strength vs. the 4-on-1 era’s 79.2 %,
+at lower contention) or shorter benchmark/profile holds (cache profiles,
+profile fewer shapes per trial, or gate ncu behind a kept-result filter)
+so the exclusive lock is released sooner. 2. <strong>Harden against
+API-drop deaths.</strong> ≈71 deaths and ~33 respawns dominated the
+operational noise and pushed worst-case handoffs past 50 min. A faster
+death detector (tighter respawn polling) or automatic mid-response retry
+would reclaim most of the under-strength time without changing the
+optimization logic. 3. <strong>Launch the full worker count from the
+start.</strong> W3 arriving 39 h late means ~39 h of 3-worker throughput
+where 4 were intended; spawning all workers at launch (and keeping the
+no-op-brief rate down — 89 of 172 briefs produced nothing) would raise
+effective fleet utilization on the next run.</p>
