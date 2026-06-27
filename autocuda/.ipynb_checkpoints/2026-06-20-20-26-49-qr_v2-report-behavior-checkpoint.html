@@ -1,0 +1,129 @@
+<h1 id="behavior-report-qr_v2">Behavior Report: qr_v2</h1>
+<h2 id="executive-summary">Executive Summary</h2>
+<p>The fleet generated <code>485</code> trials across <code>238</code>
+branches, with <code>83</code> no-trial branches and <code>205</code>
+detected gaps. The run maintained worker activity but failed
+strategically: active workers were often assigned low-upside briefs, so
+throughput did not become leaderboard progress until the late
+generator-aware branch.</p>
+<h2 id="throughput">Throughput</h2>
+<table>
+<colgroup>
+<col style="width: 15%" />
+<col style="width: 21%" />
+<col style="width: 21%" />
+<col style="width: 21%" />
+<col style="width: 21%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Branch</th>
+<th style="text-align: right;">Trials</th>
+<th style="text-align: right;">Duration</th>
+<th style="text-align: right;">Trials/hour</th>
+<th style="text-align: right;">Improvement %</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>autocuda/optimize/2026-06-20-20-26-49-qr_v2/worker-3-brief-0</td>
+<td style="text-align: right;">10</td>
+<td style="text-align: right;">8049s</td>
+<td style="text-align: right;">4.03</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="even">
+<td>autocuda/optimize/2026-06-20-20-26-49-qr_v2/worker-0-brief-6</td>
+<td style="text-align: right;">6</td>
+<td style="text-align: right;">4098s</td>
+<td style="text-align: right;">4.39</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="odd">
+<td>autocuda/optimize/2026-06-20-20-26-49-qr_v2/worker-1-brief-0</td>
+<td style="text-align: right;">6</td>
+<td style="text-align: right;">3064s</td>
+<td style="text-align: right;">5.87</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="even">
+<td>autocuda/optimize/2026-06-20-20-26-49-qr_v2/worker-1-brief-3</td>
+<td style="text-align: right;">6</td>
+<td style="text-align: right;">4187s</td>
+<td style="text-align: right;">4.30</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="odd">
+<td>autocuda/optimize/2026-06-20-20-26-49-qr_v2/worker-2-brief-1</td>
+<td style="text-align: right;">6</td>
+<td style="text-align: right;">3012s</td>
+<td style="text-align: right;">5.98</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="even">
+<td>autocuda/optimize/2026-06-20-20-26-49-qr_v2/worker-2-brief-3</td>
+<td style="text-align: right;">6</td>
+<td style="text-align: right;">3180s</td>
+<td style="text-align: right;">5.66</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="odd">
+<td>autocuda/optimize/2026-06-20-20-26-49-qr_v2/worker-3-brief-1</td>
+<td style="text-align: right;">6</td>
+<td style="text-align: right;">3378s</td>
+<td style="text-align: right;">5.33</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="even">
+<td>autocuda/optimize/2026-06-20-20-26-49-qr_v2/worker-3-brief-2</td>
+<td style="text-align: right;">6</td>
+<td style="text-align: right;">3694s</td>
+<td style="text-align: right;">4.87</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="odd">
+<td>autocuda/optimize/2026-06-20-20-26-49-qr_v2/worker-3-brief-7</td>
+<td style="text-align: right;">6</td>
+<td style="text-align: right;">2962s</td>
+<td style="text-align: right;">6.08</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="even">
+<td>autocuda/optimize/2026-06-20-20-26-49-qr_v2/worker-0-brief-48</td>
+<td style="text-align: right;">5</td>
+<td style="text-align: right;">2399s</td>
+<td style="text-align: right;">6.00</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="odd">
+<td>autocuda/optimize/2026-06-20-20-26-49-qr_v2/worker-0-brief-49</td>
+<td style="text-align: right;">5</td>
+<td style="text-align: right;">2247s</td>
+<td style="text-align: right;">6.41</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="even">
+<td>autocuda/optimize/2026-06-20-20-26-49-qr_v2/worker-0-brief-51</td>
+<td style="text-align: right;">5</td>
+<td style="text-align: right;">2810s</td>
+<td style="text-align: right;">5.12</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+</tbody>
+</table>
+<p>Throughput was adequate; selection quality was not. Many branches
+produced validated regressions from local implementation changes.</p>
+<h2 id="gaps-and-stalls">Gaps And Stalls</h2>
+<p>Total detected gaps: <code>205</code>; maximum branch gap:
+<code>1595</code> seconds. The biggest practical stall was the plateau
+around <code>74861</code>, where numerous micro-briefs ran without
+plausible 2x upside.</p>
+<h2 id="early-termination-attempts">Early-Termination Attempts</h2>
+<p>The run ended only after explicit graceful-termination instruction.
+Before termination, user interruptions corrected steering and demanded
+bolder briefs; they were not convergence proof.</p>
+<h2 id="other-aberrant-behavior">Other Aberrant Behavior</h2>
+<p>The manager failed to apply reviewer-before-brief discipline early
+and repeatedly selected micro-optimization briefs despite
+optimize-tree’s diversity/macro guidance. This is the primary
+explanation for weak results.</p>
