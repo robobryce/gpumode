@@ -1,0 +1,541 @@
+=== Non-coverage rows (category != missing_harness) ===
+non-missing_harness rows: 49
+---
+id      : bug_0172
+branch  : manager
+skill   : optimize-tree
+ts      : 2026-06-22T19:14:51.463Z
+sev     : high
+cat     : autocuda_cli_contract
+signal  : autocuda CLI rejected a skill-issued command
+evidence: line 1168 (tool_result): log). stop emit a brief_stop row carrying the worker's return- message to the manager in the description field. options: -h, --help show this help message and exit ---subcommands--- usage: autocuda log optimize-tree [-h] {baseline,brief,...
+recommend: Update the skill prose and examples to match the current CLI surface.
+source  : /home/shadeform/.claude/projects/-home-shadeform-gpumode/cff4df73-32b1-46cb-8e5a-58ad5f4046ff.jsonl
+---
+id      : bug_0173
+branch  : manager
+skill   : optimize-tree
+ts      : 2026-06-22T19:14:51.463Z
+sev     : high
+cat     : autocuda_cli_contract
+signal  : autocuda CLI rejected a skill-issued command
+evidence: line 1168 (tool_result): stop emit a brief_stop row carrying the worker's return- message to the manager in the description field. options: -h, --help show this help message and exit ---subcommands--- usage: autocuda log optimize-tree [-h] {baseline,brief,iterat...
+recommend: Update the skill prose and examples to match the current CLI surface.
+source  : /home/shadeform/.claude/projects/-home-shadeform-gpumode/cff4df73-32b1-46cb-8e5a-58ad5f4046ff.jsonl
+---
+id      : bug_0174
+branch  : manager
+skill   : optimize-tree
+ts      : 2026-06-22T19:14:51.463Z
+sev     : high
+cat     : autocuda_cli_contract
+signal  : autocuda CLI rejected a skill-issued command
+evidence: line 1168 (tool_result): message to the manager in the description field. options: -h, --help show this help message and exit ---subcommands--- usage: autocuda log optimize-tree [-h] {baseline,brief,iteration,start,stop} ... autocuda log optimize-tree: error: th...
+recommend: Update the skill prose and examples to match the current CLI surface.
+source  : /home/shadeform/.claude/projects/-home-shadeform-gpumode/cff4df73-32b1-46cb-8e5a-58ad5f4046ff.jsonl
+---
+id      : bug_0175
+branch  : manager
+skill   : optimize-tree
+ts      : 2026-06-22T19:14:51.463Z
+sev     : high
+cat     : autocuda_cli_contract
+signal  : autocuda CLI rejected a skill-issued command
+evidence: line 1168 (tool_result): options: -h, --help show this help message and exit ---subcommands--- usage: autocuda log optimize-tree [-h] {baseline,brief,iteration,start,stop} ... autocuda log optimize-tree: error: the following arguments are required: log_optimize_...
+recommend: Update the skill prose and examples to match the current CLI surface.
+source  : /home/shadeform/.claude/projects/-home-shadeform-gpumode/cff4df73-32b1-46cb-8e5a-58ad5f4046ff.jsonl
+---
+id      : bug_0176
+branch  : manager
+skill   : optimize-tree
+ts      : 2026-06-22T19:14:51.463Z
+sev     : high
+cat     : autocuda_cli_contract
+signal  : autocuda CLI rejected a skill-issued command
+evidence: line 1168 (tool_result): -h, --help show this help message and exit ---subcommands--- usage: autocuda log optimize-tree [-h] {baseline,brief,iteration,start,stop} ... autocuda log optimize-tree: error: the following arguments are required: log_optimize_tree_verb
+recommend: Update the skill prose and examples to match the current CLI surface.
+source  : /home/shadeform/.claude/projects/-home-shadeform-gpumode/cff4df73-32b1-46cb-8e5a-58ad5f4046ff.jsonl
+---
+id      : bug_0177
+branch  : manager
+skill   : 
+ts      : 2026-06-23T12:00:49.025Z
+sev     : high
+cat     : explicit_skill_issue
+signal  : Agent identified a bug or contradiction in skill instructions
+evidence: line 4059 (assistant): W0 brief-28 (NVFP4 n1024 thin trailing) completed: **NEGATIVE — raw FP4 7.4× slower**, same root cause W2 hit at n512: on-the-fly e2m1 quantization dominates (~12× the GEMM) and the **thin M=BLK=32 GEMM doesn't map to FP4 tensor-core til...
+recommend: Patch the named SKILL.md or referenced guide, then add a regression check when possible.
+source  : /home/shadeform/.claude/projects/-home-shadeform-gpumode/cff4df73-32b1-46cb-8e5a-58ad5f4046ff.jsonl
+---
+id      : bug_0178
+branch  : manager
+skill   : 
+ts      : 2026-06-24T07:52:45.492Z
+sev     : high
+cat     : autocuda_cli_contract
+signal  : autocuda CLI rejected a skill-issued command
+evidence: line 6847 (tool_result): dashboard HTTP dashboard for autocuda experiment logs. `start` launches a server that auto-refreshes every *-log.csv optimize-tree logs render as a tidy-tree search view autocuda log CSV. Writes a PNG next to the input by --- brief subco...
+recommend: Update the skill prose and examples to match the current CLI surface.
+source  : /home/shadeform/.claude/projects/-home-shadeform-gpumode/cff4df73-32b1-46cb-8e5a-58ad5f4046ff.jsonl
+---
+id      : bug_0179
+branch  : manager
+skill   : 
+ts      : 2026-06-24T07:52:45.492Z
+sev     : high
+cat     : autocuda_cli_contract
+signal  : autocuda CLI rejected a skill-issued command
+evidence: line 6847 (tool_result): launches a server that auto-refreshes every *-log.csv optimize-tree logs render as a tidy-tree search view autocuda log CSV. Writes a PNG next to the input by --- brief subcommand --- usage: autocuda [-h] [--version] {schema,init,status,...
+recommend: Update the skill prose and examples to match the current CLI surface.
+source  : /home/shadeform/.claude/projects/-home-shadeform-gpumode/cff4df73-32b1-46cb-8e5a-58ad5f4046ff.jsonl
+---
+id      : bug_0180
+branch  : manager
+skill   : 
+ts      : 2026-06-24T07:52:45.492Z
+sev     : high
+cat     : autocuda_cli_contract
+signal  : autocuda CLI rejected a skill-issued command
+evidence: line 6847 (tool_result): optimize-tree logs render as a tidy-tree search view autocuda log CSV. Writes a PNG next to the input by --- brief subcommand --- usage: autocuda [-h] [--version] {schema,init,status,export,report,log,candidates,run,dashboard,plot,instal...
+recommend: Update the skill prose and examples to match the current CLI surface.
+source  : /home/shadeform/.claude/projects/-home-shadeform-gpumode/cff4df73-32b1-46cb-8e5a-58ad5f4046ff.jsonl
+---
+id      : bug_0181
+branch  : manager
+skill   : 
+ts      : 2026-06-24T07:52:45.492Z
+sev     : high
+cat     : autocuda_cli_contract
+signal  : autocuda CLI rejected a skill-issued command
+evidence: line 6847 (tool_result): autocuda log CSV. Writes a PNG next to the input by --- brief subcommand --- usage: autocuda [-h] [--version] {schema,init,status,export,report,log,candidates,run,dashboard,plot,install} ... autocuda: error: argument namespace: invalid c...
+recommend: Update the skill prose and examples to match the current CLI surface.
+source  : /home/shadeform/.claude/projects/-home-shadeform-gpumode/cff4df73-32b1-46cb-8e5a-58ad5f4046ff.jsonl
+---
+id      : bug_0182
+branch  : manager
+skill   : 
+ts      : 2026-06-24T07:52:45.492Z
+sev     : high
+cat     : autocuda_cli_contract
+signal  : autocuda CLI rejected a skill-issued command
+evidence: line 6847 (tool_result): --- brief subcommand --- usage: autocuda [-h] [--version] {schema,init,status,export,report,log,candidates,run,dashboard,plot,install} ... autocuda: error: argument namespace: invalid choice: 'brief' (choose from 'schema', 'init', 'statu...
+recommend: Update the skill prose and examples to match the current CLI surface.
+source  : /home/shadeform/.claude/projects/-home-shadeform-gpumode/cff4df73-32b1-46cb-8e5a-58ad5f4046ff.jsonl
+---
+id      : bug_0183
+branch  : manager
+skill   : 
+ts      : 2026-06-24T07:52:45.492Z
+sev     : high
+cat     : autocuda_cli_contract
+signal  : autocuda CLI rejected a skill-issued command
+evidence: line 6847 (tool_result): usage: autocuda [-h] [--version] {schema,init,status,export,report,log,candidates,run,dashboard,plot,install} ... autocuda: error: argument namespace: invalid choice: 'brief' (choose from 'schema', 'init', 'status', 'export', 'report', '...
+recommend: Update the skill prose and examples to match the current CLI surface.
+source  : /home/shadeform/.claude/projects/-home-shadeform-gpumode/cff4df73-32b1-46cb-8e5a-58ad5f4046ff.jsonl
+---
+id      : bug_0184
+branch  : manager
+skill   : 
+ts      : 2026-06-24T09:21:57.612Z
+sev     : high
+cat     : explicit_skill_issue
+signal  : Agent identified a bug or contradiction in skill instructions
+evidence: line 7268 (assistant): Confirmed — W1 is right on both counts, and I fact-checked it: d60e14e6 lives only on `origin/autocuda/optimize/2026-06-19-04-54-07-qr_v2/...` (a **different tag**), is unreachable from all 126 of this run's branches, and the current sub...
+recommend: Patch the named SKILL.md or referenced guide, then add a regression check when possible.
+source  : /home/shadeform/.claude/projects/-home-shadeform-gpumode/cff4df73-32b1-46cb-8e5a-58ad5f4046ff.jsonl
+---
+id      : bug_0185
+branch  : manager
+skill   : 
+ts      : 2026-06-24T09:23:32.097Z
+sev     : high
+cat     : explicit_skill_issue
+signal  : Agent identified a bug or contradiction in skill instructions
+evidence: line 7279 (assistant): Now redirect W0 — its brief-48 told it to graft d60e14e6 and "coordinate ORHR with W1," both of which the no-peek correction changes. Minimal-churn fix (brief-48's large-n-TSQR target still stands; only the ORHR instruction is wrong):
+recommend: Patch the named SKILL.md or referenced guide, then add a regression check when possible.
+source  : /home/shadeform/.claude/projects/-home-shadeform-gpumode/cff4df73-32b1-46cb-8e5a-58ad5f4046ff.jsonl
+---
+id      : bug_0186
+branch  : manager
+skill   : 
+ts      : 2026-06-24T14:37:52.725Z
+sev     : high
+cat     : explicit_skill_issue
+signal  : Agent identified a bug or contradiction in skill instructions
+evidence: line 8538 (assistant): Re-reading the skill (the operating-rules + never-stop sections most relevant given the submit bug + frequent deaths), and pulling run state in parallel:
+recommend: Patch the named SKILL.md or referenced guide, then add a regression check when possible.
+source  : /home/shadeform/.claude/projects/-home-shadeform-gpumode/cff4df73-32b1-46cb-8e5a-58ad5f4046ff.jsonl
+---
+id      : bug_0187
+branch  : manager
+skill   : 
+ts      : 2026-06-24T14:38:42.472Z
+sev     : high
+cat     : explicit_skill_issue
+signal  : Agent identified a bug or contradiction in skill instructions
+evidence: line 8547 (assistant): Reflection done; the run is healthy and the one real problem (submit integrity) is fixed and verified. Summary of the manager-protocol check: **Aligned with the skill:** - **Diversity strong** — `effective_directions: 12.74` (575 nodes),...
+recommend: Patch the named SKILL.md or referenced guide, then add a regression check when possible.
+source  : /home/shadeform/.claude/projects/-home-shadeform-gpumode/cff4df73-32b1-46cb-8e5a-58ad5f4046ff.jsonl
+---
+id      : bug_0188
+branch  : manager
+skill   : 
+ts      : 2026-06-24T14:38:42.472Z
+sev     : high
+cat     : explicit_skill_issue
+signal  : Agent identified a bug or contradiction in skill instructions
+evidence: line 8547 (assistant): **Aligned with the skill:** - **Diversity strong** — `effective_directions: 12.74` (575 nodes), four distinct mechanisms, no collapse. - **Combining is the engine of the recent arc** — the −5.3% host-axis stack was *built via combines* (...
+recommend: Patch the named SKILL.md or referenced guide, then add a regression check when possible.
+source  : /home/shadeform/.claude/projects/-home-shadeform-gpumode/cff4df73-32b1-46cb-8e5a-58ad5f4046ff.jsonl
+---
+id      : bug_0189
+branch  : manager
+skill   : 
+ts      : 2026-06-24T14:38:42.472Z
+sev     : high
+cat     : explicit_skill_issue
+signal  : Agent identified a bug or contradiction in skill instructions
+evidence: line 8547 (assistant): - **Diversity strong** — `effective_directions: 12.74` (575 nodes), four distinct mechanisms, no collapse. - **Combining is the engine of the recent arc** — the −5.3% host-axis stack was *built via combines* (capture+pool+input-elim+fp16...
+recommend: Patch the named SKILL.md or referenced guide, then add a regression check when possible.
+source  : /home/shadeform/.claude/projects/-home-shadeform-gpumode/cff4df73-32b1-46cb-8e5a-58ad5f4046ff.jsonl
+---
+id      : bug_0190
+branch  : manager
+skill   : 
+ts      : 2026-06-24T14:38:42.472Z
+sev     : high
+cat     : explicit_skill_issue
+signal  : Agent identified a bug or contradiction in skill instructions
+evidence: line 8547 (assistant): - **Combining is the engine of the recent arc** — the −5.3% host-axis stack was *built via combines* (capture+pool+input-elim+fp16x3), exactly the skill's "stack disjoint wins" pattern. 15 combine briefs. - **Submitting — now correct and...
+recommend: Patch the named SKILL.md or referenced guide, then add a regression check when possible.
+source  : /home/shadeform/.claude/projects/-home-shadeform-gpumode/cff4df73-32b1-46cb-8e5a-58ad5f4046ff.jsonl
+---
+id      : bug_0191
+branch  : manager
+skill   : 
+ts      : 2026-06-24T14:38:42.472Z
+sev     : high
+cat     : explicit_skill_issue
+signal  : Agent identified a bug or contradiction in skill instructions
+evidence: line 8547 (assistant): - **Submitting — now correct and verified.** The c508b154 best (2040.9µs, 64.2×) is confirmed ACCEPTED on the board with the *right* commit, after I caught and fixed the manager-side submit bug. The skill's evidence-contract is restored....
+recommend: Patch the named SKILL.md or referenced guide, then add a regression check when possible.
+source  : /home/shadeform/.claude/projects/-home-shadeform-gpumode/cff4df73-32b1-46cb-8e5a-58ad5f4046ff.jsonl
+---
+id      : bug_0192
+branch  : manager
+skill   : 
+ts      : 2026-06-24T14:51:18.507Z
+sev     : medium
+cat     : operator_confirmation_gate
+signal  : Agent asked for confirmation instead of continuing the instructed run
+evidence: line 8601 (assistant): Yes. I read it when you gave it (the consolidated 2026-06-13-to-15 report, 299 lines), cross-checked all 8 impactful techniques + failures + unexplored areas against my run, and acted. Direct answers: **What I took from it and acted on:*...
+recommend: Tighten the invoking skill so the original operator instruction is treated as the greenlight.
+source  : /home/shadeform/.claude/projects/-home-shadeform-gpumode/cff4df73-32b1-46cb-8e5a-58ad5f4046ff.jsonl
+---
+id      : bug_0193
+branch  : manager
+skill   : 
+ts      : 2026-06-24T14:51:18.507Z
+sev     : medium
+cat     : operator_confirmation_gate
+signal  : Agent asked for confirmation instead of continuing the instructed run
+evidence: line 8601 (assistant): **What I took from it and acted on:** - **CUDA graphs** (its #1 *unexplored* lever, "natural fit for launch-bound shapes") — my fleet built exactly this: capture + rotating-pool + zero-input-copy = **−5.3%, 2040.9µs, board-ACCEPTED**. Th...
+recommend: Tighten the invoking skill so the original operator instruction is treated as the greenlight.
+source  : /home/shadeform/.claude/projects/-home-shadeform-gpumode/cff4df73-32b1-46cb-8e5a-58ad5f4046ff.jsonl
+---
+id      : bug_0194
+branch  : manager
+skill   : 
+ts      : 2026-06-24T14:51:18.507Z
+sev     : medium
+cat     : operator_confirmation_gate
+signal  : Agent asked for confirmation instead of continuing the instructed run
+evidence: line 8601 (assistant): - **CUDA graphs** (its #1 *unexplored* lever, "natural fit for launch-bound shapes") — my fleet built exactly this: capture + rotating-pool + zero-input-copy = **−5.3%, 2040.9µs, board-ACCEPTED**. That whole recent arc is the report's id...
+recommend: Tighten the invoking skill so the original operator instruction is treated as the greenlight.
+source  : /home/shadeform/.claude/projects/-home-shadeform-gpumode/cff4df73-32b1-46cb-8e5a-58ad5f4046ff.jsonl
+---
+id      : bug_0195
+branch  : manager
+skill   : 
+ts      : 2026-06-24T14:51:18.507Z
+sev     : medium
+cat     : operator_confirmation_gate
+signal  : Agent asked for confirmation instead of continuing the instructed run
+evidence: line 8601 (assistant): - **Recursive compact-WY panel** (its biggest lever, 3.75×) — I queued it, then profile-grounded it first (W3 brief-16): **measured NO-GO** here — the report's "71% panel" is stale for our kernel (ours is trailing-55%/panel-29%), and its...
+recommend: Tighten the invoking skill so the original operator instruction is treated as the greenlight.
+source  : /home/shadeform/.claude/projects/-home-shadeform-gpumode/cff4df73-32b1-46cb-8e5a-58ad5f4046ff.jsonl
+---
+id      : bug_0196
+branch  : manager
+skill   : 
+ts      : 2026-06-24T16:36:13.644Z
+sev     : critical
+cat     : autocuda_exception
+signal  : autocuda command raised an exception
+evidence: line 9196 (tool_result): === validate c508b154 content under torch2.12.1+cu130/triton3.7.1/nvrtc13.0 (from the scratch worktree's problem dir) === scratch submission HEAD-content check: c508b154 autocuda/worktrees/submit-scratch/problems/linalg/qr_v2/eval.py aut...
+recommend: Fix the CLI or skill call path that produced the traceback.
+source  : /home/shadeform/.claude/projects/-home-shadeform-gpumode/cff4df73-32b1-46cb-8e5a-58ad5f4046ff.jsonl
+---
+id      : bug_0197
+branch  : manager
+skill   : 
+ts      : 2026-06-24T16:36:13.644Z
+sev     : critical
+cat     : autocuda_exception
+signal  : autocuda command raised an exception
+evidence: line 9196 (tool_result): scratch submission HEAD-content check: c508b154 autocuda/worktrees/submit-scratch/problems/linalg/qr_v2/eval.py autocuda/worktrees/submit-scratch/problems/linalg/qr_v2/submission.py running: autocuda run exclusive -- (cd scratch problem...
+recommend: Fix the CLI or skill call path that produced the traceback.
+source  : /home/shadeform/.claude/projects/-home-shadeform-gpumode/cff4df73-32b1-46cb-8e5a-58ad5f4046ff.jsonl
+---
+id      : bug_0198
+branch  : manager
+skill   : 
+ts      : 2026-06-24T16:36:13.644Z
+sev     : critical
+cat     : autocuda_exception
+signal  : autocuda command raised an exception
+evidence: line 9196 (tool_result): autocuda/worktrees/submit-scratch/problems/linalg/qr_v2/eval.py autocuda/worktrees/submit-scratch/problems/linalg/qr_v2/submission.py running: autocuda run exclusive -- (cd scratch problem dir; python eval.py test .) ... [autocuda run] a...
+recommend: Fix the CLI or skill call path that produced the traceback.
+source  : /home/shadeform/.claude/projects/-home-shadeform-gpumode/cff4df73-32b1-46cb-8e5a-58ad5f4046ff.jsonl
+---
+id      : bug_0199
+branch  : manager
+skill   : 
+ts      : 2026-06-24T16:36:13.644Z
+sev     : critical
+cat     : autocuda_exception
+signal  : autocuda command raised an exception
+evidence: line 9196 (tool_result): autocuda/worktrees/submit-scratch/problems/linalg/qr_v2/submission.py running: autocuda run exclusive -- (cd scratch problem dir; python eval.py test .) ... [autocuda run] acquired lock=gpu-0 mode=exclusive at=2026-06-24T16:36:12.069173...
+recommend: Fix the CLI or skill call path that produced the traceback.
+source  : /home/shadeform/.claude/projects/-home-shadeform-gpumode/cff4df73-32b1-46cb-8e5a-58ad5f4046ff.jsonl
+---
+id      : bug_0200
+branch  : manager
+skill   : 
+ts      : 2026-06-24T16:36:13.644Z
+sev     : critical
+cat     : autocuda_exception
+signal  : autocuda command raised an exception
+evidence: line 9196 (tool_result): running: autocuda run exclusive -- (cd scratch problem dir; python eval.py test .) ... [autocuda run] acquired lock=gpu-0 mode=exclusive at=2026-06-24T16:36:12.069173 wait=0.000s Traceback (most recent call last): File "/home/shadeform/g...
+recommend: Fix the CLI or skill call path that produced the traceback.
+source  : /home/shadeform/.claude/projects/-home-shadeform-gpumode/cff4df73-32b1-46cb-8e5a-58ad5f4046ff.jsonl
+---
+id      : bug_0201
+branch  : manager
+skill   : 
+ts      : 2026-06-24T16:36:13.644Z
+sev     : critical
+cat     : autocuda_exception
+signal  : autocuda command raised an exception
+evidence: line 9196 (tool_result): [autocuda run] acquired lock=gpu-0 mode=exclusive at=2026-06-24T16:36:12.069173 wait=0.000s Traceback (most recent call last): File "/home/shadeform/gpumode/autocuda/worktrees/submit-scratch/problems/linalg/qr_v2/eval.py", line 14, in <m...
+recommend: Fix the CLI or skill call path that produced the traceback.
+source  : /home/shadeform/.claude/projects/-home-shadeform-gpumode/cff4df73-32b1-46cb-8e5a-58ad5f4046ff.jsonl
+---
+id      : bug_0202
+branch  : manager
+skill   : 
+ts      : 2026-06-24T16:36:13.644Z
+sev     : critical
+cat     : autocuda_exception
+signal  : autocuda command raised an exception
+evidence: line 9196 (tool_result): Traceback (most recent call last): File "/home/shadeform/gpumode/autocuda/worktrees/submit-scratch/problems/linalg/qr_v2/eval.py", line 14, in <module> from utils import clear_l2_cache, set_seed ModuleNotFoundError: No module named 'util...
+recommend: Fix the CLI or skill call path that produced the traceback.
+source  : /home/shadeform/.claude/projects/-home-shadeform-gpumode/cff4df73-32b1-46cb-8e5a-58ad5f4046ff.jsonl
+---
+id      : bug_0203
+branch  : manager
+skill   : 
+ts      : 2026-06-24T16:36:29.827Z
+sev     : critical
+cat     : autocuda_exception
+signal  : autocuda command raised an exception
+evidence: line 9201 (tool_result): 52:# problems share `../eval.py` (so EVAL_PY == SET_DIR/eval.py), but several ship 58:UTILS_PY="$("$PYTHON" "$REPO_DIR/bin/gen_specs.py" "$PROBLEM_DIR/task.yml" --file-source utils.py)" 61:UTILS_DIR="$(dirname "$UTILS_PY")" 68:# so PYTHO...
+recommend: Fix the CLI or skill call path that produced the traceback.
+source  : /home/shadeform/.claude/projects/-home-shadeform-gpumode/cff4df73-32b1-46cb-8e5a-58ad5f4046ff.jsonl
+---
+id      : bug_0204
+branch  : manager
+skill   : 
+ts      : 2026-06-24T16:36:29.827Z
+sev     : critical
+cat     : autocuda_exception
+signal  : autocuda command raised an exception
+evidence: line 9201 (tool_result): 58:UTILS_PY="$("$PYTHON" "$REPO_DIR/bin/gen_specs.py" "$PROBLEM_DIR/task.yml" --file-source utils.py)" 61:UTILS_DIR="$(dirname "$UTILS_PY")" 68:# so PYTHONPATH (inherited by children) is what makes the in-place layout 70:export PYTHONPAT...
+recommend: Fix the CLI or skill call path that produced the traceback.
+source  : /home/shadeform/.claude/projects/-home-shadeform-gpumode/cff4df73-32b1-46cb-8e5a-58ad5f4046ff.jsonl
+---
+id      : bug_0205
+branch  : manager
+skill   : 
+ts      : 2026-06-24T16:36:29.827Z
+sev     : critical
+cat     : autocuda_exception
+signal  : autocuda command raised an exception
+evidence: line 9201 (tool_result): 61:UTILS_DIR="$(dirname "$UTILS_PY")" 68:# so PYTHONPATH (inherited by children) is what makes the in-place layout 70:export PYTHONPATH="$PROBLEM_DIR:$EVAL_DIR:$UTILS_DIR${PYTHONPATH:+:$PYTHONPATH}" === simplest correct validate: run fro...
+recommend: Fix the CLI or skill call path that produced the traceback.
+source  : /home/shadeform/.claude/projects/-home-shadeform-gpumode/cff4df73-32b1-46cb-8e5a-58ad5f4046ff.jsonl
+---
+id      : bug_0206
+branch  : manager
+skill   : 
+ts      : 2026-06-24T16:36:29.827Z
+sev     : critical
+cat     : autocuda_exception
+signal  : autocuda command raised an exception
+evidence: line 9201 (tool_result): 68:# so PYTHONPATH (inherited by children) is what makes the in-place layout 70:export PYTHONPATH="$PROBLEM_DIR:$EVAL_DIR:$UTILS_DIR${PYTHONPATH:+:$PYTHONPATH}" === simplest correct validate: run from set-root dir OR set PYTHONPATH to it...
+recommend: Fix the CLI or skill call path that produced the traceback.
+source  : /home/shadeform/.claude/projects/-home-shadeform-gpumode/cff4df73-32b1-46cb-8e5a-58ad5f4046ff.jsonl
+---
+id      : bug_0207
+branch  : manager
+skill   : 
+ts      : 2026-06-24T16:36:29.827Z
+sev     : critical
+cat     : autocuda_exception
+signal  : autocuda command raised an exception
+evidence: line 9201 (tool_result): 70:export PYTHONPATH="$PROBLEM_DIR:$EVAL_DIR:$UTILS_DIR${PYTHONPATH:+:$PYTHONPATH}" === simplest correct validate: run from set-root dir OR set PYTHONPATH to it. utils.py is at problems/linalg/ === running validate with PYTHONPATH=set-ro...
+recommend: Fix the CLI or skill call path that produced the traceback.
+source  : /home/shadeform/.claude/projects/-home-shadeform-gpumode/cff4df73-32b1-46cb-8e5a-58ad5f4046ff.jsonl
+---
+id      : bug_0208
+branch  : manager
+skill   : 
+ts      : 2026-06-24T16:36:29.827Z
+sev     : critical
+cat     : autocuda_exception
+signal  : autocuda command raised an exception
+evidence: line 9201 (tool_result): === simplest correct validate: run from set-root dir OR set PYTHONPATH to it. utils.py is at problems/linalg/ === running validate with PYTHONPATH=set-root + problem-dir ... [autocuda run] acquired lock=gpu-0 mode=exclusive at=2026-06-24...
+recommend: Fix the CLI or skill call path that produced the traceback.
+source  : /home/shadeform/.claude/projects/-home-shadeform-gpumode/cff4df73-32b1-46cb-8e5a-58ad5f4046ff.jsonl
+---
+id      : bug_0209
+branch  : manager
+skill   : 
+ts      : 2026-06-24T16:36:29.827Z
+sev     : critical
+cat     : autocuda_exception
+signal  : autocuda command raised an exception
+evidence: line 9201 (tool_result): running validate with PYTHONPATH=set-root + problem-dir ... [autocuda run] acquired lock=gpu-0 mode=exclusive at=2026-06-24T16:36:28.154441 wait=0.000s Traceback (most recent call last): File "/home/shadeform/gpumode/autocuda/worktrees/s...
+recommend: Fix the CLI or skill call path that produced the traceback.
+source  : /home/shadeform/.claude/projects/-home-shadeform-gpumode/cff4df73-32b1-46cb-8e5a-58ad5f4046ff.jsonl
+---
+id      : bug_0210
+branch  : manager
+skill   : 
+ts      : 2026-06-24T16:36:29.827Z
+sev     : critical
+cat     : autocuda_exception
+signal  : autocuda command raised an exception
+evidence: line 9201 (tool_result): [autocuda run] acquired lock=gpu-0 mode=exclusive at=2026-06-24T16:36:28.154441 wait=0.000s Traceback (most recent call last): File "/home/shadeform/gpumode/autocuda/worktrees/submit-scratch/problems/linalg/qr_v2/eval.py", line 14, in <m...
+recommend: Fix the CLI or skill call path that produced the traceback.
+source  : /home/shadeform/.claude/projects/-home-shadeform-gpumode/cff4df73-32b1-46cb-8e5a-58ad5f4046ff.jsonl
+---
+id      : bug_0211
+branch  : manager
+skill   : 
+ts      : 2026-06-24T16:36:29.827Z
+sev     : critical
+cat     : autocuda_exception
+signal  : autocuda command raised an exception
+evidence: line 9201 (tool_result): Traceback (most recent call last): File "/home/shadeform/gpumode/autocuda/worktrees/submit-scratch/problems/linalg/qr_v2/eval.py", line 14, in <module> from utils import clear_l2_cache, set_seed ModuleNotFoundError: No module named 'util...
+recommend: Fix the CLI or skill call path that produced the traceback.
+source  : /home/shadeform/.claude/projects/-home-shadeform-gpumode/cff4df73-32b1-46cb-8e5a-58ad5f4046ff.jsonl
+---
+id      : bug_0212
+branch  : manager
+skill   : 
+ts      : 2026-06-24T17:56:07.794Z
+sev     : high
+cat     : autocuda_cli_contract
+signal  : autocuda CLI rejected a skill-issued command
+evidence: line 9645 (tool_result): 2026-06-24T17:24:24.757548,1,55,N/A,N/A,brief_stop,N/A,"brief-55 DECISIVE MEASURED NO-GO (barrier-free TSQR panel, n1024). The idle-SM-fill lever is REAL (ncu: panel grid-starved 0.41 waves, 88 idle S --- W2 (last 2 rows) --- 2026-06-24T...
+recommend: Update the skill prose and examples to match the current CLI surface.
+source  : /home/shadeform/.claude/projects/-home-shadeform-gpumode/cff4df73-32b1-46cb-8e5a-58ad5f4046ff.jsonl
+---
+id      : bug_0213
+branch  : manager
+skill   : 
+ts      : 2026-06-24T17:56:07.794Z
+sev     : high
+cat     : autocuda_cli_contract
+signal  : autocuda CLI rejected a skill-issued command
+evidence: line 9645 (tool_result): --- W2 (last 2 rows) --- 2026-06-24T17:38:33.033165,2,70,0,2195.268,succeeded,df78159bd0bfbe53b742b3a01af4e563e6454e11,"iter3 DECISIVE go/no-go: tcgen05 trailing is a NET LOSS, banked dead. Per-block micro-bench (B640): tcgen 2026-06-24T...
+recommend: Update the skill prose and examples to match the current CLI surface.
+source  : /home/shadeform/.claude/projects/-home-shadeform-gpumode/cff4df73-32b1-46cb-8e5a-58ad5f4046ff.jsonl
+---
+id      : bug_0214
+branch  : manager
+skill   : 
+ts      : 2026-06-24T17:56:07.794Z
+sev     : high
+cat     : autocuda_cli_contract
+signal  : autocuda CLI rejected a skill-issued command
+evidence: line 9645 (tool_result): 2026-06-24T17:38:33.033165,2,70,0,2195.268,succeeded,df78159bd0bfbe53b742b3a01af4e563e6454e11,"iter3 DECISIVE go/no-go: tcgen05 trailing is a NET LOSS, banked dead. Per-block micro-bench (B640): tcgen 2026-06-24T17:38:51.825661,2,70,N/A,...
+recommend: Update the skill prose and examples to match the current CLI surface.
+source  : /home/shadeform/.claude/projects/-home-shadeform-gpumode/cff4df73-32b1-46cb-8e5a-58ad5f4046ff.jsonl
+---
+id      : bug_0215
+branch  : manager
+skill   : 
+ts      : 2026-06-24T17:56:07.794Z
+sev     : high
+cat     : autocuda_cli_contract
+signal  : autocuda CLI rejected a skill-issued command
+evidence: line 9645 (tool_result): 2026-06-24T17:38:51.825661,2,70,N/A,N/A,brief_stop,N/A,"brief-70 CONCLUDED at clean validating commit df78159b (tcgen05 trailing fully wired, default-OFF, active path 22/22+diff+invariance CLEAN). Spi --- W3 (last 2 rows) --- 2026-06-24T...
+recommend: Update the skill prose and examples to match the current CLI surface.
+source  : /home/shadeform/.claude/projects/-home-shadeform-gpumode/cff4df73-32b1-46cb-8e5a-58ad5f4046ff.jsonl
+---
+id      : bug_0216
+branch  : manager
+skill   : 
+ts      : 2026-06-24T17:56:07.794Z
+sev     : high
+cat     : autocuda_cli_contract
+signal  : autocuda CLI rejected a skill-issued command
+evidence: line 9645 (tool_result): --- W3 (last 2 rows) --- 2026-06-24T17:33:25.388409,3,20,1,2195.843,succeeded,f52c88eadf3fc1a417f708b1107be21a9f827515,"PRIMARY JOB VERDICT (realized-occ of the fanned-out tcgen05 trailing): the fanout does NOT convert theore 2026-06-24T...
+recommend: Update the skill prose and examples to match the current CLI surface.
+source  : /home/shadeform/.claude/projects/-home-shadeform-gpumode/cff4df73-32b1-46cb-8e5a-58ad5f4046ff.jsonl
+---
+id      : bug_0217
+branch  : manager
+skill   : 
+ts      : 2026-06-24T17:56:07.794Z
+sev     : high
+cat     : autocuda_cli_contract
+signal  : autocuda CLI rejected a skill-issued command
+evidence: line 9645 (tool_result): 2026-06-24T17:33:25.388409,3,20,1,2195.843,succeeded,f52c88eadf3fc1a417f708b1107be21a9f827515,"PRIMARY JOB VERDICT (realized-occ of the fanned-out tcgen05 trailing): the fanout does NOT convert theore 2026-06-24T17:36:42.138224,3,20,N/A,...
+recommend: Update the skill prose and examples to match the current CLI surface.
+source  : /home/shadeform/.claude/projects/-home-shadeform-gpumode/cff4df73-32b1-46cb-8e5a-58ad5f4046ff.jsonl
+---
+id      : bug_0218
+branch  : manager
+skill   : 
+ts      : 2026-06-24T17:56:07.794Z
+sev     : high
+cat     : autocuda_cli_contract
+signal  : autocuda CLI rejected a skill-issued command
+evidence: line 9645 (tool_result): 2026-06-24T17:36:42.138224,3,20,N/A,N/A,brief_stop,N/A,"brief-20 both jobs done + harness fix. PRIMARY (realized-occ of the fanned-out tcgen05 trailing): profiled W2's tc_trailing_wt at FULL n512 grid usage: autocuda run [-h] {slice,excl...
+recommend: Update the skill prose and examples to match the current CLI surface.
+source  : /home/shadeform/.claude/projects/-home-shadeform-gpumode/cff4df73-32b1-46cb-8e5a-58ad5f4046ff.jsonl
+---
+id      : bug_0219
+branch  : manager
+skill   : 
+ts      : 2026-06-24T17:56:07.794Z
+sev     : high
+cat     : autocuda_cli_contract
+signal  : autocuda CLI rejected a skill-issued command
+evidence: line 9645 (tool_result): usage: autocuda run [-h] {slice,exclusive} ... autocuda run: error: the following arguments are required: run_kind === how do briefs get to workers? check + skill files === usage: autocuda run [-h] {slice,exclusive} ... positional argume...
+recommend: Update the skill prose and examples to match the current CLI surface.
+source  : /home/shadeform/.claude/projects/-home-shadeform-gpumode/cff4df73-32b1-46cb-8e5a-58ad5f4046ff.jsonl
+---
+id      : bug_0220
+branch  : manager
+skill   : 
+ts      : 2026-06-24T17:56:07.794Z
+sev     : high
+cat     : autocuda_cli_contract
+signal  : autocuda CLI rejected a skill-issued command
+evidence: line 9645 (tool_result): autocuda run: error: the following arguments are required: run_kind === how do briefs get to workers? check + skill files === usage: autocuda run [-h] {slice,exclusive} ... positional arguments: {slice,exclusive} slice run in parallel wi...
+recommend: Update the skill prose and examples to match the current CLI surface.
+source  : /home/shadeform/.claude/projects/-home-shadeform-gpumode/cff4df73-32b1-46cb-8e5a-58ad5f4046ff.jsonl

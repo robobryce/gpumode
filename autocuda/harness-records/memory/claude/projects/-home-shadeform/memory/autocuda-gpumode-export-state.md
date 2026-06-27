@@ -1,0 +1,29 @@
+---
+name: autocuda-gpumode-export-state
+description: "Exporting ~/gpumode autocuda runs to robobryce/autocuda-gpumode: the verified gap-fill method, the remote-is-multi-node-union fact, and why the live CLI export is safe alongside an idle run"
+metadata: 
+  node_type: memory
+  type: project
+  originSessionId: 575bb145-468d-41d8-8130-36842b048e92
+---
+
+Keeping `~/gpumode` autocuda runs exported to `robobryce/autocuda-gpumode` (remote `agpm`, origin=robobryce/gpumode). Gap-fill done 2026-06-27. Related: [[autocuda-pr-fanout-export-overhaul]] (the export-CLI PRs, NOT yet merged/installed — node still runs 0.4.0 CLI with `--tag <new>`, no `--incremental`/experiment-tag).
+
+**TRIAGE METHOD (reliable):**
+1. `git ls-remote --heads <URL>` → parse `name sha` map; compare to `git for-each-ref refs/heads/autocuda/`. Local-not-on-remote-at-same-sha splits into ABSENT (push) vs DIFF-SHA (check direction).
+2. DIFF-SHA export/best branches were ALL **remote-ahead** (local is ancestor) — another node/session added commits. LEAVE them; do NOT force-push. Verify with `git merge-base --is-ancestor R L`.
+3. Push ABSENT optimize branches directly (`git push <URL> refs/heads/...:refs/heads/...`, non-force) — pure object push, safe even with a live run (reads object store, never touches worktrees).
+4. Run tags with optimize branches but no export branch → run `autocuda export --tag <TAG> --data-dir ~/gpumode/autocuda` (creates `autocuda/export/<tag>` LOCALLY; no `--repo` = local only), then push the branch by hand. The CLI snapshots the WHOLE data-dir (every tag's logs + submissions + harness-records, NOT just that tag), auto-excludes `worktrees/`(3.2G)/`profiles/`(12G)/`clones/`, bundles+scrubs the 446 harness JSONLs (REDACTED markers present, 0 gh-token leaks), and passes the secret scan. Effective export ~252M.
+5. FINAL PROOF = object-level: `git for-each-ref refs/heads/autocuda/ | git rev-list --objects --stdin` minus same for `refs/remotes/<all-remote>/*` = LOCAL-ONLY objects. 0 == complete. Also assert each run tag's `on_disk` data-file count == `in_export` count in the newest export's `autocuda/` snapshot.
+
+**KEY FACTS:**
+- **The remote is a MULTI-NODE UNION.** The newest remote export (e.g. `2026-06-25-23-41-18-qr_v2`) snapshots a DIFFERENT set of run tags (06-15/06-18/06-19/06-24-19/21/06-25-02 etc.) than THIS node's data-dir — those came from other machines. So "newest remote export" does NOT necessarily contain this node's runs; must export this node's own tags.
+- **An old run with no export branch of its own is still fully preserved** — its data lives inside every later export's whole-data-dir snapshot (e.g. 06-10-07-30-51-conv2d_py: no `export/<that-tag>` branch but 23 of its files are in the eigh_py export + its 209 optimize branches are on remote).
+- A run can have a CURRENT remote export (incl. a `FINAL-SUMMARY.md` not even on local disk) while its OPTIMIZE BRANCHES are behind (15 local-only) — branches and data-dir snapshot are independent; check both.
+- **Liveness check before exporting:** `ps aux | grep -iE 'eigh|optimize-tree'` + data-dir file mtimes vs `date -u`. eigh_py run was idle ~80min (last write 10:26, now 11:48, 0 procs) despite 3 lingering worktrees → safe to export as complete. If genuinely live, branch-push is still safe; only the data-dir CLI export should wait or be treated as a point-in-time snapshot.
+
+**THIS RUN (2026-06-27) RESULT:** pushed 62 absent optimize branches (47 eigh_py + 15 06-25-22-03-01-qr_v2); created+pushed 3 new export branches (`autocuda/export/{2026-06-24-20-40-28-qr_v2, 2026-06-25-08-42-00-qr_v2_simplify, 2026-06-26-23-45-55-eigh_py}`). Final: 920 local autocuda branches, 0 absent, 0 local-only objects, all 10 run tags' data captured. The 5 remote-ahead export branches left untouched (correct).
+
+**CRITICAL — `autocuda export` does NOT bundle each run's real session logs (DON'T trust "446 harness JSONLs scrubbed").** The 0.4.0 CLI `--memory` just copies whatever sits in the data-dir's `autocuda/harness-records/` at export time — here a STALE 2-session bundle (`4986b236`+`cff4df73` from the 06-22 era) + a Codex **placeholder/excuse README** ("No complete Codex session JSONL mapping was available to this export command…"). So ALL THREE of my per-run exports carried the SAME 2 wrong sessions; the eigh_py export did NOT contain eigh_py's own sessions. Verifying "exports have all session logs" requires checking the ACTUAL transcripts, not the CLI's success message. (PR #344 fixes this with `session record`→manifest→`export --transcripts`, but it's not merged/installed.)
+- FIX METHOD (reused 06-23 tooling): on-disk top-level CC sessions live in `~/.claude/projects/-home-shadeform-gpumode/<uuid>.jsonl` (+`<uuid>/subagents/`). Diff against UUIDs already on the remote session-log branches (`2026-06-23-session-logs-complete`, `2026-06-24-at-risk-session-logs`) → the gap. Attribute Codex rollouts by gpumode-signal grep (gpumode|popcorn|leaderboard AND-NOT cccl). Scrub with `/tmp/slog/scrub_batch.py` (FIXED: anchored `b3BlbnNzaC1rZXktdj[..]{0,8000}` SSH magic — the un-anchored leading-`[A-Za-z0-9+/]*` catastrophically backtracks on big base64 lines and hangs). REFRESH `/tmp/slog/live_secrets.txt` first (creds rotate). Build signed additive branch off `main` via isolated `GIT_INDEX_FILE` plumbing under `autocuda/harness-records/sessions/{claude-code,codex}/`, push, fetch-back-verify (count, 82MB blob intact+scrubbed, 0 excuse READMEs). Pushed `autocuda/export/2026-06-27-session-logs-complete` = 265 files (263 CC + 2 codex), 139 redactions, 0 mismatches → all 23 on-disk top-level sessions now on remote.
+- HONESTY caveat: a few sessions are LIVE at capture (e.g. the in-progress export/report session 85d77e19) → their copy is a valid-JSON point-in-time PREFIX (lines_in grew after scrub read), NOT truncation by the scrubber and NOT the final conversation. Say so; don't claim "complete" for an unfinished session.
