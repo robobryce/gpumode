@@ -2,7 +2,7 @@
 
 ## Summary
 
-This is a fork of [gpu-mode/reference-kernels](https://github.com/gpu-mode/reference-kernels) wired for optimizing [GPU MODE](https://www.gpumode.com/) leaderboard kernels with autocuda. The official problems already live under `problems/<set>/<problem>/` — each a single editable `submission.py` (`custom_kernel(data) -> output`) beside its frozen `reference.py` / `task.yml`. The `eval.py` / `utils.py` they run against may live **either** at the set root (shared by the set's problems, e.g. `pmpp_v2`) **or** in the problem dir itself (e.g. `linalg/qr_py`, `bioml/trimul`), and a problem may even borrow `utils.py` from another set (`qr_py` uses `pmpp_v2/utils.py`). The harness resolves both from each problem's `task.yml` `files:` manifest — the same flattening KernelBot does — so the layout of any given problem is discovered, not assumed. autocuda's `optimize-tree` (or `optimize-simple` / `optimize-hill`) edits `submission.py` **in place** — nothing is copied or scaffolded — then **builds → validates → benchmarks** it. The benchmark metric is the harness's per-shape timing reduced to the geomean the leaderboard ranks by, so every iteration is measured exactly the way the leaderboard measures it and a wrong kernel can never be scored.
+This is a fork of [gpu-mode/reference-kernels](https://github.com/gpu-mode/reference-kernels) wired for optimizing [GPU MODE](https://www.gpumode.com/) leaderboard kernels with autocuda. The official problems already live under `problems/<set>/<problem>/` — each a single editable `submission.py` (`custom_kernel(data) -> output`) beside its frozen `reference.py` / `task.yml`. The `eval.py` / `utils.py` they run against may live **either** at the set root (shared by the set's problems, e.g. `pmpp_v2`) **or** in the problem dir itself (e.g. `linalg/qr_py`, `bioml/trimul`), and a problem may even borrow `utils.py` from another set (`qr_py` uses `pmpp_v2/utils.py`). The harness resolves both from each problem's `task.yml` `files:` manifest — the same flattening KernelBot does — so the layout of any given problem is discovered, not assumed. autocuda's `optimize-tree` (or `optimize-simple` / `optimize-hill`) edits `submission.py` **in place** — nothing is copied or scaffolded — then **builds → validates → benchmarks** it. The benchmark metric is the harness's per-shape timing reduced to the geomean the leaderboard ranks by, so every trial is measured exactly the way the leaderboard measures it and a wrong kernel can never be scored.
 
 Pick the target problem by passing its `<set>/<problem>` path — this is the single token that selects the target. It is both the `benchmark=` argument you scope the run with **and** the first positional argument to every `harness/` script (which use it to locate the editable file and put the right dirs on `PYTHONPATH`). There is no environment variable to export: the `harness/` scripts take the path as an argument, so it travels with each command instead of relying on shell state that an agent harness does not preserve between separate command invocations. There is **one** autocuda data dir for the whole repo (`autocuda/` at the root) holding the run's logs, schema, worktrees, and dashboard. The machine-agnostic project description is this `layout.md` (committed); the per-machine half — GPU, toolchain paths, measured timings/noise, profiler invocations — is `autocuda/environment.md`, which `/autocuda:discover` writes per host (run it once on a fresh machine; with this `layout.md` present it only sets up and records the environment).
 
@@ -16,7 +16,7 @@ Optimize a problem — pass its `<set>/<problem>` path as `benchmark=` (the one 
 
 **Every build, validate, benchmark, and profile command MUST be wrapped with `autocuda run` — NO EXCEPTIONS.**
 
-- **Build:** `autocuda run slice --data-dir "$DATA_DIR" --agent-id <i> -- <cmd>`
+- **Build:** `autocuda run slice --data-dir "$DATA_DIR" -- <cmd>`
 - **Validate, Benchmark, Profile:** `autocuda run exclusive --data-dir "$DATA_DIR" -- <cmd>`
 
 Direct invocations bypass the `.gpu.lock` flock in `$DATA_DIR` and produce corrupted/noisy measurements when multiple workers run concurrently. The single repo-root data dir means one lock serializes the whole fleet, even across different problems. `autocuda run` preserves the caller's working directory, and `harness/env.sh` resolves the target from the `<set>/<problem>` argument (not the cwd) to find the editable file, so a worker operates on the right `submission.py` from inside its worktree.
@@ -41,7 +41,7 @@ Frozen GPU MODE harness — DO NOT modify. These define correctness and timing e
 GPU MODE submissions compile their CUDA at *runtime* (via `load_inline`/`load` at import), so "build" here means: import `submission.py` in a fresh process to trigger that compilation now, surfacing any nvcc/compile error as a `build_error` instead of at benchmark time. A pure-PyTorch submission imports instantly. The compiled extension caches in `$TORCH_EXTENSIONS_DIR` (per-worktree: `problems/<set>/<problem>/.torch_ext`), keyed by source-content hash, so the import that validate/benchmark trigger reuses this build.
 
 ```bash
-autocuda run slice --data-dir "$DATA_DIR" --agent-id <i> -- \
+autocuda run slice --data-dir "$DATA_DIR" -- \
   bash harness/build.sh <set>/<problem>
 ```
 
@@ -96,7 +96,7 @@ autocuda run exclusive --data-dir "$DATA_DIR" -- \
 
 ## Cross-benchmark aggregation
 
-One problem is optimized per run (one `optimize-tree` run, scoped with `benchmark=<set>/<problem>`), so there is no cross-benchmark combination: a run's per-iteration score is its single benchmark's geomean-µs compared to baseline as `baseline/trial` (direction=min). To optimize a different problem, start a fresh run with a different `benchmark=<set>/<problem>` and `tag-suffix`.
+One problem is optimized per run (one `optimize-tree` run, scoped with `benchmark=<set>/<problem>`), so there is no cross-benchmark combination: a run's per-trial score is its single benchmark's geomean-µs compared to baseline as `baseline/trial` (direction=min). To optimize a different problem, start a fresh run with a different `benchmark=<set>/<problem>` and `tag-suffix`.
 
 ## Dependencies
 
@@ -114,7 +114,7 @@ autocuda schema define optimize --data-dir "$DATA_DIR" \
   --benchmark <set>/<problem>:us:min:3
 ```
 
-Every iteration row carries `--metric <set>/<problem>=<value>` (geomean µs). The only allowed `N/A` is a failure-status row.
+Every trial row carries `--metric <set>/<problem>=<value>` (geomean µs). The only allowed `N/A` is a failure-status row.
 
 ## Leaderboard submission & standings (manager)
 
