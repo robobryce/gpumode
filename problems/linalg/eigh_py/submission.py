@@ -495,14 +495,15 @@ def _eigh_megakernel(a: torch.Tensor) -> output_t:
 
 # largest n routed to the MEDIUM-n megakernel (packed-FP16-lower-triangle A in
 # SMEM + global eigenvector matrix). The kernel FITS to n=448 (packed=200KB <
-# 227KB), but one-CTA-per-matrix is SIMT-compute-bound and only WINS vs cuSOLVER
-# up to the measured crossover ~n=350-400 (b40: n=352 1.17x, n=448 0.91x; b640:
-# n=320 1.05x, n=384 0.91x). Above that the serial-column O(n^3) reduction loses
-# to cuSOLVER's whole-GPU-per-matrix syevd. Cap at 400 so the route only fires
-# where it wins (covers the n=352 benchmark shape); larger n stays on cuSOLVER.
-# The residual gate is a correctness net, not a speed net, so the cap is what
-# protects the geomean from a reseed landing at n in (400,448].
-_MEGA_MED_NMAX = 400
+# 227KB). With the blocked-compact-WY cooperative-GEMM back-transform (trial 5/6)
+# the kernel now WINS across the whole fit range at both small and large batch
+# (measured b40: n=352 1.86x, n=384 1.80x, n=416 1.83x, n=448 1.64x; b640: n=384
+# 1.53x, n=416 1.77x, n=448 1.70x). So route the full fit range; the residual
+# gate falls any matrix the FP16 reduction can't resolve back to cuSOLVER, and
+# every benchmark medium shape (only n=352) plus reseeds in (200,448] win.
+# n=512 (packed 260KB) overflows the 228KB cap -> stays on cuSOLVER (the reduction
+# cannot fit one CTA in FP16; FP8 reduction measured too inaccurate -> 100% gate).
+_MEGA_MED_NMAX = 448
 # threads per CTA for the medium-n kernel. ncu on n=352 b40 showed the kernel is
 # LATENCY-bound (3.2% SM throughput, 12.5% occupancy, barrier+SMEM-scoreboard
 # stalls dominate) -- more warps per CTA hide that latency. MUST be a power of 2:
