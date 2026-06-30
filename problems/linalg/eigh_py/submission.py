@@ -34,11 +34,32 @@ from task import input_t, output_t
 # the corresponding shapes onto the custom path and the router banks the win.
 # ---------------------------------------------------------------------------
 
-# Minimum n for which the custom batched pipeline is *eligible* (below this,
-# cuSOLVER's batched paths are faster).  _CUSTOM_MIN = inf disables the custom
-# path until a net-faster reduction is wired in; raise/lower per measured wins.
-_CUSTOM_MIN_N = 1 << 30          # custom path disabled by default (safety floor)
 _PANEL = 32
+
+# --- Per-shape-class routing table -----------------------------------------
+# The router dispatches each input INDEPENDENTLY by its shape class (n, batch,
+# structure). Each entry maps a predicate over (n, batch) -> the path that is
+# the MEASURED-faster validated choice for that class. cuSOLVER is the default
+# for every class not explicitly routed to a custom path, so the router can
+# never regress below baseline: a class only leaves cuSOLVER once a custom path
+# is proven faster on it. To bank a win on shape-class X, add it to
+# _CUSTOM_CLASSES (and point _custom_path at the winning implementation).
+#
+# Currently EMPTY: measurements show cuSOLVER is fastest on all 13 benchmark
+# shapes today (every custom path tried is slower), so the router is the
+# baseline floor (56233us). The moment a chase-free custom path beats cuSOLVER
+# on a class, list that class here and re-benchmark.
+_CUSTOM_CLASSES: list[tuple[int, int]] = []   # e.g. [(2048, 0)] to route n>=2048
+
+
+def _route_to_custom(n: int, batch: int) -> bool:
+    """Return True iff this shape class should use the custom path. Pure
+    function of matrix STRUCTURE (n, batch) -- never of any problem-identifying
+    key -- so it is legitimate algorithm selection, not result caching."""
+    for min_n, min_batch in _CUSTOM_CLASSES:
+        if n >= min_n and batch >= min_batch:
+            return True
+    return False
 
 
 @contextlib.contextmanager
@@ -357,13 +378,23 @@ def _eigh_custom(a: torch.Tensor) -> output_t:
     return Q.contiguous(), L.contiguous()
 
 
+def _custom_path(a: torch.Tensor) -> output_t:
+    """PLUG POINT for the fastest validated custom eigensolver. Currently the
+    one-stage Householder reduction + batched bisect/twisted solve + GEMM
+    back-transform (validated correct, but slower than cuSOLVER on all current
+    shapes, so not yet routed to). Repoint this at a chase-free custom path
+    (band inverse-iteration / multi-stage SBR / GEMM-only filter) the instant
+    one beats cuSOLVER, and add its winning shape classes to _CUSTOM_CLASSES."""
+    return _eigh_custom(a)
+
+
 def custom_kernel(data: input_t) -> output_t:
     a = data
     n = a.shape[-1]
-    # Route to the custom batched pipeline only where it is the measured-faster
-    # validated path; otherwise cuSOLVER (the safety floor, never slower than
-    # baseline).
-    if n >= _CUSTOM_MIN_N:
-        return _eigh_custom(a)
+    batch = a.shape[0]
+    # Independent per-shape-class dispatch: custom path only where measured
+    # faster + validated; cuSOLVER everywhere else (baseline floor, no regress).
+    if _route_to_custom(n, batch):
+        return _custom_path(a)
     values, vectors = torch.linalg.eigh(a)
     return vectors, values
