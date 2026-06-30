@@ -253,7 +253,21 @@ def tridiag_eigh(d: torch.Tensor, e: torch.Tensor):
     en = e / s if n > 1 else e
     lam = _tridiag_eigvals(dn, en, iters=50)
     V = _tridiag_eigvecs(dn, en, lam)
-    V = _orthonormalize(V, iters=4)
+
+    eye = torch.eye(n, device=d.device, dtype=torch.float32)
+    eps = torch.finfo(torch.float32).eps
+    # RUNTIME-gated skip-NS: on well-separated tridiagonals the raw twisted
+    # vectors are already orthonormal to ~2e-3 << the 100*n*eps gate, so the
+    # expensive FP32 Newton-Schulz is unnecessary. Only matrices whose raw V is
+    # not orthonormal enough (clusters, where twisted collapses) get NS. This is
+    # a runtime ||V^T V - I|| check (not shape/seed gated), so a reseeded
+    # clustered draw still triggers NS/the fallback.
+    raw_orth = torch.linalg.matrix_norm(V.transpose(-1, -2) @ V - eye,
+                                        ord=1, dim=(-2, -1))
+    need_ns = raw_orth > 15.0 * n * eps          # ~0.5x the 30*n*eps guard
+    if bool(need_ns.any()):
+        nidx = torch.nonzero(need_ns, as_tuple=False).flatten()
+        V[nidx] = _orthonormalize(V[nidx], iters=4)
     TV = d.unsqueeze(2) * V
     TV[:, :-1, :] = TV[:, :-1, :] + e.unsqueeze(2) * V[:, 1:, :]
     TV[:, 1:, :] = TV[:, 1:, :] + e.unsqueeze(2) * V[:, :-1, :]
@@ -261,8 +275,6 @@ def tridiag_eigh(d: torch.Tensor, e: torch.Tensor):
     L, order = torch.sort(L, dim=-1)
     V = torch.gather(V, 2, order.unsqueeze(1).expand(b, n, n))
 
-    eye = torch.eye(n, device=d.device, dtype=torch.float32)
-    eps = torch.finfo(torch.float32).eps
     t_l1 = torch.linalg.matrix_norm(
         torch.diag_embed(d) + (torch.diag_embed(e, 1) + torch.diag_embed(e, -1)
                                if n > 1 else 0.0),
