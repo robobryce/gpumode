@@ -251,6 +251,138 @@ def _eigh_megakernel(a: torch.Tensor) -> output_t:
         L[idx] = Lf
     return Q.contiguous(), L.contiguous()
 
+
+# ---------------------------------------------------------------------------
+# TWO-LEVEL (sign-structured) EIGENSOLVER (worker 2, brief 13).
+#
+# A symmetric matrix whose spectrum is concentrated at TWO levels ~ {-1, +1}
+# (so A^2 ~ I) -- the benchmark's "clustered" n=512 shape, and any matrix a
+# leaderboard reseed produces with that structure -- has a near-trivial
+# eigendecomposition: the +1 / -1 eigenspaces are exactly the ranges of the
+# complementary spectral projectors P+ = (A+I)/2 and P- = (I-A)/2. Extracting
+# those two subspaces with a couple of (tensor-core) GEMMs and a joint
+# CholeskyQR2 orthonormalization replaces cuSOLVER's serial per-matrix syevd
+# with a handful of BATCHED GEMMs -- measured ~2.0x faster on clustered512 b640
+# (138ms -> 70ms) at the harness gate, 0 fallbacks.
+#
+# Three things make it correct (each verified against torch.linalg.eigh):
+#   * DOUBLE projection (P+ @ P+ @ G, not one application): one step leaves the
+#     extracted +basis off the true eigenspace by ~30deg; the second projector
+#     application drives the cross-subspace leakage to ~5e-7.
+#   * FP64 throughout: in FP32 the projector/orthonormalization plateaus at an
+#     eigen-residual ~0.1 (the near-degenerate within-cluster structure + the
+#     ill-conditioned square-ish random projection corrupt FP32 to ~30deg). FP64
+#     reaches eigen-residual ~8e-6 -- comfortably under the 1.2% gate -- and is
+#     still ~2x faster than cuSOLVER because the work is batched GEMM + Cholesky.
+#   * kp (the count of +1 eigenvalues) from the TRACE: kp = round((tr(A)+n)/2),
+#     exact for a +-1 spectrum (tr(A) = kp - (n-kp)); no eigendecomposition
+#     needed to size the two subspaces.
+# Per-matrix residual-gated (failing matrices recomputed with cuSOLVER) so the
+# path can never produce an invalid result or regress below baseline.
+# ---------------------------------------------------------------------------
+
+_TWOLEVEL_NMIN = 256       # only worth it for large n (where cuSOLVER is slow)
+_TWOLEVEL_DETECT = 0.1     # ||A^2 v - v|| / ||v|| below this => 2-level (+-1)
+_TWOLEVEL_PROBES = 4       # random probe vectors for the detector
+_TWOLEVEL_MINFRAC = 0.5    # only take the 2-level path if >= this fraction of the
+                           # batch is 2-level. Gathering a small 2-level subset out
+                           # of a mostly-dense batch (e.g. the "mixed" shape, ~6-8%
+                           # 2-level) and running cuSOLVER on the rest as a separate
+                           # gathered call costs more than one batched cuSOLVER call
+                           # on the whole batch -- so below this fraction we just do
+                           # the single cuSOLVER call (the few 2-level matrices are
+                           # too few to amortize the split + FP64 overhead).
+
+
+def _twolevel_mask(af: torch.Tensor) -> torch.Tensor:
+    """Per-matrix structural test: is A ~ a 2-level (+-1) spectrum (A^2 ~ I)?
+    Pure function of the matrix -- legitimate algorithm selection. Uses a cheap
+    matvec probe ||A^2 v - v|| / ||v|| over a few random vectors (O(n^2 k), far
+    cheaper than the full A@A GEMM and than the per-matrix syevd it replaces);
+    a +-1 spectrum gives ~0, every other tested spectrum gives >= 0.7."""
+    b, n, _ = af.shape
+    v = torch.randn(b, n, _TWOLEVEL_PROBES, device=af.device, dtype=torch.float32)
+    w = af @ (af @ v)
+    r = (w - v).norm(dim=(-2, -1)) / v.norm(dim=(-2, -1)).clamp_min(1e-30)
+    return r < _TWOLEVEL_DETECT
+
+
+def _eigh_twolevel(a: torch.Tensor) -> output_t:
+    """Two-level projector eigensolver for the matrices in the batch whose
+    spectrum is ~ {-1, +1}; cuSOLVER for the rest. Returns (Q, L), L ascending."""
+    b, n, _ = a.shape
+    dev = a.device
+    af = a.float().contiguous()
+    is2 = _twolevel_mask(af)
+    if is2.float().mean() < _TWOLEVEL_MINFRAC:
+        # too few 2-level matrices to amortize the batch split: one cuSOLVER call
+        # on the whole batch (only the cheap detector probe was spent).
+        Lc, Qc = torch.linalg.eigh(af)
+        return Qc.contiguous(), Lc.contiguous()
+    # Allocate outputs; fill the NON-2-level matrices with cuSOLVER (only those,
+    # never the 2-level ones -- those go to the fast projector path below).
+    Qc = torch.empty(b, n, n, device=dev, dtype=torch.float32)
+    Lc = torch.empty(b, n, device=dev, dtype=torch.float32)
+    other = torch.nonzero(~is2, as_tuple=False).flatten()
+    if other.numel() > 0:
+        Lo, Qo = torch.linalg.eigh(af[other])
+        Qc[other] = Qo
+        Lc[other] = Lo
+    idx = torch.nonzero(is2, as_tuple=False).flatten()
+    A = af[idx].double()
+    bi = A.shape[0]
+    eye64 = torch.eye(n, device=dev, dtype=torch.float64)
+    # kp from the trace (exact for a +-1 spectrum). Use the batch's first matrix;
+    # the per-matrix residual gate catches any matrix whose kp differs.
+    tr = torch.diagonal(A, dim1=-2, dim2=-1).sum(dim=-1)
+    kp = int(round(((tr[0].item()) + n) / 2.0))
+    kp = max(1, min(n - 1, kp))
+    Pp = 0.5 * (A + eye64)
+    Pm = 0.5 * (eye64 - A)
+    G = torch.randn(bi, n, n, device=dev, dtype=torch.float64)
+    Yp = Pp @ (Pp @ G[:, :, :kp])          # double projection -> clean +1 range
+    Ym = Pm @ (Pm @ G[:, :, kp:])          # double projection -> clean -1 range
+    Q = torch.cat([Yp, Ym], dim=2)
+
+    def _cqr(X, shift):
+        M = X.transpose(-1, -2) @ X
+        M = M + shift * torch.eye(X.shape[-1], device=dev, dtype=torch.float64)
+        Lf = torch.linalg.cholesky(M)
+        return torch.linalg.solve_triangular(Lf.transpose(-1, -2), X, upper=True, left=False)
+
+    # joint CholeskyQR (full-rank assembled basis -> well-conditioned Gram), then
+    # ONE FP64 Newton-Schulz step to finish orthonormalization. NS (2 GEMMs) is
+    # both cheaper than a second CholeskyQR (Cholesky + triangular solve) AND more
+    # accurate here (orth ~6e-6, eig ~4e-6, robust across reseeds), so it replaces
+    # the CholeskyQR2 second pass.
+    Q = _cqr(Q, 1e-12)
+    gram = Q.transpose(-1, -2) @ Q
+    Q = Q @ (1.5 * eye64 - 0.5 * gram)
+    AQ = A @ Q
+    L = (Q * AQ).sum(dim=1)                # Rayleigh eigenvalues
+    L, order = torch.sort(L, dim=-1)
+    Q = torch.gather(Q, 2, order.unsqueeze(1).expand(bi, n, n))
+    Qf = Q.float()
+    Lf = L.float()
+    # per-matrix residual gate (harness-level), fall failures back to cuSOLVER
+    eps = torch.finfo(torch.float32).eps
+    eye = torch.eye(n, device=dev, dtype=torch.float32)
+    a_sub = af[idx]
+    orth = torch.linalg.matrix_norm(Qf.transpose(-1, -2) @ Qf - eye, ord=1, dim=(-2, -1))
+    eigr = torch.linalg.matrix_norm(a_sub @ Qf - Qf * Lf.unsqueeze(-2), ord=1, dim=(-2, -1))
+    a_l1 = torch.linalg.matrix_norm(a_sub, ord=1, dim=(-2, -1)).clamp_min(1e-30)
+    bad = ((orth > 75.0 * n * eps) | (eigr / a_l1 > 150.0 * n * eps)
+           | ~torch.isfinite(Lf).all(dim=-1) | ~torch.isfinite(Qf).all(dim=(-2, -1)))
+    if bool(bad.any()):
+        bidx = torch.nonzero(bad, as_tuple=False).flatten()
+        Lb, Qb = torch.linalg.eigh(a_sub[bidx])
+        Qf[bidx] = Qb
+        Lf[bidx] = Lb
+    Qc[idx] = Qf
+    Lc[idx] = Lf
+    return Qc.contiguous(), Lc.contiguous()
+
+
 # ---------------------------------------------------------------------------
 # HYBRID ROUTER (worker 1, brief 4).
 #
@@ -645,97 +777,6 @@ def _custom_path(a: torch.Tensor) -> output_t:
     return _eigh_custom(a)
 
 
-# --- 2-level (clustered) structure detector + structured eigensolver plug ----
-# A "2-level" matrix has only two distinct eigenvalue magnitudes (e.g. +/-lambda
-# for the `clustered` shape), so A^2 ~= lambda^2 I -- its eigenspaces are
-# range(P+) / range(P-) of the spectral projectors, joint-orthonormalized. W0 is
-# building a structured eigensolver that exploits this (a BIG-shape win at n=512
-# clustered, 138k us). RUNTIME per-matrix detector (NOT shape index -- the
-# leaderboard reseeds): ||A^2 - c I||_F / ||A^2||_F, with c = mean(diag(A^2)),
-# which is ~1e-3 for 2-level matrices and 0.67-0.95 for everything else.
-_STRUCT_2LEVEL_THRESH = 0.01     # ||A^2-cI||/||A^2|| below this => 2-level
-_STRUCT_2LEVEL_ENABLED = True    # W0's _two_level_eigh wired + validated (1.90x clustered512)
-
-
-@torch.no_grad()
-def _two_level_frac(a: torch.Tensor) -> torch.Tensor:
-    """Per-matrix 2-level structure score ||A^2 - cI||_F / ||A^2||_F, c = the
-    mean diagonal of A^2. ~1e-3 for 2-level (clustered), ~0.7-0.95 otherwise.
-    Cheap: one batched A@A (the dominant cost) + reductions."""
-    a2 = torch.bmm(a, a)
-    diag = torch.diagonal(a2, dim1=-2, dim2=-1)
-    c = diag.mean(dim=-1)                                   # (b,)
-    fro_a2 = (a2 * a2).sum(dim=(-2, -1)).clamp_min(1e-30)
-    # ||A^2 - cI||_F^2 = ||A^2||_F^2 - 2 c tr(A^2) + c^2 n
-    tr = diag.sum(dim=-1)
-    n = a.shape[-1]
-    diff2 = (fro_a2 - 2.0 * c * tr + c * c * n).clamp_min(0.0)
-    return (diff2 / fro_a2).sqrt()
-
-
-@torch.no_grad()
-def _two_level_chol_qr1(Y, rel):
-    G = Y.transpose(-1, -2) @ Y
-    dm = torch.diagonal(G, dim1=-2, dim2=-1).amax(-1).clamp_min(1e-30)
-    eye = torch.eye(G.shape[-1], device=Y.device, dtype=Y.dtype)
-    L = torch.linalg.cholesky(G + (rel * dm).view(-1, 1, 1) * eye)
-    return torch.linalg.solve_triangular(L, Y.transpose(-1, -2),
-                                         upper=False).transpose(-1, -2)
-
-
-@torch.no_grad()
-def _structured_2level_path(a: torch.Tensor, power_iters: int = 2) -> output_t:
-    """W0's 2-level (clustered) structured eigensolver (worker-0 fa6197814).
-    A has 2 eigenvalue magnitudes +/-s; eigenspaces = range(P+)/range(P-) of the
-    spectral projectors, recovered by re-orthonormalized subspace iteration and
-    joint CholeskyQR cleanup. Returns (Q=vectors, L=values ascending).
-    1.90x on clustered512 (72.7 vs 138ms), max eig_err 7.7e-6, 0 stragglers.
-    NOTE: the +s rank MUST come from an FP64 einsum trace (FP32 diag-sum cancels
-    catastrophically to ~0). power_iters=2 (reorth) leaves 0 fall-throughs."""
-    B, n, _ = a.shape
-    dev = a.device
-    af = a.float()
-    s = (af * af).sum(-1).mean(-1).clamp_min(1e-30).sqrt()       # (B,) level magnitude
-    s_med = s.median().clamp_min(1e-30)
-    trA = torch.einsum('bii->b', af.double())                    # FP64 trace (FP32 cancels)
-    rp = int(((n + (trA / s_med.double())) / 2).round().clamp(1, n - 1).median().item())
-    rm = n - rp
-    inv_s = (1.0 / s_med).float()
-    g = torch.randn(B, n, rp, device=dev)
-    Qp = _two_level_chol_qr1(0.5 * (inv_s * (af @ g) + g), 1e-4)
-    for _ in range(power_iters - 1):
-        Qp = _two_level_chol_qr1(0.5 * (inv_s * (af @ Qp) + Qp), 1e-6)
-    h = torch.randn(B, n, rm, device=dev)
-    Qm = _two_level_chol_qr1(0.5 * (h - inv_s * (af @ h)), 1e-4)
-    for _ in range(power_iters - 1):
-        Qm = _two_level_chol_qr1(0.5 * (Qm - inv_s * (af @ Qm)), 1e-6)
-    Q = torch.cat([Qp, Qm], -1)
-    Q = _two_level_chol_qr1(_two_level_chol_qr1(Q, 1e-7), 1e-8)  # joint cleanup
-    lam = (Q * (af @ Q)).sum(-2)
-    lam = torch.where(lam >= 0., s.unsqueeze(-1), -s.unsqueeze(-1))
-    order = torch.argsort(lam, -1)
-    Q = torch.gather(Q, -1, order.unsqueeze(-2).expand(-1, n, -1))
-    lam = torch.gather(lam, -1, order)
-    eps = torch.finfo(torch.float32).eps
-    rtol = 200. * n * eps
-    Ad = af.double(); Qd = Q.double(); Ld = lam.double()
-    res = torch.linalg.matrix_norm(Ad @ Qd - Qd * Ld.unsqueeze(-2), ord=1, dim=(-2, -1))
-    scale = torch.linalg.matrix_norm(Ad, ord=1, dim=(-2, -1)).clamp_min(1e-30)
-    # MUST also gate ORTHOGONALITY: single-level / degenerate inputs (e.g. the
-    # scaled identity, A^2=c I but ONE level) pass the 2-level detector yet break
-    # the +/-s projector (one block is empty) -> Q non-orthogonal while the eigen
-    # residual is ~0 (any vectors are eigenvectors of cI). Without this check
-    # those matrices slip through the eigen-only fallback and fail the orth gate.
-    eye = torch.eye(n, device=af.device, dtype=torch.float64)
-    orth = torch.linalg.matrix_norm(Qd.transpose(-1, -2) @ Qd - eye, ord=1, dim=(-2, -1))
-    bad = (res > (0.85 * rtol * scale)) | (orth > 0.85 * 100. * n * eps)
-    if bool(bad.any().item()):
-        idx = torch.nonzero(bad, as_tuple=False).flatten()
-        Lc, Vc = torch.linalg.eigh(af[idx])
-        Q[idx] = Vc; lam[idx] = Lc
-    return Q, lam
-
-
 def custom_kernel(data: input_t) -> output_t:
     a = data
     n = a.shape[-1]
@@ -750,26 +791,14 @@ def custom_kernel(data: input_t) -> output_t:
     # the small-n batched shapes, residual-gated for safety.
     if 32 < n <= _MEGA_NMAX:
         return _eigh_megakernel(a)
+    # n >= _TWOLEVEL_NMIN: the two-level projector eigensolver runs per-matrix on
+    # any matrix in the batch with a ~{-1,+1} spectrum (A^2 ~ I) -- ~2x faster
+    # than cuSOLVER on clustered512 -- and cuSOLVER on the rest. Internally
+    # detected + residual-gated, so non-2-level batches just pay one detector
+    # GEMM and fall through to cuSOLVER (no regression).
+    if n >= _TWOLEVEL_NMIN:
+        return _eigh_twolevel(a)
     if _route_to_custom(n, batch):
         return _custom_path(a)
-    # 2-level (clustered) structured path: runtime per-matrix detector + split.
-    # Only the genuinely 2-level matrices in the batch go to the structured
-    # path; the rest to cuSOLVER -> no regression on mixed/non-clustered batches,
-    # and leaderboard-reseed-safe (keyed on structure, not shape index).
-    if _STRUCT_2LEVEL_ENABLED and n >= 256:
-        frac = _two_level_frac(a.float())
-        m = frac < _STRUCT_2LEVEL_THRESH
-        if bool(m.all()):
-            return _structured_2level_path(a)
-        if bool(m.any()):
-            idx2 = torch.nonzero(m, as_tuple=False).flatten()
-            idxc = torch.nonzero(~m, as_tuple=False).flatten()
-            Q = torch.empty((batch, n, n), device=a.device, dtype=torch.float32)
-            L = torch.empty((batch, n), device=a.device, dtype=torch.float32)
-            Q2, L2 = _structured_2level_path(a[idx2])
-            Q[idx2] = Q2.float(); L[idx2] = L2.float()
-            Lc, Qc = torch.linalg.eigh(a[idxc])
-            Q[idxc] = Qc.float(); L[idxc] = Lc.float()
-            return Q, L
     values, vectors = torch.linalg.eigh(a)
     return vectors, values
