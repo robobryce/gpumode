@@ -334,7 +334,9 @@ extern "C" __global__ void mega_eigh_med_k(const float* __restrict__ Ain,
   // SMEM region with the panel Y(n*NB), its Gram->block-T(NB*NB), and the Z
   // workspace(NB*cw). Panels are applied in REVERSE order (last reflector block
   // first) -- the verified composition for the forward product H_0...H_{n-3}.
-  const int NB=32;
+  const int NB=16;   // panel width. Swept 8/16/24/32: 16 fastest (smaller panel
+                     // -> larger V column block cw fits SMEM, more GEMM
+                     // parallelism); MUST be <=32 (the block-T build uses one warp).
   float* Vs=(float*)shc;                       // n*cw  (V column block, Vs[i*cw+j])
   int shm_floats=(int)(((triN*sizeof(__half)+3u)&~3u)/sizeof(float)) + 2*n;
   // cw*(n+2*NB) + n*NB + NB*NB <= shm_floats   (Vs + Z + Z2 + Y + T)
