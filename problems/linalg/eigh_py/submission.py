@@ -1,6 +1,22 @@
 import torch
 from task import input_t, output_t
 
+import contextlib
+
+
+@contextlib.contextmanager
+def _tf32(enabled: bool):
+    """Temporarily route FP32 matmuls onto TF32 tensor cores (sm_100, ~1100
+    TFLOPS vs SIMT FP32). Used for the bulk O(n^3) band reduction; the final
+    orthogonality/eigenvalue polish stays in true FP32 to meet the tight
+    orthogonality gate."""
+    prev = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = enabled
+    try:
+        yield
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = prev
+
 # ---------------------------------------------------------------------------
 # Two-stage tensor-core eigensolver for large n (brief: worker 1).
 #
@@ -37,45 +53,24 @@ _NB = 32
 
 
 def _house_qr_panel(X: torch.Tensor):
-    """Householder QR of a tall panel, batched.
+    """Householder QR of a tall panel, batched, via cuSOLVER geqrf.
 
     X: (b, r, c). Returns (V, Tf):
       V  : (b, r, c) raw reflector vectors (unit leading entry per column)
       Tf : (b, c, c) compact-WY T-factor so that  H_1...H_c = I - V Tf V^T  and
            (I - V Tf V^T)^T X is upper-triangular.
-    Reflector norms are computed in FP32. X is consumed (modified) as R.
     """
     b, r, c = X.shape
     device = X.device
     dtype = X.dtype
-    V = torch.zeros((b, r, c), device=device, dtype=dtype)
-    taus = torch.zeros((b, c), device=device, dtype=dtype)
-    R = X
-    tiny = torch.finfo(torch.float32).tiny
-    for k in range(c):
-        x = R[:, k:, k]                                  # (b, r-k)
-        alpha = x[:, 0]
-        xnorm = torch.linalg.vector_norm(x.float(), dim=1).to(dtype)
-        sgn = torch.where(alpha >= 0, torch.ones_like(alpha),
-                          -torch.ones_like(alpha))
-        beta = -sgn * xnorm
-        zero_mask = xnorm <= tiny
-        beta = torch.where(zero_mask, torch.ones_like(beta), beta)
-        denom = alpha - beta
-        denom = torch.where(zero_mask, torch.ones_like(denom), denom)
-        v = x / denom.unsqueeze(1)
-        tau = (beta - alpha) / beta
-        tau = torch.where(zero_mask, torch.zeros_like(tau), tau)
-        V[:, k, k] = 1.0
-        V[:, k + 1:, k] = v[:, 1:]
-        taus[:, k] = tau
-        # Apply H_k to the trailing panel: R <- R - tau v (v^T R).
-        vcol = V[:, k:, k:k + 1]                          # (b, r-k, 1)
-        Rsub = R[:, k:, k:]
-        vtR = vcol.transpose(-1, -2) @ Rsub
-        R[:, k:, k:] = Rsub - tau.view(b, 1, 1) * (vcol @ vtR)
+    # cuSOLVER batched Householder QR: reflectors stored below the diagonal of
+    # `qr_a`, scalar factors in `tau`.
+    qr_a, taus = torch.geqrf(X)                           # (b,r,c), (b,c)
+    V = torch.tril(qr_a, diagonal=-1)
+    idx = torch.arange(c, device=device)
+    V[:, idx, idx] = 1.0                                  # unit leading entries
 
-    # Build compact-WY T-factor.
+    # Build compact-WY T-factor from V and taus (small c x c recurrence).
     Tf = torch.zeros((b, c, c), device=device, dtype=dtype)
     if c > 0:
         Tf[:, 0, 0] = taus[:, 0]
@@ -162,14 +157,16 @@ def _eigh_large(a: torch.Tensor) -> output_t:
         torch.finfo(torch.float32).tiny)
     an = af / scale
 
-    # Stage 1: full -> band (GEMM-only).
-    band, q1 = _reduce_to_band(an, _NB)
+    # Stage 1: full -> band (GEMM-only) on TF32 tensor cores.
+    with _tf32(True):
+        band, q1 = _reduce_to_band(an, _NB)
     # Stage 2: eigendecompose the banded matrix.
     Qb = _eigh_robust(band)
-    # Back-transform.
-    Q = q1 @ Qb
+    # Back-transform (TF32 is fine; Newton-Schulz fixes orthogonality next).
+    with _tf32(True):
+        Q = q1 @ Qb
 
-    # FP32 polish.
+    # FP32 polish (true FP32 to meet the tight orthogonality gate).
     Q = _newton_schulz(Q, iters=2)
     AQ = af @ Q
     L = (Q * AQ).sum(dim=1)                                # (b,n)
