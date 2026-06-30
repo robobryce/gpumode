@@ -428,6 +428,13 @@ def _eigh_megakernel(a: torch.Tensor) -> output_t:
 # the n=352 benchmark shape directly; n=512 (packed 260KB) overflows and needs
 # the tiled variant.
 _MEGA_MED_NMAX = 448
+# threads per CTA for the medium-n kernel. ncu on n=352 b40 showed the kernel is
+# LATENCY-bound (3.2% SM throughput, 12.5% occupancy, barrier+SMEM-scoreboard
+# stalls dominate) -- more warps per CTA hide that latency. MUST be a power of 2:
+# the red[] tree reduction (for s=nt>>1; s>0; s>>=1) silently drops elements at
+# non-power-of-2 thread counts (NT=768 produced garbage -> 100% cuSOLVER
+# fallback). Swept 256/512/1024: 1024 fastest+correct on n=352. red[] holds 1024.
+_MEGA_MED_NT = 1024
 
 
 def _eigh_megakernel_med(a: torch.Tensor) -> output_t:
@@ -451,7 +458,7 @@ def _eigh_megakernel_med(a: torch.Tensor) -> output_t:
     dmscr = torch.empty(b, n, n, device=dev, dtype=torch.float32)
     tauscr = torch.empty(b, n, device=dev, dtype=torch.float32)
     mod.mega_eigh_med(af, V, L, rscr, dscr, escr, dpscr, dmscr, tauscr,
-                      n, _MEGA_NT, _MEGA_BISITERS)
+                      n, _MEGA_MED_NT, _MEGA_BISITERS)
     L, order = torch.sort(L, dim=-1)
     Q = torch.gather(V, 2, order.unsqueeze(1).expand(b, n, n))
     eye = torch.eye(n, device=dev, dtype=torch.float32)
