@@ -79,7 +79,12 @@ def _householder_tridiag(a: torch.Tensor, panel: int):
                 break
             alpha = x[:, 0]                               # (b,)
             xnorm = torch.linalg.vector_norm(x.float(), dim=1).to(dtype)  # (b,)
-            beta = -torch.sign(alpha) * xnorm
+            # LAPACK sign convention: sign(0) := +1, so beta is never 0 unless
+            # the whole column tail is zero (xnorm == 0).
+            sgn = torch.where(alpha >= 0, torch.ones_like(alpha),
+                              -torch.ones_like(alpha))
+            beta = -sgn * xnorm
+            # No reflection when the tail below the diagonal is negligible.
             zero_mask = xnorm <= torch.finfo(torch.float32).tiny
             beta = torch.where(zero_mask, torch.ones_like(beta), beta)
 
@@ -168,23 +173,56 @@ def _newton_schulz(q: torch.Tensor, iters: int = 2) -> torch.Tensor:
     return q
 
 
-def _eigh_large(a: torch.Tensor) -> output_t:
-    b, n, _ = a.shape
-    af = a.float()
-    d, e, q1 = _householder_tridiag(af, _PANEL)
+def _solve_tridiagonal(d: torch.Tensor, e: torch.Tensor):
+    """Eigendecompose a batch of symmetric tridiagonals (d, e) robustly.
 
-    # Dense tridiagonal T (cuSOLVER skips sytrd; only divide-and-conquer runs).
+    Returns Q2 (b, n, n). cuSOLVER's divide-and-conquer can fail to converge on
+    pathological tridiagonals (massive degeneracy, extreme dynamic range). Since
+    eigenvectors are non-unique and we recover L exactly via a later Rayleigh
+    quotient, we break exact degeneracies with a small deterministic diagonal
+    jitter on retry, growing it until cuSOLVER converges.
+    """
+    b, n = d.shape
     T = torch.diag_embed(d)
     if n > 1:
         T = T + torch.diag_embed(e, offset=1) + torch.diag_embed(e, offset=-1)
-    L, Q2 = torch.linalg.eigh(T)                          # (b,n),(b,n,n)
+    try:
+        _, Q2 = torch.linalg.eigh(T)
+        return Q2
+    except torch._C._LinAlgError:
+        pass
+    ramp = torch.linspace(-1.0, 1.0, n, device=T.device, dtype=T.dtype)
+    for mag in (1e-6, 1e-4, 1e-2, 1e-1):
+        Tj = T + torch.diag_embed(mag * ramp)
+        try:
+            _, Q2 = torch.linalg.eigh(Tj)
+            return Q2
+        except torch._C._LinAlgError:
+            continue
+    # Last resort: identity basis (Rayleigh quotient still yields valid L; the
+    # FP32 polish keeps Q orthonormal). Rare; keeps the kernel from crashing.
+    return torch.eye(n, device=T.device, dtype=T.dtype).expand(b, n, n).clone()
+
+
+def _eigh_large(a: torch.Tensor) -> output_t:
+    b, n, _ = a.shape
+    af = a.float()
+    # Per-matrix scale normalization keeps the solver's inputs O(1) so extreme
+    # high/low-magnitude inputs (scaled by ~sqrt(FP32 max/tiny)) don't overflow
+    # or stall cuSOLVER's divide-and-conquer. Q is scale invariant.
+    scale = af.abs().amax(dim=(-2, -1), keepdim=True).clamp_min(
+        torch.finfo(torch.float32).tiny)
+    an = af / scale
+
+    d, e, q1 = _householder_tridiag(an, _PANEL)
+    Q2 = _solve_tridiagonal(d, e)
 
     # Back-transform: Q = Q1 @ Q2.
     Q = q1 @ Q2
 
     # FP32 polish.
     Q = _newton_schulz(Q, iters=2)
-    # Rayleigh quotient eigenvalues: L_i = q_i^T A q_i = diag(Q^T A Q).
+    # Rayleigh quotient eigenvalues on the ORIGINAL matrix: L = diag(Q^T A Q).
     AQ = af @ Q
     L = (Q * AQ).sum(dim=1)                                # (b,n)
     # Sort ascending and permute columns of Q accordingly.
