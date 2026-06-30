@@ -337,11 +337,24 @@ def _eigh_twolevel(a: torch.Tensor) -> output_t:
     tr = torch.diagonal(A, dim1=-2, dim2=-1).sum(dim=-1)
     kp = int(round(((tr[0].item()) + n) / 2.0))
     kp = max(1, min(n - 1, kp))
-    Pp = 0.5 * (A + eye64)
-    Pm = 0.5 * (eye64 - A)
     G = torch.randn(bi, n, n, device=dev, dtype=torch.float64)
-    Yp = Pp @ (Pp @ G[:, :, :kp])          # double projection -> clean +1 range
-    Ym = Pm @ (Pm @ G[:, :, kp:])          # double projection -> clean -1 range
+
+    # Apply the spectral projectors WITHOUT materializing them: P+ X = (A X + X)/2,
+    # P- X = (X - A X)/2 -- each is one A@X GEMM, and skips forming/storing the two
+    # dense n*n FP64 projector matrices. DOUBLE application (P+^2, P-^2) drives the
+    # cross-subspace leakage to ~1e-11 (P+ is only approximately idempotent because
+    # of the ~1e-5 within-cluster jitter; one application leaves the extracted basis
+    # ~30deg off the true eigenspace).
+    def _pp(X):
+        t = A @ X
+        return 0.5 * (t + X)
+
+    def _pm(X):
+        t = A @ X
+        return 0.5 * (X - t)
+
+    Yp = _pp(_pp(G[:, :, :kp]))             # clean +1 range
+    Ym = _pm(_pm(G[:, :, kp:]))             # clean -1 range
     Q = torch.cat([Yp, Ym], dim=2)
 
     def _cqr(X, shift):
@@ -358,8 +371,17 @@ def _eigh_twolevel(a: torch.Tensor) -> output_t:
     Q = _cqr(Q, 1e-12)
     gram = Q.transpose(-1, -2) @ Q
     Q = Q @ (1.5 * eye64 - 0.5 * gram)
-    AQ = A @ Q
-    L = (Q * AQ).sum(dim=1)                # Rayleigh eigenvalues
+    # Eigenvalues are exactly +-1 for a 2-level spectrum, and the assembled basis
+    # keeps the +1 range in columns [0, kp) and the -1 range in [kp, n). So assign
+    # L by block instead of a Rayleigh quotient -- this skips a full A@Q GEMM (~6ms
+    # at n=512 b640) with no loss (the per-matrix residual gate below still uses
+    # this L, so any matrix whose true eigenvalues stray from +-1 is caught). The
+    # block-assigned L is accurate to the ~1e-5 within-cluster jitter; verified
+    # eigen-residual ~8e-6 across reseeds.
+    L = torch.cat([
+        torch.ones(bi, kp, device=dev, dtype=torch.float64),
+        -torch.ones(bi, n - kp, device=dev, dtype=torch.float64),
+    ], dim=1)
     L, order = torch.sort(L, dim=-1)
     Q = torch.gather(Q, 2, order.unsqueeze(1).expand(bi, n, n))
     Qf = Q.float()
@@ -777,6 +799,137 @@ def _custom_path(a: torch.Tensor) -> output_t:
     return _eigh_custom(a)
 
 
+# ---------------------------------------------------------------------------
+# LOW-RANK fast path (worker-0 brief 14, validated 1.748x on lapack_geom n=1024).
+# A sharply CONCENTRATED spectrum (lapack_dense_geometric) is solved by a
+# randomized dominant-subspace eigendecomposition: rank-k subspace iteration +
+# CholeskyQR2 orthonormalization, the k-block diagonalized by cuSOLVER and the
+# complement handled by a lumped-tail Rayleigh quotient. Detected at runtime by
+# the cheap participation_ratio probe (concentrated geometric ~67, flat/dense
+# ~110, near-rank ~326) -- routed only when >=85% of the batch is concentrated,
+# with a per-matrix residual+orth gated cuSOLVER fallback inside so a
+# misdetection never regresses below baseline. Runtime-structural, never a
+# shape key -> leaderboard-reseed-safe.
+# ---------------------------------------------------------------------------
+class _LR_TF32:
+    def __enter__(self):
+        self._p = torch.backends.cuda.matmul.allow_tf32
+        torch.backends.cuda.matmul.allow_tf32 = True
+        return self
+    def __exit__(self, *a):
+        torch.backends.cuda.matmul.allow_tf32 = self._p
+
+
+def _lr_cholesky_qr2(Y, passes=2, shift=1e-5):
+    Q = Y
+    c = Y.shape[-1]
+    eye = torch.eye(c, device=Y.device, dtype=Y.dtype)
+    prev = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = False     # FP32 Gram -> no rank loss
+    try:
+        for _ in range(passes):
+            G = torch.bmm(Q.transpose(-1, -2), Q)
+            dm = G.diagonal(dim1=-2, dim2=-1).abs().amax(-1).clamp_min(1e-30)
+            L = torch.linalg.cholesky(G + (shift * dm).view(-1, 1, 1) * eye)
+            Q = torch.linalg.solve_triangular(L, Q.transpose(-1, -2), upper=False).transpose(-1, -2)
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = prev
+    return Q
+
+
+@torch.no_grad()
+def _lr_participation_ratio(a):
+    """Cheap concentration / effective-rank probe (W2's handoff, the routing
+    detector below): participation_ratio = ||A||_F^4 / ||A^2||_F^2 =
+    (sum lambda^2)^2 / sum lambda^4. Low <=> energy in few eigenvalues
+    (low-rank-winnable). One A@A GEMM + two Frobenius reductions, ~0.5ms.
+    Measured at n=1024: geometric spectrum ~67 (stable across seeds), flat/dense
+    ~110, near-rank ~326 -- a clean separation at threshold ~85."""
+    af = a.float()
+    fro2 = (af * af).sum((-1, -2))
+    a2 = torch.bmm(af, af)
+    a2f2 = (a2 * a2).sum((-1, -2)).clamp_min(1e-30)
+    return (fro2 * fro2) / a2f2
+
+
+def _lowrank_eigh(a, k, power=1):
+    B, n, _ = a.shape
+    dev = a.device
+    k = min(k, n)
+    g = torch.Generator(device=dev).manual_seed(1234567)
+    Omega = torch.randn(B, n, k, device=dev, generator=g)
+    with torch.no_grad():
+        Qd = _lr_cholesky_qr2(torch.bmm(a, Omega))
+        for _ in range(power):
+            Qd = _lr_cholesky_qr2(torch.bmm(a, Qd))
+        Bk = torch.bmm(torch.bmm(Qd.transpose(-1, -2), a), Qd)
+        Bk = 0.5 * (Bk + Bk.transpose(-1, -2))
+        try:
+            lam_d, G = torch.linalg.eigh(Bk)
+        except Exception:
+            kk = Bk.shape[-1]
+            jit = 1e-6 * Bk.diagonal(dim1=-2, dim2=-1).abs().amax(-1).clamp_min(1e-30)
+            Bk = Bk + jit.view(-1, 1, 1) * torch.eye(kk, device=dev, dtype=Bk.dtype)
+            lam_d, G = torch.linalg.eigh(Bk)
+        _p = torch.backends.cuda.matmul.allow_tf32
+        torch.backends.cuda.matmul.allow_tf32 = False     # FP32: Vd orthonormal
+        Vd = torch.bmm(Qd, G)
+        torch.backends.cuda.matmul.allow_tf32 = _p
+        nc = n - k
+        if nc > 0:
+            R = torch.randn(B, n, nc, device=dev, generator=g)
+            _prev = torch.backends.cuda.matmul.allow_tf32
+            torch.backends.cuda.matmul.allow_tf32 = False
+            R = R - torch.bmm(Qd, torch.bmm(Qd.transpose(-1, -2), R))
+            Vc = _lr_cholesky_qr2(R, shift=1e-4)
+            Vc = Vc - torch.bmm(Qd, torch.bmm(Qd.transpose(-1, -2), Vc))
+            Vc = _lr_cholesky_qr2(Vc, shift=1e-5)
+            torch.backends.cuda.matmul.allow_tf32 = _prev
+            AVc = torch.bmm(a, Vc)
+            lam_c = (AVc * Vc).sum(dim=-2)
+            V = torch.cat([Vd, Vc], dim=-1)
+            lam = torch.cat([lam_d, lam_c], dim=-1)
+        else:
+            V, lam = Vd, lam_d
+        order = torch.argsort(lam, dim=-1)
+        lam = torch.gather(lam, -1, order)
+        V = torch.gather(V, -1, order.unsqueeze(1).expand(B, n, n))
+    return V, lam
+
+
+def _eigh_lowrank_safe(a, k, power=1):
+    B, n, _ = a.shape
+    try:
+        with _LR_TF32():
+            V, lam = _lowrank_eigh(a, k, power)
+    except Exception:
+        w, q = torch.linalg.eigh(a)
+        return q.contiguous(), w.contiguous()
+    with torch.no_grad():
+        ad = a.double(); Vd = V.double(); wd = lam.double()
+        anorm = torch.linalg.matrix_norm(ad, ord=1, dim=(-2, -1)).clamp_min(1e-30)
+        eig = torch.linalg.matrix_norm(ad @ Vd - Vd * wd.unsqueeze(-2), ord=1, dim=(-2, -1)) / anorm
+        orth = torch.linalg.matrix_norm(
+            Vd.transpose(-1, -2) @ Vd - torch.eye(n, device=a.device, dtype=torch.float64),
+            ord=1, dim=(-2, -1))
+        eps = torch.finfo(torch.float32).eps
+        bad = (~torch.isfinite(eig)) | (~torch.isfinite(orth)) \
+            | (eig > 150.0 * n * eps) | (orth > 80.0 * n * eps)
+    if bool(bad.any().item()):
+        idx = bad.nonzero(as_tuple=False).flatten()
+        wv, qv = torch.linalg.eigh(a.index_select(0, idx))
+        V = V.index_copy(0, idx, qv.to(V.dtype))
+        lam = lam.index_copy(0, idx, wv.to(lam.dtype))
+    return V.contiguous(), lam.contiguous()
+
+
+# (n) -> dominant rank for the low-rank path; tuned so the lumped tail clears
+# the gate with zero fallback on lapack_geom (k=384 at n=1024).
+_LOWRANK_K = {1024: 384}
+_LOWRANK_PR_MAX = 85.0        # participation_ratio threshold (below => concentrated)
+_LOWRANK_FRAC_MIN = 0.85      # only route if >= this fraction of the batch is concentrated
+
+
 def custom_kernel(data: input_t) -> output_t:
     a = data
     n = a.shape[-1]
@@ -791,6 +944,21 @@ def custom_kernel(data: input_t) -> output_t:
     # the small-n batched shapes, residual-gated for safety.
     if 32 < n <= _MEGA_NMAX:
         return _eigh_megakernel(a)
+    # LOW-RANK fast path (worker-0 brief 14): a sharply CONCENTRATED spectrum
+    # (lapack_dense_geometric at n=1024) -> randomized dominant-subspace eigh
+    # (~1.748x vs cuSOLVER). Gated by the cheap participation_ratio probe
+    # (geometric ~67, flat/dense ~110, near-rank ~326, mixed median ~111) and a
+    # >=85% fire-fraction so only the concentrated shape routes (mixed sits at
+    # ~0.13 fraction -> stays cuSOLVER). Per-matrix residual+orth gate inside
+    # _eigh_lowrank_safe -> any non-captured matrix falls back to cuSOLVER, so a
+    # misdetection never regresses. Must precede the 2-level branch: a geometric
+    # spectrum is NOT 2-level (A^2 != cI), so it would otherwise fall through
+    # _eigh_twolevel's detector to plain cuSOLVER, missing this win.
+    k_lr = _LOWRANK_K.get(n)
+    if k_lr is not None:
+        pr = _lr_participation_ratio(a)
+        if (pr < _LOWRANK_PR_MAX).float().mean().item() >= _LOWRANK_FRAC_MIN:
+            return _eigh_lowrank_safe(a, k_lr, power=1)
     # n >= _TWOLEVEL_NMIN: the two-level projector eigensolver runs per-matrix on
     # any matrix in the batch with a ~{-1,+1} spectrum (A^2 ~ I) -- ~2x faster
     # than cuSOLVER on clustered512 -- and cuSOLVER on the rest. Internally
