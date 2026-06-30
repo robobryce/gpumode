@@ -324,10 +324,41 @@ extern "C" __global__ void mega_eigh_med_k(const float* __restrict__ Ain,
     for(int k=0;k<n;++k) Vg[k*n+ev]/=nrm;
   }
   __syncthreads();
-  // 4) back-transform (FP32): Q = (prod_c H_c) V_tri, reflectors reverse, global V
-  for(int c=n-3;c>=0;--c){
-    float tauc=Tau[c];
-    for(int j=tid;j<n;j+=nt){ float w=0.f; for(int i=c+1;i<n;++i) w+=Rm[i*n+c]*Vg[i*n+j]; w*=tauc; for(int i=c+1;i<n;++i) Vg[i*n+j]-=Rm[i*n+c]*w; }
+  // 4) back-transform (FP32): Q = (prod_c H_c) V_tri, reflectors applied c=n-3..0.
+  // SMEM-COLUMN-BLOCKED + BARRIER-FREE. The original applied each reflector to
+  // global V with a __syncthreads per reflector (n barriers) and read/wrote all
+  // of V from global per reflector (2*n^3 global traffic) -- this stage was ~78%
+  // of the kernel (ncu). KEY INSIGHT: reflectors applied to a single column are
+  // INDEPENDENT of other columns, so if one thread owns a whole column across
+  // ALL reflectors, no inter-reflector barrier is needed and V can live in fast
+  // SMEM. V (n*n FP32) does not fit SMEM at medium n, so process V in COLUMN
+  // BLOCKS of BV columns held in the (now-free, post-reduction) SMEM A region:
+  // load BV columns once, apply all n-2 reflectors barrier-free (reflectors
+  // read from global Rm per column, broadcast + L2-cached), write back once.
+  // Global V traffic drops from 2*n^3 to ~2*n^2 per block * (n/BV) blocks.
+  float* Vs=(float*)shc;                       // reuse packed-A region as FP32 V-block
+  // BV columns fit in the SMEM allocation (triN halfs + 2n floats). Compute it
+  // from the allocated bytes: shm_floats = triN/2 (halfs->floats) + 2n.
+  int shm_floats=(int)(((triN*sizeof(__half)+3u)&~3u)/sizeof(float)) + 2*n;
+  int BV=shm_floats / n; if(BV<1) BV=1; if(BV>n) BV=n;
+  for(int j0=0;j0<n;j0+=BV){
+    int bw=min(BV,n-j0);
+    // load block columns [j0,j0+bw) into Vs (column-major within block: Vs[i*bw + (j-j0)])
+    for(int idx=tid; idx<n*bw; idx+=nt){ int i=idx/bw, jj=idx%bw; Vs[i*bw+jj]=Vg[i*n+(j0+jj)]; }
+    __syncthreads();
+    // each thread owns columns jj = tid, tid+nt, ... within the block; applies
+    // ALL reflectors to its column with NO barriers (its column is private).
+    for(int jj=tid; jj<bw; jj+=nt){
+      for(int c=n-3;c>=0;--c){
+        float tauc=Tau[c]; if(tauc==0.f) continue;
+        float w=0.f; for(int i=c+1;i<n;++i) w+=Rm[i*n+c]*Vs[i*bw+jj];
+        w*=tauc;
+        for(int i=c+1;i<n;++i) Vs[i*bw+jj]-=Rm[i*n+c]*w;
+      }
+    }
+    __syncthreads();
+    // write block back to global V
+    for(int idx=tid; idx<n*bw; idx+=nt){ int i=idx/bw, jj=idx%bw; Vg[i*n+(j0+jj)]=Vs[i*bw+jj]; }
     __syncthreads();
   }
   for(int ev=tid; ev<n; ev+=nt) Lout[(long)m*n+ev]*=scale;
@@ -424,10 +455,15 @@ def _eigh_megakernel(a: torch.Tensor) -> output_t:
 
 
 # largest n routed to the MEDIUM-n megakernel (packed-FP16-lower-triangle A in
-# SMEM + global eigenvector matrix). n=448 packed = 200KB < 227KB cap. Covers
-# the n=352 benchmark shape directly; n=512 (packed 260KB) overflows and needs
-# the tiled variant.
-_MEGA_MED_NMAX = 448
+# SMEM + global eigenvector matrix). The kernel FITS to n=448 (packed=200KB <
+# 227KB), but one-CTA-per-matrix is SIMT-compute-bound and only WINS vs cuSOLVER
+# up to the measured crossover ~n=350-400 (b40: n=352 1.17x, n=448 0.91x; b640:
+# n=320 1.05x, n=384 0.91x). Above that the serial-column O(n^3) reduction loses
+# to cuSOLVER's whole-GPU-per-matrix syevd. Cap at 400 so the route only fires
+# where it wins (covers the n=352 benchmark shape); larger n stays on cuSOLVER.
+# The residual gate is a correctness net, not a speed net, so the cap is what
+# protects the geomean from a reseed landing at n in (400,448].
+_MEGA_MED_NMAX = 400
 # threads per CTA for the medium-n kernel. ncu on n=352 b40 showed the kernel is
 # LATENCY-bound (3.2% SM throughput, 12.5% occupancy, barrier+SMEM-scoreboard
 # stalls dominate) -- more warps per CTA hide that latency. MUST be a power of 2:
