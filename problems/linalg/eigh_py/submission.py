@@ -238,6 +238,92 @@ def _invit_kernel(d_ptr, e_ptr, lam_ptr, rhs_ptr, cp_ptr, v_ptr, B, n,
             tl.store(rhs_ptr + mbase + kk * n + i, xv, mask=active)
 
 
+@triton.jit
+def _twisted_kernel(d_ptr, e_ptr, lam_ptr, dp_ptr, dm_ptr, v_ptr, B, n,
+                    BLK: tl.constexpr):
+    """One program per matrix; lane i computes the eigenvector for lam_i via the
+    MRRR twisted factorization (single RRR, no cluster tree):
+      forward  pivots d+_k of  (T - lam I) = L+ D+ L+^T
+      backward pivots d-_k of  (T - lam I) = U- D- U-^T
+      twist index r = argmin_k |gamma_k|, gamma_k = d+_k + d-_k - (d_k - lam)
+      z_r = 1; z_k = -(e_k/d+_k) z_{k+1} for k<r; z_k = -(e_{k-1}/d-_k) z_{k-1}
+      for k>r; then normalize.
+    dp,dm are scratch (B,n,n). v output (B,n,n), v[pid,row,i] = component row of
+    eigenvector i."""
+    pid = tl.program_id(0)
+    if pid >= B:
+        return
+    i = tl.arange(0, BLK)
+    active = i < n
+    dbase = pid * n
+    ebase = pid * (n - 1)
+    mbase = pid * n * n
+    lam = tl.load(lam_ptr + pid * n + i, mask=active, other=0.0)
+    eps = 1e-30
+    # forward pivots
+    dpk = tl.load(d_ptr + dbase + 0) - lam
+    tl.store(dp_ptr + mbase + 0 * n + i, dpk, mask=active)
+    for kk in range(1, n):
+        prev = tl.where(tl.abs(dpk) < eps, eps, dpk)
+        ek_1 = tl.load(e_ptr + ebase + kk - 1)
+        dpk = (tl.load(d_ptr + dbase + kk) - lam) - ek_1 * ek_1 / prev
+        tl.store(dp_ptr + mbase + kk * n + i, dpk, mask=active)
+    # backward pivots
+    dmk = tl.load(d_ptr + dbase + (n - 1)) - lam
+    tl.store(dm_ptr + mbase + (n - 1) * n + i, dmk, mask=active)
+    for kk in range(n - 2, -1, -1):
+        nxt = tl.where(tl.abs(dmk) < eps, eps, dmk)
+        ek = tl.load(e_ptr + ebase + kk)
+        dmk = (tl.load(d_ptr + dbase + kk) - lam) - ek * ek / nxt
+        tl.store(dm_ptr + mbase + kk * n + i, dmk, mask=active)
+    # twist index: argmin_k |gamma_k|
+    best_g = tl.full((BLK,), 1e38, tl.float32)
+    best_r = tl.zeros((BLK,), tl.int32)
+    for kk in range(0, n):
+        dpkk = tl.load(dp_ptr + mbase + kk * n + i, mask=active, other=0.0)
+        dmkk = tl.load(dm_ptr + mbase + kk * n + i, mask=active, other=0.0)
+        dk = tl.load(d_ptr + dbase + kk)
+        g = tl.abs(dpkk + dmkk - (dk - lam))
+        upd = g < best_g
+        best_g = tl.where(upd, g, best_g)
+        best_r = tl.where(upd, kk, best_r)
+    # build eigenvector: z_r = 1, write all then recurse
+    for kk in range(0, n):
+        z0 = tl.where(kk == best_r, 1.0, 0.0)
+        tl.store(v_ptr + mbase + kk * n + i, z0 + 0.0 * lam, mask=active)
+    # downward k = r-1 .. 0
+    for kk in range(n - 2, -1, -1):
+        below = kk < best_r
+        dpkk = tl.load(dp_ptr + mbase + kk * n + i, mask=active, other=1.0)
+        dpkk = tl.where(tl.abs(dpkk) < eps, eps, dpkk)
+        ek = tl.load(e_ptr + ebase + kk)
+        znext = tl.load(v_ptr + mbase + (kk + 1) * n + i, mask=active, other=0.0)
+        zk = -(ek / dpkk) * znext
+        cur = tl.load(v_ptr + mbase + kk * n + i, mask=active, other=0.0)
+        tl.store(v_ptr + mbase + kk * n + i,
+                 tl.where(below, zk, cur), mask=active)
+    # upward k = r+1 .. n-1
+    for kk in range(1, n):
+        above = kk > best_r
+        dmkk = tl.load(dm_ptr + mbase + kk * n + i, mask=active, other=1.0)
+        dmkk = tl.where(tl.abs(dmkk) < eps, eps, dmkk)
+        ek_1 = tl.load(e_ptr + ebase + kk - 1)
+        zprev = tl.load(v_ptr + mbase + (kk - 1) * n + i, mask=active, other=0.0)
+        zk = -(ek_1 / dmkk) * zprev
+        cur = tl.load(v_ptr + mbase + kk * n + i, mask=active, other=0.0)
+        tl.store(v_ptr + mbase + kk * n + i,
+                 tl.where(above, zk, cur), mask=active)
+    # normalize
+    sumsq = tl.zeros((BLK,), tl.float32)
+    for kk in range(0, n):
+        zk = tl.load(v_ptr + mbase + kk * n + i, mask=active, other=0.0)
+        sumsq += zk * zk
+    nrm = tl.sqrt(sumsq) + 1e-30
+    for kk in range(0, n):
+        zk = tl.load(v_ptr + mbase + kk * n + i, mask=active, other=0.0) / nrm
+        tl.store(v_ptr + mbase + kk * n + i, zk, mask=active)
+
+
 def _tridiag_eigvals(d: torch.Tensor, e: torch.Tensor, iters: int = 50):
     b, n = d.shape
     abs_e = e.abs()
@@ -253,19 +339,16 @@ def _tridiag_eigvals(d: torch.Tensor, e: torch.Tensor, iters: int = 50):
     return out
 
 
-def _tridiag_eigvecs(d: torch.Tensor, e: torch.Tensor, lam: torch.Tensor,
-                     nit: int = 2, seed: int = 0):
+def _tridiag_eigvecs(d: torch.Tensor, e: torch.Tensor, lam: torch.Tensor):
+    """MRRR twisted-factorization eigenvectors (batched, one CTA per matrix)."""
     b, n = d.shape
-    g = torch.Generator(device=d.device)
-    g.manual_seed(seed)
-    rhs = torch.randn((b, n, n), device=d.device, dtype=torch.float32,
-                      generator=g)
-    cp = torch.empty((b, n, n), device=d.device, dtype=torch.float32)
+    dp = torch.empty((b, n, n), device=d.device, dtype=torch.float32)
+    dm = torch.empty((b, n, n), device=d.device, dtype=torch.float32)
     v = torch.empty((b, n, n), device=d.device, dtype=torch.float32)
     BLK = triton.next_power_of_2(n)
-    _invit_kernel[(b,)](d.contiguous(), e.contiguous(), lam.contiguous(),
-                        rhs, cp, v, b, n, nit, BLK,
-                        num_warps=min(32, max(4, BLK // 32)))
+    _twisted_kernel[(b,)](d.contiguous(), e.contiguous(), lam.contiguous(),
+                          dp, dm, v, b, n, BLK,
+                          num_warps=min(32, max(4, BLK // 32)))
     return v  # v[:, row, i] = component row of eigenvector i
 
 
@@ -304,7 +387,7 @@ def _eigh_large(a: torch.Tensor) -> output_t:
 
     # Stage 2: batched tridiagonal eigensolver.
     lam = _tridiag_eigvals(d, e, iters=50)
-    v_tri = _tridiag_eigvecs(d, e, lam, nit=2)
+    v_tri = _tridiag_eigvecs(d, e, lam)
 
     # Back-transform Q = Q1 @ V_tri (TF32).
     with _tf32(True):
