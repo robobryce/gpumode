@@ -337,8 +337,20 @@ def tridiag_eigh(d: torch.Tensor, e: torch.Tensor):
     recomputed via a single batched cuSOLVER eigh on the reconstructed dense
     tridiagonal -- self-contained, no dependency on the original dense A."""
     b, n = d.shape
-    lam = _tridiag_eigvals(d, e, iters=50)
-    V = _tridiag_eigvecs(d, e, lam)              # V[:, row, i] = eigvec i
+    d = d.float()
+    e = e.float()
+    # Per-matrix scale normalization keeps the Sturm/twisted recurrences within
+    # FP32 range for extreme-magnitude tridiagonals (eigenvectors are scale
+    # invariant; eigenvalues rescale). Robust to whatever scaling the reduction
+    # feeding this solver emits.
+    s = torch.maximum(d.abs().amax(dim=1, keepdim=True),
+                      e.abs().amax(dim=1, keepdim=True) if n > 1 else
+                      torch.zeros((b, 1), device=d.device)).clamp_min(
+        torch.finfo(torch.float32).tiny)
+    dn = d / s
+    en = e / s if n > 1 else e
+    lam = _tridiag_eigvals(dn, en, iters=50)
+    V = _tridiag_eigvecs(dn, en, lam)            # V[:, row, i] = eigvec i (scale-free)
 
     # FP32 orthonormalization of the eigenvector matrix.
     V = _orthonormalize(V, iters=4)
