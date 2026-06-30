@@ -284,7 +284,18 @@ def _tridiag_eigvecs(d: torch.Tensor, e: torch.Tensor, lam: torch.Tensor):
 
 
 def _orthonormalize(q: torch.Tensor, iters: int = 4) -> torch.Tensor:
+    # MUST run in true FP32: TF32 Newton-Schulz plateaus at ~1e-2 orthogonality
+    # (TF32's ~5e-4/op error accumulates over n columns) and never reaches the
+    # ~6e-3..1.2e-2 orthogonality gate, which forces a slow cuSOLVER fallback.
+    # FP32 NS reaches ~3e-6 in 4 iters (verified) -- the GEMMs cost more but kill
+    # the fallback, a large net win.
+    return _tf32_orthonormalize(q, iters)
+
+
+def _tf32_orthonormalize(q: torch.Tensor, iters: int) -> torch.Tensor:
     b, n, _ = q.shape
+    prev = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = False
     v = torch.randn(b, n, 1, device=q.device, dtype=q.dtype)
     v = v / v.norm(dim=1, keepdim=True).clamp_min(1e-30)
     for _ in range(3):
@@ -295,6 +306,7 @@ def _orthonormalize(q: torch.Tensor, iters: int = 4) -> torch.Tensor:
     for _ in range(iters):
         gram = q.transpose(-1, -2) @ q
         q = 1.5 * q - 0.5 * (q @ gram)
+    torch.backends.cuda.matmul.allow_tf32 = prev
     return q
 
 
