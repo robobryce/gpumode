@@ -177,6 +177,177 @@ void mega_eigh(torch::Tensor A, torch::Tensor Vout, torch::Tensor Lout,
 }'''
 
 
+# ---------------------------------------------------------------------------
+# MEDIUM-n FUSED EIGH MEGAKERNEL (worker brief 3): extend the proven n<=200
+# fused pipeline to medium n (256-448) where the all-FP32-resident SMEM design
+# overflows the 228KB opt-in cap. Two changes break the SMEM cliff:
+#
+#  (1) PACKED FP16 LOWER-TRIANGLE A in SMEM. A is symmetric and stays symmetric
+#      under the Householder rank-2 update, so only the lower triangle needs to
+#      live in SMEM: n*(n+1)/2 halfs instead of n*n. That HALVES the reduction
+#      footprint -> fits n<=448 (n=448 packed = 200KB < 227KB) vs n<=320 for a
+#      full FP16 matrix. The symv reads both triangles via symmetry A[i][j] =
+#      A[j][i]; the rank-2 update writes ONLY the lower triangle (half the work).
+#  (2) EIGENVECTOR MATRIX V IN GLOBAL MEMORY. The n*n FP32 eigenvector matrix
+#      (486KB at n=352) cannot be SMEM-resident at medium n, and (unlike the
+#      n<=200 kernel) cannot alias the packed A region (different size/layout).
+#      Stages 2-4 (Sturm bisection eigenvalues, twisted-factorization
+#      eigenvectors, Householder back-transform) therefore run against a global
+#      V buffer (Vout itself) -- the same way the n<=200 kernel already uses
+#      global DP/DM scratch for the twisted recurrence. B CTAs run concurrently
+#      so the global-V traffic is bandwidth-bound, not latency-bound.
+#
+# Everything else mirrors the n<=200 kernel: 1/max|A| scaling into FP16 range,
+# FP32 math in registers, tridiagonal d/e + reflectors spilled to global, FP32
+# eigenvectors, eigenvalues unscaled at the end. The Python wrapper applies the
+# SAME per-matrix residual+orthogonality gate, so any matrix the FP16 reduction
+# cannot resolve falls back to cuSOLVER -- never an invalid result or a
+# regression below baseline.
+# ---------------------------------------------------------------------------
+_MEGA_MED_CPP = (
+    "void mega_eigh_med(torch::Tensor A, torch::Tensor Vout, torch::Tensor Lout, "
+    "torch::Tensor rscr, torch::Tensor dscr, torch::Tensor escr, "
+    "torch::Tensor dpscr, torch::Tensor dmscr, torch::Tensor tauscr, "
+    "int n, int nt, int bisIters);"
+)
+
+_MEGA_MED_CUDA = r'''
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+// packed lower-triangle index: A[i][j] for j<=i lives at i*(i+1)/2 + j.
+__device__ __forceinline__ int _tri(int i,int j){ return (i*(i+1))>>1; }   // base for row i
+extern "C" __global__ void mega_eigh_med_k(const float* __restrict__ Ain,
+    float* __restrict__ Vout, float* __restrict__ Lout,
+    float* __restrict__ rscr, float* __restrict__ dscr, float* __restrict__ escr,
+    float* __restrict__ dpscr, float* __restrict__ dmscr, float* __restrict__ tauscr,
+    int B, int n, int bisIters){
+  int m=blockIdx.x; if(m>=B) return; int tid=threadIdx.x, nt=blockDim.x;
+  extern __shared__ char shc[];
+  __half* Ah=(__half*)shc;                       // packed lower triangle: n*(n+1)/2 halfs
+  size_t triN=((size_t)n*(n+1))>>1;
+  float* v=(float*)(Ah + triN);                  // align to float after the half region
+  // bump v up to 4-byte alignment
+  size_t voff=((size_t)(Ah+triN) - (size_t)shc); voff=(voff+3u)&~3u; v=(float*)(shc+voff);
+  float* p=v+n;
+  __shared__ float red[1024];
+  float* Rm=rscr+(long)m*n*n; float* Dm=dscr+(long)m*n; float* Em=escr+(long)m*(n-1);
+  float* DP=dpscr+(long)m*n*n; float* DM=dmscr+(long)m*n*n;
+  float* Tau=tauscr+(long)m*n;
+  float* Vg=Vout+(long)m*n*n;                    // V lives in GLOBAL memory
+  const float* Am=Ain+(long)m*n*n;
+  // packed-A accessors (symmetry: upper triangle reads the mirror lower entry)
+  #define AGET(i,j) __half2float( ((j)<=(i)) ? Ah[_tri(i,j)+(j)] : Ah[_tri(j,i)+(i)] )
+  #define ASET(i,j,val) Ah[_tri(i,j)+(j)] = __float2half(val)   // ONLY call with j<=i
+  // scale into FP16 range (read full matrix from global, write packed lower tri)
+  float amax=0.f;
+  for(int idx=tid; idx<n*n; idx+=nt){ float x=fabsf(Am[idx]); amax=fmaxf(amax,x); }
+  red[tid]=amax; __syncthreads();
+  for(int s=nt>>1;s>0;s>>=1){ if(tid<s)red[tid]=fmaxf(red[tid],red[tid+s]); __syncthreads(); }
+  float scale=red[0]; if(scale<1e-30f) scale=1.f; __syncthreads();
+  float invs=1.f/scale;
+  for(long t=tid; t<(long)triN; t+=nt){
+    // recover (i,j) from packed index t: i = floor((sqrt(8t+1)-1)/2)
+    int i=(int)((sqrtf(8.0f*(float)t+1.0f)-1.0f)*0.5f);
+    while((long)((i+1)*(i+2)/2)<=t) ++i;
+    while((long)(i*(i+1)/2)>t) --i;
+    int j=(int)(t-(long)(i*(i+1)/2));
+    Ah[t]=__float2half(Am[(long)i*n+j]*invs);
+  }
+  __syncthreads();
+  // 1) Householder tridiag (packed FP16 storage, FP32 math)
+  for(int c=0;c<n-2;++c){
+    float s2=0.f;
+    for(int i=c+1+tid;i<n;i+=nt){ float x=AGET(i,c); s2+=x*x; }
+    red[tid]=s2; __syncthreads();
+    for(int s=nt>>1;s>0;s>>=1){ if(tid<s)red[tid]+=red[tid+s]; __syncthreads(); }
+    float xnorm2=red[0];
+    float alpha=AGET(c+1,c); float tail2=xnorm2-alpha*alpha;
+    if(tail2<=1e-20f){ if(tid==0){Em[c]=alpha;Tau[c]=0.f;} for(int i=tid;i<n;i+=nt) Rm[i*n+c]=(i==c+1)?1.f:0.f; __syncthreads(); continue; }
+    float xnorm=sqrtf(xnorm2); float beta=(alpha>=0.f)?-xnorm:xnorm; float tau=(beta-alpha)/beta; float denom=alpha-beta;
+    for(int i=tid;i<n;i+=nt) v[i]=0.f; __syncthreads();
+    if(tid==0) v[c+1]=1.f;
+    for(int i=c+2+tid;i<n;i+=nt) v[i]=AGET(i,c)/denom;
+    __syncthreads();
+    for(int i=tid;i<n;i+=nt) Rm[i*n+c]=v[i];
+    // symv p = tau * A[c+1:,c+1:] @ v  (reads both triangles via AGET)
+    for(int i=c+1+tid;i<n;i+=nt){ float acc=0.f; for(int j=c+1;j<n;++j) acc+=AGET(i,j)*v[j]; p[i]=tau*acc; }
+    __syncthreads();
+    float vp=0.f; for(int i=c+1+tid;i<n;i+=nt) vp+=v[i]*p[i];
+    red[tid]=vp; __syncthreads();
+    for(int s=nt>>1;s>0;s>>=1){ if(tid<s)red[tid]+=red[tid+s]; __syncthreads(); }
+    float K=0.5f*tau*red[0];
+    for(int i=c+1+tid;i<n;i+=nt) p[i]=p[i]-K*v[i];
+    __syncthreads();
+    // rank-2 update of LOWER triangle only: A[i][j] -= v[i]p[j]+p[i]v[j] for j<=i
+    for(int i=c+1+tid;i<n;i+=nt){ float vi=v[i],wi=p[i]; for(int j=c+1;j<=i;++j){ float a=AGET(i,j); ASET(i,j,a-vi*p[j]-wi*v[j]); } }
+    if(tid==0){Em[c]=beta;Tau[c]=tau;}
+    __syncthreads();
+  }
+  if(tid==0) Em[n-2]=AGET(n-1,n-2);
+  for(int i=tid;i<n;i+=nt) Dm[i]=AGET(i,i);
+  for(int i=tid;i<n;i+=nt){ Rm[i*n+(n-2)]=0.f; }
+  __syncthreads();
+  // 2) Sturm-bisection eigenvalues
+  float glo=1e30f, ghi=-1e30f;
+  for(int i=tid;i<n;i+=nt){ float r=(i>0?fabsf(Em[i-1]):0.f)+(i<n-1?fabsf(Em[i]):0.f); glo=fminf(glo,Dm[i]-r); ghi=fmaxf(ghi,Dm[i]+r); }
+  red[tid]=glo; __syncthreads(); for(int s=nt>>1;s>0;s>>=1){ if(tid<s)red[tid]=fminf(red[tid],red[tid+s]); __syncthreads(); } glo=red[0]; __syncthreads();
+  red[tid]=ghi; __syncthreads(); for(int s=nt>>1;s>0;s>>=1){ if(tid<s)red[tid]=fmaxf(red[tid],red[tid+s]); __syncthreads(); } ghi=red[0]; __syncthreads();
+  for(int ev=tid; ev<n; ev+=nt){
+    float lo=glo, hi=ghi;
+    for(int it=0;it<bisIters;++it){
+      float mid=0.5f*(lo+hi);
+      float q=Dm[0]-mid; int cnt=(q<0.f);
+      for(int k=1;k<n;++k){ float d2=(fabsf(q)<1e-30f)?1e-30f:q; q=(Dm[k]-mid)-Em[k-1]*Em[k-1]/d2; cnt+=(q<0.f); }
+      if(cnt<=ev) lo=mid; else hi=mid;
+    }
+    Lout[(long)m*n+ev]=0.5f*(lo+hi);
+  }
+  __syncthreads();
+  // zero global V before the twisted recurrence
+  for(int i=tid;i<n*n;i+=nt) Vg[i]=0.f;
+  __syncthreads();
+  // 3) twisted-factorization eigenvectors (FP32) -> global V columns
+  float eps=1e-30f;
+  for(int ev=tid; ev<n; ev+=nt){
+    float lam=Lout[(long)m*n+ev];
+    float dpk=Dm[0]-lam; DP[0*n+ev]=dpk;
+    for(int k=1;k<n;++k){ float prev=(fabsf(dpk)<eps)?eps:dpk; dpk=(Dm[k]-lam)-Em[k-1]*Em[k-1]/prev; DP[k*n+ev]=dpk; }
+    float dmk=Dm[n-1]-lam; DM[(n-1)*n+ev]=dmk;
+    for(int k=n-2;k>=0;--k){ float nx=(fabsf(dmk)<eps)?eps:dmk; dmk=(Dm[k]-lam)-Em[k]*Em[k]/nx; DM[k*n+ev]=dmk; }
+    int r=0; float best=1e38f;
+    for(int k=0;k<n;++k){ float g=fabsf(DP[k*n+ev]+DM[k*n+ev]-(Dm[k]-lam)); if(g<best){best=g; r=k;} }
+    Vg[r*n+ev]=1.f;
+    for(int k=r-1;k>=0;--k){ float dpkk=DP[k*n+ev]; dpkk=(fabsf(dpkk)<eps)?eps:dpkk; Vg[k*n+ev]=-(Em[k]/dpkk)*Vg[(k+1)*n+ev]; }
+    for(int k=r+1;k<n;++k){ float dmkk=DM[k*n+ev]; dmkk=(fabsf(dmkk)<eps)?eps:dmkk; Vg[k*n+ev]=-(Em[k-1]/dmkk)*Vg[(k-1)*n+ev]; }
+    float nrm=0.f; for(int k=0;k<n;++k) nrm+=Vg[k*n+ev]*Vg[k*n+ev]; nrm=sqrtf(nrm)+1e-30f;
+    for(int k=0;k<n;++k) Vg[k*n+ev]/=nrm;
+  }
+  __syncthreads();
+  // 4) back-transform (FP32): Q = (prod_c H_c) V_tri, reflectors reverse, global V
+  for(int c=n-3;c>=0;--c){
+    float tauc=Tau[c];
+    for(int j=tid;j<n;j+=nt){ float w=0.f; for(int i=c+1;i<n;++i) w+=Rm[i*n+c]*Vg[i*n+j]; w*=tauc; for(int i=c+1;i<n;++i) Vg[i*n+j]-=Rm[i*n+c]*w; }
+    __syncthreads();
+  }
+  for(int ev=tid; ev<n; ev+=nt) Lout[(long)m*n+ev]*=scale;
+  #undef AGET
+  #undef ASET
+}
+void mega_eigh_med(torch::Tensor A, torch::Tensor Vout, torch::Tensor Lout,
+    torch::Tensor rscr, torch::Tensor dscr, torch::Tensor escr,
+    torch::Tensor dpscr, torch::Tensor dmscr, torch::Tensor tauscr,
+    int n, int nt, int bisIters){
+  int B=A.size(0);
+  size_t triN=((size_t)n*(n+1))>>1;
+  size_t shm=triN*sizeof(__half); shm=(shm+3u)&~3u; shm+=(size_t)2*n*sizeof(float);
+  cudaFuncSetAttribute(mega_eigh_med_k, cudaFuncAttributeMaxDynamicSharedMemorySize, shm);
+  mega_eigh_med_k<<<B,nt,shm>>>(A.data_ptr<float>(),Vout.data_ptr<float>(),Lout.data_ptr<float>(),
+    rscr.data_ptr<float>(),dscr.data_ptr<float>(),escr.data_ptr<float>(),
+    dpscr.data_ptr<float>(),dmscr.data_ptr<float>(),tauscr.data_ptr<float>(),B,n,bisIters);
+}'''
+
+
 def _mega_get():
     """Lazily compile + cache the megakernel extension. Returns the module, or
     None if compilation failed (so the caller falls back to cuSOLVER)."""
@@ -188,10 +359,10 @@ def _mega_get():
     try:
         from torch.utils.cpp_extension import load_inline
         _mega_mod = load_inline(
-            name="eigh_megakernel_w2",
-            cpp_sources=_MEGA_CPP,
-            cuda_sources=_MEGA_CUDA,
-            functions=["mega_eigh"],
+            name="eigh_megakernel_w2b3",
+            cpp_sources=_MEGA_CPP + "\n" + _MEGA_MED_CPP,
+            cuda_sources=_MEGA_CUDA + "\n" + _MEGA_MED_CUDA,
+            functions=["mega_eigh", "mega_eigh_med"],
             with_cuda=True,
             verbose=False,
             extra_cuda_cflags=["-O3", "--use_fast_math"],
@@ -232,6 +403,57 @@ def _eigh_megakernel(a: torch.Tensor) -> output_t:
     # recon 400*n*eps, orth 100*n*eps) at ~0.6-0.75x, so a matrix that comfortably
     # passes the harness is NOT spuriously fallen back (which would waste the FP16
     # speedup) yet anything actually close to failing -- or non-finite -- is caught.
+    eye = torch.eye(n, device=dev, dtype=torch.float32)
+    eps = torch.finfo(torch.float32).eps
+    orth = torch.linalg.matrix_norm(Q.transpose(-1, -2) @ Q - eye, ord=1, dim=(-2, -1))
+    aq = af @ Q
+    eigr = torch.linalg.matrix_norm(aq - Q * L.unsqueeze(-2), ord=1, dim=(-2, -1))
+    recon = torch.linalg.matrix_norm(
+        (Q * L.unsqueeze(-2)) @ Q.transpose(-1, -2) - af, ord=1, dim=(-2, -1))
+    a_l1 = torch.linalg.matrix_norm(af, ord=1, dim=(-2, -1)).clamp_min(1e-30)
+    bad = ((orth > 75.0 * n * eps)
+           | (eigr / a_l1 > 150.0 * n * eps)
+           | (recon / a_l1 > 300.0 * n * eps))
+    bad = bad | ~torch.isfinite(L).all(dim=-1) | ~torch.isfinite(Q).all(dim=(-2, -1))
+    if bool(bad.any()):
+        idx = torch.nonzero(bad, as_tuple=False).flatten()
+        Lf, Qf = torch.linalg.eigh(af[idx])
+        Q[idx] = Qf
+        L[idx] = Lf
+    return Q.contiguous(), L.contiguous()
+
+
+# largest n routed to the MEDIUM-n megakernel (packed-FP16-lower-triangle A in
+# SMEM + global eigenvector matrix). n=448 packed = 200KB < 227KB cap. Covers
+# the n=352 benchmark shape directly; n=512 (packed 260KB) overflows and needs
+# the tiled variant.
+_MEGA_MED_NMAX = 448
+
+
+def _eigh_megakernel_med(a: torch.Tensor) -> output_t:
+    """Medium-n fused megakernel (packed FP16 lower-triangle A in SMEM, global
+    eigenvector matrix). Same contract + per-matrix residual gate as
+    _eigh_megakernel; falls back to cuSOLVER for any matrix that misses the gate
+    (or wholesale if the extension is unavailable)."""
+    mod = _mega_get()
+    b, n, _ = a.shape
+    if mod is None:
+        values, vectors = torch.linalg.eigh(a)
+        return vectors, values
+    af = a.float().contiguous()
+    dev = af.device
+    V = torch.empty(b, n, n, device=dev, dtype=torch.float32)
+    L = torch.empty(b, n, device=dev, dtype=torch.float32)
+    rscr = torch.empty(b, n, n, device=dev, dtype=torch.float32)
+    dscr = torch.empty(b, n, device=dev, dtype=torch.float32)
+    escr = torch.empty(b, n - 1, device=dev, dtype=torch.float32)
+    dpscr = torch.empty(b, n, n, device=dev, dtype=torch.float32)
+    dmscr = torch.empty(b, n, n, device=dev, dtype=torch.float32)
+    tauscr = torch.empty(b, n, device=dev, dtype=torch.float32)
+    mod.mega_eigh_med(af, V, L, rscr, dscr, escr, dpscr, dmscr, tauscr,
+                      n, _MEGA_NT, _MEGA_BISITERS)
+    L, order = torch.sort(L, dim=-1)
+    Q = torch.gather(V, 2, order.unsqueeze(1).expand(b, n, n))
     eye = torch.eye(n, device=dev, dtype=torch.float32)
     eps = torch.finfo(torch.float32).eps
     orth = torch.linalg.matrix_norm(Q.transpose(-1, -2) @ Q - eye, ord=1, dim=(-2, -1))
@@ -944,6 +1166,14 @@ def custom_kernel(data: input_t) -> output_t:
     # the small-n batched shapes, residual-gated for safety.
     if 32 < n <= _MEGA_NMAX:
         return _eigh_megakernel(a)
+    # MEDIUM-n fused megakernel (brief 3): packed FP16 lower-triangle A in SMEM
+    # + global eigenvector matrix breaks the 228KB SMEM cliff that capped the
+    # all-resident kernel at n<=224. Covers the n=352 benchmark shape directly
+    # (fits n<=448). Residual-gated -> any matrix the FP16 reduction can't
+    # resolve falls back to cuSOLVER, so the path can never regress below
+    # baseline.
+    if _MEGA_NMAX < n <= _MEGA_MED_NMAX:
+        return _eigh_megakernel_med(a)
     # LOW-RANK fast path (worker-0 brief 14): a sharply CONCENTRATED spectrum
     # (lapack_dense_geometric at n=1024) -> randomized dominant-subspace eigh
     # (~1.748x vs cuSOLVER). Gated by the cheap participation_ratio probe
