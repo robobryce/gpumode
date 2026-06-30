@@ -324,41 +324,78 @@ extern "C" __global__ void mega_eigh_med_k(const float* __restrict__ Ain,
     for(int k=0;k<n;++k) Vg[k*n+ev]/=nrm;
   }
   __syncthreads();
-  // 4) back-transform (FP32): Q = (prod_c H_c) V_tri, reflectors applied c=n-3..0.
-  // SMEM-COLUMN-BLOCKED + BARRIER-FREE. The original applied each reflector to
-  // global V with a __syncthreads per reflector (n barriers) and read/wrote all
-  // of V from global per reflector (2*n^3 global traffic) -- this stage was ~78%
-  // of the kernel (ncu). KEY INSIGHT: reflectors applied to a single column are
-  // INDEPENDENT of other columns, so if one thread owns a whole column across
-  // ALL reflectors, no inter-reflector barrier is needed and V can live in fast
-  // SMEM. V (n*n FP32) does not fit SMEM at medium n, so process V in COLUMN
-  // BLOCKS of BV columns held in the (now-free, post-reduction) SMEM A region:
-  // load BV columns once, apply all n-2 reflectors barrier-free (reflectors
-  // read from global Rm per column, broadcast + L2-cached), write back once.
-  // Global V traffic drops from 2*n^3 to ~2*n^2 per block * (n/BV) blocks.
-  float* Vs=(float*)shc;                       // reuse packed-A region as FP32 V-block
-  // BV columns fit in the SMEM allocation (triN halfs + 2n floats). Compute it
-  // from the allocated bytes: shm_floats = triN/2 (halfs->floats) + 2n.
+  // 4) back-transform (FP32): Q = (prod_c H_c) V_tri, reflectors c=n-3..0.
+  // BLOCKED COMPACT-WY via cooperative SMEM GEMMs. The back-transform is ~70% of
+  // the kernel (ncu/stage-split). Applying reflectors in PANELS of NB through the
+  // compact-WY identity Q_blk -= Y (T (Y^T Q_blk)) turns the O(n^3) rank-1 sweep
+  // into matrix products that engage ALL nt threads (a per-column-serial sweep
+  // leaves only BV<<nt threads active) and need only ~n/NB barriers. V is
+  // processed in column blocks (cw cols) held in the now-free post-reduction
+  // SMEM region with the panel Y(n*NB), its Gram->block-T(NB*NB), and the Z
+  // workspace(NB*cw). Panels are applied in REVERSE order (last reflector block
+  // first) -- the verified composition for the forward product H_0...H_{n-3}.
+  const int NB=32;
+  float* Vs=(float*)shc;                       // n*cw  (V column block, Vs[i*cw+j])
   int shm_floats=(int)(((triN*sizeof(__half)+3u)&~3u)/sizeof(float)) + 2*n;
-  int BV=shm_floats / n; if(BV<1) BV=1; if(BV>n) BV=n;
-  for(int j0=0;j0<n;j0+=BV){
-    int bw=min(BV,n-j0);
-    // load block columns [j0,j0+bw) into Vs (column-major within block: Vs[i*bw + (j-j0)])
-    for(int idx=tid; idx<n*bw; idx+=nt){ int i=idx/bw, jj=idx%bw; Vs[i*bw+jj]=Vg[i*n+(j0+jj)]; }
+  // cw*(n+2*NB) + n*NB + NB*NB <= shm_floats   (Vs + Z + Z2 + Y + T)
+  int cwmax=(shm_floats - n*NB - NB*NB)/(n+2*NB); if(cwmax<1) cwmax=1; if(cwmax>n) cwmax=n;
+  float* Yp=Vs + (long)n*cwmax;                // n*NB   (panel reflectors Yp[i*NB+a])
+  float* Tp=Yp + (long)n*NB;                   // NB*NB  (Gram, overwritten by block-T)
+  float* Zp=Tp + NB*NB;                        // NB*cwmax (Z = Y^T Vblk)
+  float* Z2=Zp + (long)NB*cwmax;               // NB*cwmax (Z2 = T @ Z)
+  int nref=n-2;
+  for(int j0=0;j0<n;j0+=cwmax){
+    int cw=min(cwmax,n-j0);
+    for(int idx=tid; idx<n*cw; idx+=nt){ int i=idx/cw, jj=idx%cw; Vs[i*cw+jj]=Vg[i*n+(j0+jj)]; }
     __syncthreads();
-    // each thread owns columns jj = tid, tid+nt, ... within the block; applies
-    // ALL reflectors to its column with NO barriers (its column is private).
-    for(int jj=tid; jj<bw; jj+=nt){
-      for(int c=n-3;c>=0;--c){
-        float tauc=Tau[c]; if(tauc==0.f) continue;
-        float w=0.f; for(int i=c+1;i<n;++i) w+=Rm[i*n+c]*Vs[i*bw+jj];
-        w*=tauc;
-        for(int i=c+1;i<n;++i) Vs[i*bw+jj]-=Rm[i*n+c]*w;
+    for(int c0=((nref-1)/NB)*NB; c0>=0; c0-=NB){
+      int k=nref-c0; if(k>NB) k=NB;
+      // load panel Y (n x k) into Yp (row-major Yp[i*NB+a]); zero unused cols
+      for(int idx=tid; idx<n*NB; idx+=nt){ int i=idx/NB, a=idx%NB; Yp[i*NB+a]=(a<k)?Rm[i*n+(c0+a)]:0.f; }
+      __syncthreads();
+      // Gram G = Y^T Y (k x k) -> Tp
+      for(int idx=tid; idx<k*k; idx+=nt){ int a=idx/k, b=idx%k; float s=0.f; for(int i=0;i<n;++i) s+=Yp[i*NB+a]*Yp[i*NB+b]; Tp[a*NB+b]=s; }
+      __syncthreads();
+      // build upper-triangular block-T over Tp with ONE warp (serial in column a):
+      // T[a][a]=tau_{c0+a}; T[b][a]=-tau_a * sum_{e<a} T[b][e]*G[e][a]  (b<a)
+      if(tid<32){
+        int lane=tid;
+        // zero strict-lower triangle of T FIRST: the recursion reads T[lane][e]
+        // (e<a) which must be 0 for lane>e (T is upper-triangular). Tp still holds
+        // the symmetric Gram here, so its strict-lower is nonzero -> must clear.
+        for(int a=0;a<k;++a) for(int b=a+1+lane;b<k;b+=32) Tp[b*NB+a]=0.f;
+        __syncwarp();
+        for(int a=0;a<k;++a){
+          float ta=Tau[c0+a];
+          float ga=Tp[lane*NB+a];               // lane e holds (upper-tri) G[e][a] for e<=a
+          __syncwarp();
+          // T[lane][a] = -ta * sum_{e<a} T[lane][e] * G[e][a]  (meaningful for lane<a)
+          float val=0.f;
+          for(int e=0;e<a;++e){ float ge=__shfl_sync(0xffffffff,ga,e);   // ALL lanes call shfl (uniform)
+            if(lane<a) val+=Tp[lane*NB+e]*ge; }
+          val=-ta*val;
+          __syncwarp();
+          if(lane<a) Tp[lane*NB+a]=val;
+          if(lane==a) Tp[a*NB+a]=ta;
+          __syncwarp();
+        }
       }
+      __syncthreads();
+      // Z = Y^T @ Vblk  (k x cw)
+      for(int idx=tid; idx<k*cw; idx+=nt){ int a=idx/cw, jj=idx%cw; float s=0.f; for(int i=0;i<n;++i) s+=Yp[i*NB+a]*Vs[i*cw+jj]; Zp[a*cw+jj]=s; }
+      __syncthreads();
+      // Z2 = T @ Z  (k x cw); T upper-triangular so e>=a. Computed ONCE (not per
+      // output row i) -- folding it into the final GEMM redoes it n times.
+      for(int idx=tid; idx<k*cw; idx+=nt){ int a=idx/cw, jj=idx%cw; float s=0.f; for(int e=a;e<k;++e) s+=Tp[a*NB+e]*Zp[e*cw+jj]; Z2[a*cw+jj]=s; }
+      __syncthreads();
+      // Vblk -= Y @ Z2  (n x cw), k mults per output
+      for(int idx=tid; idx<n*cw; idx+=nt){ int i=idx/cw, jj=idx%cw;
+        float upd=0.f; for(int a=0;a<k;++a) upd+=Yp[i*NB+a]*Z2[a*cw+jj];
+        Vs[i*cw+jj]-=upd;
+      }
+      __syncthreads();
     }
-    __syncthreads();
-    // write block back to global V
-    for(int idx=tid; idx<n*bw; idx+=nt){ int i=idx/bw, jj=idx%bw; Vg[i*n+(j0+jj)]=Vs[i*bw+jj]; }
+    for(int idx=tid; idx<n*cw; idx+=nt){ int i=idx/cw, jj=idx%cw; Vg[i*n+(j0+jj)]=Vs[i*cw+jj]; }
     __syncthreads();
   }
   for(int ev=tid; ev<n; ev+=nt) Lout[(long)m*n+ev]*=scale;
