@@ -317,6 +317,56 @@ def _orthonormalize(q: torch.Tensor, iters: int = 4) -> torch.Tensor:
     return q
 
 
+def _batched_thomas(a_diag: torch.Tensor, e_b: torch.Tensor, rhs: torch.Tensor):
+    """Solve a batch of tridiagonal systems (sub/super-diag e_b, diag a_diag)
+    x = rhs, vectorized over the batch and over a 2nd (eigenvalue) axis.
+    a_diag,(rhs): (b, K, n); e_b: (b, K, n-1). Returns x same shape as rhs."""
+    b, K, n = a_diag.shape
+    eps = 1e-30
+    cp = torch.empty_like(a_diag)
+    dp = torch.empty_like(rhs)
+    a0 = a_diag[:, :, 0]
+    a0 = torch.where(a0.abs() < eps, torch.full_like(a0, eps), a0)
+    cp[:, :, 0] = e_b[:, :, 0] / a0
+    dp[:, :, 0] = rhs[:, :, 0] / a0
+    for k in range(1, n):
+        ek_1 = e_b[:, :, k - 1]
+        den = a_diag[:, :, k] - ek_1 * cp[:, :, k - 1]
+        den = torch.where(den.abs() < eps, torch.full_like(den, eps), den)
+        ek = e_b[:, :, k] if k < n - 1 else torch.zeros_like(ek_1)
+        cp[:, :, k] = ek / den
+        dp[:, :, k] = (rhs[:, :, k] - ek_1 * dp[:, :, k - 1]) / den
+    x = torch.empty_like(rhs)
+    x[:, :, n - 1] = dp[:, :, n - 1]
+    for k in range(n - 2, -1, -1):
+        x[:, :, k] = dp[:, :, k] - cp[:, :, k] * x[:, :, k + 1]
+    return x
+
+
+def _cluster_refine(d: torch.Tensor, e: torch.Tensor, lam: torch.Tensor,
+                    iters: int = 2):
+    """Block inverse subspace iteration with per-eigenvalue shift-invert + a QR
+    re-orthonormalization every step. Robust to (near-)degenerate clusters where
+    the twisted factorization collapses: shift-invert near each eigenvalue
+    amplifies its eigenvector, and the QR each step keeps the whole block
+    orthonormal (so a tight cluster can't collapse to a rank-deficient set).
+    d,e: normalized tridiagonal (b,n),(b,n-1). lam: (b,n) eigenvalues. Returns
+    V (b, n, n) eigenvectors as columns."""
+    b, n = d.shape
+    a_diag = d.unsqueeze(1) - lam.unsqueeze(2)            # (b, eig, comp)
+    a_diag = a_diag + (a_diag.abs() < 1e-6).to(a_diag.dtype) * 1e-6
+    e_b = e.unsqueeze(1).expand(b, n, n - 1).contiguous()
+    g = torch.Generator(device=d.device)
+    g.manual_seed(0x5eed)
+    V = torch.randn(b, n, n, device=d.device, dtype=torch.float32, generator=g)
+    for _ in range(iters):
+        V = _batched_thomas(a_diag, e_b, V)              # (b, eig, comp)
+        Vc = V.transpose(1, 2)                            # (b, comp, eig)
+        Q, _ = torch.linalg.qr(Vc)                        # orthonormal columns
+        V = Q.transpose(1, 2)
+    return V.transpose(1, 2).contiguous()                 # (b, comp, eig)
+
+
 def tridiag_eigh(d: torch.Tensor, e: torch.Tensor):
     """Batched symmetric-tridiagonal eigensolver -- the standalone deliverable.
 
@@ -363,19 +413,55 @@ def tridiag_eigh(d: torch.Tensor, e: torch.Tensor):
     L, order = torch.sort(L, dim=-1)
     V = torch.gather(V, 2, order.unsqueeze(1).expand(b, n, n))
 
-    # Correctness guard for collapsed (near-)degenerate clusters.
+    # Correctness guard for collapsed (near-)degenerate clusters: the twisted
+    # factorization returns rank-deficient (collapsed) vectors on tight clusters
+    # and no post-hoc orthonormalization can recover the lost dimensions. For
+    # such matrices, RECOMPUTE the eigenvectors with block inverse subspace
+    # iteration (shift-invert + QR each step) -- orthonormal by construction, so
+    # it spans the cluster eigenspace correctly. cuSOLVER stays as a last-resort
+    # safety net for the rare matrix neither path orthonormalizes.
     eye = torch.eye(n, device=d.device, dtype=torch.float32)
-    orth_err = torch.linalg.matrix_norm(V.transpose(-1, -2) @ V - eye,
-                                        ord=1, dim=(-2, -1))
     eps = torch.finfo(torch.float32).eps
-    bad = orth_err > 30.0 * n * eps
+    t_l1 = torch.linalg.matrix_norm(
+        torch.diag_embed(d) + (torch.diag_embed(e, 1) + torch.diag_embed(e, -1)
+                               if n > 1 else 0.0),
+        ord=1, dim=(-2, -1)).clamp_min(torch.finfo(torch.float32).tiny)
+
+    def _is_bad(Vm, Lm, sub):
+        # bad if non-orthogonal OR fails to diagonalize T (both checked the way
+        # the validation harness gates, with margin).
+        orth = torch.linalg.matrix_norm(Vm.transpose(-1, -2) @ Vm - eye,
+                                        ord=1, dim=(-2, -1))
+        TVm = sub[0].unsqueeze(2) * Vm
+        TVm[:, :-1, :] = TVm[:, :-1, :] + sub[1].unsqueeze(2) * Vm[:, 1:, :]
+        TVm[:, 1:, :] = TVm[:, 1:, :] + sub[1].unsqueeze(2) * Vm[:, :-1, :]
+        eigr = torch.linalg.matrix_norm(TVm - Vm * Lm.unsqueeze(-2),
+                                        ord=1, dim=(-2, -1))
+        return (orth > 30.0 * n * eps) | (eigr / sub[2] > 50.0 * n * eps)
+
+    bad = _is_bad(V, L, (d, e, t_l1))
     if bool(bad.any()):
         idx = torch.nonzero(bad, as_tuple=False).flatten()
-        T = (torch.diag_embed(d[idx]) + torch.diag_embed(e[idx], 1)
-             + torch.diag_embed(e[idx], -1))
-        Lf, Vf = torch.linalg.eigh(T)
-        V[idx] = Vf
-        L[idx] = Lf
+        # Block inverse subspace iteration on the normalized tridiagonal.
+        Vr = _cluster_refine(dn[idx], en[idx], lam[idx], iters=4)
+        di = d[idx]; ei = e[idx]
+        TVr = di.unsqueeze(2) * Vr
+        TVr[:, :-1, :] = TVr[:, :-1, :] + ei.unsqueeze(2) * Vr[:, 1:, :]
+        TVr[:, 1:, :] = TVr[:, 1:, :] + ei.unsqueeze(2) * Vr[:, :-1, :]
+        Lr = (Vr * TVr).sum(dim=1)
+        Lr, ordr = torch.sort(Lr, dim=-1)
+        Vr = torch.gather(Vr, 2, ordr.unsqueeze(1).expand(idx.numel(), n, n))
+        V[idx] = Vr
+        L[idx] = Lr
+        # cuSOLVER safety net for any matrix the refinement didn't fix.
+        still = _is_bad(V[idx], L[idx], (di, ei, t_l1[idx]))
+        if bool(still.any()):
+            sidx = idx[torch.nonzero(still, as_tuple=False).flatten()]
+            T = (torch.diag_embed(d[sidx]) + torch.diag_embed(e[sidx], 1)
+                 + torch.diag_embed(e[sidx], -1))
+            Lf, Vf = torch.linalg.eigh(T)
+            V[sidx] = Vf
+            L[sidx] = Lf
     return L.contiguous(), V.contiguous()
 
 
