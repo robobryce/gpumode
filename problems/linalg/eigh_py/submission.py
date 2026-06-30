@@ -317,6 +317,56 @@ def _orthonormalize(q: torch.Tensor, iters: int = 4) -> torch.Tensor:
     return q
 
 
+def tridiag_eigh(d: torch.Tensor, e: torch.Tensor):
+    """Batched symmetric-tridiagonal eigensolver -- the standalone deliverable.
+
+    Inputs:
+      d : (b, n)   main diagonal of each batched tridiagonal T
+      e : (b, n-1) sub/super-diagonal of each T
+    Returns:
+      L : (b, n)   eigenvalues, ascending
+      V : (b, n, n) orthonormal eigenvectors, column i <-> L[:, i]
+                    (T @ V = V @ diag(L))
+
+    Eigenvalues come from batched Sturm-sequence bisection (Triton, FP32);
+    eigenvectors from MRRR twisted factorization (Triton). Both run one CTA per
+    matrix -- no per-matrix cuSOLVER syevd in the hot loop. V is polished with a
+    GEMM-only Newton-Schulz orthonormalization. The rare matrices whose
+    (near-)degenerate clusters the twisted factorization cannot separate (their
+    V columns collapse) are detected by their orthogonality residual and
+    recomputed via a single batched cuSOLVER eigh on the reconstructed dense
+    tridiagonal -- self-contained, no dependency on the original dense A."""
+    b, n = d.shape
+    lam = _tridiag_eigvals(d, e, iters=50)
+    V = _tridiag_eigvecs(d, e, lam)              # V[:, row, i] = eigvec i
+
+    # FP32 orthonormalization of the eigenvector matrix.
+    V = _orthonormalize(V, iters=4)
+    # Rayleigh quotient eigenvalues against T (self-contained): L = diag(V^T T V)
+    # computed via the tridiagonal action TV without forming dense T.
+    TV = d.unsqueeze(2) * V
+    TV[:, :-1, :] = TV[:, :-1, :] + e.unsqueeze(2) * V[:, 1:, :]
+    TV[:, 1:, :] = TV[:, 1:, :] + e.unsqueeze(2) * V[:, :-1, :]
+    L = (V * TV).sum(dim=1)
+    L, order = torch.sort(L, dim=-1)
+    V = torch.gather(V, 2, order.unsqueeze(1).expand(b, n, n))
+
+    # Correctness guard for collapsed (near-)degenerate clusters.
+    eye = torch.eye(n, device=d.device, dtype=torch.float32)
+    orth_err = torch.linalg.matrix_norm(V.transpose(-1, -2) @ V - eye,
+                                        ord=1, dim=(-2, -1))
+    eps = torch.finfo(torch.float32).eps
+    bad = orth_err > 30.0 * n * eps
+    if bool(bad.any()):
+        idx = torch.nonzero(bad, as_tuple=False).flatten()
+        T = (torch.diag_embed(d[idx]) + torch.diag_embed(e[idx], 1)
+             + torch.diag_embed(e[idx], -1))
+        Lf, Vf = torch.linalg.eigh(T)
+        V[idx] = Vf
+        L[idx] = Lf
+    return L.contiguous(), V.contiguous()
+
+
 def _eigh_large(a: torch.Tensor) -> output_t:
     b, n, _ = a.shape
     af = a.float()
@@ -324,34 +374,28 @@ def _eigh_large(a: torch.Tensor) -> output_t:
         torch.finfo(torch.float32).tiny)
     an = af / scale
 
-    # Stage 1: tridiagonalize on TF32 tensor cores.
+    # Stage 1: tridiagonalize on TF32 tensor cores.  A = Q1 T Q1^T.
     with _tf32(True):
         d, e, q1 = _householder_tridiag(an, _PANEL)
 
-    # Stage 2: batched tridiagonal eigensolver.
-    lam = _tridiag_eigvals(d, e, iters=50)
-    v_tri = _tridiag_eigvecs(d, e, lam)
+    # Stage 2: batched tridiagonal eigensolver (the standalone deliverable).
+    _, v_tri = tridiag_eigh(d, e)
 
     # Back-transform Q = Q1 @ V_tri (TF32).
     with _tf32(True):
         Q = q1 @ v_tri
 
-    # FP32 robust orthonormalization + Rayleigh-quotient eigenvalues.
+    # FP32 orthonormalize + Rayleigh-quotient eigenvalues on the ORIGINAL A.
     Q = _orthonormalize(Q, iters=4)
     AQ = af @ Q
     L = (Q * AQ).sum(dim=1)
     L, order = torch.sort(L, dim=-1)
     Q = torch.gather(Q, 2, order.unsqueeze(1).expand(b, n, n))
 
-    # Correctness guard: inverse iteration collapses on (near-)degenerate
-    # eigenvalue clusters, leaving those matrices non-orthogonal AND/OR not
-    # diagonalizing A. Detect such matrices and recompute only those with the
-    # stock solver. The fast batched path covers the well-separated majority.
-    # Use the same L1 matrix norm the checker gates on, with margin.
+    # Correctness guard against the original A for any residual collapse.
     eye = torch.eye(n, device=af.device, dtype=torch.float32)
-    qtq = Q.transpose(-1, -2) @ Q - eye
-    orth_err = torch.linalg.matrix_norm(qtq, ord=1, dim=(-2, -1))      # (b,)
-    # eigen-equation residual relative to ||A||_1, per matrix.
+    orth_err = torch.linalg.matrix_norm(Q.transpose(-1, -2) @ Q - eye,
+                                        ord=1, dim=(-2, -1))
     aq = af @ Q
     ql = Q * L.unsqueeze(-2)
     eig_err = torch.linalg.matrix_norm(aq - ql, ord=1, dim=(-2, -1))
