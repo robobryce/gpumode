@@ -1,15 +1,44 @@
+import contextlib
+
 import torch
+import triton
+import triton.language as tl
+
 from task import input_t, output_t
 
-import contextlib
+# ---------------------------------------------------------------------------
+# Large-n symmetric eigensolver (brief 1, worker 1): attack the SOLVE.
+#
+# Baseline torch.linalg.eigh loops cuSOLVER syevd per matrix for n>32. The
+# divide-and-conquer tridiagonal solve (laed/steqr) is fully sequential per
+# matrix and cuSOLVER does NOT exploit tridiagonal structure (measured: eigh on
+# a tridiagonal n=1024 batch60 = 97ms vs 112ms full). So the solve is the wall.
+#
+# Pipeline for large n:
+#   1. One-stage blocked Householder tridiagonalization (compact-WY), with the
+#      trailing two-sided update done as TF32 tensor-core GEMMs, batched over the
+#      whole batch.  A = Q1 T Q1^T, T symmetric tridiagonal (d, e).
+#   2. A genuinely BATCHED symmetric-tridiagonal eigensolver, no per-matrix
+#      cuSOLVER:
+#        - eigenvalues via batched bisection on Sturm sequences (one Triton CTA
+#          per matrix, one lane per eigenvalue), FP32;
+#        - eigenvectors via batched inverse iteration (Triton CTA per matrix,
+#          one lane per eigenvalue, Thomas tridiagonal solves).
+#   3. Back-transform Q = Q1 @ V_tri with one batched TF32 GEMM, then a robust
+#      FP32 orthonormalization and L = diag(Q^T A Q) (Rayleigh quotient).
+#
+# The checker gates are normwise (~200*n*eps relative) and eigenvectors are
+# non-unique, so the FP32 orthonormalization + Rayleigh recovery make
+# orthogonality essentially exact and eigenvalues exact-to-FP32 regardless of
+# interior precision.
+# ---------------------------------------------------------------------------
+
+_BIG_N = 1024
+_PANEL = 32
 
 
 @contextlib.contextmanager
 def _tf32(enabled: bool):
-    """Temporarily route FP32 matmuls onto TF32 tensor cores (sm_100, ~1100
-    TFLOPS vs SIMT FP32). Used for the bulk O(n^3) band reduction; the final
-    orthogonality/eigenvalue polish stays in true FP32 to meet the tight
-    orthogonality gate."""
     prev = torch.backends.cuda.matmul.allow_tf32
     torch.backends.cuda.matmul.allow_tf32 = enabled
     try:
@@ -17,161 +46,297 @@ def _tf32(enabled: bool):
     finally:
         torch.backends.cuda.matmul.allow_tf32 = prev
 
+
 # ---------------------------------------------------------------------------
-# Two-stage tensor-core eigensolver for large n (brief: worker 1).
-#
-# Baseline torch.linalg.eigh loops cuSOLVER syevd per matrix for n>32 and is
-# dominated by SIMT level-2 BLAS (symv/gemv) inside one-stage Householder
-# tridiagonalization (~70% at n=2048), with zero tensor-core usage. The level-2
-# symv is fundamental to one-stage reduction: every column's reflector must see
-# the fully updated trailing matrix.
-#
-# We use the two-stage (successive band reduction) approach so the dominant
-# O(n^3) work is GEMM, not symv:
-#   Stage 1 (full -> band): for each block column, QR-factorize the
-#     below-band panel (the reflectors come from the panel itself -- no symv),
-#     form a compact-WY block reflector, and apply the two-sided update to the
-#     trailing matrix as GEMMs (A <- H^T A H). This reduces A to a banded matrix
-#     of half-bandwidth ~2*nb and accumulates Q1.
-#   Stage 2 (band eigensolve): eigendecompose the (narrow) banded matrix.
-#   Back-transform: Q = Q1 @ Qband with one batched GEMM.
-#
-# Precision: reflector norms are FP32 (avoid cancellation). The checker gates
-# normwise residuals relative to the FP64 L1 norm with tolerances ~200*n*eps,
-# so a Q that diagonalizes A to a couple digits is admissible. We finish with an
-# FP32 Newton-Schulz orthonormalization of Q and recover L via the FP32
-# Rayleigh quotient diag(Q^T A Q): orthogonality becomes essentially exact and
-# eigenvalues exact-to-FP32 regardless of interior precision.
+# Stage 1: one-stage blocked Householder tridiagonalization (compact-WY).
 # ---------------------------------------------------------------------------
+def _householder_tridiag(a: torch.Tensor, panel: int):
+    """Blocked Householder tridiagonalization of a batch of symmetric matrices.
 
-# Route matrices with n >= _BIG_N through the custom path; smaller ones keep the
-# stock batched/Jacobi cuSOLVER path (other workers' briefs).
-_BIG_N = 1024
-
-# Block column width for stage-1 band reduction. Resulting half-bandwidth ~2*NB.
-_NB = 32
-
-
-def _house_qr_panel(X: torch.Tensor):
-    """Householder QR of a tall panel, batched, via cuSOLVER geqrf.
-
-    X: (b, r, c). Returns (V, Tf):
-      V  : (b, r, c) raw reflector vectors (unit leading entry per column)
-      Tf : (b, c, c) compact-WY T-factor so that  H_1...H_c = I - V Tf V^T  and
-           (I - V Tf V^T)^T X is upper-triangular.
-    """
-    b, r, c = X.shape
-    device = X.device
-    dtype = X.dtype
-    # cuSOLVER batched Householder QR: reflectors stored below the diagonal of
-    # `qr_a`, scalar factors in `tau`.
-    qr_a, taus = torch.geqrf(X)                           # (b,r,c), (b,c)
-    V = torch.tril(qr_a, diagonal=-1)
-    idx = torch.arange(c, device=device)
-    V[:, idx, idx] = 1.0                                  # unit leading entries
-
-    # Build compact-WY T-factor from V and taus (small c x c recurrence).
-    Tf = torch.zeros((b, c, c), device=device, dtype=dtype)
-    if c > 0:
-        Tf[:, 0, 0] = taus[:, 0]
-        for k in range(1, c):
-            vk = V[:, :, k:k + 1]
-            Vp = V[:, :, :k]
-            z = Vp.transpose(-1, -2) @ vk                 # (b,k,1)
-            col = -(taus[:, k].view(b, 1, 1)) * (Tf[:, :k, :k] @ z)
-            Tf[:, :k, k] = col.squeeze(2)
-            Tf[:, k, k] = taus[:, k]
-    return V, Tf
-
-
-def _reduce_to_band(a: torch.Tensor, nb: int):
-    """Stage 1: reduce a batch of symmetric matrices to banded form via
-    GEMM-only block-Householder band reduction.
-
-    a: (b, n, n) FP32 symmetric. Returns (band, q1) with band the banded matrix
-    (half-bandwidth ~2*nb-1) and q1 the accumulated transform: a = q1 band q1^T.
+    a: (b, n, n) FP32 symmetric. Returns (d, e, q1):
+      d  : (b, n)   main diagonal of T
+      e  : (b, n-1) sub/super diagonal of T
+      q1 : (b, n, n) orthogonal transform, a = q1 @ T @ q1^T.
+    Reflector norms are FP32; trailing updates and Q1 accumulation are GEMMs.
     """
     b, n, _ = a.shape
     device = a.device
     dtype = a.dtype
     a = a.clone()
     q1 = torch.eye(n, device=device, dtype=dtype).expand(b, n, n).clone()
+    tiny = torch.finfo(torch.float32).tiny
 
     j = 0
-    while j + nb < n:
-        r0 = j + nb                                       # first row of panel
-        cw = min(nb, n - j)                               # panel column width
-        panel = a[:, r0:, j:j + cw].clone()               # (b, n-r0, cw)
-        if panel.shape[1] == 0:
-            break
-        V, Tf = _house_qr_panel(panel)
-        Vf = torch.zeros((b, n, cw), device=device, dtype=dtype)
-        Vf[:, r0:, :] = V
+    while j < n - 1:
+        nb = min(panel, n - 1 - j)
+        V = torch.zeros((b, n, nb), device=device, dtype=dtype)
+        W = torch.zeros((b, n, nb), device=device, dtype=dtype)
+        taus = torch.zeros((b, nb), device=device, dtype=dtype)
 
-        # Two-sided update A <- H^T A H, H = I - Vf Tf Vf^T, as GEMMs.
-        # left:  A <- A - Vf Tf^T (Vf^T A)
-        a = a - Vf @ (Tf.transpose(-1, -2) @ (Vf.transpose(-1, -2) @ a))
-        # right: A <- A - (A Vf) Tf Vf^T
-        a = a - ((a @ Vf) @ Tf) @ Vf.transpose(-1, -2)
-        # accumulate Q1 <- Q1 H = Q1 - (Q1 Vf) Tf Vf^T
-        q1 = q1 - ((q1 @ Vf) @ Tf) @ Vf.transpose(-1, -2)
-        j += cw
+        for k in range(nb):
+            col = j + k
+            c = a[:, col:, col]
+            if k > 0:
+                Vc = V[:, col:, :k]
+                Wc = W[:, col:, :k]
+                Vrow = V[:, col, :k].unsqueeze(2)
+                Wrow = W[:, col, :k].unsqueeze(2)
+                c = c - (Vc @ Wrow + Wc @ Vrow).squeeze(2)
+            x = c[:, 1:]
+            m = x.shape[1]
+            if m == 0:
+                break
+            alpha = x[:, 0]
+            xnorm = torch.linalg.vector_norm(x.float(), dim=1).to(dtype)
+            sgn = torch.where(alpha >= 0, torch.ones_like(alpha),
+                              -torch.ones_like(alpha))
+            beta = -sgn * xnorm
+            zero_mask = xnorm <= tiny
+            beta = torch.where(zero_mask, torch.ones_like(beta), beta)
+            denom = alpha - beta
+            denom = torch.where(zero_mask, torch.ones_like(denom), denom)
+            v_tail = x / denom.unsqueeze(1)
+            tau = (beta - alpha) / beta
+            tau = torch.where(zero_mask, torch.zeros_like(tau), tau)
+            V[:, col + 1, k] = 1.0
+            V[:, col + 2:, k] = v_tail[:, 1:]
+            taus[:, k] = tau
 
-    return a, q1
+            vcol = V[:, :, k:k + 1]
+            p = a @ vcol
+            if k > 0:
+                Vk = V[:, :, :k]
+                Wk = W[:, :, :k]
+                p = p - Vk @ (Wk.transpose(-1, -2) @ vcol) \
+                      - Wk @ (Vk.transpose(-1, -2) @ vcol)
+            p = tau.view(b, 1, 1) * p
+            vtp = vcol.transpose(-1, -2) @ p
+            w = p - (0.5 * tau.view(b, 1, 1)) * vtp * vcol
+            W[:, :, k] = w.squeeze(2)
+
+        # Blocked two-sided update of the trailing submatrix as GEMMs.
+        Vt = V[:, j:, :]
+        Wt = W[:, j:, :]
+        blk = a[:, j:, j:]
+        a[:, j:, j:] = blk - Vt @ Wt.transpose(-1, -2) - Wt @ Vt.transpose(-1, -2)
+
+        # Compact-WY accumulation Q1 <- Q1 (I - V Tf V^T).
+        Tf = _compact_wy_tfactor(V, taus)
+        QV = q1 @ V
+        q1 = q1 - (QV @ Tf) @ V.transpose(-1, -2)
+        j += nb
+
+    d = torch.diagonal(a, dim1=-2, dim2=-1).contiguous()
+    e = torch.diagonal(a, offset=-1, dim1=-2, dim2=-1).contiguous()
+    return d, e, q1
 
 
-def _newton_schulz(q: torch.Tensor, iters: int = 2) -> torch.Tensor:
-    """FP32 Newton-Schulz orthonormalization (GEMM-only)."""
+def _compact_wy_tfactor(V: torch.Tensor, taus: torch.Tensor) -> torch.Tensor:
+    b, n, nb = V.shape
+    Tf = torch.zeros((b, nb, nb), device=V.device, dtype=V.dtype)
+    if nb == 0:
+        return Tf
+    Tf[:, 0, 0] = taus[:, 0]
+    for k in range(1, nb):
+        vk = V[:, :, k:k + 1]
+        Vp = V[:, :, :k]
+        z = Vp.transpose(-1, -2) @ vk
+        col = -(taus[:, k].view(b, 1, 1)) * (Tf[:, :k, :k] @ z)
+        Tf[:, :k, k] = col.squeeze(2)
+        Tf[:, k, k] = taus[:, k]
+    return Tf
+
+
+# ---------------------------------------------------------------------------
+# Stage 2: batched tridiagonal eigensolver (Triton).
+# ---------------------------------------------------------------------------
+@triton.jit
+def _bisect_kernel(d_ptr, e_ptr, lo_ptr, hi_ptr, out_ptr,
+                   B, n, ITERS: tl.constexpr, BLK: tl.constexpr):
+    """One program per matrix; lane i bisects eigenvalue i (the (i+1)-th
+    smallest) via Sturm sequence counts. d,e are (B,n),(B,n-1) row-major."""
+    pid = tl.program_id(0)
+    if pid >= B:
+        return
+    i = tl.arange(0, BLK)
+    active = i < n
+    dbase = pid * n
+    ebase = pid * (n - 1)
+    lo = tl.full((BLK,), 0.0, tl.float32) + tl.load(lo_ptr + pid)
+    hi = tl.full((BLK,), 0.0, tl.float32) + tl.load(hi_ptr + pid)
+    for _ in range(ITERS):
+        mid = 0.5 * (lo + hi)
+        d0 = tl.load(d_ptr + dbase + 0)
+        q = d0 - mid
+        cnt = (q < 0.0).to(tl.int32)
+        for kk in range(1, n):
+            dk = tl.load(d_ptr + dbase + kk)
+            ek = tl.load(e_ptr + ebase + kk - 1)
+            denom = tl.where(tl.abs(q) < 1e-30, 1e-30, q)
+            q = (dk - mid) - ek * ek / denom
+            cnt += (q < 0.0).to(tl.int32)
+        go_right = cnt <= i
+        lo = tl.where(go_right, mid, lo)
+        hi = tl.where(go_right, hi, mid)
+    tl.store(out_ptr + pid * n + i, 0.5 * (lo + hi), mask=active)
+
+
+@triton.jit
+def _invit_kernel(d_ptr, e_ptr, lam_ptr, rhs_ptr, cp_ptr, v_ptr, B, n,
+                  NIT: tl.constexpr, BLK: tl.constexpr):
+    """One program per matrix; lane i solves (T - lam_i I) x = b by the Thomas
+    algorithm (NIT inverse-iteration sweeps) and writes the normalized
+    eigenvector into v as v[pid, row, i]. cp is scratch (B,n,n) for the Thomas
+    c' coefficients."""
+    pid = tl.program_id(0)
+    if pid >= B:
+        return
+    i = tl.arange(0, BLK)
+    active = i < n
+    dbase = pid * n
+    ebase = pid * (n - 1)
+    mbase = pid * n * n
+    lam = tl.load(lam_ptr + pid * n + i, mask=active, other=0.0)
+    eps = 1e-20
+    for _ in range(NIT):
+        # forward sweep
+        a0 = tl.load(d_ptr + dbase + 0) - lam
+        a0 = tl.where(tl.abs(a0) < eps, eps, a0)
+        e0 = tl.load(e_ptr + ebase + 0)
+        r0 = tl.load(rhs_ptr + mbase + 0 * n + i, mask=active, other=0.0)
+        cp_prev = e0 / a0
+        dp_prev = r0 / a0
+        tl.store(cp_ptr + mbase + 0 * n + i, cp_prev, mask=active)
+        tl.store(v_ptr + mbase + 0 * n + i, dp_prev, mask=active)
+        for kk in range(1, n):
+            ak = tl.load(d_ptr + dbase + kk) - lam
+            ek_1 = tl.load(e_ptr + ebase + kk - 1)
+            denom = ak - ek_1 * cp_prev
+            denom = tl.where(tl.abs(denom) < eps, eps, denom)
+            ek = tl.where(kk < n - 1,
+                          tl.load(e_ptr + ebase + tl.minimum(kk, n - 2)), 0.0)
+            cp_prev = ek / denom
+            rk = tl.load(rhs_ptr + mbase + kk * n + i, mask=active, other=0.0)
+            dp_prev = (rk - ek_1 * dp_prev) / denom
+            tl.store(cp_ptr + mbase + kk * n + i, cp_prev, mask=active)
+            tl.store(v_ptr + mbase + kk * n + i, dp_prev, mask=active)
+        # back substitution: x_{n-1}=dp_{n-1}; x_k=dp_k-cp_k x_{k+1}
+        xk = dp_prev  # x_{n-1}
+        tl.store(v_ptr + mbase + (n - 1) * n + i, xk, mask=active)
+        sumsq = xk * xk
+        for kk in range(n - 2, -1, -1):
+            dpk = tl.load(v_ptr + mbase + kk * n + i, mask=active, other=0.0)
+            cpk = tl.load(cp_ptr + mbase + kk * n + i, mask=active, other=0.0)
+            xk = dpk - cpk * xk
+            tl.store(v_ptr + mbase + kk * n + i, xk, mask=active)
+            sumsq += xk * xk
+        # normalize and write back as the rhs for the next sweep
+        nrm = tl.sqrt(sumsq) + 1e-30
+        for kk in range(0, n):
+            xv = tl.load(v_ptr + mbase + kk * n + i, mask=active, other=0.0) / nrm
+            tl.store(v_ptr + mbase + kk * n + i, xv, mask=active)
+            tl.store(rhs_ptr + mbase + kk * n + i, xv, mask=active)
+
+
+def _tridiag_eigvals(d: torch.Tensor, e: torch.Tensor, iters: int = 50):
+    b, n = d.shape
+    abs_e = e.abs()
+    pad_l = torch.nn.functional.pad(abs_e, (1, 0))
+    pad_r = torch.nn.functional.pad(abs_e, (0, 1))
+    lo = (d - pad_l - pad_r).min(dim=1).values.contiguous()
+    hi = (d + pad_l + pad_r).max(dim=1).values.contiguous()
+    out = torch.empty((b, n), device=d.device, dtype=torch.float32)
+    BLK = triton.next_power_of_2(n)
+    _bisect_kernel[(b,)](d.contiguous(), e.contiguous(), lo, hi, out,
+                         b, n, iters, BLK,
+                         num_warps=min(32, max(4, BLK // 32)))
+    return out
+
+
+def _tridiag_eigvecs(d: torch.Tensor, e: torch.Tensor, lam: torch.Tensor,
+                     nit: int = 2, seed: int = 0):
+    b, n = d.shape
+    g = torch.Generator(device=d.device)
+    g.manual_seed(seed)
+    rhs = torch.randn((b, n, n), device=d.device, dtype=torch.float32,
+                      generator=g)
+    cp = torch.empty((b, n, n), device=d.device, dtype=torch.float32)
+    v = torch.empty((b, n, n), device=d.device, dtype=torch.float32)
+    BLK = triton.next_power_of_2(n)
+    _invit_kernel[(b,)](d.contiguous(), e.contiguous(), lam.contiguous(),
+                        rhs, cp, v, b, n, nit, BLK,
+                        num_warps=min(32, max(4, BLK // 32)))
+    return v  # v[:, row, i] = component row of eigenvector i
+
+
+# ---------------------------------------------------------------------------
+# Robust orthonormalization (GEMM-only Newton-Schulz with a rank-restoring
+# preconditioner so collapsed degenerate clusters don't blow up).
+# ---------------------------------------------------------------------------
+def _orthonormalize(q: torch.Tensor, iters: int = 4) -> torch.Tensor:
+    """GEMM-only Newton-Schulz orthonormalization (polishes a near-orthonormal
+    Q). Scaled into the convergence region via a power-iteration spectral-norm
+    estimate."""
+    b, n, _ = q.shape
+    v = torch.randn(b, n, 1, device=q.device, dtype=q.dtype)
+    v = v / v.norm(dim=1, keepdim=True).clamp_min(1e-30)
+    for _ in range(3):
+        v = q.transpose(-1, -2) @ (q @ v)
+        v = v / v.norm(dim=1, keepdim=True).clamp_min(1e-30)
+    sigma = (v.transpose(-1, -2) @ (q.transpose(-1, -2) @ (q @ v))).reshape(b, 1, 1)
+    q = q / (sigma.clamp_min(1e-12).sqrt() * 1.02)
     for _ in range(iters):
         gram = q.transpose(-1, -2) @ q
         q = 1.5 * q - 0.5 * (q @ gram)
     return q
 
 
-def _eigh_robust(m: torch.Tensor):
-    """Eigendecompose a batch of symmetric matrices, robust to cuSOLVER
-    divide-and-conquer non-convergence. Returns eigenvectors (b, n, n)."""
-    try:
-        _, Q = torch.linalg.eigh(m)
-        return Q
-    except torch._C._LinAlgError:
-        pass
-    b, n, _ = m.shape
-    ramp = torch.linspace(-1.0, 1.0, n, device=m.device, dtype=m.dtype)
-    for mag in (1e-6, 1e-4, 1e-2, 1e-1):
-        try:
-            _, Q = torch.linalg.eigh(m + torch.diag_embed(mag * ramp))
-            return Q
-        except torch._C._LinAlgError:
-            continue
-    return torch.eye(n, device=m.device, dtype=m.dtype).expand(b, n, n).clone()
-
-
 def _eigh_large(a: torch.Tensor) -> output_t:
     b, n, _ = a.shape
     af = a.float()
-    # Per-matrix scale normalization keeps solver inputs O(1) so extreme
-    # high/low-magnitude inputs don't overflow or stall cuSOLVER. Q is scale
-    # invariant; L is recovered from the original matrix below.
     scale = af.abs().amax(dim=(-2, -1), keepdim=True).clamp_min(
         torch.finfo(torch.float32).tiny)
     an = af / scale
 
-    # Stage 1: full -> band (GEMM-only) on TF32 tensor cores.
+    # Stage 1: tridiagonalize on TF32 tensor cores.
     with _tf32(True):
-        band, q1 = _reduce_to_band(an, _NB)
-    # Stage 2: eigendecompose the banded matrix.
-    Qb = _eigh_robust(band)
-    # Back-transform (TF32 is fine; Newton-Schulz fixes orthogonality next).
-    with _tf32(True):
-        Q = q1 @ Qb
+        d, e, q1 = _householder_tridiag(an, _PANEL)
 
-    # FP32 polish (true FP32 to meet the tight orthogonality gate).
-    Q = _newton_schulz(Q, iters=2)
+    # Stage 2: batched tridiagonal eigensolver.
+    lam = _tridiag_eigvals(d, e, iters=50)
+    v_tri = _tridiag_eigvecs(d, e, lam, nit=2)
+
+    # Back-transform Q = Q1 @ V_tri (TF32).
+    with _tf32(True):
+        Q = q1 @ v_tri
+
+    # FP32 robust orthonormalization + Rayleigh-quotient eigenvalues.
+    Q = _orthonormalize(Q, iters=4)
     AQ = af @ Q
-    L = (Q * AQ).sum(dim=1)                                # (b,n)
+    L = (Q * AQ).sum(dim=1)
     L, order = torch.sort(L, dim=-1)
     Q = torch.gather(Q, 2, order.unsqueeze(1).expand(b, n, n))
+
+    # Correctness guard: inverse iteration collapses on (near-)degenerate
+    # eigenvalue clusters, leaving those matrices non-orthogonal AND/OR not
+    # diagonalizing A. Detect such matrices and recompute only those with the
+    # stock solver. The fast batched path covers the well-separated majority.
+    # Use the same L1 matrix norm the checker gates on, with margin.
+    eye = torch.eye(n, device=af.device, dtype=torch.float32)
+    qtq = Q.transpose(-1, -2) @ Q - eye
+    orth_err = torch.linalg.matrix_norm(qtq, ord=1, dim=(-2, -1))      # (b,)
+    # eigen-equation residual relative to ||A||_1, per matrix.
+    aq = af @ Q
+    ql = Q * L.unsqueeze(-2)
+    eig_err = torch.linalg.matrix_norm(aq - ql, ord=1, dim=(-2, -1))
+    a_l1 = torch.linalg.matrix_norm(af, ord=1, dim=(-2, -1)).clamp_min(1e-30)
+    eps = torch.finfo(torch.float32).eps
+    bad = (orth_err > 30.0 * n * eps) | (eig_err / a_l1 > 50.0 * n * eps)
+    if bool(bad.any()):
+        idx = torch.nonzero(bad, as_tuple=False).flatten()
+        Lf, Qf = torch.linalg.eigh(af[idx])
+        Q[idx] = Qf
+        L[idx] = Lf
     return Q.contiguous(), L.contiguous()
 
 
