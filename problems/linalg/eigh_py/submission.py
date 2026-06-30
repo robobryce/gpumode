@@ -182,63 +182,6 @@ def _bisect_kernel(d_ptr, e_ptr, lo_ptr, hi_ptr, out_ptr,
 
 
 @triton.jit
-def _invit_kernel(d_ptr, e_ptr, lam_ptr, rhs_ptr, cp_ptr, v_ptr, B, n,
-                  NIT: tl.constexpr, BLK: tl.constexpr):
-    """One program per matrix; lane i solves (T - lam_i I) x = b by the Thomas
-    algorithm (NIT inverse-iteration sweeps) and writes the normalized
-    eigenvector into v as v[pid, row, i]. cp is scratch (B,n,n) for the Thomas
-    c' coefficients."""
-    pid = tl.program_id(0)
-    if pid >= B:
-        return
-    i = tl.arange(0, BLK)
-    active = i < n
-    dbase = pid * n
-    ebase = pid * (n - 1)
-    mbase = pid * n * n
-    lam = tl.load(lam_ptr + pid * n + i, mask=active, other=0.0)
-    eps = 1e-20
-    for _ in range(NIT):
-        # forward sweep
-        a0 = tl.load(d_ptr + dbase + 0) - lam
-        a0 = tl.where(tl.abs(a0) < eps, eps, a0)
-        e0 = tl.load(e_ptr + ebase + 0)
-        r0 = tl.load(rhs_ptr + mbase + 0 * n + i, mask=active, other=0.0)
-        cp_prev = e0 / a0
-        dp_prev = r0 / a0
-        tl.store(cp_ptr + mbase + 0 * n + i, cp_prev, mask=active)
-        tl.store(v_ptr + mbase + 0 * n + i, dp_prev, mask=active)
-        for kk in range(1, n):
-            ak = tl.load(d_ptr + dbase + kk) - lam
-            ek_1 = tl.load(e_ptr + ebase + kk - 1)
-            denom = ak - ek_1 * cp_prev
-            denom = tl.where(tl.abs(denom) < eps, eps, denom)
-            ek = tl.where(kk < n - 1,
-                          tl.load(e_ptr + ebase + tl.minimum(kk, n - 2)), 0.0)
-            cp_prev = ek / denom
-            rk = tl.load(rhs_ptr + mbase + kk * n + i, mask=active, other=0.0)
-            dp_prev = (rk - ek_1 * dp_prev) / denom
-            tl.store(cp_ptr + mbase + kk * n + i, cp_prev, mask=active)
-            tl.store(v_ptr + mbase + kk * n + i, dp_prev, mask=active)
-        # back substitution: x_{n-1}=dp_{n-1}; x_k=dp_k-cp_k x_{k+1}
-        xk = dp_prev  # x_{n-1}
-        tl.store(v_ptr + mbase + (n - 1) * n + i, xk, mask=active)
-        sumsq = xk * xk
-        for kk in range(n - 2, -1, -1):
-            dpk = tl.load(v_ptr + mbase + kk * n + i, mask=active, other=0.0)
-            cpk = tl.load(cp_ptr + mbase + kk * n + i, mask=active, other=0.0)
-            xk = dpk - cpk * xk
-            tl.store(v_ptr + mbase + kk * n + i, xk, mask=active)
-            sumsq += xk * xk
-        # normalize and write back as the rhs for the next sweep
-        nrm = tl.sqrt(sumsq) + 1e-30
-        for kk in range(0, n):
-            xv = tl.load(v_ptr + mbase + kk * n + i, mask=active, other=0.0) / nrm
-            tl.store(v_ptr + mbase + kk * n + i, xv, mask=active)
-            tl.store(rhs_ptr + mbase + kk * n + i, xv, mask=active)
-
-
-@triton.jit
 def _twisted_kernel(d_ptr, e_ptr, lam_ptr, dp_ptr, dm_ptr, v_ptr, B, n,
                     BLK: tl.constexpr):
     """One program per matrix; lane i computes the eigenvector for lam_i via the
