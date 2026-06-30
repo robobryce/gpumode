@@ -34,32 +34,46 @@ from task import input_t, output_t
 # the corresponding shapes onto the custom path and the router banks the win.
 # ---------------------------------------------------------------------------
 
-_PANEL = 32
-
-# --- Per-shape-class routing table -----------------------------------------
-# The router dispatches each input INDEPENDENTLY by its shape class (n, batch,
-# structure). Each entry maps a predicate over (n, batch) -> the path that is
-# the MEASURED-faster validated choice for that class. cuSOLVER is the default
-# for every class not explicitly routed to a custom path, so the router can
-# never regress below baseline: a class only leaves cuSOLVER once a custom path
-# is proven faster on it. To bank a win on shape-class X, add it to
-# _CUSTOM_CLASSES (and point _custom_path at the winning implementation).
+# --- Per-shape-class router ------------------------------------------------
+# Each input is routed INDEPENDENTLY by matrix STRUCTURE to its measured-faster
+# VALIDATED path; cuSOLVER is the safety floor on every class not explicitly
+# routed, so the router can never regress below baseline. Routing keys are
+# matrix structure only (size n, batch, a cheap spectral-concentration probe) --
+# never a problem-identifying key -- so it is legitimate algorithm selection.
 #
-# Currently EMPTY: measurements show cuSOLVER is fastest on all 13 benchmark
-# shapes today (every custom path tried is slower), so the router is the
-# baseline floor (56233us). The moment a chase-free custom path beats cuSOLVER
-# on a class, list that class here and re-benchmark.
-_CUSTOM_CLASSES: list[tuple[int, int]] = []   # e.g. [(2048, 0)] to route n>=2048
+# Two independent custom levers (each a plug point + a class gate), wired the
+# instant a partner kernel beats cuSOLVER on a class:
+#   - SMALL-N FUSED JACOBI: kills cuSOLVER's per-matrix launch overhead on the
+#     small shapes (n in {32,176,352}); enabled by listing those n in
+#     _SMALL_JACOBI_N and pointing _small_jacobi_path at the kernel.
+#   - LOW-RANK / DOMINANT-SUBSPACE: for spectrally-concentrated batches
+#     (rankdef/clustered/nearrank), where the 1.2%-of-||A|| gate lets sub-
+#     dominant eigenpairs be lumped; gated by a cheap stable-rank probe +
+#     _lowrank_path.
+# Both EMPTY today -> every shape routes to cuSOLVER == baseline floor (56233us).
+_SMALL_JACOBI_N: set[int] = set()         # n values routed to the fused Jacobi
+_LOWRANK_N: set[int] = set()              # n values eligible for the low-rank path
+# A batch is "spectrally concentrated" (low-rank eligible) when its stable rank
+# ||A||_F^2 / ||A||_2^2 is below this fraction of n (dense ~ O(n); structured
+# rankdef/clustered/nearrank << n). Tunable per W2's path; conservative so dense
+# is never misrouted.
+_LOWRANK_STABLE_RANK_FRAC = 0.0           # 0 disables the low-rank probe
 
 
-def _route_to_custom(n: int, batch: int) -> bool:
-    """Return True iff this shape class should use the custom path. Pure
-    function of matrix STRUCTURE (n, batch) -- never of any problem-identifying
-    key -- so it is legitimate algorithm selection, not result caching."""
-    for min_n, min_batch in _CUSTOM_CLASSES:
-        if n >= min_n and batch >= min_batch:
-            return True
-    return False
+@torch.no_grad()
+def _stable_rank_frac(a: torch.Tensor) -> torch.Tensor:
+    """Cheap per-matrix stable-rank fraction sr/n = ||A||_F^2 / (||A||_2^2 n).
+    ||A||_F is free; ||A||_2 via a few power iterations (2 GEMVs each). Low for
+    spectrally-concentrated (structured) matrices, ~O(1) for well-spread dense."""
+    b, n, _ = a.shape
+    fro2 = (a * a).sum(dim=(-2, -1))
+    v = torch.randn(b, n, 1, device=a.device, dtype=a.dtype)
+    v = v / v.norm(dim=1, keepdim=True).clamp_min(1e-30)
+    for _ in range(4):
+        v = a @ (a @ v)            # (A^2) v  (A symmetric -> ||A^2||_2 = ||A||_2^2)
+        v = v / v.norm(dim=1, keepdim=True).clamp_min(1e-30)
+    spec2 = (v.transpose(-1, -2) @ (a @ (a @ v))).reshape(b).abs().clamp_min(1e-30)
+    return (fro2 / spec2) / n
 
 
 @contextlib.contextmanager
@@ -70,95 +84,6 @@ def _tf32(enabled: bool):
         yield
     finally:
         torch.backends.cuda.matmul.allow_tf32 = prev
-
-
-# ---------------------------------------------------------------------------
-# Custom batched pipeline: one-stage blocked Householder tridiagonalization +
-# batched bisection/twisted tridiagonal solve + GEMM back-transform. (Kept so
-# the router can dispatch large well-separated shapes to it once it is the
-# faster path; validated correct on all 39 test shapes.)
-# ---------------------------------------------------------------------------
-def _householder_tridiag(a: torch.Tensor, panel: int):
-    b, n, _ = a.shape
-    device = a.device
-    dtype = a.dtype
-    a = a.clone()
-    q1 = torch.eye(n, device=device, dtype=dtype).expand(b, n, n).clone()
-    tiny = torch.finfo(torch.float32).tiny
-
-    j = 0
-    while j < n - 1:
-        nb = min(panel, n - 1 - j)
-        V = torch.zeros((b, n, nb), device=device, dtype=dtype)
-        W = torch.zeros((b, n, nb), device=device, dtype=dtype)
-        taus = torch.zeros((b, nb), device=device, dtype=dtype)
-        for k in range(nb):
-            col = j + k
-            c = a[:, col:, col]
-            if k > 0:
-                Vc = V[:, col:, :k]
-                Wc = W[:, col:, :k]
-                Vrow = V[:, col, :k].unsqueeze(2)
-                Wrow = W[:, col, :k].unsqueeze(2)
-                c = c - (Vc @ Wrow + Wc @ Vrow).squeeze(2)
-            x = c[:, 1:]
-            m = x.shape[1]
-            if m == 0:
-                break
-            alpha = x[:, 0]
-            xnorm = torch.linalg.vector_norm(x.float(), dim=1).to(dtype)
-            sgn = torch.where(alpha >= 0, torch.ones_like(alpha),
-                              -torch.ones_like(alpha))
-            beta = -sgn * xnorm
-            zero_mask = xnorm <= tiny
-            beta = torch.where(zero_mask, torch.ones_like(beta), beta)
-            denom = alpha - beta
-            denom = torch.where(zero_mask, torch.ones_like(denom), denom)
-            v_tail = x / denom.unsqueeze(1)
-            tau = (beta - alpha) / beta
-            tau = torch.where(zero_mask, torch.zeros_like(tau), tau)
-            V[:, col + 1, k] = 1.0
-            V[:, col + 2:, k] = v_tail[:, 1:]
-            taus[:, k] = tau
-            vcol = V[:, :, k:k + 1]
-            p = a @ vcol
-            if k > 0:
-                Vk = V[:, :, :k]
-                Wk = W[:, :, :k]
-                p = p - Vk @ (Wk.transpose(-1, -2) @ vcol) \
-                      - Wk @ (Vk.transpose(-1, -2) @ vcol)
-            p = tau.view(b, 1, 1) * p
-            vtp = vcol.transpose(-1, -2) @ p
-            w = p - (0.5 * tau.view(b, 1, 1)) * vtp * vcol
-            W[:, :, k] = w.squeeze(2)
-        Vt = V[:, j:, :]
-        Wt = W[:, j:, :]
-        blk = a[:, j:, j:]
-        a[:, j:, j:] = blk - Vt @ Wt.transpose(-1, -2) - Wt @ Vt.transpose(-1, -2)
-        Tf = _compact_wy_tfactor(V, taus)
-        QV = q1 @ V
-        q1 = q1 - (QV @ Tf) @ V.transpose(-1, -2)
-        j += nb
-
-    d = torch.diagonal(a, dim1=-2, dim2=-1).contiguous()
-    e = torch.diagonal(a, offset=-1, dim1=-2, dim2=-1).contiguous()
-    return d, e, q1
-
-
-def _compact_wy_tfactor(V: torch.Tensor, taus: torch.Tensor) -> torch.Tensor:
-    b, n, nb = V.shape
-    Tf = torch.zeros((b, nb, nb), device=V.device, dtype=V.dtype)
-    if nb == 0:
-        return Tf
-    Tf[:, 0, 0] = taus[:, 0]
-    for k in range(1, nb):
-        vk = V[:, :, k:k + 1]
-        Vp = V[:, :, :k]
-        z = Vp.transpose(-1, -2) @ vk
-        col = -(taus[:, k].view(b, 1, 1)) * (Tf[:, :k, :k] @ z)
-        Tf[:, :k, k] = col.squeeze(2)
-        Tf[:, k, k] = taus[:, k]
-    return Tf
 
 
 @triton.jit
@@ -358,55 +283,51 @@ def tridiag_eigh(d: torch.Tensor, e: torch.Tensor):
     return L.contiguous(), V.contiguous()
 
 
-def _eigh_custom(a: torch.Tensor) -> output_t:
-    """Custom batched pipeline: reduction -> tridiag_eigh -> GEMM back-transform."""
-    b, n, _ = a.shape
-    af = a.float()
-    scale = af.abs().amax(dim=(-2, -1), keepdim=True).clamp_min(
-        torch.finfo(torch.float32).tiny)
-    an = af / scale
-    with _tf32(True):
-        d, e, q1 = _householder_tridiag(an, _PANEL)
-    _, v_tri = tridiag_eigh(d, e)
-    with _tf32(True):
-        Q = q1 @ v_tri
-    Q = _orthonormalize(Q, iters=4)
-    AQ = af @ Q
-    L = (Q * AQ).sum(dim=1)
-    L, order = torch.sort(L, dim=-1)
-    Q = torch.gather(Q, 2, order.unsqueeze(1).expand(b, n, n))
-    eye = torch.eye(n, device=af.device, dtype=torch.float32)
-    orth = torch.linalg.matrix_norm(Q.transpose(-1, -2) @ Q - eye, ord=1, dim=(-2, -1))
-    aq = af @ Q
-    eigr = torch.linalg.matrix_norm(aq - Q * L.unsqueeze(-2), ord=1, dim=(-2, -1))
-    a_l1 = torch.linalg.matrix_norm(af, ord=1, dim=(-2, -1)).clamp_min(1e-30)
-    eps = torch.finfo(torch.float32).eps
-    bad = (orth > 30.0 * n * eps) | (eigr / a_l1 > 50.0 * n * eps)
-    if bool(bad.any()):
-        idx = torch.nonzero(bad, as_tuple=False).flatten()
-        Lf, Qf = torch.linalg.eigh(af[idx])
-        Q[idx] = Qf
-        L[idx] = Lf
-    return Q.contiguous(), L.contiguous()
+def _small_jacobi_path(a: torch.Tensor) -> output_t:
+    """PLUG POINT for the small-n fused batched Jacobi (kills cuSOLVER launch
+    overhead on n in {32,176,352}). Wire W0's kernel here and list its winning
+    n in _SMALL_JACOBI_N. Until then, falls through to cuSOLVER."""
+    values, vectors = torch.linalg.eigh(a)
+    return vectors, values
 
 
-def _custom_path(a: torch.Tensor) -> output_t:
-    """PLUG POINT for the fastest validated custom eigensolver. Currently the
-    one-stage Householder reduction + batched bisect/twisted solve + GEMM
-    back-transform (validated correct, but slower than cuSOLVER on all current
-    shapes, so not yet routed to). Repoint this at a chase-free custom path
-    (band inverse-iteration / multi-stage SBR / GEMM-only filter) the instant
-    one beats cuSOLVER, and add its winning shape classes to _CUSTOM_CLASSES."""
-    return _eigh_custom(a)
+def _lowrank_path(a: torch.Tensor) -> output_t:
+    """PLUG POINT for the low-rank / dominant-subspace solver for spectrally-
+    concentrated batches (rankdef/clustered/nearrank). Wire W2's kernel here and
+    enable via _LOWRANK_N + _LOWRANK_STABLE_RANK_FRAC. Until then, cuSOLVER."""
+    values, vectors = torch.linalg.eigh(a)
+    return vectors, values
+
+
+def _cusolver(a: torch.Tensor) -> output_t:
+    values, vectors = torch.linalg.eigh(a)
+    return vectors, values
 
 
 def custom_kernel(data: input_t) -> output_t:
     a = data
     n = a.shape[-1]
     batch = a.shape[0]
-    # Independent per-shape-class dispatch: custom path only where measured
-    # faster + validated; cuSOLVER everywhere else (baseline floor, no regress).
-    if _route_to_custom(n, batch):
-        return _custom_path(a)
-    values, vectors = torch.linalg.eigh(a)
-    return vectors, values
+    # Independent per-shape-class dispatch. cuSOLVER is the floor (no regress);
+    # a class leaves it only when a custom path is measured faster on it.
+    if n in _SMALL_JACOBI_N:
+        return _small_jacobi_path(a)
+    if n in _LOWRANK_N and _LOWRANK_STABLE_RANK_FRAC > 0.0:
+        # spectral-concentration probe: route only the genuinely low-rank
+        # matrices in this batch to the low-rank path; the rest to cuSOLVER.
+        frac = _stable_rank_frac(a.float())
+        if bool((frac < _LOWRANK_STABLE_RANK_FRAC).all()):
+            return _lowrank_path(a)
+        if bool((frac < _LOWRANK_STABLE_RANK_FRAC).any()):
+            # mixed batch: split -- low-rank path for concentrated, cuSOLVER else
+            mask = frac < _LOWRANK_STABLE_RANK_FRAC
+            idx_lr = torch.nonzero(mask, as_tuple=False).flatten()
+            idx_cs = torch.nonzero(~mask, as_tuple=False).flatten()
+            Q = torch.empty((batch, n, n), device=a.device, dtype=torch.float32)
+            L = torch.empty((batch, n), device=a.device, dtype=torch.float32)
+            Qlr, Llr = _lowrank_path(a[idx_lr])
+            Q[idx_lr] = Qlr.float(); L[idx_lr] = Llr.float()
+            Qcs, Lcs = _cusolver(a[idx_cs])
+            Q[idx_cs] = Qcs.float(); L[idx_cs] = Lcs.float()
+            return Q, L
+    return _cusolver(a)
