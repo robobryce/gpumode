@@ -28,7 +28,11 @@ from task import input_t, output_t
 # can never produce an invalid result or regress below baseline.
 # ---------------------------------------------------------------------------
 
-_MEGA_NMAX = 176          # largest n routed to the megakernel (SMEM-fit + win)
+_MEGA_NMAX = 200          # largest n routed to the megakernel. n=200 FP32 V =
+                          # 160KB < 227KB SMEM cap, and the only benchmark shape in
+                          # (32,200] is n=176; the wider bound (covering reseeds to
+                          # nearby n) is safe because the residual gate falls any
+                          # matrix the FP16 reduction can't resolve back to cuSOLVER.
 _MEGA_NT = 256            # threads per CTA
 _MEGA_BISITERS = 45       # Sturm-bisection iterations (FP32 converged)
 _mega_mod = None          # lazily-compiled extension module (None until built)
@@ -37,63 +41,83 @@ _mega_failed = False      # set if compilation failed -> never retry, use cuSOLV
 _MEGA_CPP = (
     "void mega_eigh(torch::Tensor A, torch::Tensor Vout, torch::Tensor Lout, "
     "torch::Tensor rscr, torch::Tensor dscr, torch::Tensor escr, "
-    "torch::Tensor dpscr, torch::Tensor dmscr, int n, int nt, int bisIters);"
+    "torch::Tensor dpscr, torch::Tensor dmscr, torch::Tensor tauscr, "
+    "int n, int nt, int bisIters);"
 )
 
+# Mixed-precision megakernel. The Householder REDUCTION (stage 1) -- the dominant
+# cost (~65%) and the most SMEM-bandwidth-bound stage -- runs with the matrix held
+# as FP16 in shared memory (compute stays in FP32 registers): half the SMEM bytes
+# moved per symv / rank-2 update gives a measured ~1.5x on the reduction (1864 ->
+# 1208us at n=176). The matrix is scaled by 1/max|A| before the FP16 cast so
+# high-magnitude inputs do not overflow FP16's ~65504 range (eigenvalues are scaled
+# back by max|A| at the end; eigenvectors are scale-invariant). Stages 2-4 (Sturm
+# bisection, twisted-factorization eigenvectors, Householder back-transform) run in
+# FP32 -- FP16 eigenvector storage was measured to break the orthogonality gate.
+# The FP16 A buffer and the FP32 eigenvector buffer SHARE one (n*n)*4-byte SMEM
+# region (reduction finishes, its tridiagonal d/e/reflectors are already spilled to
+# global, then the region is reinterpreted as the FP32 eigenvector matrix), so the
+# SMEM footprint is unchanged from the all-FP32 kernel: (n*n + 2n)*4 bytes.
 _MEGA_CUDA = r'''
 #include <torch/extension.h>
 #include <cuda_runtime.h>
-// One CTA per matrix. SMEM holds A (n*n) reused as the eigenvector matrix V,
-// plus reflector workspace v (n) and p (n). Reflector vectors are spilled to
-// global rscr; the forward/backward twisted pivots use global dpscr/dmscr.
+#include <cuda_fp16.h>
 extern "C" __global__ void mega_eigh_k(const float* __restrict__ Ain,
     float* __restrict__ Vout, float* __restrict__ Lout,
     float* __restrict__ rscr, float* __restrict__ dscr, float* __restrict__ escr,
-    float* __restrict__ dpscr, float* __restrict__ dmscr,
+    float* __restrict__ dpscr, float* __restrict__ dmscr, float* __restrict__ tauscr,
     int B, int n, int bisIters){
   int m=blockIdx.x; if(m>=B) return; int tid=threadIdx.x, nt=blockDim.x;
-  extern __shared__ float sh[];
-  float* A=sh; float* v=A+n*n; float* p=v+n;
+  extern __shared__ char shc[];
+  __half* Ah=(__half*)shc;          // stage 1: n*n halfs (first 2*n*n bytes)
+  float*  Vf=(float*)shc;           // stages 2-4: n*n floats (same region)
+  float* v=(float*)(shc + (size_t)n*n*sizeof(float)); float* p=v+n;  // never aliases Vf
   __shared__ float red[1024];
   float* Rm=rscr+(long)m*n*n; float* Dm=dscr+(long)m*n; float* Em=escr+(long)m*(n-1);
-  float* DP=dpscr+(long)m*n*n; float* DM=dmscr+(long)m*n*n;  // [k*n+ev]
+  float* DP=dpscr+(long)m*n*n; float* DM=dmscr+(long)m*n*n;
+  float* Tau=tauscr+(long)m*n;
   const float* Am=Ain+(long)m*n*n;
-  for(int i=tid;i<n*n;i+=nt) A[i]=Am[i];
+  // scale into FP16 range
+  float amax=0.f;
+  for(int i=tid;i<n*n;i+=nt){ float x=fabsf(Am[i]); amax=fmaxf(amax,x); }
+  red[tid]=amax; __syncthreads();
+  for(int s=nt>>1;s>0;s>>=1){ if(tid<s)red[tid]=fmaxf(red[tid],red[tid+s]); __syncthreads(); }
+  float scale=red[0]; if(scale<1e-30f) scale=1.f; __syncthreads();
+  float invs=1.f/scale;
+  for(int i=tid;i<n*n;i+=nt) Ah[i]=__float2half(Am[i]*invs);
   __syncthreads();
-  // 1) Householder tridiag; spill reflector vectors v_c to Rm[:,c]
+  // 1) Householder tridiag (FP16 storage, FP32 math); spill reflectors v_c -> Rm[:,c], tau_c -> Tau
   for(int c=0;c<n-2;++c){
     float s2=0.f;
-    for(int i=c+1+tid;i<n;i+=nt){ float x=A[i*n+c]; s2+=x*x; }
+    for(int i=c+1+tid;i<n;i+=nt){ float x=__half2float(Ah[i*n+c]); s2+=x*x; }
     red[tid]=s2; __syncthreads();
     for(int s=nt>>1;s>0;s>>=1){ if(tid<s)red[tid]+=red[tid+s]; __syncthreads(); }
-    float xnorm2=red[0]; __syncthreads();
-    float alpha=A[(c+1)*n+c]; float tail2=xnorm2-alpha*alpha;
-    if(tail2<=1e-30f){ if(tid==0)Em[c]=alpha; for(int i=tid;i<n;i+=nt) Rm[i*n+c]=(i==c+1)?1.f:0.f; __syncthreads(); continue; }
+    float xnorm2=red[0];
+    float alpha=__half2float(Ah[(c+1)*n+c]); float tail2=xnorm2-alpha*alpha;
+    if(tail2<=1e-20f){ if(tid==0){Em[c]=alpha;Tau[c]=0.f;} for(int i=tid;i<n;i+=nt) Rm[i*n+c]=(i==c+1)?1.f:0.f; __syncthreads(); continue; }
     float xnorm=sqrtf(xnorm2); float beta=(alpha>=0.f)?-xnorm:xnorm; float tau=(beta-alpha)/beta; float denom=alpha-beta;
     for(int i=tid;i<n;i+=nt) v[i]=0.f; __syncthreads();
     if(tid==0) v[c+1]=1.f;
-    for(int i=c+2+tid;i<n;i+=nt) v[i]=A[i*n+c]/denom;
+    for(int i=c+2+tid;i<n;i+=nt) v[i]=__half2float(Ah[i*n+c])/denom;
     __syncthreads();
     for(int i=tid;i<n;i+=nt) Rm[i*n+c]=v[i];
-    __syncthreads();
-    for(int i=c+1+tid;i<n;i+=nt){ float acc=0.f; for(int j=c+1;j<n;++j) acc+=A[i*n+j]*v[j]; p[i]=tau*acc; }
+    for(int i=c+1+tid;i<n;i+=nt){ float acc=0.f; for(int j=c+1;j<n;++j) acc+=__half2float(Ah[i*n+j])*v[j]; p[i]=tau*acc; }
     __syncthreads();
     float vp=0.f; for(int i=c+1+tid;i<n;i+=nt) vp+=v[i]*p[i];
     red[tid]=vp; __syncthreads();
     for(int s=nt>>1;s>0;s>>=1){ if(tid<s)red[tid]+=red[tid+s]; __syncthreads(); }
-    float K=0.5f*tau*red[0]; __syncthreads();
+    float K=0.5f*tau*red[0];
     for(int i=c+1+tid;i<n;i+=nt) p[i]=p[i]-K*v[i];
     __syncthreads();
-    for(int i=c+1+tid;i<n;i+=nt){ float vi=v[i],wi=p[i]; for(int j=c+1;j<n;++j) A[i*n+j]-=vi*p[j]+wi*v[j]; }
-    __syncthreads();
-    if(tid==0) Em[c]=beta;
+    for(int i=c+1+tid;i<n;i+=nt){ float vi=v[i],wi=p[i]; for(int j=c+1;j<n;++j){ float a=__half2float(Ah[i*n+j]); Ah[i*n+j]=__float2half(a-vi*p[j]-wi*v[j]); } }
+    if(tid==0){Em[c]=beta;Tau[c]=tau;}
     __syncthreads();
   }
-  if(tid==0) Em[n-2]=A[(n-1)*n+(n-2)];
-  for(int i=tid;i<n;i+=nt) Dm[i]=A[i*n+i];
+  if(tid==0) Em[n-2]=__half2float(Ah[(n-1)*n+(n-2)]);
+  for(int i=tid;i<n;i+=nt) Dm[i]=__half2float(Ah[i*n+i]);
   for(int i=tid;i<n;i+=nt){ Rm[i*n+(n-2)]=0.f; }
   __syncthreads();
-  // 2) Sturm-bisection eigenvalues
+  // 2) Sturm-bisection eigenvalues (of the scaled tridiagonal; unscaled at the end)
   float glo=1e30f, ghi=-1e30f;
   for(int i=tid;i<n;i+=nt){ float r=(i>0?fabsf(Em[i-1]):0.f)+(i<n-1?fabsf(Em[i]):0.f); glo=fminf(glo,Dm[i]-r); ghi=fmaxf(ghi,Dm[i]+r); }
   red[tid]=glo; __syncthreads(); for(int s=nt>>1;s>0;s>>=1){ if(tid<s)red[tid]=fminf(red[tid],red[tid+s]); __syncthreads(); } glo=red[0]; __syncthreads();
@@ -109,8 +133,12 @@ extern "C" __global__ void mega_eigh_k(const float* __restrict__ Ain,
     Lout[(long)m*n+ev]=0.5f*(lo+hi);
   }
   __syncthreads();
-  // 3) twisted-factorization eigenvectors: forward dp, backward dm,
-  //    twist r=argmin|dp+dm-(d-lam)|, build z into A[:,ev]
+  // reinterpret the SMEM region as the FP32 eigenvector matrix (reduction is done;
+  // d/e/reflectors/tau are saved in global). Zero it before the twisted recurrence.
+  for(int i=tid;i<n*n;i+=nt) Vf[i]=0.f;
+  __syncthreads();
+  // 3) twisted-factorization eigenvectors (FP32): forward dp, backward dm,
+  //    twist r=argmin|dp+dm-(d-lam)|, build z into Vf[:,ev]
   float eps=1e-30f;
   for(int ev=tid; ev<n; ev+=nt){
     float lam=Lout[(long)m*n+ev];
@@ -120,30 +148,32 @@ extern "C" __global__ void mega_eigh_k(const float* __restrict__ Ain,
     for(int k=n-2;k>=0;--k){ float nx=(fabsf(dmk)<eps)?eps:dmk; dmk=(Dm[k]-lam)-Em[k]*Em[k]/nx; DM[k*n+ev]=dmk; }
     int r=0; float best=1e38f;
     for(int k=0;k<n;++k){ float g=fabsf(DP[k*n+ev]+DM[k*n+ev]-(Dm[k]-lam)); if(g<best){best=g; r=k;} }
-    A[r*n+ev]=1.f;
-    for(int k=r-1;k>=0;--k){ float dpkk=DP[k*n+ev]; dpkk=(fabsf(dpkk)<eps)?eps:dpkk; A[k*n+ev]=-(Em[k]/dpkk)*A[(k+1)*n+ev]; }
-    for(int k=r+1;k<n;++k){ float dmkk=DM[k*n+ev]; dmkk=(fabsf(dmkk)<eps)?eps:dmkk; A[k*n+ev]=-(Em[k-1]/dmkk)*A[(k-1)*n+ev]; }
-    float nrm=0.f; for(int k=0;k<n;++k) nrm+=A[k*n+ev]*A[k*n+ev]; nrm=sqrtf(nrm)+1e-30f;
-    for(int k=0;k<n;++k) A[k*n+ev]/=nrm;
+    Vf[r*n+ev]=1.f;
+    for(int k=r-1;k>=0;--k){ float dpkk=DP[k*n+ev]; dpkk=(fabsf(dpkk)<eps)?eps:dpkk; Vf[k*n+ev]=-(Em[k]/dpkk)*Vf[(k+1)*n+ev]; }
+    for(int k=r+1;k<n;++k){ float dmkk=DM[k*n+ev]; dmkk=(fabsf(dmkk)<eps)?eps:dmkk; Vf[k*n+ev]=-(Em[k-1]/dmkk)*Vf[(k-1)*n+ev]; }
+    float nrm=0.f; for(int k=0;k<n;++k) nrm+=Vf[k*n+ev]*Vf[k*n+ev]; nrm=sqrtf(nrm)+1e-30f;
+    for(int k=0;k<n;++k) Vf[k*n+ev]/=nrm;
   }
   __syncthreads();
-  // 4) back-transform: Q = (prod_c H_c) V_tri, reflectors reverse c=n-3..0
+  // 4) back-transform (FP32): Q = (prod_c H_c) V_tri, reflectors reverse c=n-3..0,
+  //    using the stored tau_c (no per-c reduction).
   for(int c=n-3;c>=0;--c){
-    float vv=0.f; for(int i=c+1+tid;i<n;i+=nt){ float x=Rm[i*n+c]; vv+=x*x; }
-    red[tid]=vv; __syncthreads(); for(int s=nt>>1;s>0;s>>=1){ if(tid<s)red[tid]+=red[tid+s]; __syncthreads(); } float tauc=2.f/(red[0]+1e-30f); __syncthreads();
-    for(int j=tid;j<n;j+=nt){ float w=0.f; for(int i=c+1;i<n;++i) w+=Rm[i*n+c]*A[i*n+j]; w*=tauc; for(int i=c+1;i<n;++i) A[i*n+j]-=Rm[i*n+c]*w; }
+    float tauc=Tau[c];
+    for(int j=tid;j<n;j+=nt){ float w=0.f; for(int i=c+1;i<n;++i) w+=Rm[i*n+c]*Vf[i*n+j]; w*=tauc; for(int i=c+1;i<n;++i) Vf[i*n+j]-=Rm[i*n+c]*w; }
     __syncthreads();
   }
-  for(int i=tid;i<n*n;i+=nt) Vout[(long)m*n*n+i]=A[i];
+  for(int i=tid;i<n*n;i+=nt) Vout[(long)m*n*n+i]=Vf[i];
+  for(int ev=tid; ev<n; ev+=nt) Lout[(long)m*n+ev]*=scale;  // unscale eigenvalues
 }
 void mega_eigh(torch::Tensor A, torch::Tensor Vout, torch::Tensor Lout,
     torch::Tensor rscr, torch::Tensor dscr, torch::Tensor escr,
-    torch::Tensor dpscr, torch::Tensor dmscr, int n, int nt, int bisIters){
+    torch::Tensor dpscr, torch::Tensor dmscr, torch::Tensor tauscr,
+    int n, int nt, int bisIters){
   int B=A.size(0); size_t shm=((size_t)n*n+2*n)*sizeof(float);
   cudaFuncSetAttribute(mega_eigh_k, cudaFuncAttributeMaxDynamicSharedMemorySize, shm);
   mega_eigh_k<<<B,nt,shm>>>(A.data_ptr<float>(),Vout.data_ptr<float>(),Lout.data_ptr<float>(),
     rscr.data_ptr<float>(),dscr.data_ptr<float>(),escr.data_ptr<float>(),
-    dpscr.data_ptr<float>(),dmscr.data_ptr<float>(),B,n,bisIters);
+    dpscr.data_ptr<float>(),dmscr.data_ptr<float>(),tauscr.data_ptr<float>(),B,n,bisIters);
 }'''
 
 
@@ -192,18 +222,27 @@ def _eigh_megakernel(a: torch.Tensor) -> output_t:
     escr = torch.empty(b, n - 1, device=dev, dtype=torch.float32)
     dpscr = torch.empty(b, n, n, device=dev, dtype=torch.float32)
     dmscr = torch.empty(b, n, n, device=dev, dtype=torch.float32)
-    mod.mega_eigh(af, V, L, rscr, dscr, escr, dpscr, dmscr,
+    tauscr = torch.empty(b, n, device=dev, dtype=torch.float32)
+    mod.mega_eigh(af, V, L, rscr, dscr, escr, dpscr, dmscr, tauscr,
                   n, _MEGA_NT, _MEGA_BISITERS)
     L, order = torch.sort(L, dim=-1)
     Q = torch.gather(V, 2, order.unsqueeze(1).expand(b, n, n))
-    # Residual gate: recompute any failing matrix with cuSOLVER.
+    # Per-matrix residual gate: recompute any failing matrix with cuSOLVER. The
+    # trigger thresholds track the harness gates (reference.py: eigen 200*n*eps,
+    # recon 400*n*eps, orth 100*n*eps) at ~0.6-0.75x, so a matrix that comfortably
+    # passes the harness is NOT spuriously fallen back (which would waste the FP16
+    # speedup) yet anything actually close to failing -- or non-finite -- is caught.
     eye = torch.eye(n, device=dev, dtype=torch.float32)
     eps = torch.finfo(torch.float32).eps
     orth = torch.linalg.matrix_norm(Q.transpose(-1, -2) @ Q - eye, ord=1, dim=(-2, -1))
     aq = af @ Q
     eigr = torch.linalg.matrix_norm(aq - Q * L.unsqueeze(-2), ord=1, dim=(-2, -1))
+    recon = torch.linalg.matrix_norm(
+        (Q * L.unsqueeze(-2)) @ Q.transpose(-1, -2) - af, ord=1, dim=(-2, -1))
     a_l1 = torch.linalg.matrix_norm(af, ord=1, dim=(-2, -1)).clamp_min(1e-30)
-    bad = (orth > 30.0 * n * eps) | (eigr / a_l1 > 50.0 * n * eps)
+    bad = ((orth > 75.0 * n * eps)
+           | (eigr / a_l1 > 150.0 * n * eps)
+           | (recon / a_l1 > 300.0 * n * eps))
     bad = bad | ~torch.isfinite(L).all(dim=-1) | ~torch.isfinite(Q).all(dim=(-2, -1))
     if bool(bad.any()):
         idx = torch.nonzero(bad, as_tuple=False).flatten()
@@ -615,7 +654,7 @@ def _custom_path(a: torch.Tensor) -> output_t:
 # leaderboard reseeds): ||A^2 - c I||_F / ||A^2||_F, with c = mean(diag(A^2)),
 # which is ~1e-3 for 2-level matrices and 0.67-0.95 for everything else.
 _STRUCT_2LEVEL_THRESH = 0.01     # ||A^2-cI||/||A^2|| below this => 2-level
-_STRUCT_2LEVEL_ENABLED = False   # flip True once _structured_2level_path wins
+_STRUCT_2LEVEL_ENABLED = True    # W0's _two_level_eigh wired + validated (1.90x clustered512)
 
 
 @torch.no_grad()
@@ -634,11 +673,67 @@ def _two_level_frac(a: torch.Tensor) -> torch.Tensor:
     return (diff2 / fro_a2).sqrt()
 
 
-def _structured_2level_path(a: torch.Tensor) -> output_t:
-    """PLUG POINT for W0's 2-level (clustered) structured eigensolver. cuSOLVER
-    stub for now; repoint at W0's kernel the instant it validates + wins."""
-    values, vectors = torch.linalg.eigh(a)
-    return vectors, values
+@torch.no_grad()
+def _two_level_chol_qr1(Y, rel):
+    G = Y.transpose(-1, -2) @ Y
+    dm = torch.diagonal(G, dim1=-2, dim2=-1).amax(-1).clamp_min(1e-30)
+    eye = torch.eye(G.shape[-1], device=Y.device, dtype=Y.dtype)
+    L = torch.linalg.cholesky(G + (rel * dm).view(-1, 1, 1) * eye)
+    return torch.linalg.solve_triangular(L, Y.transpose(-1, -2),
+                                         upper=False).transpose(-1, -2)
+
+
+@torch.no_grad()
+def _structured_2level_path(a: torch.Tensor, power_iters: int = 2) -> output_t:
+    """W0's 2-level (clustered) structured eigensolver (worker-0 fa6197814).
+    A has 2 eigenvalue magnitudes +/-s; eigenspaces = range(P+)/range(P-) of the
+    spectral projectors, recovered by re-orthonormalized subspace iteration and
+    joint CholeskyQR cleanup. Returns (Q=vectors, L=values ascending).
+    1.90x on clustered512 (72.7 vs 138ms), max eig_err 7.7e-6, 0 stragglers.
+    NOTE: the +s rank MUST come from an FP64 einsum trace (FP32 diag-sum cancels
+    catastrophically to ~0). power_iters=2 (reorth) leaves 0 fall-throughs."""
+    B, n, _ = a.shape
+    dev = a.device
+    af = a.float()
+    s = (af * af).sum(-1).mean(-1).clamp_min(1e-30).sqrt()       # (B,) level magnitude
+    s_med = s.median().clamp_min(1e-30)
+    trA = torch.einsum('bii->b', af.double())                    # FP64 trace (FP32 cancels)
+    rp = int(((n + (trA / s_med.double())) / 2).round().clamp(1, n - 1).median().item())
+    rm = n - rp
+    inv_s = (1.0 / s_med).float()
+    g = torch.randn(B, n, rp, device=dev)
+    Qp = _two_level_chol_qr1(0.5 * (inv_s * (af @ g) + g), 1e-4)
+    for _ in range(power_iters - 1):
+        Qp = _two_level_chol_qr1(0.5 * (inv_s * (af @ Qp) + Qp), 1e-6)
+    h = torch.randn(B, n, rm, device=dev)
+    Qm = _two_level_chol_qr1(0.5 * (h - inv_s * (af @ h)), 1e-4)
+    for _ in range(power_iters - 1):
+        Qm = _two_level_chol_qr1(0.5 * (Qm - inv_s * (af @ Qm)), 1e-6)
+    Q = torch.cat([Qp, Qm], -1)
+    Q = _two_level_chol_qr1(_two_level_chol_qr1(Q, 1e-7), 1e-8)  # joint cleanup
+    lam = (Q * (af @ Q)).sum(-2)
+    lam = torch.where(lam >= 0., s.unsqueeze(-1), -s.unsqueeze(-1))
+    order = torch.argsort(lam, -1)
+    Q = torch.gather(Q, -1, order.unsqueeze(-2).expand(-1, n, -1))
+    lam = torch.gather(lam, -1, order)
+    eps = torch.finfo(torch.float32).eps
+    rtol = 200. * n * eps
+    Ad = af.double(); Qd = Q.double(); Ld = lam.double()
+    res = torch.linalg.matrix_norm(Ad @ Qd - Qd * Ld.unsqueeze(-2), ord=1, dim=(-2, -1))
+    scale = torch.linalg.matrix_norm(Ad, ord=1, dim=(-2, -1)).clamp_min(1e-30)
+    # MUST also gate ORTHOGONALITY: single-level / degenerate inputs (e.g. the
+    # scaled identity, A^2=c I but ONE level) pass the 2-level detector yet break
+    # the +/-s projector (one block is empty) -> Q non-orthogonal while the eigen
+    # residual is ~0 (any vectors are eigenvectors of cI). Without this check
+    # those matrices slip through the eigen-only fallback and fail the orth gate.
+    eye = torch.eye(n, device=af.device, dtype=torch.float64)
+    orth = torch.linalg.matrix_norm(Qd.transpose(-1, -2) @ Qd - eye, ord=1, dim=(-2, -1))
+    bad = (res > (0.85 * rtol * scale)) | (orth > 0.85 * 100. * n * eps)
+    if bool(bad.any().item()):
+        idx = torch.nonzero(bad, as_tuple=False).flatten()
+        Lc, Vc = torch.linalg.eigh(af[idx])
+        Q[idx] = Vc; lam[idx] = Lc
+    return Q, lam
 
 
 def custom_kernel(data: input_t) -> output_t:
