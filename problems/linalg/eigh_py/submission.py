@@ -691,12 +691,24 @@ def _eigh_twolevel(a: torch.Tensor) -> output_t:
     Q = torch.gather(Q, 2, order.unsqueeze(1).expand(bi, n, n))
     Qf = Q.float()
     Lf = L.float()
-    # per-matrix residual gate (harness-level), fall failures back to cuSOLVER
+    # per-matrix residual gate (harness-level), fall failures back to cuSOLVER.
+    # The eigen-residual GEMM a_sub@Qf feeds ONLY the pass/fail decision (TF32's
+    # ~3e-4/op error is far below the 150*n*eps ~ 9.2e-3 eigen gate), so it runs on
+    # TF32 tensor cores (~8x the FP32-SIMT rate the profile shows this GEMM taking
+    # on clustered512, ~15% of the shape). The ORTHOGONALITY GEMM Qf^T@Qf stays
+    # true FP32 (allow_tf32 off): brief-18 measured that TF32's error accumulates
+    # over n column dot-products above the orth bound (orth 6.18e-3 > 6.10e-3 gate
+    # despite true orth 8.7e-7 -> spurious fallback). brief-20 combine.
     eps = torch.finfo(torch.float32).eps
     eye = torch.eye(n, device=dev, dtype=torch.float32)
     a_sub = af[idx]
+    _gp = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = False
     orth = torch.linalg.matrix_norm(Qf.transpose(-1, -2) @ Qf - eye, ord=1, dim=(-2, -1))
-    eigr = torch.linalg.matrix_norm(a_sub @ Qf - Qf * Lf.unsqueeze(-2), ord=1, dim=(-2, -1))
+    torch.backends.cuda.matmul.allow_tf32 = True    # eigen-gate A@Q -> TF32 (gate-only)
+    aQ = a_sub @ Qf
+    torch.backends.cuda.matmul.allow_tf32 = _gp
+    eigr = torch.linalg.matrix_norm(aQ - Qf * Lf.unsqueeze(-2), ord=1, dim=(-2, -1))
     a_l1 = torch.linalg.matrix_norm(a_sub, ord=1, dim=(-2, -1)).clamp_min(1e-30)
     bad = ((orth > 75.0 * n * eps) | (eigr / a_l1 > 150.0 * n * eps)
            | ~torch.isfinite(Lf).all(dim=-1) | ~torch.isfinite(Qf).all(dim=(-2, -1)))
