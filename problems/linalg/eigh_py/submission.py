@@ -2716,31 +2716,37 @@ _sign_dc_omega_cache: dict = {}   # (b,n,K,dev) -> fixed random projection block
 
 # --- RECURSIVE (multi-level) sign-DC for the large-n cuSOLVER shapes (brief 47) ---
 # The single-level sign-DC above splits n=512 into two <=448-wide reduced blocks the
-# fused megakernel base case can solve. For n=2048 (shape 5, b8, ~185ms) and n=1024
-# (shape 7 dense subset) a single split leaves K ~ n/2 >= 512-1024, above the base
-# case's 836 SMEM/cluster ceiling -- so RECURSE: shift-split each oversized block by
-# sign(A - sigma I) again (2048 -> ~1024 -> ~576-wide blocks; 1024 -> ~576) until the
-# blocks fit the megakernel/cluster base (_SIGN_DC_BASE_MAX). Each level rank-selects
-# exactly the block's dimension of eigenpairs from its 2K candidates by projector
-# MEMBERSHIP, so the oversample padding/junk is filtered before returning up the
-# recursion -- nested membership composes (the base case returns ALL k eigenpairs,
-# every level returns exactly its block dimension). The sign iteration is spectrum-
-# INDEPENDENT fixed-cost batched tensor-core GEMM, so it targets cuSOLVER's O(n^3)
-# spectrum-dependent syevd at these n the same way the n=512 level did.
-_SIGN_DC_BASE_MAX = 836   # blocks <= this go to the fused megakernel/cluster base
-                          # (_lr_reduced_eigh: <=448 one-CTA, 449..836 C-CTA cluster);
-                          # larger blocks recurse via a shifted sign split.
+# fused megakernel base case can solve. For n=2048 (shape 5, b8, ~185ms) a single
+# shifted split at the median (sigma = trace/m) into two ~1229-wide invariant-subspace
+# blocks -- each solved by _lr_reduced_eigh (which routes >836-wide blocks to cuSOLVER)
+# -- ALREADY BEATS full-n=2048 cuSOLVER: two syevd calls at 1229 cost ~2*(1229/2048)^3
+# ~ 0.43x the single-2048 syevd, and the sign split is spectrum-INDEPENDENT batched
+# tensor-core GEMM. Measured shape5 185ms -> 137ms (-26%), orth ~1.2e-4, 0 fallback.
+#
+# DEEPER recursion (splitting the ~1229 block again to reach the <=836 cluster / <=448
+# megakernel base) was MEASURED broken here: the reduced block U+^T A U+ carries the
+# oversample's JUNK directions mixed with the real + subspace, and recursing on it lets
+# the inner eigenvectors span BOTH -- so the OUTER projector-membership can no longer
+# separate real from junk (orth blew to ~8-11, 100% fallback, shape5 +55%). Nested
+# membership does NOT compose through the padded reduced block. A clean recursion needs
+# a JUNK-free reduced block (exact per-matrix rank-revealing subspace, which breaks the
+# fixed-shape batched launch) -- open for a follow-up. Until then the split is depth-1
+# (base ceiling >= n/2+margin so the halves go straight to the base solver).
+_SIGN_DC_BASE_MAX = 1300   # blocks <= this go to _lr_reduced_eigh (<=448 one-CTA mega,
+                          # 449..836 C-CTA cluster, >836 cuSOLVER). At 1300 the n=2048
+                          # ~1229-wide halves land on the base solver directly (depth-1,
+                          # cuSOLVER halves); no second split (which mixes junk, above).
 _SIGN_DC_REC_MARGIN = 0.10  # oversample margin (fraction of m) added to ceil(m/2) for
-                          # the recursive split width K, absorbing shift-imbalance so
-                          # neither side exceeds K (the true per-side count is
-                          # variable; oversampling + membership rank-select makes the
-                          # fixed-K launch exact). K = ceil(m/2) + ceil(margin*m).
-                          # 0.10 keeps 2048->1229->738 (738<=836 base) at depth 2 (a
-                          # 0.14 margin pushes the level-1 block to 840, forcing a
-                          # wasteful third level).
-_SIGN_DC_REC_NS_ITERS = 22  # NS sign iters per recursion level (the shifted split's
-                          # near-sigma eigenvalues need a touch more than the n=512
-                          # level; membership tolerates a fuzzy sign).
+                          # the split width K, absorbing shift-imbalance so neither side
+                          # exceeds K (the true per-side count is variable; oversampling
+                          # + membership rank-select makes the fixed-K launch exact).
+                          # K = ceil(m/2) + ceil(margin*m); n=2048 -> K=1229.
+_SIGN_DC_REC_NS_ITERS = 45  # NS sign iters for the split. A semicircle (GOE) spectrum
+                          # has its HIGHEST eigenvalue density at the median shift sigma,
+                          # so the near-sigma eigenvalues (relative gap ~1/m) need many
+                          # NS steps to reach a clean +-1 sign (a fuzzy sign there makes
+                          # P+/P- overlap -> non-orthonormal selected Q). 45 gives
+                          # orth ~1.2e-4 on shape5 (gate 1.8e-2), 0 fallback.
 _SIGN_DC_REC_POWER_ITERS = 12  # A^2 power iters for the shifted-block spectral-norm scale
 _SIGN_DC_LARGE_N = {2048}   # dense-class n routed to the recursive path (shape 5).
                             # n=1024 is handled by the mixed-peel/single-level probes;
@@ -2908,17 +2914,18 @@ def _sign_dc_eye(m, dev):
 
 
 def _sign_dc_block_eigh(A_blk, dev):
-    """Recursive full eigendecomposition of a batched symmetric block (B, m, m).
-    Returns (lam, G) -- ALL m eigenpairs (A_blk @ G[:,:,i] = lam[:,i]*G[:,:,i]),
-    ordering arbitrary (the caller re-sorts). For m <= _SIGN_DC_BASE_MAX this is the
-    fused megakernel/cluster base case; larger blocks are split by a SHIFTED matrix
-    sign function sign(A_blk - sigma I) into two ~m/2 invariant subspaces, each solved
-    recursively, then the m true eigenpairs are rank-selected from the 2K candidates
-    by projector MEMBERSHIP. Nested membership composes: every level returns exactly
-    its block dimension, so oversample junk is filtered before returning up. Purely
-    batched tensor-core GEMM + one base-case megakernel per leaf block -- spectrum-
-    independent, unlike cuSOLVER's spectrum-dependent syevd. No gate here (the OUTER
-    per-matrix residual gate + cuSOLVER fallback catches any block it can't resolve)."""
+    """Full eigendecomposition of a batched symmetric block (B, m, m) via a SHIFTED
+    matrix-sign split. Returns (lam, G) -- ALL m eigenpairs (A_blk @ G[:,:,i] =
+    lam[:,i]*G[:,:,i]), ordering arbitrary (the caller re-sorts). For m <=
+    _SIGN_DC_BASE_MAX this is the base solver (_lr_reduced_eigh: megakernel / cluster /
+    cuSOLVER by size); larger blocks are split by sign(A_blk - sigma I) into two ~m/2
+    invariant-subspace blocks, each solved by the base solver, and the m true eigenpairs
+    are rank-selected from the 2K candidates by projector MEMBERSHIP (real ~1, junk ~0).
+    The split is spectrum-INDEPENDENT batched tensor-core GEMM. NOTE: this recurses in
+    principle, but DEEPER-than-one recursion is broken (the reduced block's oversample
+    junk mixes into the real subspace so nested membership can't separate them -- see
+    the _SIGN_DC_BASE_MAX note); the live base ceiling forces depth-1. No gate here (the
+    OUTER per-matrix residual gate + cuSOLVER fallback catches any block it misses)."""
     B = A_blk.shape[0]
     m = A_blk.shape[-1]
     if m <= _SIGN_DC_BASE_MAX:
