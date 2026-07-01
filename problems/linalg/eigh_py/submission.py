@@ -597,6 +597,20 @@ _TWOLEVEL_MINFRAC = 0.5    # only take the 2-level path if >= this fraction of t
                            # on the whole batch -- so below this fraction we just do
                            # the single cuSOLVER call (the few 2-level matrices are
                            # too few to amortize the split + FP64 overhead).
+# Projector precision for the two-level path. The four spectral-projector A@X
+# GEMMs (P+^2, P-^2) are the dominant O(n^3) cost of the clustered512 shape
+# (~33% of the ~58ms, FP64 d884gemm on B200's weak ~40 TFLOPS FP64 tensor).
+# brief-18's probe refuted PLAIN TF32 (eig-res 1.01) and BARE FP32 (eig-res
+# 0.0423) here: the near-degenerate +-1 spectrum (~1e-5 jitter) sets the
+# projector's convergence floor at the GEMM's per-op error, so single-precision
+# is not enough. "3xtf32" is the near-FP32 alternative -- an Ozaki hi+lo split
+# (Ah@Bh + Ah@Bl + Al@Bh, three TF32 bmms on ~1100 TFLOPS tensor cores) that
+# recovers ~6e-6 relative accuracy, ~10x tighter than plain TF32 and comparable
+# to FP32-SIMT while running on the far-faster TF32 path. Whether that clears the
+# 150*n*eps ~ 9.2e-3 eigen gate on this spectrum is measured, not assumed; a miss
+# is caught by the per-matrix residual gate and recomputed with cuSOLVER, so it
+# can never regress below baseline. "fp64" = the safe reference path.
+_TWOLEVEL_PROJ = "3xtf32"  # "fp64" | "3xtf32" (near-FP32 tensor-core projector)
 
 
 def _twolevel_mask(af: torch.Tensor) -> torch.Tensor:
@@ -642,25 +656,52 @@ def _eigh_twolevel(a: torch.Tensor) -> output_t:
     tr = torch.diagonal(A, dim1=-2, dim2=-1).sum(dim=-1)
     kp = int(round(((tr[0].item()) + n) / 2.0))
     kp = max(1, min(n - 1, kp))
-    G = torch.randn(bi, n, n, device=dev, dtype=torch.float64)
 
     # Apply the spectral projectors WITHOUT materializing them: P+ X = (A X + X)/2,
     # P- X = (X - A X)/2 -- each is one A@X GEMM, and skips forming/storing the two
-    # dense n*n FP64 projector matrices. DOUBLE application (P+^2, P-^2) drives the
-    # cross-subspace leakage to ~1e-11 (P+ is only approximately idempotent because
-    # of the ~1e-5 within-cluster jitter; one application leaves the extracted basis
-    # ~30deg off the true eigenspace).
-    def _pp(X):
-        t = A @ X
-        return 0.5 * (t + X)
+    # dense n*n projector matrices. DOUBLE application (P+^2, P-^2) drives the
+    # cross-subspace leakage to ~1e-11 in FP64 (P+ is only approximately idempotent
+    # because of the ~1e-5 within-cluster jitter; one application leaves the
+    # extracted basis ~30deg off the true eigenspace).
+    #
+    # The projector GEMMs run in "fp64" (safe reference) or "3xtf32" (Ozaki hi+lo
+    # split on TF32 tensor cores, ~FP32-accurate). In 3xtf32 mode A and the random
+    # probe G are FP32 and each A@X is _matmul_3xtf32(A, X); the assembled basis is
+    # cast back up to FP64 for the (delicate) Gram/Cholesky/NS orthonormalization.
+    proj_3xtf32 = (_TWOLEVEL_PROJ == "3xtf32")
+    if proj_3xtf32:
+        Ap = af[idx]                        # FP32 for the TF32-split projector
+        G = torch.randn(bi, n, n, device=dev, dtype=torch.float32)
+        _pprev = torch.backends.cuda.matmul.allow_tf32
+        torch.backends.cuda.matmul.allow_tf32 = True   # 3xTF32 bmms hit tensor cores
 
-    def _pm(X):
-        t = A @ X
-        return 0.5 * (X - t)
+        def _pp(X):
+            t = _matmul_3xtf32(Ap, X)
+            return 0.5 * (t + X)
 
-    Yp = _pp(_pp(G[:, :, :kp]))             # clean +1 range
-    Ym = _pm(_pm(G[:, :, kp:]))             # clean -1 range
-    Q = torch.cat([Yp, Ym], dim=2)
+        def _pm(X):
+            t = _matmul_3xtf32(Ap, X)
+            return 0.5 * (X - t)
+
+        Yp = _pp(_pp(G[:, :, :kp]))         # clean +1 range
+        Ym = _pm(_pm(G[:, :, kp:]))         # clean -1 range
+        Q = torch.cat([Yp, Ym], dim=2)
+        torch.backends.cuda.matmul.allow_tf32 = _pprev
+        Q = Q.double()                      # lift to the Gram/Cholesky/NS precision
+    else:
+        G = torch.randn(bi, n, n, device=dev, dtype=torch.float64)
+
+        def _pp(X):
+            t = A @ X
+            return 0.5 * (t + X)
+
+        def _pm(X):
+            t = A @ X
+            return 0.5 * (X - t)
+
+        Yp = _pp(_pp(G[:, :, :kp]))         # clean +1 range
+        Ym = _pm(_pm(G[:, :, kp:]))         # clean -1 range
+        Q = torch.cat([Yp, Ym], dim=2)
 
     def _cqr(X, shift):
         M = X.transpose(-1, -2) @ X
