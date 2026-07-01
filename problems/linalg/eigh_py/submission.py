@@ -2018,11 +2018,30 @@ def _lr_lift_gemm(A, B, mode):
 # of "fp32" | "tf32" | "3xtf32"; the residual+orth gate inside _eigh_lowrank_safe
 # falls any matrix a reduced-precision factor cannot resolve back to cuSOLVER, so
 # nothing here can produce an invalid result (only a wasted double-solve).
-# Per-pass dominant CQR2 Gram schedule: pass 1 FP32 (ill-conditioned input),
-# pass 2 TF32 (well-conditioned after pass-1 self-correction). Puts half the
-# dominant-Gram work on tensor cores safely.
-_LR_DOM_GRAM_MODE = ("fp32", "tf32")   # dominant power-step CQR2 Gram Q^T Q precision
-_LR_VD_LIFT_MODE = "fp32"              # Vd = Qd @ G lift GEMM precision
+# Default dominant CQR2 Gram / Vd-lift precision (used when the caller does not
+# pass an explicit per-shape mode). fp32 is the safe baseline; the caller routes
+# 3xTF32 in via _lr_dom_gram_mode_for where the profile + fallback measurements
+# show it is a net win (see that helper).
+_LR_DOM_GRAM_MODE = "fp32"   # dominant power-step CQR2 Gram Q^T Q precision
+_LR_VD_LIFT_MODE = "fp32"    # Vd = Qd @ G lift GEMM precision
+
+
+def _lr_dom_gram_mode_for(n: int, k: int):
+    """Per-shape dominant-CQR2-Gram precision, chosen by matrix STRUCTURE (n and
+    the routed dominant rank k) -- legitimate algorithm selection. FP32-accurate
+    3xTF32 (Ozaki hi+lo split) puts the dominant Gram GEMM on TF32 tensor cores
+    (~1.8x the FP32-SIMT rate) WITHOUT changing the fallback decision, EXCEPT on
+    shapes that sit exactly at the orth-gate margin: brief-44 t5 measured that the
+    n=512 dense-concentrated route (k=352, the steep band) partially falls back
+    under 3xTF32 (its ~6e-6 residual tips zero-margin matrices over 80*n*eps),
+    while every n=1024 route (k in {384,608,768}) and the n=512 rankdef route
+    (k=384) keep their fallback at 0 and gain 2-5%. So route 3xTF32 for n=1024 and
+    for n=512 with k>=384; keep FP32 on the zero-margin n=512 k<=352 route."""
+    if n >= 1024:
+        return "3xtf32"
+    if n >= 512 and k >= 384:
+        return "3xtf32"
+    return "fp32"
 
 
 def _lr_cholesky_qr2(Y, passes=2, shift=1e-5, tf32_gram=False, gram_mode=None):
@@ -2505,6 +2524,11 @@ _MIXED_PEEL_PSD_PR_LO = 37.0  # psd window low edge (psd PR ~[40,44]; rowscale ~
 _MIXED_PEEL_PSD_PR_HI = 48.0  # psd window high edge (dense ~[51.6,58.1] above; == dense LO)
 _MIXED_PEEL_PSD_K = 256       # psd dominant rank: smallest k that clears the eigen
                               # gate while staying under the inner-solve orth ceiling
+# brief-44: dominant CQR2 Gram precision for the mixed-peel low-rank subsets
+# (dense k=352 + psd k=256). 3xTF32 (FP32-accurate) routes the dominant Gram GEMM
+# to tensor cores; measured to keep the peel's gate fallback at 0 (the mixed dense
+# subset has margin the whole-batch dense512 route lacks).
+_MIXED_PEEL_DOM_GRAM_MODE = "3xtf32"
 
 
 def _mixed_peel_count(pr: torch.Tensor) -> int:
@@ -2528,11 +2552,15 @@ def _eigh_mixed_peel(a: torch.Tensor, pr: torch.Tensor) -> output_t:
     Q = torch.empty(b, n, n, device=dev, dtype=torch.float32)
     L = torch.empty(b, n, device=dev, dtype=torch.float32)
     taken = torch.zeros(b, dtype=torch.bool, device=dev)
-    # 1) dense subset -> split-mega low-rank (residual-gated internally)
+    # 1) dense subset -> split-mega low-rank (residual-gated internally). brief-44:
+    # dominant Gram at _MIXED_PEEL_DOM_GRAM_MODE (3xTF32 on tensor cores; the mixed
+    # dense subset carried gate margin under 3xTF32 in t5, unlike the zero-margin
+    # dense512 whole-batch route).
     dense_mask = (pr >= _MIXED_PEEL_PR_LO) & (pr < _MIXED_PEEL_PR_HI)
     gidx = torch.nonzero(dense_mask, as_tuple=False).flatten()
     a_sub = af.index_select(0, gidx).contiguous()
-    Qs, Ls = _eigh_lowrank_safe(a_sub, _MIXED_PEEL_K, power=1)
+    Qs, Ls = _eigh_lowrank_safe(a_sub, _MIXED_PEEL_K, power=1,
+                                dom_gram_mode=_MIXED_PEEL_DOM_GRAM_MODE)
     Q.index_copy_(0, gidx, Qs)
     L.index_copy_(0, gidx, Ls)
     taken |= dense_mask
@@ -2547,7 +2575,8 @@ def _eigh_mixed_peel(a: torch.Tensor, pr: torch.Tensor) -> output_t:
         pidx = torch.nonzero(psd_mask, as_tuple=False).flatten()
         if pidx.numel() > 0:
             a_psd = af.index_select(0, pidx).contiguous()
-            Qp, Lp = _eigh_lowrank_safe(a_psd, _MIXED_PEEL_PSD_K, power=1)
+            Qp, Lp = _eigh_lowrank_safe(a_psd, _MIXED_PEEL_PSD_K, power=1,
+                                        dom_gram_mode=_MIXED_PEEL_DOM_GRAM_MODE)
             Q.index_copy_(0, pidx, Qp)
             L.index_copy_(0, pidx, Lp)
             taken |= psd_mask
@@ -2613,7 +2642,8 @@ def custom_kernel(data: input_t) -> output_t:
     pr = _lr_participation_ratio(a) if n in _LOWRANK_BANDS else None
     k_lr = _lowrank_route_k(a, n, pr=pr)
     if k_lr is not None:
-        return _eigh_lowrank_safe(a, k_lr, power=1)
+        return _eigh_lowrank_safe(a, k_lr, power=1,
+                                  dom_gram_mode=_lr_dom_gram_mode_for(n, k_lr))
     # MIXED-BATCH DENSE PEEL (brief 28): a heterogeneous n=512 mixed batch (the
     # benchmark's shape 6) whose whole-batch low-rank route was (correctly)
     # refused above by the homogeneity gate still has a large DENSE subset that
