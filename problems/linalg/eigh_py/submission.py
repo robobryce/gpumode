@@ -1125,12 +1125,20 @@ class _LR_TF32:
         torch.backends.cuda.matmul.allow_tf32 = self._p
 
 
-def _lr_cholesky_qr2(Y, passes=2, shift=1e-5):
+def _lr_cholesky_qr2(Y, passes=2, shift=1e-5, tf32_gram=True):
+    # The Gram G = Q^T Q feeds a shifted Cholesky, which TOLERATES the ~3e-4 TF32
+    # rounding: CholeskyQR2's SECOND pass re-orthonormalizes whatever residual
+    # non-orthogonality the first (TF32) Gram leaves, and the (shift*dm)*I jitter
+    # guards the factorization against the TF32-perturbed Gram going indefinite.
+    # brief-6 measured the Gram GEMM ~8-10x faster on TF32 tensor cores vs the
+    # FP32-SIMT cutlass path (which the profile shows as simt_sgemm, ~18ms on
+    # shape 4). The triangular solve is not a GEMM, so allow_tf32 does not touch
+    # it -- the orthonormal Q comes out of solve_triangular in true FP32.
     Q = Y
     c = Y.shape[-1]
     eye = torch.eye(c, device=Y.device, dtype=Y.dtype)
     prev = torch.backends.cuda.matmul.allow_tf32
-    torch.backends.cuda.matmul.allow_tf32 = False     # FP32 Gram -> no rank loss
+    torch.backends.cuda.matmul.allow_tf32 = bool(tf32_gram)
     try:
         for _ in range(passes):
             G = torch.bmm(Q.transpose(-1, -2), Q)
