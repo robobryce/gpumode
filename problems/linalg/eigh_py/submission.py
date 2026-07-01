@@ -2835,7 +2835,7 @@ _SIGN_DC_REC_MARGIN = 0.045 # oversample margin (fraction of m) added to ceil(m/
                           # the ~sqrt(n)~45 balance fluctuation). Swept 0.10/0.05/0.035
                           # -> shape5 123/111/107ms; any matrix whose side > K just falls
                           # back to cuSOLVER via the gate (correctness preserved).
-_SIGN_DC_REC_NS_ITERS = 30  # NS sign iters for the split. A semicircle (GOE) spectrum
+_SIGN_DC_REC_NS_ITERS = 16  # NS sign iters for the split. A semicircle (GOE) spectrum
                           # has its highest eigenvalue density at the median shift sigma,
                           # so near-sigma eigenvalues get a fuzzy sign -> some P+/P-
                           # overlap; the finishing FP32 NS + membership + gate absorb it.
@@ -2850,7 +2850,7 @@ _SIGN_DC_REC_POWER_ITERS = 6   # A^2 power iters for the shifted-block spectral-
 # smin 0.715, MEASURED); it is inside the NS convergence radius but needs several
 # quadratically-converging steps to reach the gate (1 step suffices only for the
 # cuSOLVER base's ~1e-3 start). No effect on shape 11 (its own _SIGN_DC_FINAL_NS).
-_SIGN_DC_LARGE_FINAL_NS = 6
+_SIGN_DC_LARGE_FINAL_NS = 8
 _SIGN_DC_LARGE_N = {2048}   # dense-class n routed to the recursive path (shape 5).
                             # n=1024 is handled by the mixed-peel/single-level probes;
                             # the recursive path is guarded to these n only so shape 11
@@ -2890,7 +2890,7 @@ _SIGN_DC_BASE_REORTH = 0
 # eigenvector. Distinct from _SIGN_DC_BASE_REORTH (which orthonormalized the K x K
 # gstk -- a no-op because the cluster gstk is genuinely non-orthogonal in near-
 # degenerate clusters; the tall Vp/Vm block is full-column-rank so CQR2 works there).
-_SIGN_DC_HALF_REORTH = 2
+_SIGN_DC_HALF_REORTH = 0
 _SIGN_DC_SIDE_MEMBERSHIP = False
 _SIGN_DC_SIDE_W = 40.0
 # brief-55: COUNT-based per-half rank-select (vs a global topk over both halves).
