@@ -2077,12 +2077,23 @@ def _lr_dom_gram_mode_for(n: int, k: int):
 
 def _lr_av_mode_for(n: int, k: int):
     """Per-shape precision for the four A@X matvecs (A@Omega range-finder, A@Qd
-    power, A@Qd Rayleigh, A@Vc complement). FP32-accurate 3xTF32 puts them on the
-    TF32 tensor cores (~8-10x the FP32-SIMT rate) at ~6e-6 rel accuracy, which the
-    orth/eigen gates tolerate. Like the dominant Gram, the n=512 dense-concentrated
-    route (k<=352, shape 3) sits at the orth-gate margin, so a per-shape guard can
-    keep it FP32 if 3xTF32 tips it into fallback (measured per trial)."""
-    return _LR_AV_MODE
+    power, A@Qd Rayleigh, A@Vc complement).
+
+    brief-54 MEASURED (t1 3xtf32 vs t2 tf32, matched contention): these matvecs
+    already ran on plain-TF32 tensor cores in the parent (they are plain bmm inside
+    the _LR_TF32 allow_tf32=True scope, NOT FP32-SIMT). So the real trade is 1-pass
+    TF32 (~3e-4, fastest GEMM) vs 3-pass 3xTF32 (~6e-6, ~1.7x the GEMM cost). Plain
+    TF32 is gate-clean and fastest on almost every low-rank route (shapes 3/4/8/12:
+    tf32 81.2/48.9/91.7/33.5ms << 3xtf32 87.5/51.6/98.2/35.9ms) -- the extra Ozaki
+    passes just cost more where the gate already passes. The ONE exception is the
+    n=1024 NEAR-RANK-DEFICIENT route (k=768 == exact rank 3n/4, shape 10): its
+    dominant subspace reaches into the ~1e-6 near-null tail (ill-conditioned), so
+    plain TF32's ~3e-4 tips matrices into cuSOLVER fallback (tf32 102.7ms) while
+    3xTF32's ~6e-6 keeps them gate-clean (3xtf32 94.0ms, -8.5%). Route 3xTF32 only
+    for that near-rank case (n>=1024, k>=768); plain TF32 everywhere else."""
+    if n >= 1024 and k >= 768:
+        return "3xtf32"
+    return "tf32"
 
 
 def _lr_cholesky_qr2(Y, passes=2, shift=1e-5, tf32_gram=False, gram_mode=None):
@@ -2585,9 +2596,10 @@ _MIXED_PEEL_PSD_K = 256       # psd dominant rank: smallest k that clears the ei
 # subset has margin the whole-batch dense512 route lacks).
 _MIXED_PEEL_DOM_GRAM_MODE = "3xtf32"
 # brief-54: A@X matvec precision for the mixed-peel low-rank subsets (dense k=352,
-# psd k=256). 3xTF32 puts the A@Omega / A@Qd / A@Vc matvecs on tensor cores; the
-# subset call stays per-matrix residual-gated so any drift falls back safely.
-_MIXED_PEEL_AV_MODE = "3xtf32"
+# psd k=256, both n=512). brief-54 t1/t2 measured plain TF32 is gate-clean and
+# fastest on the n=512 routes (the mixed dense subset mirrors shape 3, gate-clean
+# at tf32); the extra 3xTF32 Ozaki passes only cost more here. Keep plain TF32.
+_MIXED_PEEL_AV_MODE = "tf32"
 
 
 def _mixed_peel_count(pr: torch.Tensor) -> int:
