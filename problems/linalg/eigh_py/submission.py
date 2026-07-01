@@ -2714,6 +2714,44 @@ _SIGN_DC_HOM_MAX = 3.0    # homogeneous-batch ceiling (heterogeneous mixed batch
                           # are the mixed-peel router's job, not this one)
 _sign_dc_omega_cache: dict = {}   # (b,n,K,dev) -> fixed random projection block pair
 
+# --- RECURSIVE (multi-level) sign-DC for the large-n cuSOLVER shapes (brief 47) ---
+# The single-level sign-DC above splits n=512 into two <=448-wide reduced blocks the
+# fused megakernel base case can solve. For n=2048 (shape 5, b8, ~185ms) and n=1024
+# (shape 7 dense subset) a single split leaves K ~ n/2 >= 512-1024, above the base
+# case's 836 SMEM/cluster ceiling -- so RECURSE: shift-split each oversized block by
+# sign(A - sigma I) again (2048 -> ~1024 -> ~576-wide blocks; 1024 -> ~576) until the
+# blocks fit the megakernel/cluster base (_SIGN_DC_BASE_MAX). Each level rank-selects
+# exactly the block's dimension of eigenpairs from its 2K candidates by projector
+# MEMBERSHIP, so the oversample padding/junk is filtered before returning up the
+# recursion -- nested membership composes (the base case returns ALL k eigenpairs,
+# every level returns exactly its block dimension). The sign iteration is spectrum-
+# INDEPENDENT fixed-cost batched tensor-core GEMM, so it targets cuSOLVER's O(n^3)
+# spectrum-dependent syevd at these n the same way the n=512 level did.
+_SIGN_DC_BASE_MAX = 836   # blocks <= this go to the fused megakernel/cluster base
+                          # (_lr_reduced_eigh: <=448 one-CTA, 449..836 C-CTA cluster);
+                          # larger blocks recurse via a shifted sign split.
+_SIGN_DC_REC_MARGIN = 0.10  # oversample margin (fraction of m) added to ceil(m/2) for
+                          # the recursive split width K, absorbing shift-imbalance so
+                          # neither side exceeds K (the true per-side count is
+                          # variable; oversampling + membership rank-select makes the
+                          # fixed-K launch exact). K = ceil(m/2) + ceil(margin*m).
+                          # 0.10 keeps 2048->1229->738 (738<=836 base) at depth 2 (a
+                          # 0.14 margin pushes the level-1 block to 840, forcing a
+                          # wasteful third level).
+_SIGN_DC_REC_NS_ITERS = 22  # NS sign iters per recursion level (the shifted split's
+                          # near-sigma eigenvalues need a touch more than the n=512
+                          # level; membership tolerates a fuzzy sign).
+_SIGN_DC_REC_POWER_ITERS = 12  # A^2 power iters for the shifted-block spectral-norm scale
+_SIGN_DC_LARGE_N = {2048}   # dense-class n routed to the recursive path (shape 5).
+                            # n=1024 is handled by the mixed-peel/single-level probes;
+                            # the recursive path is guarded to these n only so shape 11
+                            # (n=512) and the low-rank paths are untouched.
+_SIGN_DC_LARGE_PR_LO = 150.0   # participation-ratio floor for the large-n dense class
+                               # (n=2048 dense cond1 PR is high/flat; low-rank bands
+                               # are below and route earlier).
+_sign_dc_rec_omega_cache: dict = {}   # (b,m,K,dev) -> fixed random projection blocks
+_sign_dc_eye_cache: dict = {}         # (m,dev) -> identity for the shift
+
 
 def _sign_dc_omega(b, n, K, dev):
     """Fixed random projection blocks (Omega+, Omega-) for the subspace probes,
@@ -2845,6 +2883,171 @@ def _sign_dc_solve(af, n, dev):
     return Q, L, AQ, order
 
 
+def _sign_dc_rec_omega(b, m, K, dev):
+    """Fixed random projection blocks (Omega+, Omega-) for a recursion level of
+    shape (b, m, K), cached by (b,m,K,dev). A fixed random subspace is fine: the
+    membership rank-select + the outer residual gate catch any degenerate draw."""
+    key = (b, m, K, dev)
+    om = _sign_dc_rec_omega_cache.get(key)
+    if om is None:
+        g = torch.Generator(device=dev).manual_seed(20260701 + m * 131 + K)
+        Om = torch.randn(b, m, K, device=dev, dtype=torch.float32, generator=g)
+        Om2 = torch.randn(b, m, K, device=dev, dtype=torch.float32, generator=g)
+        om = (Om, Om2)
+        _sign_dc_rec_omega_cache[key] = om
+    return om
+
+
+def _sign_dc_eye(m, dev):
+    key = (m, dev)
+    e = _sign_dc_eye_cache.get(key)
+    if e is None:
+        e = torch.eye(m, device=dev, dtype=torch.float32)
+        _sign_dc_eye_cache[key] = e
+    return e
+
+
+def _sign_dc_block_eigh(A_blk, dev):
+    """Recursive full eigendecomposition of a batched symmetric block (B, m, m).
+    Returns (lam, G) -- ALL m eigenpairs (A_blk @ G[:,:,i] = lam[:,i]*G[:,:,i]),
+    ordering arbitrary (the caller re-sorts). For m <= _SIGN_DC_BASE_MAX this is the
+    fused megakernel/cluster base case; larger blocks are split by a SHIFTED matrix
+    sign function sign(A_blk - sigma I) into two ~m/2 invariant subspaces, each solved
+    recursively, then the m true eigenpairs are rank-selected from the 2K candidates
+    by projector MEMBERSHIP. Nested membership composes: every level returns exactly
+    its block dimension, so oversample junk is filtered before returning up. Purely
+    batched tensor-core GEMM + one base-case megakernel per leaf block -- spectrum-
+    independent, unlike cuSOLVER's spectrum-dependent syevd. No gate here (the OUTER
+    per-matrix residual gate + cuSOLVER fallback catches any block it can't resolve)."""
+    B = A_blk.shape[0]
+    m = A_blk.shape[-1]
+    if m <= _SIGN_DC_BASE_MAX:
+        return _lr_reduced_eigh(A_blk)
+    # shift = mean eigenvalue (== trace/m); ~ the median for a roughly-symmetric or
+    # roughly-uniform spectrum, so the +/- split is close to balanced.
+    sigma = A_blk.diagonal(dim1=-2, dim2=-1).mean(dim=-1).reshape(B, 1, 1)
+    eye_m = _sign_dc_eye(m, dev)
+    Ash = A_blk - sigma * eye_m
+    _gp = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = True
+    # spectral-norm scale of the shifted block via A^2 power iteration (sign-robust
+    # for the indefinite shifted spectrum)
+    v = torch.randn(B, m, 1, device=dev, dtype=torch.float32)
+    v = v / v.norm(dim=1, keepdim=True).clamp_min(1e-30)
+    for _ in range(_SIGN_DC_REC_POWER_ITERS):
+        v = Ash @ (Ash @ v)
+        v = v / v.norm(dim=1, keepdim=True).clamp_min(1e-30)
+    nrm2 = (v.transpose(-1, -2) @ (Ash @ (Ash @ v))).abs().reshape(B, 1, 1).clamp_min(1e-30)
+    scale = nrm2.sqrt() * 1.02
+    # Newton-Schulz sign iteration on the shifted block (baddbmm fuses the 1.5X-0.5X^3)
+    X = Ash / scale
+    for _ in range(_SIGN_DC_REC_NS_ITERS):
+        X2 = torch.bmm(X, X)
+        X = torch.baddbmm(X, X, X2, beta=1.5, alpha=-0.5)
+
+    def _pp(M):
+        return torch.baddbmm(M, X, M, beta=0.5, alpha=0.5)
+
+    def _pm(M):
+        return torch.baddbmm(M, X, M, beta=0.5, alpha=-0.5)
+    import math as _math
+    K = (m + 1) // 2 + _math.ceil(_SIGN_DC_REC_MARGIN * m)
+    K = min(K, m)
+    Om, Om2 = _sign_dc_rec_omega(B, m, K, dev)
+    # oversized invariant-subspace bases (batched CholeskyQR, NOT cuSOLVER QR),
+    # both stacked into one (2B, m, K) CQR + one A@U GEMM.
+    Ustk = _sign_dc_cqr(torch.cat([_pp(Om), _pm(Om2)], dim=0),
+                        passes=_SIGN_DC_CQR_PASSES)               # (2B, m, K)
+    torch.backends.cuda.matmul.allow_tf32 = _gp
+    # reduced K x K blocks (both halves stacked): B+ = U+^T A U+, B- = U-^T A U-.
+    with _LR_TF32():
+        AU = torch.bmm(A_blk, Ustk[:B])
+        AU = torch.cat([AU, torch.bmm(A_blk, Ustk[B:])], dim=0)
+        Bstk = torch.bmm(Ustk.transpose(-1, -2), AU)
+        Bstk = 0.5 * (Bstk + Bstk.transpose(-1, -2))
+    # RECURSE on the K x K reduced blocks -> full 2B*K eigendecomposition.
+    lstk, gstk = _sign_dc_block_eigh(Bstk, dev)
+    torch.backends.cuda.matmul.allow_tf32 = True
+    Vstk = torch.bmm(Ustk, gstk)               # (2B, m, K) candidate eigenvectors
+    Vp, Vm = Vstk[:B], Vstk[B:]
+    lp, lm = lstk[:B], lstk[B:]
+    # projector membership (of the SHIFTED sign): ~1 for a real eigenvector of that
+    # half, ~0 for oversample junk.
+    selp = _pp(Vp).norm(dim=1)                 # (B, K)
+    selm = _pm(Vm).norm(dim=1)                 # (B, K)
+    torch.backends.cuda.matmul.allow_tf32 = _gp
+    Vall = torch.cat([Vp, Vm], dim=-1)         # m x 2K
+    Lall = torch.cat([lp, lm], dim=-1)         # 2K
+    mem = torch.cat([selp, selm], dim=-1)      # 2K
+    topi = mem.topk(m, dim=-1).indices         # the m true eigenpairs of this block
+    G = torch.gather(Vall, 2, topi.unsqueeze(1).expand(B, m, m))
+    lam = torch.gather(Lall, 1, topi)
+    return lam, G
+
+
+def _sign_dc_solve_large(af, n, dev):
+    """Batched spectral divide-and-conquer eigh for the large-n dense class (n=2048)
+    via the RECURSIVE shifted matrix-sign block eigensolver. Returns (Q, L, AQ, order)
+    with Q's columns paired with the ascending L; the CALLER owns the per-matrix
+    residual gate + cuSOLVER fallback. Same finishing structure as _sign_dc_solve
+    (3xTF32 finishing NS orthonormalization + Rayleigh-quotient L), but the whole n x n
+    block is solved by the recursion instead of a single split."""
+    b = af.shape[0]
+    lam, G = _sign_dc_block_eigh(af, dev)      # (b, n), (b, n, n) -- all n eigenpairs
+    Q = G
+    # finishing Newton-Schulz orthonormalization (cleans the TF32-sign bases' orth to
+    # ~1e-4), Gram + Q@Gram in 3xTF32 (~FP32 accuracy at ~1.6x FP32-SIMT).
+    _gp = torch.backends.cuda.matmul.allow_tf32
+    if _SIGN_DC_FINAL_NS > 0:
+        torch.backends.cuda.matmul.allow_tf32 = True
+        for _ in range(_SIGN_DC_FINAL_NS):
+            g = _gram_3xtf32_sym(Q)
+            Q = 1.5 * Q - 0.5 * _matmul_3xtf32(Q, g)
+        torch.backends.cuda.matmul.allow_tf32 = _gp
+    # Rayleigh-quotient re-eval of L on the orthonormalized Q; A@Q on TF32 feeds both
+    # the Rayleigh L and the caller's eigen-residual gate (column-aligned by order).
+    torch.backends.cuda.matmul.allow_tf32 = True
+    AQ = af @ Q
+    torch.backends.cuda.matmul.allow_tf32 = _gp
+    L = (Q * AQ).sum(dim=1)
+    L, order = torch.sort(L, dim=-1)
+    oexp = order.unsqueeze(1).expand(b, n, n)
+    Q = torch.gather(Q, 2, oexp)
+    AQ = torch.gather(AQ, 2, oexp)
+    return Q, L, AQ, order
+
+
+def _eigh_sign_dc_large(a: torch.Tensor) -> output_t:
+    """Recursive (multi-level) spectral divide-and-conquer eigensolver for the large-n
+    dense class (n=2048, shape 5), with a per-matrix residual+orth gate + cuSOLVER
+    fallback (so it can never regress below the cuSOLVER floor or emit an invalid
+    factorization). Falls back wholesale to cuSOLVER if the pipeline raises."""
+    b, n, _ = a.shape
+    dev = a.device
+    af = a.float().contiguous()
+    try:
+        Q, L, AQ, _order = _sign_dc_solve_large(af, n, dev)
+    except Exception:
+        Lc, Qc = torch.linalg.eigh(af)
+        return Qc.contiguous(), Lc.contiguous()
+    eps = torch.finfo(torch.float32).eps
+    eye = _sign_dc_eye(n, dev)
+    _gp = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = True
+    orth = torch.linalg.matrix_norm(_gram_3xtf32_sym(Q) - eye, ord=1, dim=(-2, -1))
+    torch.backends.cuda.matmul.allow_tf32 = _gp
+    eigr = torch.linalg.matrix_norm(AQ - Q * L.unsqueeze(-2), ord=1, dim=(-2, -1))
+    a_l1 = torch.linalg.matrix_norm(af, ord=1, dim=(-2, -1)).clamp_min(1e-30)
+    bad = ((orth > 75.0 * n * eps) | (eigr / a_l1 > 150.0 * n * eps)
+           | ~torch.isfinite(L).all(dim=-1) | ~torch.isfinite(Q).all(dim=(-2, -1)))
+    if bool(bad.any()):
+        idx = torch.nonzero(bad, as_tuple=False).flatten()
+        Lf, Qf = torch.linalg.eigh(af[idx])
+        Q[idx] = Qf
+        L[idx] = Lf
+    return Q.contiguous(), L.contiguous()
+
+
 def _eigh_sign_dc(a: torch.Tensor) -> output_t:
     """Spectral divide-and-conquer eigensolver via the matrix sign function, with a
     per-matrix residual+orth gate + cuSOLVER fallback (so it can never regress below
@@ -2943,6 +3146,22 @@ def custom_kernel(data: input_t) -> output_t:
         if hom_ratio >= _MIXED_PEEL_HOM_MAX and \
                 _mixed_peel_count(pr) >= _MIXED_PEEL_MIN_COUNT:
             return _eigh_mixed_peel(a, pr)
+    # RECURSIVE (multi-level) SPECTRAL D&C for the large-n dense class (brief 47):
+    # n=2048 (shape 5, b8, ~185ms) is the board's largest dense benchmark, on the
+    # plain cuSOLVER syevd floor (Householder tridiag + O(n^3) spectrum-dependent
+    # divide-and-conquer, zero tensor cores). A single sign-split leaves K ~ n/2 =
+    # 1024, above the megakernel/cluster base ceiling (836), so RECURSE the shifted
+    # matrix-sign split (2048 -> ~1229 -> ~738-wide blocks -> cluster base) with
+    # nested membership rank-select. Spectrum-independent batched tensor-core GEMM,
+    # per-matrix residual-gated with a cuSOLVER fallback -> no regression. Fires only
+    # for the large-n dense class (n in _SIGN_DC_LARGE_N), a HOMOGENEOUS, high-PR,
+    # NON-2-level batch; low-rank/mixed shapes return earlier or are a different n.
+    if n in _SIGN_DC_LARGE_N:
+        pr_lg = _lr_participation_ratio(a)
+        if ((pr_lg >= _SIGN_DC_LARGE_PR_LO).float().mean().item() >= _LOWRANK_FRAC_MIN
+                and (pr_lg.max() / pr_lg.min().clamp_min(1e-30)).item() < _SIGN_DC_HOM_MAX
+                and _twolevel_mask(a.float()).float().mean().item() < _TWOLEVEL_MINFRAC):
+            return _eigh_sign_dc_large(a)
     # SPECTRAL DIVIDE-AND-CONQUER via the matrix sign function (brief 43): the
     # n=512 dense-even batch (shape 11, the board's worst shape ~208ms) is a dense
     # matrix with a gapless evenly-spaced signed spectrum -- NOT low-rank (PR ~284,
