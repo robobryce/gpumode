@@ -2825,7 +2825,7 @@ _SIGN_DC_BASE_MAX = 1300   # blocks <= this go to _lr_reduced_eigh (<=448 one-CT
                           # 449..836 C-CTA cluster, >836 cuSOLVER). At 1300 the n=2048
                           # ~1229-wide halves land on the base solver directly (depth-1,
                           # cuSOLVER halves); no second split (which mixes junk, above).
-_SIGN_DC_REC_MARGIN = 0.045 # oversample margin (fraction of m) added to ceil(m/2) for
+_SIGN_DC_REC_MARGIN = 0.03  # oversample margin (fraction of m) added to ceil(m/2) for
                           # the split width K. The sign(A - trace/m*I) split of a
                           # semicircle (GOE) spectrum is well-BALANCED (measured max_side
                           # ~1030 for the n=2048 shape5 seed, m/2=1024), so a small margin
