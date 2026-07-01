@@ -2765,6 +2765,16 @@ _SIGN_DC_LARGE_PR_LO = 150.0   # participation-ratio floor for the large-n dense
 _sign_dc_rec_omega_cache: dict = {}   # (b,m,K,dev) -> fixed random projection blocks
 _sign_dc_eye_cache: dict = {}         # (m,dev) -> identity for the shift
 _SIGN_DC_LARGE_DBG = False            # set True to print orth/eigr/fallback diagnostics
+# SINGLE-LEVEL N-way spectral divide for n=2048 (vs the depth-1 binary split): splits
+# the whole n x n block into _SIGN_DC_NWAYS pieces at once (nways-1 Ritz-estimated
+# shifts), each piece to the cluster/mega base. 1 = binary depth-1 (2 blocks -> cuSOLVER
+# at >836); 3 = 3-way (~683-wide pieces -> cluster base, no reduced-block recursion so
+# no junk propagation). nways trades more sign functions for a smaller/faster base solve.
+_SIGN_DC_NWAYS = 3
+_SIGN_DC_MW_MARGIN = 0.06   # oversample margin for the N-way piece width K =
+                            # ceil(m/nways) + ceil(margin*m). Ritz shifts are less
+                            # balanced than the binary median, so a bit more margin.
+_SIGN_DC_RITZ_PROJ = 256    # random Rayleigh-Ritz projection dim for shift estimation
 
 
 def _sign_dc_omega(b, n, K, dev):
@@ -3007,6 +3017,107 @@ def _sign_dc_block_eigh(A_blk, dev):
     return lam, G
 
 
+def _sign_dc_ritz_shifts(A_blk, dev, nways, m_proj):
+    """Estimate nways-1 balanced split shifts from a random Rayleigh-Ritz projection
+    of A_blk (B, m, m): B_small = Q^T A Q with Q an m_proj-dim random orthonormal
+    basis; the eigenvalues of B_small sample A_blk's spectrum, and their (i/nways)
+    quantiles estimate A_blk's quantiles. Cheap (m_proj x m_proj eigh) and robust to
+    a skewed spectrum (where a semicircle-radius model overshoots). Returns shifts
+    (B, nways-1) ascending."""
+    B = A_blk.shape[0]
+    g = torch.Generator(device=dev).manual_seed(424242)
+    Om = torch.randn(B, A_blk.shape[-1], m_proj, device=dev, dtype=torch.float32, generator=g)
+    Q, _ = torch.linalg.qr(Om)
+    with _LR_TF32():
+        Bs = torch.bmm(Q.transpose(-1, -2), torch.bmm(A_blk, Q))
+    Bs = 0.5 * (Bs + Bs.transpose(-1, -2))
+    ritz = torch.linalg.eigvalsh(Bs)            # (B, m_proj) sampled spectrum
+    ps = torch.tensor([i / nways for i in range(1, nways)], device=dev, dtype=torch.float32)
+    sh = torch.quantile(ritz, ps, dim=-1)       # (nways-1, B)
+    return sh.transpose(0, 1).contiguous()       # (B, nways-1)
+
+
+def _sign_dc_multiway(A_blk, dev, nways):
+    """SINGLE-LEVEL N-way spectral divide of a batched symmetric block (B, m, m) via
+    nways-1 shifted matrix-sign functions: split into nways ~m/nways-wide invariant-
+    subspace pieces, each solved by the base solver (_lr_reduced_eigh: cluster at
+    <=836, one-CTA mega at <=448), then rank-select the m true eigenpairs from the
+    nways*K candidates by projector MEMBERSHIP. Unlike deeper _sign_dc_block_eigh
+    recursion, this is ONE level (no reduced-block re-splitting), so the oversample
+    junk of each piece never propagates into another split -> membership stays clean.
+    Shifts come from a random Rayleigh-Ritz sample of the spectrum (_sign_dc_ritz_shifts),
+    robust for the skewed dense spectrum. Returns (lam, G) -- all m eigenpairs, unsorted.
+    No gate (the OUTER per-matrix residual gate + cuSOLVER fallback catches misses)."""
+    import math as _math
+    B = A_blk.shape[0]
+    m = A_blk.shape[-1]
+    shifts = _sign_dc_ritz_shifts(A_blk, dev, nways, _SIGN_DC_RITZ_PROJ)   # (B, nways-1)
+    eye_m = _sign_dc_eye(m, dev)
+    _gp = torch.backends.cuda.matmul.allow_tf32
+    # per-shift sign functions S_j = sign(A - shift_j I)
+    Ss = []
+    for j in range(nways - 1):
+        sig = shifts[:, j].reshape(B, 1, 1)
+        Ash = A_blk - sig * eye_m
+        torch.backends.cuda.matmul.allow_tf32 = True
+        v = torch.randn(B, m, 1, device=dev, dtype=torch.float32)
+        v = v / v.norm(dim=1, keepdim=True).clamp_min(1e-30)
+        for _ in range(_SIGN_DC_REC_POWER_ITERS):
+            v = Ash @ (Ash @ v)
+            v = v / v.norm(dim=1, keepdim=True).clamp_min(1e-30)
+        nrm2 = (v.transpose(-1, -2) @ (Ash @ (Ash @ v))).abs().reshape(B, 1, 1).clamp_min(1e-30)
+        scale = nrm2.sqrt() * 1.02
+        X = Ash / scale
+        for _ in range(_SIGN_DC_REC_NS_ITERS):
+            X2 = torch.bmm(X, X)
+            X = torch.baddbmm(X, X, X2, beta=1.5, alpha=-0.5)
+        torch.backends.cuda.matmul.allow_tf32 = _gp
+        Ss.append(X)
+
+    # projector for piece i (not materialized): applied to a thin operand M (B, m, w).
+    #   piece 0:      P(<s0)          = 0.5(M - S0 M)
+    #   piece last:   P(>=s_{last-1}) = 0.5(M + S_{n-2} M)
+    #   piece i (mid):P(>=s_{i-1}) P(<s_i) = 0.5(.+.) then 0.5(.-.)
+    def _apply_piece(i, M):
+        if i == 0:
+            return torch.baddbmm(M, Ss[0], M, beta=0.5, alpha=-0.5)
+        if i == nways - 1:
+            return torch.baddbmm(M, Ss[-1], M, beta=0.5, alpha=0.5)
+        Y = torch.baddbmm(M, Ss[i - 1], M, beta=0.5, alpha=0.5)   # >= s_{i-1}
+        return torch.baddbmm(Y, Ss[i], Y, beta=0.5, alpha=-0.5)    # then < s_i
+    K = _math.ceil(m / nways) + _math.ceil(_SIGN_DC_MW_MARGIN * m)
+    K = min(K, m)
+    # oversized invariant-subspace bases for every piece, stacked into one CQR.
+    Om, Om2 = _sign_dc_rec_omega(B, m, K, dev)
+    torch.backends.cuda.matmul.allow_tf32 = True
+    probes = [Om, Om2] + [_sign_dc_rec_omega(B, m, K, dev)[0] for _ in range(nways - 2)]
+    Ublocks = [_apply_piece(i, probes[i]) for i in range(nways)]
+    torch.backends.cuda.matmul.allow_tf32 = _gp
+    Ustk = _sign_dc_cqr(torch.cat(Ublocks, dim=0), passes=_SIGN_DC_CQR_PASSES)  # (nways*B, m, K)
+    # reduced K x K blocks for every piece, stacked -> ONE base-solver launch.
+    with _LR_TF32():
+        AUs = [torch.bmm(A_blk, Ustk[i * B:(i + 1) * B]) for i in range(nways)]
+        AU = torch.cat(AUs, dim=0)
+        Bstk = torch.bmm(Ustk.transpose(-1, -2), AU)
+        Bstk = 0.5 * (Bstk + Bstk.transpose(-1, -2))
+    lstk, gstk = _lr_reduced_eigh(Bstk)          # (nways*B, K), (nways*B, K, K)
+    torch.backends.cuda.matmul.allow_tf32 = True
+    Vstk = torch.bmm(Ustk, gstk)                 # (nways*B, m, K) candidate eigenvectors
+    # membership per piece (of that piece's projector)
+    sels = []
+    for i in range(nways):
+        Vi = Vstk[i * B:(i + 1) * B]
+        sels.append(_apply_piece(i, Vi).norm(dim=1))   # (B, K)
+    torch.backends.cuda.matmul.allow_tf32 = _gp
+    Vall = torch.cat([Vstk[i * B:(i + 1) * B] for i in range(nways)], dim=-1)  # (B, m, nways*K)
+    Lall = torch.cat([lstk[i * B:(i + 1) * B] for i in range(nways)], dim=-1)  # (B, nways*K)
+    mem = torch.cat(sels, dim=-1)                # (B, nways*K)
+    topi = mem.topk(m, dim=-1).indices
+    G = torch.gather(Vall, 2, topi.unsqueeze(1).expand(B, m, m))
+    lam = torch.gather(Lall, 1, topi)
+    return lam, G
+
+
 def _sign_dc_solve_large(af, n, dev):
     """Batched spectral divide-and-conquer eigh for the large-n dense class (n=2048)
     via the RECURSIVE shifted matrix-sign block eigensolver. Returns (Q, L, AQ, order)
@@ -3015,7 +3126,10 @@ def _sign_dc_solve_large(af, n, dev):
     (3xTF32 finishing NS orthonormalization + Rayleigh-quotient L), but the whole n x n
     block is solved by the recursion instead of a single split."""
     b = af.shape[0]
-    lam, G = _sign_dc_block_eigh(af, dev)      # (b, n), (b, n, n) -- all n eigenpairs
+    if _SIGN_DC_NWAYS > 1:
+        lam, G = _sign_dc_multiway(af, dev, _SIGN_DC_NWAYS)   # single-level N-way
+    else:
+        lam, G = _sign_dc_block_eigh(af, dev)  # (b, n), (b, n, n) -- all n eigenpairs (depth-1)
     Q = G
     # finishing Newton-Schulz orthonormalization (cleans the TF32-sign bases' orth to
     # ~1e-4), Gram + Q@Gram in 3xTF32 (~FP32 accuracy at ~1.6x FP32-SIMT).
