@@ -2119,7 +2119,7 @@ def _lr_av_mode_for(n: int, k: int):
     3xTF32's ~6e-6 keeps them gate-clean (3xtf32 94.0ms, -8.5%). Route 3xTF32 only
     for that near-rank case (n>=1024, k>=768); plain TF32 everywhere else."""
     if n >= 1024 and k >= 768:
-        return "3xtf32"
+        return "2xtf32"  # brief-54 probe: 2-term split (cheaper) on shape10 A@X
     return "tf32"
 
 
