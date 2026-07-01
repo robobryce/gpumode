@@ -2054,7 +2054,7 @@ _LR_VD_LIFT_MODE = "fp32"    # Vd = Qd @ G lift GEMM precision
 # FP32-SIMT runs ~40 TFLOPS while FP32-accurate 3xTF32 (Ozaki hi+lo split, ~6e-6 rel)
 # runs ~8-10x faster on the TF32 tensor cores and stays inside the orth/eigen gates
 # (plain TF32 at ~3e-4 does NOT -> mass fallback). "fp32" | "tf32" | "3xtf32".
-_LR_AV_MODE = "3xtf32"       # A@X (range-finder / power / Rayleigh) matvec precision
+_LR_AV_MODE = "tf32"         # A@X (range-finder / power / Rayleigh) matvec precision
 
 
 def _lr_dom_gram_mode_for(n: int, k: int):
