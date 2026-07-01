@@ -2594,6 +2594,12 @@ _SIGN_DC_NS_ITERS = 20    # Newton-Schulz sign iterations (each = 2 batched GEMM
                           # eig margin (3.6e-3) with the fewest GEMMs.
 _SIGN_DC_POWER_ITERS = 15 # A^2 power iterations for the spectral-norm scale estimate
 _SIGN_DC_FINAL_NS = 1     # finishing FP32 NS orthonormalization steps on Q
+_SIGN_DC_CQR_PASSES = 2   # subspace-basis CholeskyQR passes. REQUIRED at 2: the
+                          # projected bases P+/- @ Omega are rank-deficient (the K
+                          # oversample exceeds the true subspace rank), and 1 shifted
+                          # CQR pass leaves U too far from orthonormal -> the membership
+                          # split degrades -> mass cuSOLVER fallback (shape 11 measured
+                          # 304ms with passes=1 vs 109ms with passes=2).
 _SIGN_DC_PR_LO = 200.0    # participation-ratio floor: only the flat/dense-even class
                           # (PR ~284) routes; every low-rank band is below this, and
                           # near-rank (PR ~326 at n=1024) is a different n.
@@ -2671,7 +2677,8 @@ def _sign_dc_solve(af, n, dev):
     # bases are the SAME (n x K) shape, so STACK them (2b x n x K) and run one CQR +
     # one A@U GEMM instead of two -- better GPU fill, half the launch overhead.
     Om, Om2 = _sign_dc_omega(b, n, K, dev)
-    Ustk = _sign_dc_cqr(torch.cat([_pp(Om), _pm(Om2)], dim=0))     # (2b, n, K)
+    Ustk = _sign_dc_cqr(torch.cat([_pp(Om), _pm(Om2)], dim=0),
+                        passes=_SIGN_DC_CQR_PASSES)               # (2b, n, K)
     torch.backends.cuda.matmul.allow_tf32 = _gp
     # reduced K x K blocks -> fused tensor-core megakernel (raw, unsorted, ungated).
     # Both blocks solved in ONE stacked (2b, K, K) megakernel launch: one-CTA-per-matrix,
