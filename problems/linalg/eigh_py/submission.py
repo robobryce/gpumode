@@ -1842,17 +1842,20 @@ _LOWRANK_FRAC_MIN = 0.85      # only route if >= this fraction of the batch is i
 _LOWRANK_HOM_MAX = 3.0        # max(PR)/min(PR) below this => homogeneous batch (safe to route non-steep bands)
 
 
-def _lowrank_route_k(a: torch.Tensor, n: int):
+def _lowrank_route_k(a: torch.Tensor, n: int, pr: torch.Tensor = None):
     """Return the dominant-block rank k for the low-rank path on this batch, or
     None to skip it. Pure function of matrix STRUCTURE (spectrum concentration
     via the participation-ratio probe). Bands are (pr_lo, pr_hi, k); the first
     band with >= _LOWRANK_FRAC_MIN of the batch in [pr_lo, pr_hi) wins, and any
     non-steep band (pr_lo > 0) additionally requires a HOMOGENEOUS batch so the
-    heterogeneous mixed batches stay on cuSOLVER."""
+    heterogeneous mixed batches stay on cuSOLVER. `pr` may be a precomputed
+    participation-ratio vector (the mixed-peel router shares one A@A GEMM with
+    this call), else it is computed here."""
     bands = _LOWRANK_BANDS.get(n)
     if bands is None:
         return None
-    pr = _lr_participation_ratio(a)
+    if pr is None:
+        pr = _lr_participation_ratio(a)
     hom = (pr.max() / pr.min().clamp_min(1e-30)).item() < _LOWRANK_HOM_MAX
     for pr_lo, pr_hi, k in bands:
         in_band = ((pr >= pr_lo) & (pr < pr_hi)).float().mean().item()
@@ -1862,6 +1865,97 @@ def _lowrank_route_k(a: torch.Tensor, n: int):
             continue
         return k
     return None
+
+
+# ---------------------------------------------------------------------------
+# MIXED-BATCH DENSE PEEL (worker, brief 28).
+#
+# The n=512 "mixed" benchmark batch (shape 6, b640) is a HETEROGENEOUS mix:
+# ~40% dense + ~60% individually-cheaper structures (psd/rankdef/nearrank/band/
+# repeated/clustered/spectrum/rowscale). It sits on the whole-batch cuSOLVER
+# floor because _lowrank_route_k's homogeneity gate (correctly) refuses to route
+# the whole heterogeneous batch to one low-rank k. brief-10 refuted peeling the
+# dense subset under the OLD (slower) low-rank inner solve: the dense-subset
+# margin over cuSOLVER was only ~10% -- too thin to overcome the classifier A@A
+# (~4ms) + the second cuSOLVER call. brief-24's SPLIT back-transform then made
+# the k<=448 low-rank inner solve ~1.2-1.5x faster, which FLIPS the economics.
+#
+# STEP-1 probe (brief-28, mixed512 b640) RE-MEASURED it, live:
+#   * the truly-dense matrices sit in a razor-tight PR window ~[51.6, 58.1]
+#     (a clean separation from psd~42 / rowscale~27 / rankdef~83 / spectrum~111),
+#     so a conservative PR window [48,62) captures exactly the 264 dense matrices
+#     with ZERO gate-fallbacks;
+#   * split-mega low-rank on that dense subset = 34.0ms vs cuSOLVER-gathered
+#     78.8ms -- a 56.8% margin (brief-10 saw ~10%); the cuSOLVER MARGINAL saving
+#     (whole 163.9ms - rest 100.6ms = 63.2ms) minus the LR subset (34.0ms) =
+#     +29.2ms, now COMFORTABLY exceeding the classifier+gather/scatter overhead
+#     (~4.1ms);
+#   * end-to-end: peel = 139.1ms vs whole-batch cuSOLVER 163.5ms = a 24.4ms win
+#     (-14.9%) on this shape, 0 fallbacks.
+# The break-even is ~64 dense matrices (cuSOLVER's n=512 knee): below it,
+# removing the subset does not drop cuSOLVER off its floor so the marginal saving
+# is ~0 while the low-rank path still pays its ~28ms fixed floor -> a loss (probe:
+# 32 mats +10ms LOSS, 64 mats break-even, 96 mats -3.3ms WIN, 264 mats -24.4ms).
+# So the peel FIRES only when the dense-window count >= _MIXED_PEEL_MIN_COUNT
+# (128, a 2x margin over break-even so noise/reseed variation cannot flip it).
+#
+# mixed1024 (shape 7, b60) does NOT qualify: only ~2/60 matrices are dense, far
+# below break-even, and cuSOLVER's per-matrix n=1024 marginal (~1.4ms) is tiny
+# while the LR floor is ~15ms -> the probe measured a LOSS at every window, so
+# the peel is gated to n=512 only. Homogeneous batches never reach this branch
+# (they route through _lowrank_route_k above). Runtime-structural (PR window +
+# count), never a shape key -> leaderboard-reseed-safe; the low-rank subset call
+# is itself per-matrix residual-gated so a misclassified matrix falls back to
+# cuSOLVER inside it (never an invalid result, only a wasted double-solve).
+# ---------------------------------------------------------------------------
+_MIXED_PEEL_N = 512           # only the n=512 mixed batch qualifies (probe: n=1024 loses)
+_MIXED_PEEL_PR_LO = 48.0      # dense window low edge (dense PR ~[51.6,58.1]; psd~42 below)
+_MIXED_PEEL_PR_HI = 62.0      # dense window high edge (rankdef/nearrank~83 above)
+_MIXED_PEEL_K = 352           # low-rank dominant rank for the dense n=512 subset
+                              # (== the homogeneous dense512 band k; the split-mega
+                              # inner-solve orth ceiling is ~k=384, brief-26)
+_MIXED_PEEL_MIN_COUNT = 128   # min dense-window matrices to fire (~2x the ~64
+                              # cuSOLVER-knee break-even; below it the peel loses)
+_MIXED_PEEL_HOM_MAX = 3.0     # only peel a HETEROGENEOUS batch (max/min PR >= this);
+                              # a homogeneous batch is _lowrank_route_k's job
+
+
+def _mixed_peel_count(pr: torch.Tensor) -> int:
+    """Number of matrices in the dense PR window -- the peel's fire decision."""
+    return int(((pr >= _MIXED_PEEL_PR_LO) & (pr < _MIXED_PEEL_PR_HI)).sum().item())
+
+
+def _eigh_mixed_peel(a: torch.Tensor, pr: torch.Tensor) -> output_t:
+    """Per-matrix structural router for the heterogeneous n=512 mixed batch:
+    PEEL the dense-concentrated subset (PR in the tight dense window) to the
+    fast split-mega low-rank path, run batched cuSOLVER on the rest, scatter
+    both back. `pr` is the participation-ratio vector already computed by the
+    caller (shared with _lowrank_route_k -- ONE A@A GEMM for both). The low-rank
+    subset call is itself per-matrix residual-gated (falls any matrix it can't
+    resolve back to cuSOLVER inside _eigh_lowrank_safe), so correctness is
+    identical to whole-batch cuSOLVER; only the DENSE matrices that clear the
+    gate resolve faster."""
+    b, n, _ = a.shape
+    dev = a.device
+    dense_mask = (pr >= _MIXED_PEEL_PR_LO) & (pr < _MIXED_PEEL_PR_HI)
+    gidx = torch.nonzero(dense_mask, as_tuple=False).flatten()
+    ridx = torch.nonzero(~dense_mask, as_tuple=False).flatten()
+    Q = torch.empty(b, n, n, device=dev, dtype=torch.float32)
+    L = torch.empty(b, n, device=dev, dtype=torch.float32)
+    # dense subset -> split-mega low-rank (residual-gated internally)
+    a_sub = a.index_select(0, gidx).contiguous()
+    Qs, Ls = _eigh_lowrank_safe(a_sub, _MIXED_PEEL_K, power=1)
+    Q.index_copy_(0, gidx, Qs)
+    L.index_copy_(0, gidx, Ls)
+    # rest -> batched cuSOLVER (the structure-independent floor; the probe showed
+    # no Python-level partition of the non-dense classes beats one cuSOLVER call
+    # on them -- brief-10 -- so the rest stays whole)
+    if ridx.numel() > 0:
+        a_rest = a.index_select(0, ridx).contiguous()
+        Lr, Qr = torch.linalg.eigh(a_rest)
+        Q.index_copy_(0, ridx, Qr)
+        L.index_copy_(0, ridx, Lr)
+    return Q.contiguous(), L.contiguous()
 
 
 def custom_kernel(data: input_t) -> output_t:
@@ -1896,9 +1990,28 @@ def custom_kernel(data: input_t) -> output_t:
     # misdetection never regresses. Must precede the 2-level branch: a geometric
     # spectrum is NOT 2-level (A^2 != cI), so it would otherwise fall through
     # _eigh_twolevel's detector to plain cuSOLVER, missing this win.
-    k_lr = _lowrank_route_k(a, n)
+    # Compute the participation-ratio probe ONCE for the n in {512,1024} regime
+    # and share it between _lowrank_route_k (whole-batch low-rank routing) and the
+    # mixed-batch dense peel below, so the ~3.6ms A@A GEMM is paid only once.
+    pr = _lr_participation_ratio(a) if n in _LOWRANK_BANDS else None
+    k_lr = _lowrank_route_k(a, n, pr=pr)
     if k_lr is not None:
         return _eigh_lowrank_safe(a, k_lr, power=1)
+    # MIXED-BATCH DENSE PEEL (brief 28): a heterogeneous n=512 mixed batch (the
+    # benchmark's shape 6) whose whole-batch low-rank route was (correctly)
+    # refused above by the homogeneity gate still has a large DENSE subset that
+    # the split-mega low-rank path resolves ~1.6x faster than cuSOLVER. Peel that
+    # dense subset (tight PR window) to low-rank, cuSOLVER on the rest -- measured
+    # -14.9% on mixed512 b640, 0 fallbacks. Fires only for n=512, a heterogeneous
+    # batch, and >= _MIXED_PEEL_MIN_COUNT dense matrices (the cuSOLVER-knee
+    # break-even), so mixed1024 (too few dense) and homogeneous batches never
+    # take it -> no regression. Uses the shared pr; the peel's low-rank subset
+    # call is per-matrix residual-gated so correctness is identical to cuSOLVER.
+    if n == _MIXED_PEEL_N and pr is not None:
+        hom_ratio = (pr.max() / pr.min().clamp_min(1e-30)).item()
+        if hom_ratio >= _MIXED_PEEL_HOM_MAX and \
+                _mixed_peel_count(pr) >= _MIXED_PEEL_MIN_COUNT:
+            return _eigh_mixed_peel(a, pr)
     # n >= _TWOLEVEL_NMIN: the two-level projector eigensolver runs per-matrix on
     # any matrix in the batch with a ~{-1,+1} spectrum (A^2 ~ I) -- ~2x faster
     # than cuSOLVER on clustered512 -- and cuSOLVER on the rest. Internally
