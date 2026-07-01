@@ -665,7 +665,7 @@ __device__ __forceinline__ float _clsum(float x, float* red, int tid, int nt){
   return red[0];
 }
 extern "C" __global__ void __cluster_dims__(CLUST_C,1,1)
-    __launch_bounds__(CLUST_NT, 2) mega_eigh_clust_split_k(
+    mega_eigh_clust_split_k(
     const float* __restrict__ Ain,
     float* __restrict__ Vout, float* __restrict__ Lout,
     float* __restrict__ rscr, float* __restrict__ dscr, float* __restrict__ escr,
@@ -689,12 +689,21 @@ extern "C" __global__ void __cluster_dims__(CLUST_C,1,1)
   float* v = (float*)(shc + voff);             // n floats: this CTA's copy of v
   float* p = v + n;                            // n floats: this CTA's partial p
   __shared__ float red[1024];
+  // peer-visible SMEM staging for the cross-CTA SCALAR reductions (amax/s2/alpha):
+  // clx[0]=amax/s2 partial, clx[1]=alpha (owner CTA only), read from the peer via
+  // map_shared_rank. The scalar DSMEM reads are race-free (single value ordered by
+  // cluster.sync). The VECTOR exchange (v/p, below) is the one that raced through
+  // DSMEM map_shared_rank -- non-deterministic tridiag + NaN at k=608 (brief-21 hit
+  // the same) -- so v/p go through GLOBAL staging (vgm/pgm) + __threadfence() +
+  // cluster.sync, which IS deterministic (Dm run-to-run diff 0.0, k=256/512/608).
+  __shared__ float clx[2];
   float* Rm=rscr+(long)m*n*n; float* Dm=dscr+(long)m*n; float* Em=escr+(long)m*(n-1);
   float* DP=dpscr+(long)m*n*n; float* DM=dmscr+(long)m*n*n;
   float* Tau=tauscr+(long)m*n;
   float* Vg=Vout+(long)m*n*n;                  // Z (tridiag eigenvectors) in GLOBAL
   const float* Am=Ain+(long)m*n*n;
-  float* pgm = pscr + (long)m*(long)C*n;
+  float* vgm = vscr + (long)m*n;               // global v staging (n floats, all CTAs write owned rows)
+  float* pgm = pscr + (long)m*(long)C*n;       // global per-CTA p staging (C*n)
   #define LBASE(i) ( (size_t)(((size_t)(i)*((i)+1))>>1) - triLo )
   #define AOWN(i,j) __half2float( Ah[ LBASE(i) + (j) ] )
   #define AOWNSET(i,j,val) Ah[ LBASE(i) + (j) ] = __float2half(val)
@@ -704,11 +713,11 @@ extern "C" __global__ void __cluster_dims__(CLUST_C,1,1)
   for(int i=r0;i<r1;++i){ for(int j=tid;j<=i;j+=nt){ float x=fabsf(Am[(long)i*n+j]); amax=fmaxf(amax,x);} }
   red[tid]=amax; __syncthreads();
   for(int s=nt>>1;s>0;s>>=1){ if(tid<s)red[tid]=fmaxf(red[tid],red[tid+s]); __syncthreads(); }
-  if(tid==0) pgm[(long)R*n]=red[0];
+  if(tid==0) clx[0]=red[0];               // this CTA's max|A| -> peer-visible SMEM
   __syncthreads();
-  cl.sync();
-  float scale=0.f;
-  for(int rr=0;rr<C;++rr) scale=fmaxf(scale, pgm[(long)rr*n]);
+  cl.sync();                              // orders clx across the cluster (DSMEM)
+  float scale=clx[0];
+  { volatile float* peerx = (volatile float*)cl.map_shared_rank(clx, R^1); scale=fmaxf(scale, peerx[0]); }
   if(scale<1e-30f) scale=1.f;
   float invs=1.f/scale;
   cl.sync();
@@ -723,11 +732,15 @@ extern "C" __global__ void __cluster_dims__(CLUST_C,1,1)
     if(active) for(int i=is+tid;i<r1;i+=nt){ float x=AOWN(i,c); s2+=x*x; }
     s2 = _clsum(s2, red, tid, nt);
     int ownerC1=0; { for(int rr=0;rr<C;++rr){ if(c+1>=bnd[rr] && c+1<bnd[rr+1]){ ownerC1=rr; break; } } }
-    if(tid==0){ pgm[(long)R*n+1]=s2; if((int)R==ownerC1) pgm[(long)R*n+2]=AOWN(c+1,c); }
+    // stage this CTA's partial s2 (clx[0]) + alpha=AOWN(c+1,c) on the owner (clx[1])
+    // into peer-visible SMEM; cluster.sync orders the DSMEM peer reads below.
+    if(tid==0){ clx[0]=s2; if((int)R==ownerC1) clx[1]=AOWN(c+1,c); }
     __syncthreads();
     cl.sync();
-    float xnorm2=0.f; for(int rr=0;rr<C;++rr) xnorm2+=pgm[(long)rr*n+1];
-    float alpha = pgm[(long)ownerC1*n+2];
+    float xnorm2, alpha;
+    { volatile float* peerx = (volatile float*)cl.map_shared_rank(clx, R^1);
+      xnorm2 = clx[0] + peerx[0];
+      alpha = ((int)R==ownerC1) ? clx[1] : peerx[1]; }
     bool lead = ((int)R==ownerC1);
     float tail2 = xnorm2 - alpha*alpha;
     if(tail2<=1e-20f){
@@ -739,32 +752,36 @@ extern "C" __global__ void __cluster_dims__(CLUST_C,1,1)
     float xnorm=sqrtf(xnorm2); float beta=(alpha>=0.f)?-xnorm:xnorm; float tau=(beta-alpha)/beta; float denom=alpha-beta;
     for(int i=r0+tid;i<r1;i+=nt){
       float vi = (i<=c)?0.f : ((i==c+1)?1.f : AOWN(i,c)/denom);
-      v[i]=vi; Rm[i*n+c]=vi;
+      v[i]=vi; Rm[i*n+c]=vi; vgm[i]=vi;      // stage owned v into GLOBAL
     }
+    __threadfence();                          // publish owned-v global writes to peers
     __syncthreads();
     cl.sync();
-    { float* vpeer = cl.map_shared_rank(v, R^1);
-      int pr0=bnd[R^1], pr1=bnd[(R^1)+1];
-      for(int i=pr0+tid;i<pr1;i+=nt) v[i]=vpeer[i]; }
+    // Cross-CTA v exchange via GLOBAL staging (vgm) + threadfence -- the DSMEM
+    // map_shared_rank peer read raced (non-deterministic tridiag; brief-21 same),
+    // so read the peer's owned v rows from GLOBAL after the fenced cluster barrier.
+    { int pr0=bnd[R^1], pr1=bnd[(R^1)+1];
+      for(int i=pr0+tid;i<pr1;i+=nt) v[i]=vgm[i]; }
     __syncthreads();
     // symv p = tau*A@v, no-atomic symmetric dot product (C==2). Owned row i:
     //   p[i] = sum_{j<=i} A[i][j] v[j]  (lower, local)  + sum_{j>i} A[j][i] v[j] (upper)
-    __half* AhPeer = cl.map_shared_rank(Ah, 1);
+    volatile __half* AhPeer = (volatile __half*)cl.map_shared_rank(Ah, 1);
     long triLoPeer = ((long)bnd[1]*(bnd[1]+1))/2;
     if(active) for(int i=is+tid; i<r1; i+=nt){
       float acc=0.f;
       for(int j=c;j<=i;++j) acc += AOWN(i,j)*v[j];
       int jl_hi = (r1<n)? r1 : n;
       for(int j=i+1;j<jl_hi;++j) acc += AOWN(j,i)*v[j];
-      if(r1<n){ for(int j=r1;j<n;++j) acc += __half2float(AhPeer[((long)j*(j+1))/2 - triLoPeer + i])*v[j]; }
-      p[i]=tau*acc;
+      if(r1<n){ for(int j=r1;j<n;++j){ __half hh = AhPeer[((long)j*(j+1))/2 - triLoPeer + i]; acc += __half2float(hh)*v[j]; } }
+      p[i]=tau*acc; pgm[(long)R*n+i]=p[i];    // stage owned p into GLOBAL
     }
+    __threadfence();                          // publish owned-p global writes to peers
     __syncthreads();
     cl.sync();
-    { float* ppeer = cl.map_shared_rank(p, R^1);
-      int pr0=bnd[R^1], pr1=bnd[(R^1)+1];
+    // Cross-CTA p exchange via GLOBAL staging (pgm[R*n+i]) + threadfence.
+    { int pr0=bnd[R^1], pr1=bnd[(R^1)+1];
       int ps=(pr0>c+1)?pr0:(c+1);
-      for(int i=ps+tid;i<pr1;i+=nt) p[i]=ppeer[i]; }
+      for(int i=ps+tid;i<pr1;i+=nt) p[i]=pgm[(long)(R^1)*n+i]; }
     __syncthreads();
     float vp=0.f;
     for(int i=c+1+tid;i<n;i+=nt) vp+=v[i]*p[i];
