@@ -2028,16 +2028,23 @@ def _lr_lift_gemm(A, B, mode):
 # The DOMINANT-subspace CholeskyQR2 (the power step on Qd) and the Vd = Qd@G lift
 # are the FP32-SIMT (cutlass3x_sm100_simt_sgemm) GEMMs the brief-40 profile found
 # dominating the low-rank routed path (shapes 8/10 + the mixed peel). B200 runs
-# TF32 tensor-core GEMMs ~8-10x faster than FP32-SIMT, so routing these two GEMM
-# families to TF32 -- and trusting CQR2's SECOND reorthogonalization pass to
-# self-correct the reduced first-pass precision -- is the lever. Each knob is one
-# of "fp32" | "tf32" | "3xtf32"; the residual+orth gate inside _eigh_lowrank_safe
-# falls any matrix a reduced-precision factor cannot resolve back to cuSOLVER, so
-# nothing here can produce an invalid result (only a wasted double-solve).
-# Default dominant CQR2 Gram / Vd-lift precision (used when the caller does not
-# pass an explicit per-shape mode). fp32 is the safe baseline; the caller routes
-# 3xTF32 in via _lr_dom_gram_mode_for where the profile + fallback measurements
-# show it is a net win (see that helper).
+# TF32 tensor-core GEMMs much faster than FP32-SIMT. MEASURED (brief-44):
+#   * plain TF32 anywhere in the DOMINANT CQR2 (either pass) or on the Vd lift ->
+#     MASS FALLBACK (t1/t2/t6): the low-rank shapes sit at the orth-gate FLOOR
+#     (ill-conditioned Qd, kappa 1e3-1e4; the spectral tail leaves the subspace
+#     only approx-invariant), so TF32's ~3e-4/op breaks orthonormality over the
+#     80*n*eps gate and the 2-pass CQR2 does NOT self-correct it.
+#   * FP32-accurate 3xTF32 (Ozaki hi+lo split) on the dominant Gram is SAFE (no
+#     fallback change) and a net win on every low-rank shape EXCEPT the zero-margin
+#     n=512 dense-concentrated route (shape3, k=352), where 3xTF32's ~6e-6 residual
+#     tips borderline matrices over the gate (partial fallback, t5). So 3xTF32 is
+#     routed per-shape by _lr_dom_gram_mode_for; the Vd lift 3xTF32 is net-neutral
+#     (small GEMM, t4/t8) so it stays FP32.
+# Each knob is "fp32" | "tf32" | "3xtf32" (or a per-pass tuple for the Gram); the
+# residual+orth gate inside _eigh_lowrank_safe falls any matrix a reduced-precision
+# factor cannot resolve back to cuSOLVER, so nothing here can produce an invalid
+# result (only a wasted double-solve). These are the DEFAULTS when the caller does
+# not pass an explicit per-shape mode; the live callers pass _lr_dom_gram_mode_for.
 _LR_DOM_GRAM_MODE = "fp32"   # dominant power-step CQR2 Gram Q^T Q precision
 _LR_VD_LIFT_MODE = "fp32"    # Vd = Qd @ G lift GEMM precision
 
@@ -2265,12 +2272,11 @@ def _lowrank_eigh(a, k, power=1, dom_gram_mode=None, vd_lift_mode=None):
         # <=1.7e-3) and ~5-8% faster than rp2/pp2 (one fewer Gram+Cholesky+trsm on
         # the n-row dominant block). The FINAL power CQR2 MUST stay 2-pass -- 1
         # pass there gives orth ~6-11 -> 100% fallback (probed).
-        # brief-44: the DOMINANT power-step CQR2 Gram runs at _LR_DOM_GRAM_MODE
-        # (TF32 tensor cores by default -- ~8-10x the FP32-SIMT rate). The 2-pass
-        # CQR2 self-corrects the reduced first-pass precision; the residual+orth
-        # gate falls any matrix it cannot resolve back to cuSOLVER. The RANGE-FINDER
-        # CQR2 stays 1-pass FP32: it has no self-correcting second pass, and its Qd0
-        # only has to SPAN the subspace (re-orthonormalized by the power CQR2 below).
+        # brief-44: the DOMINANT power-step CQR2 Gram runs at dom_gram_mode (the
+        # caller passes FP32-accurate 3xTF32 per-shape via _lr_dom_gram_mode_for --
+        # tensor cores where it is a net win, FP32 on the zero-margin dense512
+        # route). The RANGE-FINDER CQR2 stays 1-pass FP32: its Qd0 only has to SPAN
+        # the subspace (re-orthonormalized by the power CQR2 below).
         Qd = _lr_cholesky_qr2(torch.bmm(a, Omega), passes=1)
         for _ in range(power):
             Qd = _lr_cholesky_qr2(torch.bmm(a, Qd), gram_mode=dom_gram_mode)
@@ -2287,11 +2293,11 @@ def _lowrank_eigh(a, k, power=1, dom_gram_mode=None, vd_lift_mode=None):
             Bk = Bk + jit.view(-1, 1, 1) * torch.eye(kk, device=dev, dtype=Bk.dtype)
             lam_d, G = torch.linalg.eigh(Bk)
         _p = torch.backends.cuda.matmul.allow_tf32
-        # brief-44: Vd = Qd @ G lift at _LR_VD_LIFT_MODE. Qd is orthonormal (fresh
-        # from CQR2) and G is orthonormal (reduced-block eigenvectors), so this
-        # n*k @ k*k product is WELL-conditioned -- the regime where TF32's ~3e-4/op
-        # error does not compound. Routing it to TF32 tensor cores (~8-10x the
-        # FP32-SIMT rate) is the lever; the orth gate catches any Vd that drifts.
+        # brief-44: Vd = Qd @ G lift at vd_lift_mode (FP32 by default). 3xTF32 here
+        # was net-neutral (t4/t8: this small n*k @ k*k GEMM does not amortize the
+        # Ozaki split) and plain TF32 is unsafe (breaks V=[Vd,Vc] orth over the gate,
+        # t2 / brief-7 t7), so the live callers leave it FP32. The orth gate catches
+        # any Vd that drifts regardless of mode.
         Vd = _lr_lift_gemm(Qd, G, vd_lift_mode)
         # A@Vd == (A@Qd)@G feeds ONLY the residual gate (its ~3e-4 TF32 error is
         # far below the 9.2e-3 gate), so it runs on plain TF32 tensor cores.
