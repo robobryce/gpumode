@@ -764,27 +764,22 @@ extern "C" __global__ void mega_eigh_clust_split_k(
     __syncthreads();
     // symv p = tau*A@v, no-atomic symmetric dot product. Owned active row i:
     //   p[i] = sum_{j<=i} A[i][j] v[j]  (lower, local)  + sum_{j>i} A[j][i] v[j] (upper)
-    // The upper part reads column i of rows j>i: local rows j in (i,r1) from Ah,
-    // and rows j in [bnd[rr],bnd[rr+1]) owned by each PEER rank rr>R from that
-    // peer's Ah via map_shared_rank (generic over C).
+    // FUSED single row loop (one pass over owned rows, matching the fast C=2 path):
+    // lower + local-upper from this CTA's Ah, then each PEER rank rr>R contributes
+    // its rows [bnd[rr],bnd[rr+1]) from its Ah via map_shared_rank. AhPeer[rr] is
+    // resolved once outside the row loop (peer map is per-rank, not per-row).
+    volatile __half* AhP[8]; long triLoP[8];
+    for(int rr=(int)R+1; rr<C; ++rr){ AhP[rr]=(volatile __half*)cl.map_shared_rank(Ah, rr); triLoP[rr]=((long)bnd[rr]*(bnd[rr]+1))/2; }
     if(active) for(int i=is+tid; i<r1; i+=nt){
       float acc=0.f;
-      for(int j=c;j<=i;++j) acc += AOWN(i,j)*v[j];
-      for(int j=i+1;j<r1;++j) acc += AOWN(j,i)*v[j];
-      p[i]=tau*acc;
-    }
-    // add the peer-rank upper contributions (rows owned by ranks > R)
-    for(int rr=(int)R+1; rr<C; ++rr){
-      volatile __half* AhPeer = (volatile __half*)cl.map_shared_rank(Ah, rr);
-      long triLoPeer = ((long)bnd[rr]*(bnd[rr]+1))/2;
-      int pj0=bnd[rr], pj1=bnd[rr+1];
-      if(active) for(int i=is+tid; i<r1; i+=nt){
-        float acc=0.f;
-        for(int j=pj0;j<pj1;++j){ __half hh = AhPeer[((long)j*(j+1))/2 - triLoPeer + i]; acc += __half2float(hh)*v[j]; }
-        p[i]+=tau*acc;
+      for(int j=c;j<=i;++j) acc += AOWN(i,j)*v[j];        // lower (local)
+      for(int j=i+1;j<r1;++j) acc += AOWN(j,i)*v[j];       // upper, local rows
+      for(int rr=(int)R+1; rr<C; ++rr){                    // upper, peer rows
+        volatile __half* AhPeer=AhP[rr]; long tlp=triLoP[rr];
+        for(int j=bnd[rr];j<bnd[rr+1];++j){ __half hh=AhPeer[((long)j*(j+1))/2 - tlp + i]; acc += __half2float(hh)*v[j]; }
       }
+      p[i]=tau*acc; pgm[i]=p[i];                           // stage owned p into GLOBAL pfull (disjoint)
     }
-    if(active) for(int i=is+tid;i<r1;i+=nt) pgm[i]=p[i];   // stage owned p into GLOBAL pfull (disjoint writes)
     __threadfence();                          // publish owned-p global writes to peers
     __syncthreads();
     cl.sync();
@@ -1102,12 +1097,10 @@ _MEGA_CLUST_NT = 512
 # k<=~836 (k=768 shape-10: 590KB/3=197KB). _mega_clust_C(k) picks the smallest C.
 _SMEM_CAP_HALVES = 116000       # ~228KB / 2B, with margin for the v/p/block-T SMEM
 _MEGA_CLUST_KMIN = 449          # k>448 (won't fit one CTA in FP16 -> the k<=448 mega path)
-# Cap at the C=2 ceiling (~682): C=2 (k=608 shape-4) WINS (cluster inner 27ms vs
-# cuSOLVER 48ms = 1.76x -> shape4 -33%), but C=3 (k=768 shape-10) is CORRECT
-# (nbad 0/60, gate-passing) yet SLOWER than cuSOLVER (83ms vs 67ms = 0.81x, 3-way
-# distributed coordination + 24 tridiag panels) -> routing it REGRESSED shape10
-# 108639->124664us. So k=768 stays on cuSOLVER pending a faster C=3 / a tiled solve.
-_MEGA_CLUST_KMAX = 682          # C=2 ceiling (k=608 fits; k=768 needs C=3 which loses)
+# C=3 ceiling (~836). C=2 (k=608 shape-4): cluster inner 22ms vs cuSOLVER 48ms =
+# 2.19x. C=3 (k=768 shape-10): after the FUSED single-pass symv, 63.7ms vs 67.3ms
+# = 1.06x (was 0.81x with the split symv) -- now a thin win; measured end-to-end.
+_MEGA_CLUST_KMAX = 836          # C=3 ceiling (k=608 C=2, k=768 C=3)
 # route the k>448 reduced blocks (k=608 shape-4 C=2, k=768 shape-10 C=3) to the
 # cluster inner solve. Flag so the path can be disabled without editing routing.
 _LR_CLUST_ENABLED = True
