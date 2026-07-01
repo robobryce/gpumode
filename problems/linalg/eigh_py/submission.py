@@ -1402,7 +1402,14 @@ def _twolevel_mask(af: torch.Tensor) -> torch.Tensor:
     a +-1 spectrum gives ~0, every other tested spectrum gives >= 0.7."""
     b, n, _ = af.shape
     v = torch.randn(b, n, _TWOLEVEL_PROBES, device=af.device, dtype=torch.float32)
+    # brief-54: the A^2@v probe matvecs (n*n @ n*4) feed ONLY the 2-level threshold
+    # decision (routing), not any returned factor -- so plain TF32 is routing-safe
+    # (measured: the mask r<_TWOLEVEL_DETECT is BIT-IDENTICAL fp32-vs-tf32) and moves
+    # them off FP32-SIMT (~537us->255us at n=512 b640).
+    _p = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = True
     w = af @ (af @ v)
+    torch.backends.cuda.matmul.allow_tf32 = _p
     r = (w - v).norm(dim=(-2, -1)) / v.norm(dim=(-2, -1)).clamp_min(1e-30)
     return r < _TWOLEVEL_DETECT
 
