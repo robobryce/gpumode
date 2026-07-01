@@ -1095,7 +1095,15 @@ _MEGA_CLUST_NT = 512
 # is row-distributed across C CTAs, so per-CTA SMEM ~ tri(k)*2B / C must be <= the
 # ~228KB opt-in cap. C=2 fits k<=~682 (k=608 shape-4: 370KB/2=185KB); C=3 fits
 # k<=~836 (k=768 shape-10: 590KB/3=197KB). _mega_clust_C(k) picks the smallest C.
-_SMEM_CAP_HALVES = 116000       # ~228KB / 2B, with margin for the v/p/block-T SMEM
+_SMEM_CAP_HALVES = 111000       # per-CTA packed-FP16 triangle halves cap. Tightened
+                                # from 116000 (brief-55): the host shm = triangle +
+                                # v/p (2*k floats) + block-T; 116000 halves alone is
+                                # ~232KB, so at the C=5 boundary (k~1065-1076) the
+                                # triangle + v/p OVERFLOWS the 228KB opt-in cap ->
+                                # launch fails -> cuSOLVER fallback. 111000 halves
+                                # (~217KB) leaves headroom for v/p+block-T so a chosen
+                                # C always FITS. Preserves k=608->C2, k=768->C3 (shapes
+                                # 4/10) and k~1086->C6 (shape-5 halves, shm 201KB).
 _MEGA_CLUST_KMIN = 449          # k>448 (won't fit one CTA in FP16 -> the k<=448 mega path)
 # Ceiling extended from 836 (C=3) to fit the n=2048 sign-DC depth-1 halves (k~1030-
 # 1124, brief-55). C=2 (k=608 shape-4): cluster inner 22ms vs cuSOLVER 48ms = 2.19x.
