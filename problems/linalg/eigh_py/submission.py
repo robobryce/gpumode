@@ -1308,9 +1308,18 @@ def _lowrank_eigh(a, k, power=1):
             _prev = torch.backends.cuda.matmul.allow_tf32
             torch.backends.cuda.matmul.allow_tf32 = False
             R = R - torch.bmm(Qd, torch.bmm(Qd.transpose(-1, -2), R))
-            Vc = _lr_cholesky_qr2(R, shift=1e-4)
+            # The complement basis Vc spans the ORTHOGONAL complement of the
+            # (already-projected-out) dominant subspace, built from a random
+            # matrix -> WELL-conditioned, so its CQR2 Gram tolerates TF32 (unlike
+            # the ill-conditioned dominant Qd). brief-16 probe: complement-Gram
+            # TF32 gives orth <=5.6e-3 (~0-1 fallback across shapes 3/4/8/10/12)
+            # while the Gram GEMM runs ~9x faster on tensor cores. The projections
+            # (R - Qd Qd^T R) stay FP32 (allow_tf32=False here) -- TF32 there
+            # leaves TF32-level Qd leakage in the complement, breaking cross-block
+            # orthogonality of V=[Vd,Vc] (probed orth ~0.5).
+            Vc = _lr_cholesky_qr2(R, shift=1e-4, tf32_gram=True)
             Vc = Vc - torch.bmm(Qd, torch.bmm(Qd.transpose(-1, -2), Vc))
-            Vc = _lr_cholesky_qr2(Vc, shift=1e-5)
+            Vc = _lr_cholesky_qr2(Vc, shift=1e-5, tf32_gram=True)
             torch.backends.cuda.matmul.allow_tf32 = _prev
             AVc = torch.bmm(a, Vc)
             lam_c = (AVc * Vc).sum(dim=-2)
