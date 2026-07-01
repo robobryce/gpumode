@@ -2851,6 +2851,21 @@ _SIGN_DC_REC_POWER_ITERS = 6   # A^2 power iters for the shifted-block spectral-
 # quadratically-converging steps to reach the gate (1 step suffices only for the
 # cuSOLVER base's ~1e-3 start). No effect on shape 11 (its own _SIGN_DC_FINAL_NS).
 _SIGN_DC_LARGE_FINAL_NS = 8
+# brief-55: finishing orthonormalizer for the large-n path. "ns" = Newton-Schulz
+# (needs ~8 steps from the cluster base's orth-0.65 start); "cqr" = shifted
+# CholeskyQR2 -- MEASURED both slower (transposed-RHS trsm on 2048x2048) AND less
+# accurate (shift=1e-4 floors orth ~1e-2) than NS here, so "ns" is kept.
+_SIGN_DC_LARGE_FINISH = "ns"
+# precision of the finishing-NS GEMMs (Gram + Q@Gram): "tf32x3" (3xTF32 Ozaki,
+# ~FP32 acc, ~3 GEMMs/op), "tf32" (1-pass plain TF32, ~3e-4 rel, 1 GEMM/op), "fp32"
+# (SIMT). The finishing NS just orthonormalizes an already-full-rank Q, so plain TF32
+# (cheapest tensor-core) may floor orth low enough under the 1.8e-2 gate -- tested.
+_SIGN_DC_LARGE_FINISH_PREC = "tf32"
+# brief-55: number of TRAILING finishing-NS steps run at 3xTF32 (Ozaki, ~FP32 acc) to
+# polish orth below the plain-TF32 floor (~1.7e-2, right at the gate). The leading
+# (_SIGN_DC_LARGE_FINAL_NS - this) steps stay plain-TF32 (cheap). Only meaningful when
+# _SIGN_DC_LARGE_FINISH_PREC != "tf32x3".
+_SIGN_DC_LARGE_FINISH_POLISH = 2
 _SIGN_DC_LARGE_N = {2048}   # dense-class n routed to the recursive path (shape 5).
                             # n=1024 is handled by the mixed-peel/single-level probes;
                             # the recursive path is guarded to these n only so shape 11
@@ -3377,11 +3392,37 @@ def _sign_dc_solve_large(af, n, dev):
     # step is 2 n x n GEMMs on b=8.
     _gp = torch.backends.cuda.matmul.allow_tf32
     _nfin = _SIGN_DC_LARGE_FINAL_NS if _SIGN_DC_LARGE_FINAL_NS is not None else _SIGN_DC_FINAL_NS
-    if _nfin > 0:
+    if _SIGN_DC_LARGE_FINISH == "cqr" and _nfin > 0:
+        # brief-55: CholeskyQR2 finish instead of many NS steps. The assembled Q from
+        # the C-CTA cluster base starts at orth ~0.65 but FULL RANK (smin 0.715, cond
+        # ~1.4 -- MEASURED via SIGNDC_RANK_DBG), which Cholesky handles trivially, so
+        # ONE shifted-CQR pass drives orth to ~1e-6 vs the ~8 quadratic NS steps a
+        # 0.65 start needs. _nfin here is the CQR pass count (2 is ample). Cheaper: a
+        # CQR pass is Gram + Cholesky + trsm (~3 big ops) vs 8 NS steps x 3 Ozaki GEMMs.
         torch.backends.cuda.matmul.allow_tf32 = True
-        for _ in range(_nfin):
-            g = _gram_3xtf32_sym(Q)
-            Q = 1.5 * Q - 0.5 * _matmul_3xtf32(Q, g)
+        Q = _sign_dc_cqr(Q, passes=_nfin)
+        torch.backends.cuda.matmul.allow_tf32 = _gp
+    elif _nfin > 0:
+        torch.backends.cuda.matmul.allow_tf32 = True
+        # MIXED-precision finish (brief-55): the first (_nfin - polish) NS steps run at
+        # plain TF32 (1 GEMM/op, ~3e-4 rel) -- cheap, and enough to pull orth from the
+        # cluster base's ~0.65 start down to the TF32 floor ~1.7e-2 (right at the gate).
+        # The LAST `polish` steps run at 3xTF32 (Ozaki, ~FP32 acc) to push orth below
+        # that floor to ~1e-5 (safe reseed margin) at only `polish` x the Ozaki cost.
+        # Best of both: near-TF32 speed, near-FP32 final accuracy.
+        _polish = _SIGN_DC_LARGE_FINISH_POLISH
+        _fp = _SIGN_DC_LARGE_FINISH_PREC
+        for _i in range(_nfin):
+            hi = (_i >= _nfin - _polish)
+            if hi or _fp == "tf32x3":
+                g = _gram_3xtf32_sym(Q)
+                Q = 1.5 * Q - 0.5 * _matmul_3xtf32(Q, g)
+            else:
+                _pp2 = torch.backends.cuda.matmul.allow_tf32
+                torch.backends.cuda.matmul.allow_tf32 = (_fp == "tf32")
+                g = torch.bmm(Q.transpose(-1, -2), Q)
+                Q = 1.5 * Q - 0.5 * torch.bmm(Q, g)
+                torch.backends.cuda.matmul.allow_tf32 = _pp2
         torch.backends.cuda.matmul.allow_tf32 = _gp
     # Rayleigh-quotient re-eval of L on the orthonormalized Q; A@Q on TF32 feeds both
     # the Rayleigh L and the caller's eigen-residual gate (column-aligned by order).
