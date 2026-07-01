@@ -1200,27 +1200,91 @@ def _lr_bare_scratch(B, k, dev):
     return buf
 
 
+def _lr_reduced_mega(Bk):
+    """RAW megakernel eigh of Bk (B x k x k) for k in the SMEM-fit range
+    (32,448]. No wrapper gate, no scratch re-alloc, no sort. Returns (lam, G)."""
+    mod = _mega_get()
+    kk = Bk.shape[-1]
+    B = Bk.shape[0]
+    Bkc = Bk.contiguous()
+    V, L, rscr, dscr, escr, dpscr, dmscr, tauscr = _lr_bare_scratch(B, kk, Bk.device)
+    if kk <= _MEGA_NMAX:
+        mod.mega_eigh(Bkc, V, L, rscr, dscr, escr, dpscr, dmscr, tauscr,
+                      kk, _MEGA_NT, _MEGA_BISITERS)
+    else:
+        mod.mega_eigh_med(Bkc, V, L, rscr, dscr, escr, dpscr, dmscr, tauscr,
+                          kk, _MEGA_MED_NT, _MEGA_BISITERS)
+    return L, V
+
+
+# For k > _MEGA_MED_NMAX (dense1024 k=608, nearrank1024 k=768) the packed-FP16
+# block does not fit one CTA's SMEM, so the megakernel can't run directly. But
+# the reduced block Bk = Qd^T A Qd is itself CONCENTRATED (it is the top-k
+# Rayleigh projection of an already-concentrated spectrum), so a SECOND
+# randomized-subspace pass captures it: project Bk onto a k2 <= 448 dominant
+# subspace (Y2 = CholeskyQR2(Bk @ Om2)), form the k2*k2 reduced-reduced block
+# C = Y2^T Bk Y2 which DOES fit the megakernel, solve C with the bare megakernel,
+# lift the dominant eigenpairs back (Vd2 = Y2 @ G2), and lump the (k - k2)
+# complement with a Rayleigh quotient -- exactly the outer low-rank structure
+# applied recursively to the reduced block. All GEMMs run on TF32 tensor cores
+# (the block is small; the outer FP32 A@V gate still catches any matrix this
+# reduced solve can't resolve). Returns a FULL (lam, G) for Bk.
+_LR_REDUCED_K2 = 384       # inner dominant rank for the k>448 nested solve
+
+
+def _lr_reduced_nested(Bk, k2):
+    B, k, _ = Bk.shape
+    dev = Bk.device
+    k2 = min(k2, k)
+    g = torch.Generator(device=dev).manual_seed(24681357)
+    prev = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = True
+    Om2 = torch.randn(B, k, k2, device=dev, generator=g)
+    Y2 = _lr_cholesky_qr2(torch.bmm(Bk, Om2))
+    Y2 = _lr_cholesky_qr2(torch.bmm(Bk, Y2))
+    BY = torch.bmm(Bk, Y2)                    # Bk @ Y2  (B,k,k2), reused for C + gate
+    C = torch.bmm(Y2.transpose(-1, -2), BY)   # reduced-reduced block (B,k2,k2)
+    C = 0.5 * (C + C.transpose(-1, -2))
+    lam2, G2 = _lr_reduced_mega(C)            # fits megakernel (k2<=448)
+    # dominant eigenpairs of Bk lifted back
+    torch.backends.cuda.matmul.allow_tf32 = False   # Vd2 must be orthonormal
+    Vd2 = torch.bmm(Y2, G2)                    # (B,k,k2)
+    torch.backends.cuda.matmul.allow_tf32 = prev
+    kc = k - k2
+    if kc > 0:
+        R = torch.randn(B, k, kc, device=dev, generator=g)
+        torch.backends.cuda.matmul.allow_tf32 = False
+        R = R - torch.bmm(Y2, torch.bmm(Y2.transpose(-1, -2), R))
+        Vc2 = _lr_cholesky_qr2(R, shift=1e-4)
+        Vc2 = Vc2 - torch.bmm(Y2, torch.bmm(Y2.transpose(-1, -2), Vc2))
+        Vc2 = _lr_cholesky_qr2(Vc2, shift=1e-5)
+        torch.backends.cuda.matmul.allow_tf32 = prev
+        lam_c2 = (torch.bmm(Bk, Vc2) * Vc2).sum(dim=-2)   # Rayleigh quotient
+        G = torch.cat([Vd2, Vc2], dim=-1)
+        lam = torch.cat([lam2, lam_c2], dim=-1)
+    else:
+        G, lam = Vd2, lam2
+    return lam, G
+
+
 def _lr_reduced_eigh(Bk):
-    """Eigendecomposition of the reduced symmetric block Bk (B x k x k) via the
-    RAW fused megakernel primitive -- no wrapper gate, no scratch re-alloc, no
-    sort (the outer low-rank path re-sorts). Returns (lam, G) in the
-    torch.linalg.eigh convention (Bk @ G[:,:,i] = lam[:,i] * G[:,:,i]); ordering
-    is whatever the kernel produced (ascending by Sturm construction, but the
-    outer path sorts regardless). Falls through to cuSOLVER when the extension is
-    unavailable or k is outside the megakernel's SMEM-fit range."""
+    """Eigendecomposition of the reduced symmetric block Bk (B x k x k). Returns
+    (lam, G) in the torch.linalg.eigh convention (Bk @ G[:,:,i] = lam[:,i] *
+    G[:,:,i]); ordering is whatever the path produced (the OUTER low-rank path
+    re-sorts every eigenpair at the end, so ordering here is irrelevant), and NO
+    inner gate is run (the outer FP32 A@V-reusing gate catches any matrix the
+    reduced solve can't resolve). Three regimes:
+      * 32 < k <= 448: RAW megakernel (fits one CTA's SMEM).
+      * k > 448: nested randomized-subspace reduced solve (the block is
+        concentrated by construction; its k2<=448 dominant sub-block goes to the
+        megakernel, complement via Rayleigh quotient).
+      * k <= 32 or extension unavailable: cuSOLVER."""
     mod = _mega_get()
     kk = Bk.shape[-1]
     if mod is not None and 32 < kk <= _MEGA_MED_NMAX:
-        B = Bk.shape[0]
-        Bkc = Bk.contiguous()
-        V, L, rscr, dscr, escr, dpscr, dmscr, tauscr = _lr_bare_scratch(B, kk, Bk.device)
-        if kk <= _MEGA_NMAX:
-            mod.mega_eigh(Bkc, V, L, rscr, dscr, escr, dpscr, dmscr, tauscr,
-                          kk, _MEGA_NT, _MEGA_BISITERS)
-        else:
-            mod.mega_eigh_med(Bkc, V, L, rscr, dscr, escr, dpscr, dmscr, tauscr,
-                              kk, _MEGA_MED_NT, _MEGA_BISITERS)
-        return L, V
+        return _lr_reduced_mega(Bk)
+    if mod is not None and kk > _MEGA_MED_NMAX:
+        return _lr_reduced_nested(Bk, _LR_REDUCED_K2)
     lam, G = torch.linalg.eigh(Bk)
     return lam, G
 
