@@ -1180,9 +1180,14 @@ def _lowrank_eigh(a, k, power=1):
             Bk = Bk + jit.view(-1, 1, 1) * torch.eye(kk, device=dev, dtype=Bk.dtype)
             lam_d, G = torch.linalg.eigh(Bk)
         _p = torch.backends.cuda.matmul.allow_tf32
-        torch.backends.cuda.matmul.allow_tf32 = False     # FP32: Vd orthonormal
+        torch.backends.cuda.matmul.allow_tf32 = False     # FP32: Vd MUST be orthonormal
         Vd = torch.bmm(Qd, G)
-        AVd = torch.bmm(AQd, G)                           # A@Vd == (A@Qd)@G (cheap k-GEMM)
+        # A@Vd == (A@Qd)@G feeds ONLY the residual gate (its ~3e-4 TF32 error is
+        # far below the 9.2e-3 gate), so it runs on TF32 tensor cores (~8-9x
+        # faster than the FP32-SIMT bmm). Vd itself stays FP32 -- TF32 there
+        # breaks the orthogonality gate (probed: orth 1.34 >> 4.9e-3). brief-7 t7.
+        torch.backends.cuda.matmul.allow_tf32 = True
+        AVd = torch.bmm(AQd, G)
         torch.backends.cuda.matmul.allow_tf32 = _p
         nc = n - k
         if nc > 0:
