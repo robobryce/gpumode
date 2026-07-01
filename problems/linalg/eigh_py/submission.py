@@ -2835,7 +2835,7 @@ _SIGN_DC_REC_MARGIN = 0.045 # oversample margin (fraction of m) added to ceil(m/
                           # the ~sqrt(n)~45 balance fluctuation). Swept 0.10/0.05/0.035
                           # -> shape5 123/111/107ms; any matrix whose side > K just falls
                           # back to cuSOLVER via the gate (correctness preserved).
-_SIGN_DC_REC_NS_ITERS = 16  # NS sign iters for the split. A semicircle (GOE) spectrum
+_SIGN_DC_REC_NS_ITERS = 30  # NS sign iters for the split. A semicircle (GOE) spectrum
                           # has its highest eigenvalue density at the median shift sigma,
                           # so near-sigma eigenvalues get a fuzzy sign -> some P+/P-
                           # overlap; the finishing FP32 NS + membership + gate absorb it.
@@ -2864,6 +2864,28 @@ _SIGN_DC_MW_MARGIN = 0.06   # oversample margin for the N-way piece width K =
                             # ceil(m/nways) + ceil(margin*m). Ritz shifts are less
                             # balanced than the binary median, so a bit more margin.
 _SIGN_DC_RITZ_PROJ = 256    # random Rayleigh-Ritz projection dim for shift estimation
+# brief-55: eigenvalue-side membership consistency for the projector rank-select.
+# Only matters when the base solver's eigenvectors are ~1e-2 orthonormal (the C-CTA
+# cluster at K~1117), where a near-sigma eigenvector leaks into both halves and the
+# raw membership topk picks duplicate columns. The weight downweights a candidate
+# whose eigenvalue side disagrees with its projector half, breaking the +/- tie.
+# _SIGN_DC_SIDE_W sets the sigmoid transition width in mean-eigenvalue-spacing units
+# (larger = sharper split at sigma). No effect on the cuSOLVER-base paths (their
+# membership is already crisp; the correct-side copy always wins the tie anyway).
+# brief-55: re-orthonormalize the base solver's eigenvectors (N CholeskyQR passes,
+# 0 = off) before the projector-membership assembly. Fixes the C-CTA cluster base's
+# ~1e-2 gstk orth that makes the membership double-pick near-sigma eigenvectors.
+_SIGN_DC_BASE_REORTH = 2
+_SIGN_DC_SIDE_MEMBERSHIP = False
+_SIGN_DC_SIDE_W = 40.0
+# brief-55: COUNT-based per-half rank-select (vs a global topk over both halves).
+# Picks exactly n+ candidates from the + half and (m-n+) from the - half, where
+# n+ = round((m + trace(sign))/2). Because P+ and P- project onto ORTHOGONAL
+# subspaces, per-half selection makes the assembled basis orthogonal even when the
+# base solver's eigenvectors are only ~1e-2 orthonormal -- the failure the global
+# topk hits (double-picking a near-sigma eigenvector). Guarded by the outer residual
+# gate + cuSOLVER fallback, so an off-by-a-few count estimate falls back safely.
+_SIGN_DC_COUNT_SELECT = False
 
 
 def _sign_dc_omega(b, n, K, dev):
@@ -3088,6 +3110,36 @@ def _sign_dc_block_eigh(A_blk, dev):
         Bstk = 0.5 * (Bstk + Bstk.transpose(-1, -2))
     # RECURSE on the K x K reduced blocks -> full 2B*K eigendecomposition.
     lstk, gstk = _sign_dc_block_eigh(Bstk, dev)
+    # brief-55: re-orthonormalize the base solver's eigenvectors before assembly.
+    # The C-CTA cluster base (K~1117) returns gstk only ~1e-2 orthonormal (its
+    # twisted-factorization stage-3 gives near-degenerate eigenvectors a fuzzy angle);
+    # cuSOLVER at K<=300 returns ~1e-6. That ~1e-2 fuzz is what lets a near-sigma
+    # eigenvector's + and - copies both score high in the membership -> the topk
+    # double-picks -> near-duplicate column -> orth ~2 -> full fallback (t1/t2). A
+    # single CholeskyQR2 pass drives gstk to ~1e-6 (it is well-conditioned + full rank
+    # -- orth 1e-2, NOT rank-deficient), which sharpens the membership so the topk
+    # separates real from junk/duplicate cleanly. gstk columns still span the same
+    # eigenspaces (orthonormalizing within a near-degenerate cluster keeps them
+    # B_stk-eigenvectors to Rayleigh accuracy), and the OUTER Rayleigh recomputes L on
+    # the assembled Q anyway. Cheap: a K x K Gram+Cholesky+trsm on 2B blocks.
+    if _SIGN_DC_BASE_REORTH:
+        _gpb = torch.backends.cuda.matmul.allow_tf32
+        torch.backends.cuda.matmul.allow_tf32 = True
+        gstk = _sign_dc_cqr(gstk, passes=_SIGN_DC_BASE_REORTH)
+        torch.backends.cuda.matmul.allow_tf32 = _gpb
+    if _SIGN_DC_LARGE_DBG:
+        import sys as _sys
+        _gp2 = torch.backends.cuda.matmul.allow_tf32
+        torch.backends.cuda.matmul.allow_tf32 = True
+        Kk = gstk.shape[-1]
+        eyeK = torch.eye(Kk, device=dev, dtype=gstk.dtype)
+        g_orth = torch.linalg.matrix_norm(torch.bmm(gstk.transpose(-1, -2), gstk) - eyeK, ord=1, dim=(-2, -1))
+        g_res = torch.linalg.matrix_norm(torch.bmm(Bstk, gstk) - gstk * lstk.unsqueeze(-2), ord=1, dim=(-2, -1))
+        b_l1 = torch.linalg.matrix_norm(Bstk, ord=1, dim=(-2, -1)).clamp_min(1e-30)
+        torch.backends.cuda.matmul.allow_tf32 = _gp2
+        _sys.stderr.write(f"[SIGNDC_BASE_DBG] m={m} K={Kk} base_gstk_orth_max={g_orth.max().item():.4g} "
+                          f"base_gstk_eigr_rel_max={(g_res/b_l1).max().item():.4g}\n")
+        _sys.stderr.flush()
     torch.backends.cuda.matmul.allow_tf32 = True
     Vstk = torch.bmm(Ustk, gstk)               # (2B, m, K) candidate eigenvectors
     Vp, Vm = Vstk[:B], Vstk[B:]
@@ -3097,6 +3149,67 @@ def _sign_dc_block_eigh(A_blk, dev):
     selp = _pp(Vp).norm(dim=1)                 # (B, K)
     selm = _pm(Vm).norm(dim=1)                 # (B, K)
     torch.backends.cuda.matmul.allow_tf32 = _gp
+    # EIGENVALUE-SIDE membership consistency (brief-55): when the base solver's
+    # eigenvectors are only ~1e-2 orthonormal (the C-CTA cluster at K~1117, vs
+    # ~1e-6 for cuSOLVER at K<=300), a real eigenvector whose eigenvalue sits near
+    # the split shift sigma leaks into BOTH halves with membership ~0.7-0.9 -> the
+    # raw topk picks both copies -> the assembled Q has a near-duplicate column ->
+    # orth blows to ~2 -> full cuSOLVER fallback (brief-47 / brief-55 t1). But the
+    # reduced eigenvalue lp/lm IS the A_blk eigenvalue, and a genuine + eigenvector
+    # has lp>sigma (a - eigenvector lm<sigma). Downweight a candidate that projects
+    # into a half whose sign disagrees with its eigenvalue side, so each near-sigma
+    # eigenvector is kept in exactly ONE half (the higher-scored, correct-side copy).
+    # sigma_blk = trace/m == the mean eigenvalue (== the split shift). The weight is
+    # a smooth step in units of the local eigenvalue scale so it never hard-drops a
+    # genuine near-sigma eigenvector, only breaks the +/- tie. gstk orth ~1e-2 and
+    # eigr ~2e-3 are BOTH clean; the ONLY failure mode is duplicate selection, which
+    # this resolves without touching the (correct) eigenpairs.
+    if _SIGN_DC_SIDE_MEMBERSHIP:
+        sigma_blk = A_blk.diagonal(dim1=-2, dim2=-1).mean(dim=-1, keepdim=True)  # (B,1)
+        escale = (lp.amax(dim=-1) - lp.amin(dim=-1)).clamp_min(1e-30) / m         # (B,)
+        w = (_SIGN_DC_SIDE_W / escale).view(B, 1)
+        wp = torch.sigmoid((lp - sigma_blk) * w)   # ~1 if lp>sigma (correct + side)
+        wm = torch.sigmoid((sigma_blk - lm) * w)   # ~1 if lm<sigma (correct - side)
+        selp = selp * wp
+        selm = selm * wm
+    if _SIGN_DC_COUNT_SELECT:
+        # COUNT-BASED per-half selection (brief-55): pick exactly n+ from the + half
+        # and (m-n+) from the - half, INSTEAD of a global topk over both. The + and -
+        # invariant subspaces are orthogonal by construction (P+ P- = 0), so selecting
+        # within each half separately makes the assembled basis orthogonal AS LONG AS
+        # a near-sigma eigenvector isn't taken by BOTH halves. A global topk CAN take
+        # both copies (each with membership ~0.7-0.9) of a near-sigma eigenvector ->
+        # near-duplicate column -> orth ~2 -> fallback (t1/t2). The per-half split
+        # respects the subspace dimensions (n+ = (m + trace(sign))/2), so a genuine +
+        # eigenvector near sigma is picked in the + half's top-n+ and its leaked -
+        # copy loses to the genuine - eigenvectors in the - half's top-(m-n+). Junk
+        # oversample columns (~90/half) lose to the real ones in either half. n+ is
+        # derived from the sign trace; the residual gate + cuSOLVER fallback still
+        # catches any matrix whose count estimate is off (correctness preserved).
+        trS = X.diagonal(dim1=-2, dim2=-1).sum(dim=-1)      # (B,) ~ n+ - n-
+        nplus = torch.round((m + trS) / 2.0).clamp(0, m).to(torch.int64)  # (B,)
+        # gather per-matrix (variable n+ across the batch): sort each half's membership
+        # descending; take the first nplus[b] from +, first (m-nplus[b]) from -.
+        ip = torch.argsort(selp, dim=-1, descending=True)   # (B,K)
+        im = torch.argsort(selm, dim=-1, descending=True)   # (B,K)
+        ar = torch.arange(m, device=dev).view(1, m)         # (1,m)
+        # column j<nplus -> take +half rank j; else -> -half rank (j-nplus).
+        npv = nplus.view(B, 1)
+        from_plus = ar < npv                                # (B,m)
+        rank_p = ar.clamp_max(K - 1)                        # +half rank for j<nplus
+        rank_m = (ar - npv).clamp(0, K - 1)                 # -half rank for j>=nplus
+        gi_p = torch.gather(ip, 1, rank_p)                  # (B,m) col-index into Vp/lp
+        gi_m = torch.gather(im, 1, rank_m)                  # (B,m) col-index into Vm/lm
+        sel_from_p = from_plus                              # (B,m) bool
+        gi = torch.where(sel_from_p, gi_p, gi_m)            # (B,m) index into that half
+        Gp = torch.gather(Vp, 2, gi.unsqueeze(1).expand(B, m, m))
+        Gm = torch.gather(Vm, 2, gi.unsqueeze(1).expand(B, m, m))
+        Lp = torch.gather(lp, 1, gi)
+        Lm = torch.gather(lm, 1, gi)
+        selmask = sel_from_p.unsqueeze(1)                   # (B,1,m)
+        G = torch.where(selmask, Gp, Gm)
+        lam = torch.where(sel_from_p, Lp, Lm)
+        return lam, G
     Vall = torch.cat([Vp, Vm], dim=-1)         # m x 2K
     Lall = torch.cat([lp, lm], dim=-1)         # 2K
     mem = torch.cat([selp, selm], dim=-1)      # 2K
