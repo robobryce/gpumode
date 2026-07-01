@@ -1125,15 +1125,17 @@ class _LR_TF32:
         torch.backends.cuda.matmul.allow_tf32 = self._p
 
 
-def _lr_cholesky_qr2(Y, passes=2, shift=1e-5, tf32_gram=True):
-    # The Gram G = Q^T Q feeds a shifted Cholesky, which TOLERATES the ~3e-4 TF32
-    # rounding: CholeskyQR2's SECOND pass re-orthonormalizes whatever residual
-    # non-orthogonality the first (TF32) Gram leaves, and the (shift*dm)*I jitter
-    # guards the factorization against the TF32-perturbed Gram going indefinite.
-    # brief-6 measured the Gram GEMM ~8-10x faster on TF32 tensor cores vs the
-    # FP32-SIMT cutlass path (which the profile shows as simt_sgemm, ~18ms on
-    # shape 4). The triangular solve is not a GEMM, so allow_tf32 does not touch
-    # it -- the orthonormal Q comes out of solve_triangular in true FP32.
+def _lr_cholesky_qr2(Y, passes=2, shift=1e-5, tf32_gram=False):
+    # tf32_gram routes the Gram G = Q^T Q through TF32 tensor cores (measured
+    # ~9x faster than the FP32-SIMT cutlass simt_sgemm path). SAFE ONLY when the
+    # input columns are WELL-CONDITIONED: for the ILL-conditioned dominant
+    # subspace Qd (near-rank-deficient by construction of a concentrated
+    # spectrum) TF32's ~3e-4 relative error is amplified by kappa(Qd)~1e3-1e4 to
+    # orth ~0.1-1.3 >> the 4.9e-3 gate -> ~100% cuSOLVER fallback (brief-16 t1,
+    # MEASURED). So the dominant CQR2 keeps FP32 (tf32_gram=False default); only
+    # the well-conditioned complement Gram may use it. The triangular solve is
+    # not a GEMM, so the orthonormal Q always comes out of solve_triangular in
+    # true FP32.
     Q = Y
     c = Y.shape[-1]
     eye = torch.eye(c, device=Y.device, dtype=Y.dtype)
@@ -1267,7 +1269,15 @@ def _lowrank_eigh(a, k, power=1):
     g = torch.Generator(device=dev).manual_seed(1234567)
     Omega = torch.randn(B, n, k, device=dev, generator=g)
     with torch.no_grad():
-        Qd = _lr_cholesky_qr2(torch.bmm(a, Omega))
+        # Range-finder orthonormalization needs only ONE CQR pass: its output Qd0
+        # is immediately re-orthonormalized by the power step's CQR2 below, so the
+        # intermediate basis only has to SPAN the subspace and keep the power
+        # iteration numerically stable -- it does not have to be orthonormal to
+        # gate tolerance. brief-16 t2 MEASURED rp1/pp2 at 0 fallbacks (orth stays
+        # <=1.7e-3) and ~5-8% faster than rp2/pp2 (one fewer Gram+Cholesky+trsm on
+        # the n-row dominant block). The FINAL power CQR2 MUST stay 2-pass -- 1
+        # pass there gives orth ~6-11 -> 100% fallback (probed).
+        Qd = _lr_cholesky_qr2(torch.bmm(a, Omega), passes=1)
         for _ in range(power):
             Qd = _lr_cholesky_qr2(torch.bmm(a, Qd))
         # A@Qd is computed here and REUSED below (both to form Bk and to build
