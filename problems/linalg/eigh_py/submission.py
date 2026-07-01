@@ -1157,6 +1157,74 @@ def _lr_participation_ratio(a):
     return (fro2 * fro2) / a2f2
 
 
+# ---------------------------------------------------------------------------
+# BARE inner eigh of the low-rank path's reduced Rayleigh block Bk (B x k x k).
+#
+# The reduced block Bk = Qd^T A Qd is a small DENSE symmetric matrix -- exactly
+# the regime where the fused megakernel (one CTA per matrix, whole eigh resident
+# in SMEM, one launch) beats cuSOLVER's per-matrix syevd (the brief-7 profile
+# shows laed3/gemvx/symv, all cuSOLVER-internal to this reduced eigh, at ~40-50%
+# of the low-rank path). brief-7 t5 ROUTED it to the megakernel but REGRESSED
+# +41% because it called the TOP-LEVEL wrapper (_eigh_megakernel_med), which per
+# call allocates 7 B*k*k / B*k scratch buffers, runs its OWN full residual gate
+# (orth + eigr + recon matrix_norms + an af@Q GEMM on the k-blocks), and sorts +
+# gathers -- all redundant here because the OUTER _eigh_lowrank_safe already has
+# a cheap FP32 A@V-reusing gate and _lowrank_eigh re-sorts every eigenpair at the
+# end. This BARE entry drops all of it: allocate scratch ONCE (cached by (B,k)),
+# launch the raw kernel, return (lam, G) UNSORTED and UNGATED. Any Bk the FP16
+# reduction can't resolve produces a non-orthonormal Vd = Qd@G, which the outer
+# gate catches and falls that whole matrix back to cuSOLVER -- so correctness is
+# identical to the cuSOLVER inner solve, the megakernel's raw speed is kept, and
+# the wrapper tax is gone.
+# ---------------------------------------------------------------------------
+_lr_scr_cache: dict = {}   # (B,k) -> tuple of persistent scratch buffers
+
+
+def _lr_bare_scratch(B, k, dev):
+    """Persistent scratch for the bare megakernel inner solve, cached by (B,k)
+    so repeated benchmark iterations reuse the ~1GB of B*k*k buffers instead of
+    re-allocating them every call (part of the wrapper tax brief-7 t5 paid)."""
+    key = (B, k, dev)
+    buf = _lr_scr_cache.get(key)
+    if buf is None:
+        V = torch.empty(B, k, k, device=dev, dtype=torch.float32)
+        L = torch.empty(B, k, device=dev, dtype=torch.float32)
+        rscr = torch.empty(B, k, k, device=dev, dtype=torch.float32)
+        dscr = torch.empty(B, k, device=dev, dtype=torch.float32)
+        escr = torch.empty(B, k - 1, device=dev, dtype=torch.float32)
+        dpscr = torch.empty(B, k, k, device=dev, dtype=torch.float32)
+        dmscr = torch.empty(B, k, k, device=dev, dtype=torch.float32)
+        tauscr = torch.empty(B, k, device=dev, dtype=torch.float32)
+        buf = (V, L, rscr, dscr, escr, dpscr, dmscr, tauscr)
+        _lr_scr_cache[key] = buf
+    return buf
+
+
+def _lr_reduced_eigh(Bk):
+    """Eigendecomposition of the reduced symmetric block Bk (B x k x k) via the
+    RAW fused megakernel primitive -- no wrapper gate, no scratch re-alloc, no
+    sort (the outer low-rank path re-sorts). Returns (lam, G) in the
+    torch.linalg.eigh convention (Bk @ G[:,:,i] = lam[:,i] * G[:,:,i]); ordering
+    is whatever the kernel produced (ascending by Sturm construction, but the
+    outer path sorts regardless). Falls through to cuSOLVER when the extension is
+    unavailable or k is outside the megakernel's SMEM-fit range."""
+    mod = _mega_get()
+    kk = Bk.shape[-1]
+    if mod is not None and 32 < kk <= _MEGA_MED_NMAX:
+        B = Bk.shape[0]
+        Bkc = Bk.contiguous()
+        V, L, rscr, dscr, escr, dpscr, dmscr, tauscr = _lr_bare_scratch(B, kk, Bk.device)
+        if kk <= _MEGA_NMAX:
+            mod.mega_eigh(Bkc, V, L, rscr, dscr, escr, dpscr, dmscr, tauscr,
+                          kk, _MEGA_NT, _MEGA_BISITERS)
+        else:
+            mod.mega_eigh_med(Bkc, V, L, rscr, dscr, escr, dpscr, dmscr, tauscr,
+                              kk, _MEGA_MED_NT, _MEGA_BISITERS)
+        return L, V
+    lam, G = torch.linalg.eigh(Bk)
+    return lam, G
+
+
 def _lowrank_eigh(a, k, power=1):
     B, n, _ = a.shape
     dev = a.device
@@ -1173,7 +1241,7 @@ def _lowrank_eigh(a, k, power=1):
         Bk = torch.bmm(Qd.transpose(-1, -2), AQd)
         Bk = 0.5 * (Bk + Bk.transpose(-1, -2))
         try:
-            lam_d, G = torch.linalg.eigh(Bk)
+            lam_d, G = _lr_reduced_eigh(Bk)
         except Exception:
             kk = Bk.shape[-1]
             jit = 1e-6 * Bk.diagonal(dim1=-2, dim2=-1).abs().amax(-1).clamp_min(1e-30)
