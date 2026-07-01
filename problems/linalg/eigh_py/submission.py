@@ -2119,7 +2119,7 @@ def _lr_av_mode_for(n: int, k: int):
     3xTF32's ~6e-6 keeps them gate-clean (3xtf32 94.0ms, -8.5%). Route 3xTF32 only
     for that near-rank case (n>=1024, k>=768); plain TF32 everywhere else."""
     if n >= 1024 and k >= 768:
-        return "2xtf32"  # brief-54 probe: 2-term split (cheaper) on shape10 A@X
+        return "3xtf32"  # brief-54: 3-TERM split required (t10: 2-term misses the tile)
     return "tf32"
 
 
@@ -2136,7 +2136,7 @@ def _lr_proj_mode_for(n: int, k: int):
     +1.2%; shape 8 rankdef512 nc=128: 91640->93190 +1.7%) -- too small to amortize.
     Route 3xTF32 for n>=1024, FP32 (parent's mode) for n=512."""
     if n >= 1024:
-        return "3xtf32"
+        return "2xtf32"  # brief-54 probe: 2-term split on n>=1024 projections
     return "fp32"
 
 
