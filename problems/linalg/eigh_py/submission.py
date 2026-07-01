@@ -1125,25 +1125,53 @@ class _LR_TF32:
         torch.backends.cuda.matmul.allow_tf32 = self._p
 
 
-def _lr_cholesky_qr2(Y, passes=2, shift=1e-5, tf32_gram=False):
-    # tf32_gram routes the Gram G = Q^T Q through TF32 tensor cores (measured
-    # ~9x faster than the FP32-SIMT cutlass simt_sgemm path). SAFE ONLY when the
-    # input columns are WELL-CONDITIONED: for the ILL-conditioned dominant
-    # subspace Qd (near-rank-deficient by construction of a concentrated
-    # spectrum) TF32's ~3e-4 relative error is amplified by kappa(Qd)~1e3-1e4 to
-    # orth ~0.1-1.3 >> the 4.9e-3 gate -> ~100% cuSOLVER fallback (brief-16 t1,
-    # MEASURED). So the dominant CQR2 keeps FP32 (tf32_gram=False default); only
-    # the well-conditioned complement Gram may use it. The triangular solve is
-    # not a GEMM, so the orthonormal Q always comes out of solve_triangular in
-    # true FP32.
+def _gram_3xtf32(Qt, Q):
+    # ~FP32-accurate Gram Qt @ Q on TF32 tensor cores via a 2-term (hi+lo) split
+    # (an Ozaki-style "3xTF32" scheme): each operand is split into a TF32-exact
+    # high part (low 13 fp32 mantissa bits zeroed -> 10-bit mantissa == TF32) and
+    # its fp32 residual low part, then the product is hi@hi + hi@lo + lo@hi (the
+    # lo@lo term is ~1e-8 relative, dropped). Three TF32 bmms recover the Gram to
+    # ~6e-6 relative error (probed) -- ~10x tighter than plain TF32's ~7e-5 --
+    # while running ~1.8x faster than the FP32-SIMT simt_sgemm cutlass path. This
+    # is accurate enough that the CholeskyQR2 orthonormalization of the ILL-
+    # conditioned dominant subspace stays under the orthogonality gate (plain
+    # TF32 there fails; brief-16 t1). allow_tf32 must be True on entry so the
+    # three bmms hit the tensor cores.
+    mask = ~0x1FFF
+    Qh = (Q.view(torch.int32) & mask).view(torch.float32)
+    Ql = Q - Qh
+    Qth = Qh.transpose(-1, -2)
+    Qtl = Ql.transpose(-1, -2)
+    return torch.bmm(Qth, Qh) + torch.bmm(Qth, Ql) + torch.bmm(Qtl, Qh)
+
+
+def _lr_cholesky_qr2(Y, passes=2, shift=1e-5, tf32_gram=False, gram_mode=None):
+    # gram_mode selects the precision of the Gram G = Q^T Q (the dominant
+    # FP32-SIMT cost of the CholeskyQR2 orthonormalization):
+    #   "fp32"    - true FP32 simt_sgemm (default; the accurate, slow path).
+    #   "tf32"    - single-pass TF32 tensor core (~9x faster than fp32). SAFE
+    #               ONLY for WELL-conditioned inputs: on the ILL-conditioned
+    #               dominant subspace Qd its ~3e-4 error x kappa(Qd)~1e3-1e4 ->
+    #               orth ~0.1-1.3 >> the gate -> ~100% cuSOLVER fallback (t1).
+    #   "3xtf32"  - Ozaki-style hi+lo split, 3 TF32 bmms, ~FP32 accuracy at
+    #               ~1.8x FP32 speed -- accurate enough for the ill-conditioned
+    #               dominant Gram (brief-16).
+    # tf32_gram=True is the back-compat alias for gram_mode="tf32". The
+    # triangular solve is not a GEMM, so Q always leaves solve_triangular in true
+    # FP32 regardless of gram_mode.
+    if gram_mode is None:
+        gram_mode = "tf32" if tf32_gram else "fp32"
     Q = Y
     c = Y.shape[-1]
     eye = torch.eye(c, device=Y.device, dtype=Y.dtype)
     prev = torch.backends.cuda.matmul.allow_tf32
-    torch.backends.cuda.matmul.allow_tf32 = bool(tf32_gram)
+    torch.backends.cuda.matmul.allow_tf32 = (gram_mode in ("tf32", "3xtf32"))
     try:
         for _ in range(passes):
-            G = torch.bmm(Q.transpose(-1, -2), Q)
+            if gram_mode == "3xtf32":
+                G = _gram_3xtf32(Q.transpose(-1, -2), Q)
+            else:
+                G = torch.bmm(Q.transpose(-1, -2), Q)
             dm = G.diagonal(dim1=-2, dim2=-1).abs().amax(-1).clamp_min(1e-30)
             L = torch.linalg.cholesky(G + (shift * dm).view(-1, 1, 1) * eye)
             Q = torch.linalg.solve_triangular(L, Q.transpose(-1, -2), upper=False).transpose(-1, -2)
@@ -1277,9 +1305,14 @@ def _lowrank_eigh(a, k, power=1):
         # <=1.7e-3) and ~5-8% faster than rp2/pp2 (one fewer Gram+Cholesky+trsm on
         # the n-row dominant block). The FINAL power CQR2 MUST stay 2-pass -- 1
         # pass there gives orth ~6-11 -> 100% fallback (probed).
-        Qd = _lr_cholesky_qr2(torch.bmm(a, Omega), passes=1)
+        # All dominant-subspace Grams run in 3xTF32 (Ozaki hi+lo split, 3 TF32
+        # bmms, ~FP32 accuracy at ~1.8x FP32 speed): plain TF32 breaks the
+        # ill-conditioned Qd's orthonormality (t1), but 3xTF32 keeps orth under
+        # gate (probed <=8.5e-3, 0 fallback on shapes 3/4/10/12) while moving the
+        # Gram off the FP32-SIMT simt_sgemm path. brief-16 t4.
+        Qd = _lr_cholesky_qr2(torch.bmm(a, Omega), passes=1, gram_mode="3xtf32")
         for _ in range(power):
-            Qd = _lr_cholesky_qr2(torch.bmm(a, Qd))
+            Qd = _lr_cholesky_qr2(torch.bmm(a, Qd), gram_mode="3xtf32")
         # A@Qd is computed here and REUSED below (both to form Bk and to build
         # A@Vd = (A@Qd)@G cheaply, so the residual gate needs no separate A@V).
         AQd = torch.bmm(a, Qd)
@@ -1310,16 +1343,16 @@ def _lowrank_eigh(a, k, power=1):
             R = R - torch.bmm(Qd, torch.bmm(Qd.transpose(-1, -2), R))
             # The complement basis Vc spans the ORTHOGONAL complement of the
             # (already-projected-out) dominant subspace, built from a random
-            # matrix -> WELL-conditioned, so its CQR2 Gram tolerates TF32 (unlike
-            # the ill-conditioned dominant Qd). brief-16 probe: complement-Gram
-            # TF32 gives orth <=5.6e-3 (~0-1 fallback across shapes 3/4/8/10/12)
-            # while the Gram GEMM runs ~9x faster on tensor cores. The projections
-            # (R - Qd Qd^T R) stay FP32 (allow_tf32=False here) -- TF32 there
-            # leaves TF32-level Qd leakage in the complement, breaking cross-block
-            # orthogonality of V=[Vd,Vc] (probed orth ~0.5).
-            Vc = _lr_cholesky_qr2(R, shift=1e-4, tf32_gram=True)
+            # matrix -> WELL-conditioned. Its CQR2 Gram runs in 3xTF32 (same Ozaki
+            # split as the dominant Gram): ~FP32 accuracy off the FP32-SIMT path.
+            # 3xTF32 is even TIGHTER than plain TF32 here (probed orth 3.6e-3 vs
+            # 6.6e-3 on shape3, clearing its 1-matrix marginal fallback) and still
+            # ~1.8x faster than FP32-SIMT. The projections (R - Qd Qd^T R) stay
+            # FP32 (allow_tf32=False here) -- TF32 there leaves TF32-level Qd
+            # leakage, breaking cross-block orthogonality of V=[Vd,Vc] (orth ~0.5).
+            Vc = _lr_cholesky_qr2(R, shift=1e-4, gram_mode="3xtf32")
             Vc = Vc - torch.bmm(Qd, torch.bmm(Qd.transpose(-1, -2), Vc))
-            Vc = _lr_cholesky_qr2(Vc, shift=1e-5, tf32_gram=True)
+            Vc = _lr_cholesky_qr2(Vc, shift=1e-5, gram_mode="3xtf32")
             torch.backends.cuda.matmul.allow_tf32 = _prev
             AVc = torch.bmm(a, Vc)
             lam_c = (AVc * Vc).sum(dim=-2)
