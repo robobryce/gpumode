@@ -1125,8 +1125,8 @@ class _LR_TF32:
         torch.backends.cuda.matmul.allow_tf32 = self._p
 
 
-def _gram_3xtf32(Qt, Q):
-    # ~FP32-accurate Gram Qt @ Q on TF32 tensor cores via a 2-term (hi+lo) split
+def _gram_3xtf32(Q):
+    # ~FP32-accurate Gram Q^T @ Q on TF32 tensor cores via a 2-term (hi+lo) split
     # (an Ozaki-style "3xTF32" scheme): each operand is split into a TF32-exact
     # high part (low 13 fp32 mantissa bits zeroed -> 10-bit mantissa == TF32) and
     # its fp32 residual low part, then the product is hi@hi + hi@lo + lo@hi (the
@@ -1169,7 +1169,7 @@ def _lr_cholesky_qr2(Y, passes=2, shift=1e-5, tf32_gram=False, gram_mode=None):
     try:
         for _ in range(passes):
             if gram_mode == "3xtf32":
-                G = _gram_3xtf32(Q.transpose(-1, -2), Q)
+                G = _gram_3xtf32(Q)
             else:
                 G = torch.bmm(Q.transpose(-1, -2), Q)
             dm = G.diagonal(dim1=-2, dim2=-1).abs().amax(-1).clamp_min(1e-30)
@@ -1349,16 +1349,15 @@ def _lowrank_eigh(a, k, power=1):
             # the low-rank shapes). The projections (R - Qd Qd^T R) stay FP32
             # (allow_tf32=False here) -- TF32 there leaves TF32-level Qd leakage,
             # breaking cross-block orthogonality of V=[Vd,Vc] (orth ~0.5, probed).
-            # Both complement CQR passes stay 2-pass: making the final one 1-pass
-            # raised live fallbacks on rankdef512 (shape8) + lapgeom1024 (shape12)
-            # -> net loss (brief-16 t5). Complement Gram uses 3xTF32 (Ozaki split):
-            # tighter than plain TF32 (orth 3.6e-3 vs 6.6e-3 on shape3, clearing
-            # its 1-matrix marginal fallback) and the nc-column Gram is small
-            # enough that the split overhead is minor (unlike the b640/n=512
-            # dominant Gram where 3xTF32 net-lost, t4). brief-16 t7.
-            Vc = _lr_cholesky_qr2(R, shift=1e-4, gram_mode="3xtf32")
+            # Both complement CQR passes stay 2-pass (making the final one 1-pass
+            # raised live fallbacks on shapes 8/12 -> net loss, t5) and use plain
+            # TF32 for the Gram: 3xTF32 there was TIGHTER numerically (orth 3.6e-3
+            # vs 6.6e-3 on shape3) but its split overhead net-lost even on the
+            # smaller nc complement Gram at b640 (shape8 +18%, t7). Plain TF32 is
+            # the measured-fastest complement Gram.
+            Vc = _lr_cholesky_qr2(R, shift=1e-4, gram_mode="tf32")
             Vc = Vc - torch.bmm(Qd, torch.bmm(Qd.transpose(-1, -2), Vc))
-            Vc = _lr_cholesky_qr2(Vc, shift=1e-5, gram_mode="3xtf32")
+            Vc = _lr_cholesky_qr2(Vc, shift=1e-5, gram_mode="tf32")
             torch.backends.cuda.matmul.allow_tf32 = _prev
             AVc = torch.bmm(a, Vc)
             lam_c = (AVc * Vc).sum(dim=-2)
@@ -1398,9 +1397,19 @@ def _eigh_lowrank_safe(a, k, power=1):
         eye = torch.eye(n, device=a.device, dtype=torch.float32)
         anorm = torch.linalg.matrix_norm(a, ord=1, dim=(-2, -1)).clamp_min(1e-30)
         eig = torch.linalg.matrix_norm(AV - V * lam.unsqueeze(-2), ord=1, dim=(-2, -1)) / anorm
+        # Orthogonality gate GEMM V^T V is a full n*n*n batched GEMM (one of the
+        # largest FP32-SIMT simt_sgemm terms in the profile: ~4ms on shape3 b640).
+        # Compute it in 3xTF32 (Ozaki hi+lo split): ~FP32 accuracy (probed orth
+        # matches FP32 to 1e-6, 0 pass/fail-decision disagreements vs the FP32
+        # gate on shapes 3/4/8/12) but ~1.6x faster because it is a SINGLE one-
+        # shot GEMM -- the 3-GEMM Ozaki cost still beats FP32-SIMT here, unlike
+        # inside the CQR2 loop where the trsm dominated and the split overhead
+        # net-lost (t4/t7). Plain TF32 is UNSAFE here: its ~3e-4 error
+        # systematically inflates the measured orth (shape3 7.9e-3 -> 9.3e-3),
+        # flipping ~640/640 gate decisions -> spurious cuSOLVER fallbacks.
         _p = torch.backends.cuda.matmul.allow_tf32
-        torch.backends.cuda.matmul.allow_tf32 = False
-        orth = torch.linalg.matrix_norm(V.transpose(-1, -2) @ V - eye, ord=1, dim=(-2, -1))
+        torch.backends.cuda.matmul.allow_tf32 = True
+        orth = torch.linalg.matrix_norm(_gram_3xtf32(V) - eye, ord=1, dim=(-2, -1))
         torch.backends.cuda.matmul.allow_tf32 = _p
         bad = (~torch.isfinite(eig)) | (~torch.isfinite(orth)) \
             | (eig > 150.0 * n * eps) | (orth > 80.0 * n * eps)
