@@ -626,7 +626,7 @@ _MEGA_CLUST_CPP = (
     "torch::Tensor rscr, torch::Tensor dscr, torch::Tensor escr, "
     "torch::Tensor dpscr, torch::Tensor dmscr, torch::Tensor tauscr, "
     "torch::Tensor vscr, torch::Tensor pscr, torch::Tensor bounds, torch::Tensor Tout, "
-    "int n, int nt, int bisIters, int nb);"
+    "int n, int nt, int bisIters, int nb, int C);"
 )
 
 _MEGA_CLUST_CUDA = r'''
@@ -645,13 +645,8 @@ namespace cg = cooperative_groups;
 // OWNED rows; the lower part is local, the upper part reads local rows + the peer
 // CTA's rows via remote-DSMEM map_shared_rank (specialized to C==2, the routed
 // case). The small n-vectors v,p are exchanged DIRECTLY through peer DSMEM
-// (disjoint owned ranges -> race-free after cluster.sync).
-#ifndef CLUST_C
-#define CLUST_C 2
-#endif
-#ifndef CLUST_NT
-#define CLUST_NT 512
-#endif
+// (disjoint owned ranges -> race-free after cluster.sync). C is a RUNTIME kernel
+// arg (not a compile-time define) so one build serves C=2 (k=608) and C=3 (k=768).
 // Two-level warp-shuffle block sum-reduction (intra-warp __shfl_down = 0 barriers,
 // one cross-warp pass through red[] = 2 barriers). `red` holds one float per warp.
 __device__ __forceinline__ float _clsum(float x, float* red, int tid, int nt){
@@ -664,18 +659,20 @@ __device__ __forceinline__ float _clsum(float x, float* red, int tid, int nt){
   __syncthreads();
   return red[0];
 }
-extern "C" __global__ void __cluster_dims__(CLUST_C,1,1)
-    mega_eigh_clust_split_k(
+// Cluster dim (C) is RUNTIME (via the cudaLaunchAttributeClusterDimension launch
+// attribute + the `C` kernel arg) so ONE compiled kernel serves C=2 (k=608, shape
+// 4) and C=3 (k=768, shape 10). No __cluster_dims__ compile-time attribute -- that
+// would FIX the cluster size and force a separate kernel per C.
+extern "C" __global__ void mega_eigh_clust_split_k(
     const float* __restrict__ Ain,
     float* __restrict__ Vout, float* __restrict__ Lout,
     float* __restrict__ rscr, float* __restrict__ dscr, float* __restrict__ escr,
     float* __restrict__ dpscr, float* __restrict__ dmscr, float* __restrict__ tauscr,
     float* __restrict__ vscr, float* __restrict__ pscr, const int* __restrict__ bnd,
     float* __restrict__ Tout,
-    int B, int n, int bisIters, int nb){
+    int B, int n, int bisIters, int nb, int C){
   cg::cluster_group cl = cg::this_cluster();
   unsigned R = cl.block_rank();               // 0..C-1
-  const int C = CLUST_C;
   int m = blockIdx.x / C; if(m>=B) return;
   int tid=threadIdx.x, nt=blockDim.x;
   int r0 = bnd[R];
@@ -716,8 +713,8 @@ extern "C" __global__ void __cluster_dims__(CLUST_C,1,1)
   if(tid==0) clx[0]=red[0];               // this CTA's max|A| -> peer-visible SMEM
   __syncthreads();
   cl.sync();                              // orders clx across the cluster (DSMEM)
-  float scale=clx[0];
-  { volatile float* peerx = (volatile float*)cl.map_shared_rank(clx, R^1); scale=fmaxf(scale, peerx[0]); }
+  float scale=0.f;
+  for(int rr=0;rr<C;++rr){ volatile float* peerx=(volatile float*)cl.map_shared_rank(clx, rr); scale=fmaxf(scale, peerx[0]); }
   if(scale<1e-30f) scale=1.f;
   float invs=1.f/scale;
   cl.sync();
@@ -737,10 +734,12 @@ extern "C" __global__ void __cluster_dims__(CLUST_C,1,1)
     if(tid==0){ clx[0]=s2; if((int)R==ownerC1) clx[1]=AOWN(c+1,c); }
     __syncthreads();
     cl.sync();
-    float xnorm2, alpha;
-    { volatile float* peerx = (volatile float*)cl.map_shared_rank(clx, R^1);
-      xnorm2 = clx[0] + peerx[0];
-      alpha = ((int)R==ownerC1) ? clx[1] : peerx[1]; }
+    float xnorm2=0.f, alpha=0.f;
+    for(int rr=0;rr<C;++rr){
+      volatile float* peerx = (volatile float*)cl.map_shared_rank(clx, rr);
+      xnorm2 += peerx[0];
+      if(rr==ownerC1) alpha = peerx[1];
+    }
     bool lead = ((int)R==ownerC1);
     float tail2 = xnorm2 - alpha*alpha;
     if(tail2<=1e-20f){
@@ -759,29 +758,39 @@ extern "C" __global__ void __cluster_dims__(CLUST_C,1,1)
     cl.sync();
     // Cross-CTA v exchange via GLOBAL staging (vgm) + threadfence -- the DSMEM
     // map_shared_rank peer read raced (non-deterministic tridiag; brief-21 same),
-    // so read the peer's owned v rows from GLOBAL after the fenced cluster barrier.
-    { int pr0=bnd[R^1], pr1=bnd[(R^1)+1];
-      for(int i=pr0+tid;i<pr1;i+=nt) v[i]=vgm[i]; }
+    // so read every NON-owned v row from GLOBAL after the fenced cluster barrier.
+    // Generic over C: this CTA owns [r0,r1); all other rows come from vgm.
+    for(int i=tid;i<n;i+=nt) if(i<r0||i>=r1) v[i]=vgm[i];
     __syncthreads();
-    // symv p = tau*A@v, no-atomic symmetric dot product (C==2). Owned row i:
+    // symv p = tau*A@v, no-atomic symmetric dot product. Owned active row i:
     //   p[i] = sum_{j<=i} A[i][j] v[j]  (lower, local)  + sum_{j>i} A[j][i] v[j] (upper)
-    volatile __half* AhPeer = (volatile __half*)cl.map_shared_rank(Ah, 1);
-    long triLoPeer = ((long)bnd[1]*(bnd[1]+1))/2;
+    // The upper part reads column i of rows j>i: local rows j in (i,r1) from Ah,
+    // and rows j in [bnd[rr],bnd[rr+1]) owned by each PEER rank rr>R from that
+    // peer's Ah via map_shared_rank (generic over C).
     if(active) for(int i=is+tid; i<r1; i+=nt){
       float acc=0.f;
       for(int j=c;j<=i;++j) acc += AOWN(i,j)*v[j];
-      int jl_hi = (r1<n)? r1 : n;
-      for(int j=i+1;j<jl_hi;++j) acc += AOWN(j,i)*v[j];
-      if(r1<n){ for(int j=r1;j<n;++j){ __half hh = AhPeer[((long)j*(j+1))/2 - triLoPeer + i]; acc += __half2float(hh)*v[j]; } }
-      p[i]=tau*acc; pgm[(long)R*n+i]=p[i];    // stage owned p into GLOBAL
+      for(int j=i+1;j<r1;++j) acc += AOWN(j,i)*v[j];
+      p[i]=tau*acc;
     }
+    // add the peer-rank upper contributions (rows owned by ranks > R)
+    for(int rr=(int)R+1; rr<C; ++rr){
+      volatile __half* AhPeer = (volatile __half*)cl.map_shared_rank(Ah, rr);
+      long triLoPeer = ((long)bnd[rr]*(bnd[rr]+1))/2;
+      int pj0=bnd[rr], pj1=bnd[rr+1];
+      if(active) for(int i=is+tid; i<r1; i+=nt){
+        float acc=0.f;
+        for(int j=pj0;j<pj1;++j){ __half hh = AhPeer[((long)j*(j+1))/2 - triLoPeer + i]; acc += __half2float(hh)*v[j]; }
+        p[i]+=tau*acc;
+      }
+    }
+    if(active) for(int i=is+tid;i<r1;i+=nt) pgm[i]=p[i];   // stage owned p into GLOBAL pfull (disjoint writes)
     __threadfence();                          // publish owned-p global writes to peers
     __syncthreads();
     cl.sync();
-    // Cross-CTA p exchange via GLOBAL staging (pgm[R*n+i]) + threadfence.
-    { int pr0=bnd[R^1], pr1=bnd[(R^1)+1];
-      int ps=(pr0>c+1)?pr0:(c+1);
-      for(int i=ps+tid;i<pr1;i+=nt) p[i]=pgm[(long)(R^1)*n+i]; }
+    // Cross-CTA p exchange via GLOBAL pfull (pgm[0..n)) + threadfence. Read every
+    // NON-owned active row's p from pfull (generic over C).
+    for(int i=(c+1)+tid;i<n;i+=nt) if(i<r0||i>=r1) p[i]=pgm[i];
     __syncthreads();
     float vp=0.f;
     for(int i=c+1+tid;i<n;i+=nt) vp+=v[i]*p[i];
@@ -894,9 +903,8 @@ void mega_eigh_clust_split(torch::Tensor A, torch::Tensor Vout, torch::Tensor Lo
     torch::Tensor rscr, torch::Tensor dscr, torch::Tensor escr,
     torch::Tensor dpscr, torch::Tensor dmscr, torch::Tensor tauscr,
     torch::Tensor vscr, torch::Tensor pscr, torch::Tensor bounds, torch::Tensor Tout,
-    int n, int nt, int bisIters, int nb){
+    int n, int nt, int bisIters, int nb, int C){
   int B=A.size(0);
-  const int C=CLUST_C;
   // Size dynamic SMEM from the LARGEST balanced CTA row-block (must match the
   // Python bounds). Also ensure the block-T build region (rank 0) fits.
   size_t myTriMax=0;
@@ -935,7 +943,7 @@ void mega_eigh_clust_split(torch::Tensor A, torch::Tensor Vout, torch::Tensor Lo
     rscr.data_ptr<float>(),dscr.data_ptr<float>(),escr.data_ptr<float>(),
     dpscr.data_ptr<float>(),dmscr.data_ptr<float>(),tauscr.data_ptr<float>(),
     vscr.data_ptr<float>(),pscr.data_ptr<float>(),bounds.data_ptr<int>(),
-    Tout.data_ptr<float>(),B,n,bisIters,nb);
+    Tout.data_ptr<float>(),B,n,bisIters,nb,C);
 }'''
 
 
@@ -970,12 +978,10 @@ def _mega_get():
             verbose=False,
             # -O3/--use_fast_math is the LIVE-ACCEPTED best-lineage flag set (8b9b6f40,
             # ACCEPTED 39/39). brief-22's -O2 downgrade cost shape-1 (n=176) +11%
-            # (2523->2804us); -O3 recovers it. -DCLUST_C / -DCLUST_NT keep the cluster
-            # kernel's compile-time cluster size + __launch_bounds__ in sync with the
-            # Python constants.
-            extra_cuda_cflags=["-O3", "--use_fast_math",
-                               f"-DCLUST_C={_MEGA_CLUST_C}",
-                               f"-DCLUST_NT={_MEGA_CLUST_NT}"],
+            # (2523->2804us); -O3 recovers it. The cluster kernel takes its size C as
+            # a RUNTIME arg (no CLUST_C/__launch_bounds__ compile-time defines), so one
+            # build serves C=2 (k=608) and C=3 (k=768).
+            extra_cuda_cflags=["-O3", "--use_fast_math"],
         )
         return _mega_mod
     except Exception:
@@ -1089,20 +1095,34 @@ _lr_split_T_cache: dict = {}   # (B,n,nb,dev) -> persistent block-T scratch
 # threads per CTA. Same latency-hiding argument as the medium-n kernel; power of 2
 # for the red[] tree reductions. brief-14 swept 256/512/1024 -> 512 best on n=512.
 _MEGA_CLUST_NT = 512
-# cluster size (CTAs per matrix). MUST equal CLUST_C in the CUDA source.
-# k=608 packed=370KB / 2 = 185KB/CTA < 228KB SMEM -> C=2 fits.
-_MEGA_CLUST_C = 2
-# only k in this window is routed to the cluster inner solve (k=608 shape-4 block).
-# k>448 (won't fit one CTA in FP16) and <= the C=2 SMEM ceiling. k=608 packed/2 =
-# 185KB < 228KB fits; the ceiling for C=2 is the largest k with tri(k)/2*2B <= 228KB
-# i.e. tri(k) <= 233472 halves -> k <= ~682. k=768 (shape 10) overflows C=2
-# (packed/2=295KB) -> stays on cuSOLVER unless C=3 / tiling is added.
-_MEGA_CLUST_KMIN = 449
-_MEGA_CLUST_KMAX = 680
-# route the k=608 reduced block to the cluster inner solve. Flag so the path can
-# be disabled without editing the routing (kept ON = the brief's experiment).
+# Cluster size C (CTAs per matrix) is chosen at RUNTIME per k so ONE compiled
+# kernel serves both shapes: the packed-FP16 k-triangle (tri(k)=k(k+1)/2 halves)
+# is row-distributed across C CTAs, so per-CTA SMEM ~ tri(k)*2B / C must be <= the
+# ~228KB opt-in cap. C=2 fits k<=~682 (k=608 shape-4: 370KB/2=185KB); C=3 fits
+# k<=~836 (k=768 shape-10: 590KB/3=197KB). _mega_clust_C(k) picks the smallest C.
+_SMEM_CAP_HALVES = 116000       # ~228KB / 2B, with margin for the v/p/block-T SMEM
+_MEGA_CLUST_KMIN = 449          # k>448 (won't fit one CTA in FP16 -> the k<=448 mega path)
+# Cap at the C=2 ceiling (~682): C=2 (k=608 shape-4) WINS (cluster inner 27ms vs
+# cuSOLVER 48ms = 1.76x -> shape4 -33%), but C=3 (k=768 shape-10) is CORRECT
+# (nbad 0/60, gate-passing) yet SLOWER than cuSOLVER (83ms vs 67ms = 0.81x, 3-way
+# distributed coordination + 24 tridiag panels) -> routing it REGRESSED shape10
+# 108639->124664us. So k=768 stays on cuSOLVER pending a faster C=3 / a tiled solve.
+_MEGA_CLUST_KMAX = 682          # C=2 ceiling (k=608 fits; k=768 needs C=3 which loses)
+# route the k>448 reduced blocks (k=608 shape-4 C=2, k=768 shape-10 C=3) to the
+# cluster inner solve. Flag so the path can be disabled without editing routing.
 _LR_CLUST_ENABLED = True
 _mega_clust_bounds_cache: dict = {}
+
+
+def _mega_clust_C(k: int) -> int:
+    """Smallest cluster size C in {2,3,4} whose per-CTA packed-FP16 half-triangle
+    (~tri(k)/C halves) fits the ~228KB SMEM cap. C=2 for k<=~682 (k=608), C=3 for
+    k<=~836 (k=768). Returns 0 if even C=4 can't fit (caller stays on cuSOLVER)."""
+    tri = k * (k + 1) // 2
+    for C in (2, 3, 4):
+        if (tri + C - 1) // C <= _SMEM_CAP_HALVES:
+            return C
+    return 0
 
 
 def _mega_clust_bounds(n: int, C: int, dev) -> torch.Tensor:
@@ -1135,12 +1155,13 @@ def _mega_clust_bounds(n: int, C: int, dev) -> torch.Tensor:
     return b
 
 
-def _lr_reduced_clust(Bk):
+def _lr_reduced_clust(Bk, C):
     """Reduced-block eigh of Bk (B x k x k) for k in the C-CTA cluster window
-    (449,680] via the SPLIT cluster kernel + torch tensor-core WY back-transform.
-    The packed-FP16 k-triangle is row-distributed across C=2 CTAs' DSMEM (fits at
-    k=608). Returns (lam, G) UNSORTED; NO gate (the OUTER low-rank A@V gate catches
-    any block the cluster solve can't resolve). Same contract as _lr_reduced_mega."""
+    (448,836] via the SPLIT cluster kernel + torch tensor-core WY back-transform.
+    The packed-FP16 k-triangle is row-distributed across C CTAs' DSMEM (k=608 C=2,
+    k=768 C=3). Returns (lam, G) UNSORTED; NO gate (the OUTER low-rank A@V gate
+    catches any block the cluster solve can't resolve). Same contract as
+    _lr_reduced_mega."""
     mod = _mega_get()
     kk = Bk.shape[-1]
     B = Bk.shape[0]
@@ -1154,7 +1175,6 @@ def _lr_reduced_clust(Bk):
     dpscr = torch.empty(B, kk, kk, device=dev, dtype=torch.float32)
     dmscr = torch.empty(B, kk, kk, device=dev, dtype=torch.float32)
     tauscr = torch.empty(B, kk, device=dev, dtype=torch.float32)
-    C = _MEGA_CLUST_C
     vscr = torch.empty(B, kk, device=dev, dtype=torch.float32)
     pscr = torch.empty(B, C, kk, device=dev, dtype=torch.float32)
     bounds = _mega_clust_bounds(kk, C, dev)
@@ -1162,7 +1182,7 @@ def _lr_reduced_clust(Bk):
     T, npan = _mega_med_split_T(B, kk, nb, dev)
     mod.mega_eigh_clust_split(Bkc, V, L, rscr, dscr, escr, dpscr, dmscr, tauscr,
                               vscr, pscr, bounds, T, kk, _MEGA_CLUST_NT,
-                              _MEGA_BISITERS, nb)
+                              _MEGA_BISITERS, nb, C)
     # V holds Z; rscr the Householder panel; T the per-panel block-T -> torch WY.
     G = _mega_med_backtransform(V, rscr, T, kk, nb, npan)
     return L, G
@@ -2113,20 +2133,23 @@ def _lr_reduced_eigh(Bk):
     kk = Bk.shape[-1]
     if mod is not None and 32 < kk <= _MEGA_MED_NMAX:
         return _lr_reduced_mega(Bk)
-    # k in (448, 680] (dense1024 k=608, shape 4): C-CTA thread-block CLUSTER solve
-    # -- the packed-FP16 k-triangle is row-distributed across 2 CTAs' DSMEM so it
-    # fits (k=608 packed 370KB / 2 = 185KB/CTA < 228KB). This is the split kernel
-    # (tridiag+Sturm+twisted distributed, then torch tensor-core WY back-transform),
-    # so any block it can't resolve makes G non-orthonormal -> the OUTER FP32 A@V
-    # gate falls that matrix back to cuSOLVER (no regression). k=768 (shape 10)
-    # overflows C=2 (packed/2=295KB) -> falls through to cuSOLVER below.
+    # k in (448, 836] (dense1024 k=608 shape-4 -> C=2; nearrank1024 k=768 shape-10
+    # -> C=3): C-CTA thread-block CLUSTER solve -- the packed-FP16 k-triangle is
+    # row-distributed across C CTAs' DSMEM so it fits (k=608 370KB/2=185KB/CTA;
+    # k=768 590KB/3=197KB/CTA; both < 228KB). Split kernel (tridiag+Sturm+twisted
+    # distributed, then torch tensor-core WY back-transform); any block it can't
+    # resolve makes G non-orthonormal -> the OUTER FP32 A@V gate falls that matrix
+    # back to cuSOLVER (no regression). Cross-CTA v/p exchange via GLOBAL staging +
+    # threadfence (the DSMEM peer read raced -> NaN; brief-35 t2 root cause+fix).
     if (_LR_CLUST_ENABLED and mod is not None
             and hasattr(mod, "mega_eigh_clust_split")
             and _MEGA_CLUST_KMIN <= kk <= _MEGA_CLUST_KMAX):
-        try:
-            return _lr_reduced_clust(Bk)
-        except Exception:
-            pass
+        C = _mega_clust_C(kk)
+        if C > 0:
+            try:
+                return _lr_reduced_clust(Bk, C)
+            except Exception:
+                pass
     # k > 448 (dense1024 k=608, nearrank1024 k=768) stays on cuSOLVER. The
     # packed-FP16 megakernel overflows one CTA's SMEM there, and FOUR non-cuSOLVER
     # inner solvers were all MEASURED slower than cuSOLVER's syevd loop:
