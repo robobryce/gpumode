@@ -1230,13 +1230,15 @@ def _lr_reduced_eigh(Bk):
     kk = Bk.shape[-1]
     if mod is not None and 32 < kk <= _MEGA_MED_NMAX:
         return _lr_reduced_mega(Bk)
-    # k > 448: the packed-FP16 megakernel overflows one CTA's SMEM. Both
-    # torch.linalg.eigh's per-matrix syevd loop AND cusolverDnXsyevBatched were
-    # MEASURED to hit the same floor here (trial 4/5 profiles: Xsyev for n>32
-    # launches the identical symv/gemvx/laed3/larfg syevd machinery, just looped
-    # -- it is NOT a genuinely-parallel batched dense eigensolver), and the
-    # nested-subspace reduced solve regressed +60-96% (trial 2). So k>448 stays
-    # on cuSOLVER (the floor) until a genuine tensor-core k>448 primitive lands.
+    # k > 448: the packed-FP16 megakernel overflows one CTA's SMEM, and every
+    # non-cuSOLVER inner solver tried for this regime was MEASURED slower than
+    # cuSOLVER's syevd loop: cusolverDnXsyevBatched hits the same syevd machinery
+    # (trial 4/5, neutral), the nested randomized-subspace reduced solve regressed
+    # +60-96% (trial 2), and the Python blocked-Householder _eigh_custom pipeline
+    # regressed 5.4x (trial 6, latency-bound per-column Python loop). So k>448
+    # stays on cuSOLVER (the floor) -- a genuine batched tensor-core k>448 primitive
+    # (a fused SMEM megakernel that tiles k>448, or a spectral 2-way split into two
+    # <=448 blocks each megakernel'd) remains open for a follow-up.
     lam, G = torch.linalg.eigh(Bk)
     return lam, G
 
