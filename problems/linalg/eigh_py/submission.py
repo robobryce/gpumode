@@ -2134,9 +2134,11 @@ def _lr_proj_mode_for(n: int, k: int):
     nc=640: 33520->33025 -1.5%) because the large-nc projection GEMM amortizes the
     Ozaki 3-pass split; the n=512 routes LOSE (shape 3 dense512 nc=160: 81222->82216
     +1.2%; shape 8 rankdef512 nc=128: 91640->93190 +1.7%) -- too small to amortize.
-    Route 3xTF32 for n>=1024, FP32 (parent's mode) for n=512."""
+    Route 3xTF32 for n>=1024, FP32 (parent's mode) for n=512. brief-54 t11 PROVED
+    a 2-term split here is UNSAFE (mass fallback: its 3e-4 x kappa(Qd) breaks V orth)
+    -- the projections need the full 3-term 3xTF32."""
     if n >= 1024:
-        return "2xtf32"  # brief-54 probe: 2-term split on n>=1024 projections
+        return "3xtf32"
     return "fp32"
 
 
