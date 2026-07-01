@@ -2855,7 +2855,9 @@ _SIGN_DC_LARGE_FINAL_NS = 8
 # (needs ~8 steps from the cluster base's orth-0.65 start); "cqr" = shifted
 # CholeskyQR2 -- MEASURED both slower (transposed-RHS trsm on 2048x2048) AND less
 # accurate (shift=1e-4 floors orth ~1e-2) than NS here, so "ns" is kept.
-_SIGN_DC_LARGE_FINISH = "ns"
+_SIGN_DC_LARGE_FINISH = "cqrns"
+# brief-55: CQR pass count for the "cqrns" finish (robust from-orth>1 contraction).
+_SIGN_DC_LARGE_CQR_PASSES = 1
 # precision of the finishing-NS GEMMs (Gram + Q@Gram): "tf32x3" (3xTF32 Ozaki,
 # ~FP32 acc, ~3 GEMMs/op), "tf32" (1-pass plain TF32, ~3e-4 rel, 1 GEMM/op), "fp32"
 # (SIMT). The finishing NS just orthonormalizes an already-full-rank Q, so plain TF32
@@ -2865,7 +2867,7 @@ _SIGN_DC_LARGE_FINISH_PREC = "tf32"
 # polish orth below the plain-TF32 floor (~1.7e-2, right at the gate). The leading
 # (_SIGN_DC_LARGE_FINAL_NS - this) steps stay plain-TF32 (cheap). Only meaningful when
 # _SIGN_DC_LARGE_FINISH_PREC != "tf32x3".
-_SIGN_DC_LARGE_FINISH_POLISH = 2
+_SIGN_DC_LARGE_FINISH_POLISH = 1
 _SIGN_DC_LARGE_N = {2048}   # dense-class n routed to the recursive path (shape 5).
                             # n=1024 is handled by the mixed-peel/single-level probes;
                             # the recursive path is guarded to these n only so shape 11
@@ -2875,7 +2877,7 @@ _SIGN_DC_LARGE_PR_LO = 150.0   # participation-ratio floor for the large-n dense
                                # are below and route earlier).
 _sign_dc_rec_omega_cache: dict = {}   # (b,m,K,dev) -> fixed random projection blocks
 _sign_dc_eye_cache: dict = {}         # (m,dev) -> identity for the shift
-_SIGN_DC_LARGE_DBG = True             # set True to print orth/eigr/fallback diagnostics
+_SIGN_DC_LARGE_DBG = False            # set True to print orth/eigr/fallback diagnostics
 # SINGLE-LEVEL N-way spectral divide for n=2048 (vs the depth-1 binary split): splits
 # the whole n x n block into _SIGN_DC_NWAYS pieces at once (nways-1 Ritz-estimated
 # shifts), each piece to the cluster/mega base. 1 = binary depth-1 (2 blocks -> cuSOLVER
@@ -3365,6 +3367,57 @@ def _sign_dc_multiway(A_blk, dev, nways):
     return lam, G
 
 
+def _sign_dc_large_finish(Q):
+    """Finishing orthonormalization of the assembled large-n eigenvector matrix Q
+    (b, n, n) before the Rayleigh L + gate. brief-55: with the C-CTA cluster base the
+    assembled Q's orth START varies with the spectrum's near-sigma density -- most
+    seeds ~0.65 (inside the NS convergence radius), but some seeds have a matrix whose
+    near-sigma +/- overlap pushes orth > 1, where plain Newton-Schulz DIVERGES (1/8
+    fallback on a reseed sweep at NS-sign=16). Modes:
+      "ns"    : mixed NS (leading plain-TF32 + trailing 3xTF32 polish) -- fast, but only
+                safe when the start is < 1 (needs a sharper sign / more NS-sign iters).
+      "cqrns" : ONE shifted CholeskyQR pass FIRST (Q is full-rank, smin~0.7, so Cholesky
+                is well-posed from ANY orth incl >1 -> pulls it to the ~1e-2 shift floor),
+                THEN the 3xTF32 NS polish (floor -> ~1e-5). Reseed-robust regardless of
+                sign sharpness because CQR (not NS) does the from->1 contraction.
+    _SIGN_DC_LARGE_FINAL_NS is the NS step count; _SIGN_DC_LARGE_FINISH_POLISH the # of
+    trailing 3xTF32 steps."""
+    _nfin = _SIGN_DC_LARGE_FINAL_NS if _SIGN_DC_LARGE_FINAL_NS is not None else _SIGN_DC_FINAL_NS
+    if _nfin <= 0 and _SIGN_DC_LARGE_FINISH != "cqrns":
+        return Q
+    _gp = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = True
+    _polish = _SIGN_DC_LARGE_FINISH_POLISH
+    _fp = _SIGN_DC_LARGE_FINISH_PREC
+    if _SIGN_DC_LARGE_FINISH == "cqrns":
+        # robust contraction from any starting orth via CQR (handles orth>1), then NS
+        # polish. _SIGN_DC_LARGE_CQR_PASSES CQR passes, then `polish` 3xTF32 NS steps.
+        Q = _sign_dc_cqr(Q, passes=_SIGN_DC_LARGE_CQR_PASSES)
+        for _ in range(_polish):
+            g = _gram_3xtf32_sym(Q)
+            Q = 1.5 * Q - 0.5 * _matmul_3xtf32(Q, g)
+        torch.backends.cuda.matmul.allow_tf32 = _gp
+        return Q
+    if _SIGN_DC_LARGE_FINISH == "cqr":
+        Q = _sign_dc_cqr(Q, passes=_nfin)
+        torch.backends.cuda.matmul.allow_tf32 = _gp
+        return Q
+    # "ns": mixed-precision NS (leading plain-TF32, trailing `polish` 3xTF32).
+    for _i in range(_nfin):
+        hi = (_i >= _nfin - _polish)
+        if hi or _fp == "tf32x3":
+            g = _gram_3xtf32_sym(Q)
+            Q = 1.5 * Q - 0.5 * _matmul_3xtf32(Q, g)
+        else:
+            _pp2 = torch.backends.cuda.matmul.allow_tf32
+            torch.backends.cuda.matmul.allow_tf32 = (_fp == "tf32")
+            g = torch.bmm(Q.transpose(-1, -2), Q)
+            Q = 1.5 * Q - 0.5 * torch.bmm(Q, g)
+            torch.backends.cuda.matmul.allow_tf32 = _pp2
+    torch.backends.cuda.matmul.allow_tf32 = _gp
+    return Q
+
+
 def _sign_dc_solve_large(af, n, dev):
     """Batched spectral divide-and-conquer eigh for the large-n dense class (n=2048)
     via the RECURSIVE shifted matrix-sign block eigensolver. Returns (Q, L, AQ, order)
@@ -3391,39 +3444,7 @@ def _sign_dc_solve_large(af, n, dev):
     # so the large-n finish takes more steps to drive orth below the gate. Cheap: each
     # step is 2 n x n GEMMs on b=8.
     _gp = torch.backends.cuda.matmul.allow_tf32
-    _nfin = _SIGN_DC_LARGE_FINAL_NS if _SIGN_DC_LARGE_FINAL_NS is not None else _SIGN_DC_FINAL_NS
-    if _SIGN_DC_LARGE_FINISH == "cqr" and _nfin > 0:
-        # brief-55: CholeskyQR2 finish instead of many NS steps. The assembled Q from
-        # the C-CTA cluster base starts at orth ~0.65 but FULL RANK (smin 0.715, cond
-        # ~1.4 -- MEASURED via SIGNDC_RANK_DBG), which Cholesky handles trivially, so
-        # ONE shifted-CQR pass drives orth to ~1e-6 vs the ~8 quadratic NS steps a
-        # 0.65 start needs. _nfin here is the CQR pass count (2 is ample). Cheaper: a
-        # CQR pass is Gram + Cholesky + trsm (~3 big ops) vs 8 NS steps x 3 Ozaki GEMMs.
-        torch.backends.cuda.matmul.allow_tf32 = True
-        Q = _sign_dc_cqr(Q, passes=_nfin)
-        torch.backends.cuda.matmul.allow_tf32 = _gp
-    elif _nfin > 0:
-        torch.backends.cuda.matmul.allow_tf32 = True
-        # MIXED-precision finish (brief-55): the first (_nfin - polish) NS steps run at
-        # plain TF32 (1 GEMM/op, ~3e-4 rel) -- cheap, and enough to pull orth from the
-        # cluster base's ~0.65 start down to the TF32 floor ~1.7e-2 (right at the gate).
-        # The LAST `polish` steps run at 3xTF32 (Ozaki, ~FP32 acc) to push orth below
-        # that floor to ~1e-5 (safe reseed margin) at only `polish` x the Ozaki cost.
-        # Best of both: near-TF32 speed, near-FP32 final accuracy.
-        _polish = _SIGN_DC_LARGE_FINISH_POLISH
-        _fp = _SIGN_DC_LARGE_FINISH_PREC
-        for _i in range(_nfin):
-            hi = (_i >= _nfin - _polish)
-            if hi or _fp == "tf32x3":
-                g = _gram_3xtf32_sym(Q)
-                Q = 1.5 * Q - 0.5 * _matmul_3xtf32(Q, g)
-            else:
-                _pp2 = torch.backends.cuda.matmul.allow_tf32
-                torch.backends.cuda.matmul.allow_tf32 = (_fp == "tf32")
-                g = torch.bmm(Q.transpose(-1, -2), Q)
-                Q = 1.5 * Q - 0.5 * torch.bmm(Q, g)
-                torch.backends.cuda.matmul.allow_tf32 = _pp2
-        torch.backends.cuda.matmul.allow_tf32 = _gp
+    Q = _sign_dc_large_finish(Q)
     # Rayleigh-quotient re-eval of L on the orthonormalized Q; A@Q on TF32 feeds both
     # the Rayleigh L and the caller's eigen-residual gate (column-aligned by order).
     torch.backends.cuda.matmul.allow_tf32 = True
