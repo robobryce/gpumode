@@ -2527,6 +2527,200 @@ def _eigh_mixed_peel(a: torch.Tensor, pr: torch.Tensor) -> output_t:
     return Q.contiguous(), L.contiguous()
 
 
+# ---------------------------------------------------------------------------
+# SPECTRAL DIVIDE-AND-CONQUER via the MATRIX SIGN FUNCTION (brief 43).
+#
+# The n=512 lapack_dense_even batch (shape 11, b640) is the WORST shape on the
+# board (~208ms): a DENSE matrix with an EVENLY-SPACED signed spectrum (eigenvalues
+# +-linspace(1, ~2.4e-7) with random per-eigenvalue signs). cuSOLVER's syevd
+# divide-and-conquer cannot deflate a gapless spectrum, so it runs the full O(n^3)
+# dense secular solve per matrix, serially, over the 640-batch -- and its cost is
+# SPECTRUM-DEPENDENT (this gapless case 208ms vs the decaying shape-3 79ms at the
+# identical n=512 b640). It sits on the cuSOLVER floor because it is not low-rank
+# (participation-ratio ~284, above every low-rank band) and not 2-level.
+#
+# This path replaces that with batched SPECTRAL DIVIDE-AND-CONQUER whose cost is
+# SPECTRUM-INDEPENDENT (entirely batched tensor-core GEMM + two reduced megakernel
+# eigh calls, a fixed amount of work regardless of gaps):
+#   1. sign(A) via SCALED Newton-Schulz: scale A by 1/(1.02*||A||_2) (spectral norm
+#      from a few A^2 power iterations, so the estimate is sign-robust for an
+#      indefinite spectrum) into (-1,1), then iterate X <- 1.5 X - 0.5 X^3. Each
+#      iter is two batched TF32 GEMMs; ~30 iters drive |X|->1 (the near-zero
+#      eigenvalues plateau X near +-1 but their SIGN is resolved well enough for
+#      the projector-membership ranking below). Spectral projectors P+ = (I+S)/2,
+#      P- = (I-S)/2.
+#   2. Oversized invariant-subspace bases: U+ = orthonormalize(P+ @ Omega) (n x K),
+#      U- = orthonormalize(P- @ Omega2) (n x K), K a FIXED oversample >= the max +
+#      (and -) count over the batch, so both bases are batchable at ONE shape even
+#      though the true +count varies per matrix. Orthonormalization is a shifted
+#      batched CholeskyQR (Gram + Cholesky + trsm -- all GEMM/BLAS3, NOT the
+#      per-matrix-serial cuSOLVER QR which alone cost ~900ms here). U+'s top-(k+)
+#      columns span the exact + invariant subspace; the remaining K-(k+) columns
+#      QR-complete into the - subspace.
+#   3. Reduced blocks B+ = U+^T A U+, B- = U-^T A U- (K x K each, K<=~320 <= the
+#      medium megakernel's 448 SMEM-fit range) solved by the FUSED TENSOR-CORE
+#      MEGAKERNEL (2.4-5.3x faster than cuSOLVER on these blocks), NOT cuSOLVER.
+#      Because the + eigenvectors are A-invariant, B+ is block-diagonal between its
+#      real +block and its junk padding block, so eigh(B+) returns the exact +
+#      eigenpairs mixed with non-invariant junk eigenpairs from the padding.
+#   4. Lift V+ = U+ @ G+, V- = U- @ G-. RANK-SELECT the n true eigenpairs from the
+#      2K candidates by projector MEMBERSHIP ||P+ V+|| / ||P- V-|| (~1 for a real
+#      eigenvector of that block, ~0 for the padding junk): take the top-n by
+#      membership. This is what makes the FIXED-K oversample exact -- the junk
+#      padding eigenpairs (which are NOT invariant and would wreck the residual)
+#      are filtered out, leaving exactly the n invariant eigenpairs.
+#   5. ONE finishing FP32 Newton-Schulz orthonormalization step on the assembled
+#      eigenvector matrix (cleans the ~1e-2 orthogonality of the TF32-sign bases to
+#      ~1e-4, well under the gate) and a Rayleigh-quotient re-eval of L.
+#
+# Per-matrix residual+orth gated: any matrix the reduced-precision sign split can't
+# resolve to the harness gates is recomputed with cuSOLVER, so the path can never
+# produce an invalid result or regress below the cuSOLVER floor. Runtime-structural
+# routing (n, participation-ratio band, homogeneity), never a problem key ->
+# leaderboard-reseed-safe.
+# ---------------------------------------------------------------------------
+_SIGN_DC_N = 512          # routed only at n=512 (the shape-11 dense-even class)
+_SIGN_DC_K = 300          # oversized subspace width (>= max +count/-count over the
+                          # batch; +count ~ n/2 +- ~24 for a random-sign even spectrum,
+                          # so 300 covers it with margin and both K-blocks fit the
+                          # medium megakernel's n<=448 range)
+_SIGN_DC_NS_ITERS = 30    # Newton-Schulz sign iterations (each = 2 batched GEMMs)
+_SIGN_DC_POWER_ITERS = 15 # A^2 power iterations for the spectral-norm scale estimate
+_SIGN_DC_FINAL_NS = 1     # finishing FP32 NS orthonormalization steps on Q
+_SIGN_DC_PR_LO = 200.0    # participation-ratio floor: only the flat/dense-even class
+                          # (PR ~284) routes; every low-rank band is below this, and
+                          # near-rank (PR ~326 at n=1024) is a different n.
+_SIGN_DC_HOM_MAX = 3.0    # homogeneous-batch ceiling (heterogeneous mixed batches
+                          # are the mixed-peel router's job, not this one)
+
+
+def _sign_dc_cqr(Y, passes=2, shift=1e-4):
+    """Shifted batched CholeskyQR orthonormalization (Gram -> Cholesky -> trsm, all
+    BLAS3). The shift regularizes the rank-deficient directions of P+/P- @ Omega
+    (the oversample width K exceeds the true subspace rank), so the near-null
+    padding columns become small-norm junk columns rather than breaking the
+    Cholesky -- the membership rank-select drops them afterward."""
+    Qc = Y
+    c = Y.shape[-1]
+    eyek = torch.eye(c, device=Y.device, dtype=Y.dtype)
+    for _ in range(passes):
+        G = torch.bmm(Qc.transpose(-1, -2), Qc)
+        dm = G.diagonal(dim1=-2, dim2=-1).abs().amax(-1).clamp_min(1e-30)
+        L = torch.linalg.cholesky(G + (shift * dm).view(-1, 1, 1) * eyek)
+        Qc = torch.linalg.solve_triangular(L, Qc.transpose(-1, -2), upper=False).transpose(-1, -2)
+    return Qc
+
+
+def _sign_dc_solve(af, n, dev):
+    """Batched spectral divide-and-conquer eigh via the matrix sign function.
+    Returns (Q, L) UNSORTED-then-sorted (columns of Q pair with L); the CALLER
+    owns the per-matrix residual gate + cuSOLVER fallback."""
+    b = af.shape[0]
+    K = _SIGN_DC_K
+    eye_n = torch.eye(n, device=dev, dtype=torch.float32).expand(b, n, n)
+    _gp = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = True
+    # spectral-norm scale via A^2 power iteration (sign-robust for indefinite A)
+    v = torch.randn(b, n, 1, device=dev, dtype=torch.float32)
+    v = v / v.norm(dim=1, keepdim=True).clamp_min(1e-30)
+    for _ in range(_SIGN_DC_POWER_ITERS):
+        v = af @ (af @ v)
+        v = v / v.norm(dim=1, keepdim=True).clamp_min(1e-30)
+    nrm2 = (v.transpose(-1, -2) @ (af @ (af @ v))).abs().reshape(b, 1, 1).clamp_min(1e-30)
+    scale = nrm2.sqrt() * 1.02
+    # Newton-Schulz sign iteration X <- 1.5 X - 0.5 X^3
+    X = af / scale
+    for _ in range(_SIGN_DC_NS_ITERS):
+        X = 1.5 * X - 0.5 * (X @ (X @ X))
+    Pp = 0.5 * (eye_n + X)
+    Pm = 0.5 * (eye_n - X)
+    # oversized invariant-subspace bases (batched CholeskyQR, NOT cuSOLVER QR)
+    Om = torch.randn(b, n, K, device=dev, dtype=torch.float32)
+    Om2 = torch.randn(b, n, K, device=dev, dtype=torch.float32)
+    Up = _sign_dc_cqr(torch.bmm(Pp, Om))
+    Um = _sign_dc_cqr(torch.bmm(Pm, Om2))
+    torch.backends.cuda.matmul.allow_tf32 = _gp
+    # reduced K x K blocks -> fused tensor-core megakernel (raw, unsorted, ungated)
+    with _LR_TF32():
+        Bp = torch.bmm(Up.transpose(-1, -2), torch.bmm(af, Up))
+        Bp = 0.5 * (Bp + Bp.transpose(-1, -2))
+        Bm = torch.bmm(Um.transpose(-1, -2), torch.bmm(af, Um))
+        Bm = 0.5 * (Bm + Bm.transpose(-1, -2))
+    try:
+        lp, gp = _lr_reduced_eigh(Bp)
+        lm, gm = _lr_reduced_eigh(Bm)
+    except Exception:
+        lp, gp = torch.linalg.eigh(Bp)
+        lm, gm = torch.linalg.eigh(Bm)
+    torch.backends.cuda.matmul.allow_tf32 = True
+    Vp = torch.bmm(Up, gp)                     # n x K candidate + eigenvectors
+    Vm = torch.bmm(Um, gm)                     # n x K candidate - eigenvectors
+    # projector membership: ~1 for a real eigenvector of that block, ~0 for padding
+    selp = torch.bmm(Pp, Vp).norm(dim=1)       # (b, K)
+    selm = torch.bmm(Pm, Vm).norm(dim=1)       # (b, K)
+    torch.backends.cuda.matmul.allow_tf32 = _gp
+    Vall = torch.cat([Vp, Vm], dim=-1)         # n x 2K
+    Lall = torch.cat([lp, lm], dim=-1)         # 2K
+    mem = torch.cat([selp, selm], dim=-1)      # 2K
+    topi = mem.topk(n, dim=-1).indices         # the n true eigenpairs
+    Q = torch.gather(Vall, 2, topi.unsqueeze(1).expand(b, n, n))
+    L = torch.gather(Lall, 1, topi)
+    # finishing FP32 Newton-Schulz orthonormalization (cleans TF32-sign orth to ~1e-4)
+    if _SIGN_DC_FINAL_NS > 0:
+        _p2 = torch.backends.cuda.matmul.allow_tf32
+        torch.backends.cuda.matmul.allow_tf32 = False
+        for _ in range(_SIGN_DC_FINAL_NS):
+            g = torch.bmm(Q.transpose(-1, -2), Q)
+            Q = 1.5 * Q - 0.5 * torch.bmm(Q, g)
+        torch.backends.cuda.matmul.allow_tf32 = _p2
+    # Rayleigh-quotient re-eval of L on the orthonormalized Q (eigenvalues are the
+    # diagonal of Q^T A Q; feeds the gate + output). A@Q on TF32 (gate-precision).
+    torch.backends.cuda.matmul.allow_tf32 = True
+    AQ = af @ Q
+    torch.backends.cuda.matmul.allow_tf32 = _gp
+    L = (Q * AQ).sum(dim=1)
+    L, order = torch.sort(L, dim=-1)
+    Q = torch.gather(Q, 2, order.unsqueeze(1).expand(b, n, n))
+    return Q, L, AQ, order
+
+
+def _eigh_sign_dc(a: torch.Tensor) -> output_t:
+    """Spectral divide-and-conquer eigensolver via the matrix sign function, with a
+    per-matrix residual+orth gate + cuSOLVER fallback (so it can never regress below
+    the cuSOLVER floor or emit an invalid factorization). Falls back wholesale to
+    cuSOLVER if the extension is unavailable or the pipeline raises."""
+    b, n, _ = a.shape
+    dev = a.device
+    af = a.float().contiguous()
+    try:
+        Q, L, _AQ, _order = _sign_dc_solve(af, n, dev)
+    except Exception:
+        Lc, Qc = torch.linalg.eigh(af)
+        return Qc.contiguous(), Lc.contiguous()
+    # per-matrix residual gate (harness-level). Orthogonality GEMM stays true FP32
+    # (TF32 accumulates over n column dot-products above the orth bound); the eigen
+    # gate A@Q recompute runs on TF32 tensor cores (gate-only, error far below the
+    # eigen bound). Same gate structure as the low-rank / two-level paths.
+    eps = torch.finfo(torch.float32).eps
+    eye = torch.eye(n, device=dev, dtype=torch.float32)
+    _gp = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = False
+    orth = torch.linalg.matrix_norm(Q.transpose(-1, -2) @ Q - eye, ord=1, dim=(-2, -1))
+    torch.backends.cuda.matmul.allow_tf32 = True
+    aq = af @ Q
+    torch.backends.cuda.matmul.allow_tf32 = _gp
+    eigr = torch.linalg.matrix_norm(aq - Q * L.unsqueeze(-2), ord=1, dim=(-2, -1))
+    a_l1 = torch.linalg.matrix_norm(af, ord=1, dim=(-2, -1)).clamp_min(1e-30)
+    bad = ((orth > 75.0 * n * eps) | (eigr / a_l1 > 150.0 * n * eps)
+           | ~torch.isfinite(L).all(dim=-1) | ~torch.isfinite(Q).all(dim=(-2, -1)))
+    if bool(bad.any()):
+        idx = torch.nonzero(bad, as_tuple=False).flatten()
+        Lf, Qf = torch.linalg.eigh(af[idx])
+        Q[idx] = Qf
+        L[idx] = Lf
+    return Q.contiguous(), L.contiguous()
+
+
 def custom_kernel(data: input_t) -> output_t:
     a = data
     n = a.shape[-1]
@@ -2581,6 +2775,22 @@ def custom_kernel(data: input_t) -> output_t:
         if hom_ratio >= _MIXED_PEEL_HOM_MAX and \
                 _mixed_peel_count(pr) >= _MIXED_PEEL_MIN_COUNT:
             return _eigh_mixed_peel(a, pr)
+    # SPECTRAL DIVIDE-AND-CONQUER via the matrix sign function (brief 43): the
+    # n=512 dense-even batch (shape 11, the board's worst shape ~208ms) is a dense
+    # matrix with a gapless evenly-spaced signed spectrum -- NOT low-rank (PR ~284,
+    # above every low-rank band) and NOT 2-level -- so it sits on the cuSOLVER floor
+    # whose gapless-spectrum cost is the worst on the board. Route it to the batched
+    # sign-function spectral D&C (sign(A) -> +/- invariant-subspace split -> two
+    # reduced megakernel eigh blocks -> membership rank-select), whose cost is
+    # SPECTRUM-INDEPENDENT and runs on tensor cores. Fires only at n=512 for a
+    # HOMOGENEOUS, HIGH-participation-ratio (>=200), NON-2-level batch (2-level goes
+    # to the faster two-level path below; low-rank/mixed already returned above), and
+    # is per-matrix residual-gated with a cuSOLVER fallback -> no regression.
+    if (n == _SIGN_DC_N and pr is not None
+            and (pr >= _SIGN_DC_PR_LO).float().mean().item() >= _LOWRANK_FRAC_MIN
+            and (pr.max() / pr.min().clamp_min(1e-30)).item() < _SIGN_DC_HOM_MAX
+            and _twolevel_mask(a.float()).float().mean().item() < _TWOLEVEL_MINFRAC):
+        return _eigh_sign_dc(a)
     # n >= _TWOLEVEL_NMIN: the two-level projector eigensolver runs per-matrix on
     # any matrix in the batch with a ~{-1,+1} spectrum (A^2 ~ I) -- ~2x faster
     # than cuSOLVER on clustered512 -- and cuSOLVER on the rest. Internally
