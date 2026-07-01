@@ -2047,6 +2047,22 @@ def _lr_lift_gemm(A, B, mode):
 # not pass an explicit per-shape mode; the live callers pass _lr_dom_gram_mode_for.
 _LR_DOM_GRAM_MODE = "fp32"   # dominant power-step CQR2 Gram Q^T Q precision
 _LR_VD_LIFT_MODE = "fp32"    # Vd = Qd @ G lift GEMM precision
+# brief-54: the A@Omega range-finder / A@Qd power / A@Qd Rayleigh / A@Vc complement
+# matvecs are the LAST big FP32-SIMT GEMMs left in the low-rank path (brief-44 moved
+# the dominant Gram + Vd lift to 3xTF32 but explicitly LEFT these four A@X matvecs on
+# FP32-SIMT). Each is an n*n @ n*k batched GEMM (A is n*n, X is n*k) -- on B200
+# FP32-SIMT runs ~40 TFLOPS while FP32-accurate 3xTF32 (Ozaki hi+lo split, ~6e-6 rel)
+# runs ~8-10x faster on the TF32 tensor cores and stays inside the orth/eigen gates
+# (plain TF32 at ~3e-4 does NOT -> mass fallback). "fp32" | "tf32" | "3xtf32".
+_LR_AV_MODE = "tf32"         # A@X (range-finder / power / Rayleigh) matvec precision
+# brief-54: the Qd-projection GEMMs R <- R - Qd(Qd^T R) (building the complement
+# basis Vc orthogonal to the dominant subspace, run TWICE) are the FP32-SIMT
+# simt_sgemm GEMMs that PERSIST in the shape-8/10 profile after the A@X matvecs
+# went to TF32 (~9-10% of shape 10). They involve the ILL-conditioned Qd
+# (kappa 1e3-1e4), so plain TF32's ~3e-4 leakage x kappa breaks V=[Vd,Vc]
+# cross-block orth -> fallback (parent measured this UNSAFE). 3xTF32 (~6e-6) is
+# safe. "fp32" | "tf32" | "3xtf32".
+_LR_PROJ_MODE = "fp32"       # Qd-projection (complement build) GEMM precision
 
 
 def _lr_dom_gram_mode_for(n: int, k: int):
@@ -2065,6 +2081,42 @@ def _lr_dom_gram_mode_for(n: int, k: int):
     if n >= 512 and k >= 384:
         return "3xtf32"
     return "fp32"
+
+
+def _lr_av_mode_for(n: int, k: int):
+    """Per-shape precision for the four A@X matvecs (A@Omega range-finder, A@Qd
+    power, A@Qd Rayleigh, A@Vc complement).
+
+    brief-54 MEASURED (t1 3xtf32 vs t2 tf32, matched contention): these matvecs
+    already ran on plain-TF32 tensor cores in the parent (they are plain bmm inside
+    the _LR_TF32 allow_tf32=True scope, NOT FP32-SIMT). So the real trade is 1-pass
+    TF32 (~3e-4, fastest GEMM) vs 3-pass 3xTF32 (~6e-6, ~1.7x the GEMM cost). Plain
+    TF32 is gate-clean and fastest on almost every low-rank route (shapes 3/4/8/12:
+    tf32 81.2/48.9/91.7/33.5ms << 3xtf32 87.5/51.6/98.2/35.9ms) -- the extra Ozaki
+    passes just cost more where the gate already passes. The ONE exception is the
+    n=1024 NEAR-RANK-DEFICIENT route (k=768 == exact rank 3n/4, shape 10): its
+    dominant subspace reaches into the ~1e-6 near-null tail (ill-conditioned), so
+    plain TF32's ~3e-4 tips matrices into cuSOLVER fallback (tf32 102.7ms) while
+    3xTF32's ~6e-6 keeps them gate-clean (3xtf32 94.0ms, -8.5%). Route 3xTF32 only
+    for that near-rank case (n>=1024, k>=768); plain TF32 everywhere else."""
+    if n >= 1024 and k >= 768:
+        return "3xtf32"
+    return "tf32"
+
+
+def _lr_proj_mode_for(n: int, k: int):
+    """Per-shape precision for the Qd-projection GEMMs R <- R - Qd(Qd^T R). 3xTF32
+    puts them on tensor cores at ~6e-6 (safe for the ill-conditioned Qd, unlike
+    plain TF32); measured per-shape whether the tensor-core gain beats the Ozaki
+    3-pass overhead at each (n, k)."""
+    return _LR_PROJ_MODE
+
+
+def _lr_project_out(Qd, X, mode):
+    """X - Qd @ (Qd^T @ X), the projection onto the orthogonal complement of the
+    dominant subspace span(Qd), with both GEMMs at `mode` precision."""
+    QtX = _lr_lift_gemm(Qd.transpose(-1, -2), X, mode)
+    return X - _lr_lift_gemm(Qd, QtX, mode)
 
 
 def _lr_cholesky_qr2(Y, passes=2, shift=1e-5, tf32_gram=False, gram_mode=None):
@@ -2253,7 +2305,8 @@ def _lr_reduced_eigh(Bk):
     return lam, G
 
 
-def _lowrank_eigh(a, k, power=1, dom_gram_mode=None, vd_lift_mode=None):
+def _lowrank_eigh(a, k, power=1, dom_gram_mode=None, vd_lift_mode=None,
+                  av_mode=None, proj_mode=None):
     B, n, _ = a.shape
     dev = a.device
     k = min(k, n)
@@ -2261,6 +2314,10 @@ def _lowrank_eigh(a, k, power=1, dom_gram_mode=None, vd_lift_mode=None):
         dom_gram_mode = _LR_DOM_GRAM_MODE
     if vd_lift_mode is None:
         vd_lift_mode = _LR_VD_LIFT_MODE
+    if av_mode is None:
+        av_mode = _LR_AV_MODE
+    if proj_mode is None:
+        proj_mode = _LR_PROJ_MODE
     g = torch.Generator(device=dev).manual_seed(1234567)
     Omega = torch.randn(B, n, k, device=dev, generator=g)
     with torch.no_grad():
@@ -2277,12 +2334,16 @@ def _lowrank_eigh(a, k, power=1, dom_gram_mode=None, vd_lift_mode=None):
         # tensor cores where it is a net win, FP32 on the zero-margin dense512
         # route). The RANGE-FINDER CQR2 stays 1-pass FP32: its Qd0 only has to SPAN
         # the subspace (re-orthonormalized by the power CQR2 below).
-        Qd = _lr_cholesky_qr2(torch.bmm(a, Omega), passes=1)
+        # brief-54: A@Omega range-finder + A@Qd power + A@Qd Rayleigh matvecs run
+        # at av_mode (FP32-accurate 3xTF32 on tensor cores by default). Each is an
+        # n*n @ n*k batched GEMM previously on FP32-SIMT (simt_sgemm); 3xTF32 keeps
+        # ~6e-6 accuracy (orth/eigen gates tolerate it) at ~8-10x the SIMT rate.
+        Qd = _lr_cholesky_qr2(_lr_lift_gemm(a, Omega, av_mode), passes=1)
         for _ in range(power):
-            Qd = _lr_cholesky_qr2(torch.bmm(a, Qd), gram_mode=dom_gram_mode)
+            Qd = _lr_cholesky_qr2(_lr_lift_gemm(a, Qd, av_mode), gram_mode=dom_gram_mode)
         # A@Qd is computed here and REUSED below (both to form Bk and to build
         # A@Vd = (A@Qd)@G cheaply, so the residual gate needs no separate A@V).
-        AQd = torch.bmm(a, Qd)
+        AQd = _lr_lift_gemm(a, Qd, av_mode)
         Bk = torch.bmm(Qd.transpose(-1, -2), AQd)
         Bk = 0.5 * (Bk + Bk.transpose(-1, -2))
         try:
@@ -2309,12 +2370,13 @@ def _lowrank_eigh(a, k, power=1, dom_gram_mode=None, vd_lift_mode=None):
             R = torch.randn(B, n, nc, device=dev, generator=g)
             _prev = torch.backends.cuda.matmul.allow_tf32
             torch.backends.cuda.matmul.allow_tf32 = False
-            # The Qd-projections (R - Qd Qd^T R) stay FP32. 3xTF32 here was safe
-            # (~6e-6 Qd-leakage, as clean as FP32) but net-neutral (t9): the
-            # projection GEMMs are too small to amortize the split overhead at
-            # b640. Plain TF32 is UNSAFE -- its ~3e-4 leakage x kappa(Qd) breaks
-            # cross-block orthogonality of V=[Vd,Vc] (orth ~0.5 -> fallback).
-            R = R - torch.bmm(Qd, torch.bmm(Qd.transpose(-1, -2), R))
+            # brief-54: the Qd-projections (R - Qd Qd^T R, run TWICE) at proj_mode.
+            # They involve the ILL-conditioned Qd (kappa 1e3-1e4), so plain TF32's
+            # ~3e-4 leakage x kappa breaks V=[Vd,Vc] cross-block orth (orth ~0.5 ->
+            # fallback) -- parent kept them FP32-SIMT. 3xTF32 (~6e-6 Qd-leakage, as
+            # clean as FP32) puts them on tensor cores; whether that beats the
+            # 3-pass Ozaki overhead at each (n,k) is measured per-shape.
+            R = _lr_project_out(Qd, R, proj_mode)
             # The complement basis Vc spans the ORTHOGONAL complement of the
             # (already-projected-out) dominant subspace, built from a random
             # matrix -> WELL-conditioned, so its CQR2 Gram tolerates plain TF32
@@ -2323,10 +2385,12 @@ def _lowrank_eigh(a, k, power=1, dom_gram_mode=None, vd_lift_mode=None):
             # the final one 1-pass raised live fallbacks on shapes 8/12, t5); the
             # Gram uses plain TF32 (3xTF32 there net-lost, t7).
             Vc = _lr_cholesky_qr2(R, shift=1e-4, gram_mode="tf32")
-            Vc = Vc - torch.bmm(Qd, torch.bmm(Qd.transpose(-1, -2), Vc))
+            Vc = _lr_project_out(Qd, Vc, proj_mode)
             Vc = _lr_cholesky_qr2(Vc, shift=1e-5, gram_mode="tf32")
             torch.backends.cuda.matmul.allow_tf32 = _prev
-            AVc = torch.bmm(a, Vc)
+            # brief-54: A@Vc complement Rayleigh matvec at av_mode (3xTF32). Feeds
+            # lam_c = diag(Vc^T A Vc) and the complement's eigen-gate residual.
+            AVc = _lr_lift_gemm(a, Vc, av_mode)
             lam_c = (AVc * Vc).sum(dim=-2)
             V = torch.cat([Vd, Vc], dim=-1)
             AV = torch.cat([AVd, AVc], dim=-1)
@@ -2341,11 +2405,13 @@ def _lowrank_eigh(a, k, power=1, dom_gram_mode=None, vd_lift_mode=None):
     return V, lam, AV
 
 
-def _eigh_lowrank_safe(a, k, power=1, dom_gram_mode=None, vd_lift_mode=None):
+def _eigh_lowrank_safe(a, k, power=1, dom_gram_mode=None, vd_lift_mode=None,
+                       av_mode=None, proj_mode=None):
     B, n, _ = a.shape
     try:
         with _LR_TF32():
-            V, lam, AV = _lowrank_eigh(a, k, power, dom_gram_mode, vd_lift_mode)
+            V, lam, AV = _lowrank_eigh(a, k, power, dom_gram_mode, vd_lift_mode,
+                                       av_mode, proj_mode)
     except Exception:
         w, q = torch.linalg.eigh(a)
         return q.contiguous(), w.contiguous()
@@ -2555,6 +2621,15 @@ _MIXED_PEEL_PSD_K = 256       # psd dominant rank: smallest k that clears the ei
 # to tensor cores; measured to keep the peel's gate fallback at 0 (the mixed dense
 # subset has margin the whole-batch dense512 route lacks).
 _MIXED_PEEL_DOM_GRAM_MODE = "3xtf32"
+# brief-54: A@X matvec precision for the mixed-peel low-rank subsets (dense k=352,
+# psd k=256, both n=512). brief-54 t1/t2 measured plain TF32 is gate-clean and
+# fastest on the n=512 routes (the mixed dense subset mirrors shape 3, gate-clean
+# at tf32); the extra 3xTF32 Ozaki passes only cost more here. Keep plain TF32.
+_MIXED_PEEL_AV_MODE = "tf32"
+# brief-54: Qd-projection precision for the mixed-peel low-rank subsets (n=512).
+# t4 measured 3xTF32 net-neutral here (projections too small to amortize Ozaki);
+# keep FP32 (parent's mode) for the minimal-diff keeper.
+_MIXED_PEEL_PROJ_MODE = "fp32"
 
 
 def _mixed_peel_count(pr: torch.Tensor) -> int:
@@ -2586,7 +2661,9 @@ def _eigh_mixed_peel(a: torch.Tensor, pr: torch.Tensor) -> output_t:
     gidx = torch.nonzero(dense_mask, as_tuple=False).flatten()
     a_sub = af.index_select(0, gidx).contiguous()
     Qs, Ls = _eigh_lowrank_safe(a_sub, _MIXED_PEEL_K, power=1,
-                                dom_gram_mode=_MIXED_PEEL_DOM_GRAM_MODE)
+                                dom_gram_mode=_MIXED_PEEL_DOM_GRAM_MODE,
+                                av_mode=_MIXED_PEEL_AV_MODE,
+                                proj_mode=_MIXED_PEEL_PROJ_MODE)
     Q.index_copy_(0, gidx, Qs)
     L.index_copy_(0, gidx, Ls)
     taken |= dense_mask
@@ -2602,7 +2679,9 @@ def _eigh_mixed_peel(a: torch.Tensor, pr: torch.Tensor) -> output_t:
         if pidx.numel() > 0:
             a_psd = af.index_select(0, pidx).contiguous()
             Qp, Lp = _eigh_lowrank_safe(a_psd, _MIXED_PEEL_PSD_K, power=1,
-                                        dom_gram_mode=_MIXED_PEEL_DOM_GRAM_MODE)
+                                        dom_gram_mode=_MIXED_PEEL_DOM_GRAM_MODE,
+                                        av_mode=_MIXED_PEEL_AV_MODE,
+                                        proj_mode=_MIXED_PEEL_PROJ_MODE)
             Q.index_copy_(0, pidx, Qp)
             L.index_copy_(0, pidx, Lp)
             taken |= psd_mask
@@ -3273,7 +3352,9 @@ def custom_kernel(data: input_t) -> output_t:
         # Vd lift stays FP32: t8 measured 3xTF32 on the small n*k@k*k lift GEMM as
         # net-neutral over the dominant-Gram 3xTF32 win (confirms brief-16 t9).
         return _eigh_lowrank_safe(a, k_lr, power=1,
-                                  dom_gram_mode=_lr_dom_gram_mode_for(n, k_lr))
+                                  dom_gram_mode=_lr_dom_gram_mode_for(n, k_lr),
+                                  av_mode=_lr_av_mode_for(n, k_lr),
+                                  proj_mode=_lr_proj_mode_for(n, k_lr))
     # MIXED-BATCH DENSE PEEL (brief 28): a heterogeneous n=512 mixed batch (the
     # benchmark's shape 6) whose whole-batch low-rank route was (correctly)
     # refused above by the homogeneity gate still has a large DENSE subset that
