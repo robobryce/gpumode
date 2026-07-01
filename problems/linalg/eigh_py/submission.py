@@ -1976,6 +1976,22 @@ def _gram_3xtf32(Q):
     return torch.bmm(Qth, Qh) + torch.bmm(Qth, Ql) + torch.bmm(Qtl, Qh)
 
 
+def _gram_3xtf32_sym(Q):
+    # SYMMETRIC-aware 3xTF32 Gram G = Q^T Q (brief-44): exploits that the two Ozaki
+    # cross terms are TRANSPOSES of each other for a Gram -- Qh^T Ql and Ql^T Qh
+    # satisfy (Qh^T Ql)^T = Ql^T Qh -- so G = Qh^T Qh + C + C^T with C = Qh^T Ql
+    # is exactly the 3-term _gram_3xtf32 result but with only TWO tensor-core bmms
+    # (Qh^T Qh + Qh^T Ql) instead of three (the Ql^T Qh bmm is replaced by C^T, a
+    # cheap transpose-add). ~33% fewer bmm flops for the dominant CQR2 Gram, same
+    # ~6e-6 accuracy. allow_tf32 must be True on entry so both bmms hit tensor cores.
+    mask = ~0x1FFF
+    Qh = (Q.view(torch.int32) & mask).view(torch.float32)
+    Ql = Q - Qh
+    Qth = Qh.transpose(-1, -2)
+    C = torch.bmm(Qth, Ql)
+    return torch.bmm(Qth, Qh) + C + C.transpose(-1, -2)
+
+
 def _matmul_3xtf32(A, B):
     # ~FP32-accurate general batched matmul A @ B on TF32 tensor cores via the
     # same Ozaki hi+lo split as _gram_3xtf32: A = Ah+Al, B = Bh+Bl, product =
@@ -1992,6 +2008,65 @@ def _matmul_3xtf32(A, B):
     return torch.bmm(Ah, Bh) + torch.bmm(Ah, Bl) + torch.bmm(Al, Bh)
 
 
+def _lr_lift_gemm(A, B, mode):
+    """One low-rank lift/product GEMM A @ B at the requested precision:
+    "fp32" (true FP32-SIMT), "tf32" (single-pass TF32 tensor core), or "3xtf32"
+    (Ozaki hi+lo split, ~FP32 accuracy). allow_tf32 is scoped tightly so no other
+    path's GEMM precision is perturbed."""
+    prev = torch.backends.cuda.matmul.allow_tf32
+    try:
+        if mode == "3xtf32":
+            torch.backends.cuda.matmul.allow_tf32 = True
+            return _matmul_3xtf32(A, B)
+        torch.backends.cuda.matmul.allow_tf32 = (mode == "tf32")
+        return torch.bmm(A, B)
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = prev
+
+
+# ---- brief-44: dominant low-rank CQR2 Gram / Vd-lift precision knobs ----
+# The DOMINANT-subspace CholeskyQR2 (the power step on Qd) and the Vd = Qd@G lift
+# are the FP32-SIMT (cutlass3x_sm100_simt_sgemm) GEMMs the brief-40 profile found
+# dominating the low-rank routed path (shapes 8/10 + the mixed peel). B200 runs
+# TF32 tensor-core GEMMs much faster than FP32-SIMT. MEASURED (brief-44):
+#   * plain TF32 anywhere in the DOMINANT CQR2 (either pass) or on the Vd lift ->
+#     MASS FALLBACK (t1/t2/t6): the low-rank shapes sit at the orth-gate FLOOR
+#     (ill-conditioned Qd, kappa 1e3-1e4; the spectral tail leaves the subspace
+#     only approx-invariant), so TF32's ~3e-4/op breaks orthonormality over the
+#     80*n*eps gate and the 2-pass CQR2 does NOT self-correct it.
+#   * FP32-accurate 3xTF32 (Ozaki hi+lo split) on the dominant Gram is SAFE (no
+#     fallback change) and a net win on every low-rank shape EXCEPT the zero-margin
+#     n=512 dense-concentrated route (shape3, k=352), where 3xTF32's ~6e-6 residual
+#     tips borderline matrices over the gate (partial fallback, t5). So 3xTF32 is
+#     routed per-shape by _lr_dom_gram_mode_for; the Vd lift 3xTF32 is net-neutral
+#     (small GEMM, t4/t8) so it stays FP32.
+# Each knob is "fp32" | "tf32" | "3xtf32" (or a per-pass tuple for the Gram); the
+# residual+orth gate inside _eigh_lowrank_safe falls any matrix a reduced-precision
+# factor cannot resolve back to cuSOLVER, so nothing here can produce an invalid
+# result (only a wasted double-solve). These are the DEFAULTS when the caller does
+# not pass an explicit per-shape mode; the live callers pass _lr_dom_gram_mode_for.
+_LR_DOM_GRAM_MODE = "fp32"   # dominant power-step CQR2 Gram Q^T Q precision
+_LR_VD_LIFT_MODE = "fp32"    # Vd = Qd @ G lift GEMM precision
+
+
+def _lr_dom_gram_mode_for(n: int, k: int):
+    """Per-shape dominant-CQR2-Gram precision, chosen by matrix STRUCTURE (n and
+    the routed dominant rank k) -- legitimate algorithm selection. FP32-accurate
+    3xTF32 (Ozaki hi+lo split) puts the dominant Gram GEMM on TF32 tensor cores
+    (~1.8x the FP32-SIMT rate) WITHOUT changing the fallback decision, EXCEPT on
+    shapes that sit exactly at the orth-gate margin: brief-44 t5 measured that the
+    n=512 dense-concentrated route (k=352, the steep band) partially falls back
+    under 3xTF32 (its ~6e-6 residual tips zero-margin matrices over 80*n*eps),
+    while every n=1024 route (k in {384,608,768}) and the n=512 rankdef route
+    (k=384) keep their fallback at 0 and gain 2-5%. So route 3xTF32 for n=1024 and
+    for n=512 with k>=384; keep FP32 on the zero-margin n=512 k<=352 route."""
+    if n >= 1024:
+        return "3xtf32"
+    if n >= 512 and k >= 384:
+        return "3xtf32"
+    return "fp32"
+
+
 def _lr_cholesky_qr2(Y, passes=2, shift=1e-5, tf32_gram=False, gram_mode=None):
     # gram_mode selects the precision of the Gram G = Q^T Q (the dominant
     # FP32-SIMT cost of the CholeskyQR2 orthonormalization):
@@ -2006,17 +2081,30 @@ def _lr_cholesky_qr2(Y, passes=2, shift=1e-5, tf32_gram=False, gram_mode=None):
     # tf32_gram=True is the back-compat alias for gram_mode="tf32". The
     # triangular solve is not a GEMM, so Q always leaves solve_triangular in true
     # FP32 regardless of gram_mode.
+    #
+    # gram_mode may be a PER-PASS tuple/list (brief-44): CholeskyQR2 mathematically
+    # self-corrects CONDITIONING -- after pass 1, Q1 = Q0 R0^-1 has kappa(Q1)~1
+    # regardless of kappa(Q0). So pass 1's Gram (on the ILL-conditioned input, where
+    # TF32's ~3e-4 x kappa blows up -> t1 fallback) needs FP32/3xTF32, but pass 2's
+    # Gram (on the now well-conditioned Q1) safely tolerates plain TF32. A per-pass
+    # ("fp32","tf32") schedule thus puts HALF the dominant-Gram work on the ~9x
+    # tensor-core path while keeping the ill-conditioned pass-1 Gram accurate.
     if gram_mode is None:
         gram_mode = "tf32" if tf32_gram else "fp32"
+    if isinstance(gram_mode, (list, tuple)):
+        pass_modes = [gram_mode[min(i, len(gram_mode) - 1)] for i in range(passes)]
+    else:
+        pass_modes = [gram_mode] * passes
     Q = Y
     c = Y.shape[-1]
     eye = torch.eye(c, device=Y.device, dtype=Y.dtype)
     prev = torch.backends.cuda.matmul.allow_tf32
-    torch.backends.cuda.matmul.allow_tf32 = (gram_mode in ("tf32", "3xtf32"))
     try:
-        for _ in range(passes):
-            if gram_mode == "3xtf32":
-                G = _gram_3xtf32(Q)
+        for pm in pass_modes:
+            torch.backends.cuda.matmul.allow_tf32 = (pm in ("tf32", "3xtf32"))
+            if pm == "3xtf32":
+                # symmetric-aware 3xTF32 Gram: 2 bmms (vs 3), same ~6e-6 accuracy.
+                G = _gram_3xtf32_sym(Q)
             else:
                 G = torch.bmm(Q.transpose(-1, -2), Q)
             dm = G.diagonal(dim1=-2, dim2=-1).abs().amax(-1).clamp_min(1e-30)
@@ -2165,10 +2253,14 @@ def _lr_reduced_eigh(Bk):
     return lam, G
 
 
-def _lowrank_eigh(a, k, power=1):
+def _lowrank_eigh(a, k, power=1, dom_gram_mode=None, vd_lift_mode=None):
     B, n, _ = a.shape
     dev = a.device
     k = min(k, n)
+    if dom_gram_mode is None:
+        dom_gram_mode = _LR_DOM_GRAM_MODE
+    if vd_lift_mode is None:
+        vd_lift_mode = _LR_VD_LIFT_MODE
     g = torch.Generator(device=dev).manual_seed(1234567)
     Omega = torch.randn(B, n, k, device=dev, generator=g)
     with torch.no_grad():
@@ -2180,15 +2272,14 @@ def _lowrank_eigh(a, k, power=1):
         # <=1.7e-3) and ~5-8% faster than rp2/pp2 (one fewer Gram+Cholesky+trsm on
         # the n-row dominant block). The FINAL power CQR2 MUST stay 2-pass -- 1
         # pass there gives orth ~6-11 -> 100% fallback (probed).
-        # Dominant-subspace Grams stay FP32. Precision on the Gram is NOT the
-        # lever: the CQR2 triangular solve (not the Gram) dominates CQR2 (~16% of
-        # the profile), and both TF32 (breaks the ill-conditioned Qd orthogonality
-        # -> fallback, t1) and 3xTF32 (split overhead on B*n*k tensors exceeds the
-        # small Gram savings, esp at b640/n=512 -> shape3/8 regress, t4) net-lose
-        # here. The win came from doing FEWER CQR passes (range-finder 1-pass, t2).
+        # brief-44: the DOMINANT power-step CQR2 Gram runs at dom_gram_mode (the
+        # caller passes FP32-accurate 3xTF32 per-shape via _lr_dom_gram_mode_for --
+        # tensor cores where it is a net win, FP32 on the zero-margin dense512
+        # route). The RANGE-FINDER CQR2 stays 1-pass FP32: its Qd0 only has to SPAN
+        # the subspace (re-orthonormalized by the power CQR2 below).
         Qd = _lr_cholesky_qr2(torch.bmm(a, Omega), passes=1)
         for _ in range(power):
-            Qd = _lr_cholesky_qr2(torch.bmm(a, Qd))
+            Qd = _lr_cholesky_qr2(torch.bmm(a, Qd), gram_mode=dom_gram_mode)
         # A@Qd is computed here and REUSED below (both to form Bk and to build
         # A@Vd = (A@Qd)@G cheaply, so the residual gate needs no separate A@V).
         AQd = torch.bmm(a, Qd)
@@ -2202,13 +2293,12 @@ def _lowrank_eigh(a, k, power=1):
             Bk = Bk + jit.view(-1, 1, 1) * torch.eye(kk, device=dev, dtype=Bk.dtype)
             lam_d, G = torch.linalg.eigh(Bk)
         _p = torch.backends.cuda.matmul.allow_tf32
-        torch.backends.cuda.matmul.allow_tf32 = False     # FP32: Vd MUST be orthonormal
-        # Vd = Qd @ G lift. Kept FP32: 3xTF32 here (Qd, G both well-conditioned,
-        # numerically identical to FP32) was MEASURED net-neutral (t9) -- this
-        # n*k @ k*k GEMM is too small to amortize the Ozaki split overhead at
-        # b640 (unlike the ~2x-larger gate V^TV GEMM where 3xTF32 won). Plain TF32
-        # is unsafe (breaks orthogonality, orth 1.34, brief-7 t7).
-        Vd = torch.bmm(Qd, G)
+        # brief-44: Vd = Qd @ G lift at vd_lift_mode (FP32 by default). 3xTF32 here
+        # was net-neutral (t4/t8: this small n*k @ k*k GEMM does not amortize the
+        # Ozaki split) and plain TF32 is unsafe (breaks V=[Vd,Vc] orth over the gate,
+        # t2 / brief-7 t7), so the live callers leave it FP32. The orth gate catches
+        # any Vd that drifts regardless of mode.
+        Vd = _lr_lift_gemm(Qd, G, vd_lift_mode)
         # A@Vd == (A@Qd)@G feeds ONLY the residual gate (its ~3e-4 TF32 error is
         # far below the 9.2e-3 gate), so it runs on plain TF32 tensor cores.
         torch.backends.cuda.matmul.allow_tf32 = True
@@ -2251,11 +2341,11 @@ def _lowrank_eigh(a, k, power=1):
     return V, lam, AV
 
 
-def _eigh_lowrank_safe(a, k, power=1):
+def _eigh_lowrank_safe(a, k, power=1, dom_gram_mode=None, vd_lift_mode=None):
     B, n, _ = a.shape
     try:
         with _LR_TF32():
-            V, lam, AV = _lowrank_eigh(a, k, power)
+            V, lam, AV = _lowrank_eigh(a, k, power, dom_gram_mode, vd_lift_mode)
     except Exception:
         w, q = torch.linalg.eigh(a)
         return q.contiguous(), w.contiguous()
@@ -2457,6 +2547,11 @@ _MIXED_PEEL_PSD_PR_LO = 37.0  # psd window low edge (psd PR ~[40,44]; rowscale ~
 _MIXED_PEEL_PSD_PR_HI = 48.0  # psd window high edge (dense ~[51.6,58.1] above; == dense LO)
 _MIXED_PEEL_PSD_K = 256       # psd dominant rank: smallest k that clears the eigen
                               # gate while staying under the inner-solve orth ceiling
+# brief-44: dominant CQR2 Gram precision for the mixed-peel low-rank subsets
+# (dense k=352 + psd k=256). 3xTF32 (FP32-accurate) routes the dominant Gram GEMM
+# to tensor cores; measured to keep the peel's gate fallback at 0 (the mixed dense
+# subset has margin the whole-batch dense512 route lacks).
+_MIXED_PEEL_DOM_GRAM_MODE = "3xtf32"
 
 
 def _mixed_peel_count(pr: torch.Tensor) -> int:
@@ -2480,11 +2575,15 @@ def _eigh_mixed_peel(a: torch.Tensor, pr: torch.Tensor) -> output_t:
     Q = torch.empty(b, n, n, device=dev, dtype=torch.float32)
     L = torch.empty(b, n, device=dev, dtype=torch.float32)
     taken = torch.zeros(b, dtype=torch.bool, device=dev)
-    # 1) dense subset -> split-mega low-rank (residual-gated internally)
+    # 1) dense subset -> split-mega low-rank (residual-gated internally). brief-44:
+    # dominant Gram at _MIXED_PEEL_DOM_GRAM_MODE (3xTF32 on tensor cores; the mixed
+    # dense subset carried gate margin under 3xTF32 in t5, unlike the zero-margin
+    # dense512 whole-batch route).
     dense_mask = (pr >= _MIXED_PEEL_PR_LO) & (pr < _MIXED_PEEL_PR_HI)
     gidx = torch.nonzero(dense_mask, as_tuple=False).flatten()
     a_sub = af.index_select(0, gidx).contiguous()
-    Qs, Ls = _eigh_lowrank_safe(a_sub, _MIXED_PEEL_K, power=1)
+    Qs, Ls = _eigh_lowrank_safe(a_sub, _MIXED_PEEL_K, power=1,
+                                dom_gram_mode=_MIXED_PEEL_DOM_GRAM_MODE)
     Q.index_copy_(0, gidx, Qs)
     L.index_copy_(0, gidx, Ls)
     taken |= dense_mask
@@ -2499,7 +2598,8 @@ def _eigh_mixed_peel(a: torch.Tensor, pr: torch.Tensor) -> output_t:
         pidx = torch.nonzero(psd_mask, as_tuple=False).flatten()
         if pidx.numel() > 0:
             a_psd = af.index_select(0, pidx).contiguous()
-            Qp, Lp = _eigh_lowrank_safe(a_psd, _MIXED_PEEL_PSD_K, power=1)
+            Qp, Lp = _eigh_lowrank_safe(a_psd, _MIXED_PEEL_PSD_K, power=1,
+                                        dom_gram_mode=_MIXED_PEEL_DOM_GRAM_MODE)
             Q.index_copy_(0, pidx, Qp)
             L.index_copy_(0, pidx, Lp)
             taken |= psd_mask
@@ -2815,7 +2915,10 @@ def custom_kernel(data: input_t) -> output_t:
     pr = _lr_participation_ratio(a) if n in _LOWRANK_BANDS else None
     k_lr = _lowrank_route_k(a, n, pr=pr)
     if k_lr is not None:
-        return _eigh_lowrank_safe(a, k_lr, power=1)
+        # Vd lift stays FP32: t8 measured 3xTF32 on the small n*k@k*k lift GEMM as
+        # net-neutral over the dominant-Gram 3xTF32 win (confirms brief-16 t9).
+        return _eigh_lowrank_safe(a, k_lr, power=1,
+                                  dom_gram_mode=_lr_dom_gram_mode_for(n, k_lr))
     # MIXED-BATCH DENSE PEEL (brief 28): a heterogeneous n=512 mixed batch (the
     # benchmark's shape 6) whose whole-batch low-rank route was (correctly)
     # refused above by the homogeneity gate still has a large DENSE subset that
