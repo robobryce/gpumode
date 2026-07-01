@@ -2560,8 +2560,7 @@ def _eigh_mixed_peel(a: torch.Tensor, pr: torch.Tensor) -> output_t:
     gidx = torch.nonzero(dense_mask, as_tuple=False).flatten()
     a_sub = af.index_select(0, gidx).contiguous()
     Qs, Ls = _eigh_lowrank_safe(a_sub, _MIXED_PEEL_K, power=1,
-                                dom_gram_mode=_MIXED_PEEL_DOM_GRAM_MODE,
-                                vd_lift_mode=_MIXED_PEEL_DOM_GRAM_MODE)
+                                dom_gram_mode=_MIXED_PEEL_DOM_GRAM_MODE)
     Q.index_copy_(0, gidx, Qs)
     L.index_copy_(0, gidx, Ls)
     taken |= dense_mask
@@ -2577,8 +2576,7 @@ def _eigh_mixed_peel(a: torch.Tensor, pr: torch.Tensor) -> output_t:
         if pidx.numel() > 0:
             a_psd = af.index_select(0, pidx).contiguous()
             Qp, Lp = _eigh_lowrank_safe(a_psd, _MIXED_PEEL_PSD_K, power=1,
-                                        dom_gram_mode=_MIXED_PEEL_DOM_GRAM_MODE,
-                                        vd_lift_mode=_MIXED_PEEL_DOM_GRAM_MODE)
+                                        dom_gram_mode=_MIXED_PEEL_DOM_GRAM_MODE)
             Q.index_copy_(0, pidx, Qp)
             L.index_copy_(0, pidx, Lp)
             taken |= psd_mask
@@ -2644,9 +2642,10 @@ def custom_kernel(data: input_t) -> output_t:
     pr = _lr_participation_ratio(a) if n in _LOWRANK_BANDS else None
     k_lr = _lowrank_route_k(a, n, pr=pr)
     if k_lr is not None:
-        gm = _lr_dom_gram_mode_for(n, k_lr)
+        # Vd lift stays FP32: t8 measured 3xTF32 on the small n*k@k*k lift GEMM as
+        # net-neutral over the dominant-Gram 3xTF32 win (confirms brief-16 t9).
         return _eigh_lowrank_safe(a, k_lr, power=1,
-                                  dom_gram_mode=gm, vd_lift_mode=gm)
+                                  dom_gram_mode=_lr_dom_gram_mode_for(n, k_lr))
     # MIXED-BATCH DENSE PEEL (brief 28): a heterogeneous n=512 mixed batch (the
     # benchmark's shape 6) whose whole-batch low-rank route was (correctly)
     # refused above by the homogeneity gate still has a large DENSE subset that
