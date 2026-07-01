@@ -2584,7 +2584,14 @@ _SIGN_DC_K = 300          # oversized subspace width (>= max +count/-count over 
                           # batch; +count ~ n/2 +- ~24 for a random-sign even spectrum,
                           # so 300 covers it with margin and both K-blocks fit the
                           # medium megakernel's n<=448 range)
-_SIGN_DC_NS_ITERS = 30    # Newton-Schulz sign iterations (each = 2 batched GEMMs)
+_SIGN_DC_NS_ITERS = 24    # Newton-Schulz sign iterations (each = 2 batched GEMMs).
+                          # The near-zero eigenvalues plateau |X| below 1 (they need
+                          # ~22 quadratic steps to fully resolve), but the projector
+                          # MEMBERSHIP rank-select tolerates a fuzzy sign, so ~24 iters
+                          # is enough for a clean split (shape-11 eig ~3.5e-3, ~3.5x
+                          # under the gate) at far less cost than driving ||X^2-I|| to
+                          # machine precision (~60 iters). Swept 20/24/30: 24 keeps a
+                          # ~2x eig margin with the fewest GEMMs.
 _SIGN_DC_POWER_ITERS = 15 # A^2 power iterations for the spectral-norm scale estimate
 _SIGN_DC_FINAL_NS = 1     # finishing FP32 NS orthonormalization steps on Q
 _SIGN_DC_PR_LO = 200.0    # participation-ratio floor: only the flat/dense-even class
