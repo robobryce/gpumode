@@ -1976,6 +1976,22 @@ def _gram_3xtf32(Q):
     return torch.bmm(Qth, Qh) + torch.bmm(Qth, Ql) + torch.bmm(Qtl, Qh)
 
 
+def _gram_3xtf32_sym(Q):
+    # SYMMETRIC-aware 3xTF32 Gram G = Q^T Q (brief-44): exploits that the two Ozaki
+    # cross terms are TRANSPOSES of each other for a Gram -- Qh^T Ql and Ql^T Qh
+    # satisfy (Qh^T Ql)^T = Ql^T Qh -- so G = Qh^T Qh + C + C^T with C = Qh^T Ql
+    # is exactly the 3-term _gram_3xtf32 result but with only TWO tensor-core bmms
+    # (Qh^T Qh + Qh^T Ql) instead of three (the Ql^T Qh bmm is replaced by C^T, a
+    # cheap transpose-add). ~33% fewer bmm flops for the dominant CQR2 Gram, same
+    # ~6e-6 accuracy. allow_tf32 must be True on entry so both bmms hit tensor cores.
+    mask = ~0x1FFF
+    Qh = (Q.view(torch.int32) & mask).view(torch.float32)
+    Ql = Q - Qh
+    Qth = Qh.transpose(-1, -2)
+    C = torch.bmm(Qth, Ql)
+    return torch.bmm(Qth, Qh) + C + C.transpose(-1, -2)
+
+
 def _matmul_3xtf32(A, B):
     # ~FP32-accurate general batched matmul A @ B on TF32 tensor cores via the
     # same Ozaki hi+lo split as _gram_3xtf32: A = Ah+Al, B = Bh+Bl, product =
@@ -2080,7 +2096,8 @@ def _lr_cholesky_qr2(Y, passes=2, shift=1e-5, tf32_gram=False, gram_mode=None):
         for pm in pass_modes:
             torch.backends.cuda.matmul.allow_tf32 = (pm in ("tf32", "3xtf32"))
             if pm == "3xtf32":
-                G = _gram_3xtf32(Q)
+                # symmetric-aware 3xTF32 Gram: 2 bmms (vs 3), same ~6e-6 accuracy.
+                G = _gram_3xtf32_sym(Q)
             else:
                 G = torch.bmm(Q.transpose(-1, -2), Q)
             dm = G.diagonal(dim1=-2, dim2=-1).abs().amax(-1).clamp_min(1e-30)
