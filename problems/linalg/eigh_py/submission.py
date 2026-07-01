@@ -2062,7 +2062,7 @@ _LR_AV_MODE = "tf32"         # A@X (range-finder / power / Rayleigh) matvec prec
 # (kappa 1e3-1e4), so plain TF32's ~3e-4 leakage x kappa breaks V=[Vd,Vc]
 # cross-block orth -> fallback (parent measured this UNSAFE). 3xTF32 (~6e-6) is
 # safe. "fp32" | "tf32" | "3xtf32".
-_LR_PROJ_MODE = "3xtf32"     # Qd-projection (complement build) GEMM precision
+_LR_PROJ_MODE = "fp32"       # Qd-projection (complement build) GEMM precision
 
 
 def _lr_dom_gram_mode_for(n: int, k: int):
@@ -2627,7 +2627,9 @@ _MIXED_PEEL_DOM_GRAM_MODE = "3xtf32"
 # at tf32); the extra 3xTF32 Ozaki passes only cost more here. Keep plain TF32.
 _MIXED_PEEL_AV_MODE = "tf32"
 # brief-54: Qd-projection precision for the mixed-peel low-rank subsets (n=512).
-_MIXED_PEEL_PROJ_MODE = "3xtf32"
+# t4 measured 3xTF32 net-neutral here (projections too small to amortize Ozaki);
+# keep FP32 (parent's mode) for the minimal-diff keeper.
+_MIXED_PEEL_PROJ_MODE = "fp32"
 
 
 def _mixed_peel_count(pr: torch.Tensor) -> int:
