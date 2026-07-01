@@ -1351,10 +1351,14 @@ def _lowrank_eigh(a, k, power=1):
             # breaking cross-block orthogonality of V=[Vd,Vc] (orth ~0.5, probed).
             # Both complement CQR passes stay 2-pass: making the final one 1-pass
             # raised live fallbacks on rankdef512 (shape8) + lapgeom1024 (shape12)
-            # -> net loss (brief-16 t5).
-            Vc = _lr_cholesky_qr2(R, shift=1e-4, gram_mode="tf32")
+            # -> net loss (brief-16 t5). Complement Gram uses 3xTF32 (Ozaki split):
+            # tighter than plain TF32 (orth 3.6e-3 vs 6.6e-3 on shape3, clearing
+            # its 1-matrix marginal fallback) and the nc-column Gram is small
+            # enough that the split overhead is minor (unlike the b640/n=512
+            # dominant Gram where 3xTF32 net-lost, t4). brief-16 t7.
+            Vc = _lr_cholesky_qr2(R, shift=1e-4, gram_mode="3xtf32")
             Vc = Vc - torch.bmm(Qd, torch.bmm(Qd.transpose(-1, -2), Vc))
-            Vc = _lr_cholesky_qr2(Vc, shift=1e-5, gram_mode="tf32")
+            Vc = _lr_cholesky_qr2(Vc, shift=1e-5, gram_mode="3xtf32")
             torch.backends.cuda.matmul.allow_tf32 = _prev
             AVc = torch.bmm(a, Vc)
             lam_c = (AVc * Vc).sum(dim=-2)
