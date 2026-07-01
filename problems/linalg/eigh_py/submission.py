@@ -2667,26 +2667,31 @@ def _sign_dc_solve(af, n, dev):
 
     def _pm(M):
         return torch.baddbmm(M, X, M, beta=0.5, alpha=-0.5)
-    # oversized invariant-subspace bases (batched CholeskyQR, NOT cuSOLVER QR)
+    # oversized invariant-subspace bases (batched CholeskyQR, NOT cuSOLVER QR). Both
+    # bases are the SAME (n x K) shape, so STACK them (2b x n x K) and run one CQR +
+    # one A@U GEMM instead of two -- better GPU fill, half the launch overhead.
     Om, Om2 = _sign_dc_omega(b, n, K, dev)
-    Up = _sign_dc_cqr(_pp(Om))
-    Um = _sign_dc_cqr(_pm(Om2))
+    Ustk = _sign_dc_cqr(torch.cat([_pp(Om), _pm(Om2)], dim=0))     # (2b, n, K)
     torch.backends.cuda.matmul.allow_tf32 = _gp
-    # reduced K x K blocks -> fused tensor-core megakernel (raw, unsorted, ungated)
+    # reduced K x K blocks -> fused tensor-core megakernel (raw, unsorted, ungated).
+    # Both blocks solved in ONE stacked (2b, K, K) megakernel launch: one-CTA-per-matrix,
+    # so 2b CTAs fill the 148 SMs better than two b-CTA launches (~9% measured). The
+    # A@U half is done on each b-block (both share af, so no b*n*n repeat of af) then
+    # concatenated for the stacked reduced Gram + eigh.
     with _LR_TF32():
-        Bp = torch.bmm(Up.transpose(-1, -2), torch.bmm(af, Up))
-        Bp = 0.5 * (Bp + Bp.transpose(-1, -2))
-        Bm = torch.bmm(Um.transpose(-1, -2), torch.bmm(af, Um))
-        Bm = 0.5 * (Bm + Bm.transpose(-1, -2))
+        AU = torch.bmm(af, Ustk[:b])
+        AU = torch.cat([AU, torch.bmm(af, Ustk[b:])], dim=0)
+        Bstk = torch.bmm(Ustk.transpose(-1, -2), AU)
+        Bstk = 0.5 * (Bstk + Bstk.transpose(-1, -2))
     try:
-        lp, gp = _lr_reduced_eigh(Bp)
-        lm, gm = _lr_reduced_eigh(Bm)
+        lstk, gstk = _lr_reduced_eigh(Bstk)
     except Exception:
-        lp, gp = torch.linalg.eigh(Bp)
-        lm, gm = torch.linalg.eigh(Bm)
+        lstk, gstk = torch.linalg.eigh(Bstk)
     torch.backends.cuda.matmul.allow_tf32 = True
-    Vp = torch.bmm(Up, gp)                     # n x K candidate + eigenvectors
-    Vm = torch.bmm(Um, gm)                     # n x K candidate - eigenvectors
+    Up, Um = Ustk[:b], Ustk[b:]
+    Vstk = torch.bmm(Ustk, gstk)               # (2b, n, K) candidate eigenvectors
+    Vp, Vm = Vstk[:b], Vstk[b:]
+    lp, lm = lstk[:b], lstk[b:]
     # projector membership: ~1 for a real eigenvector of that block, ~0 for padding
     selp = _pp(Vp).norm(dim=1)                 # (b, K)
     selm = _pm(Vm).norm(dim=1)                 # (b, K)
