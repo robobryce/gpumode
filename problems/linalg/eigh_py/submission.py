@@ -1097,22 +1097,32 @@ _MEGA_CLUST_NT = 512
 # k<=~836 (k=768 shape-10: 590KB/3=197KB). _mega_clust_C(k) picks the smallest C.
 _SMEM_CAP_HALVES = 116000       # ~228KB / 2B, with margin for the v/p/block-T SMEM
 _MEGA_CLUST_KMIN = 449          # k>448 (won't fit one CTA in FP16 -> the k<=448 mega path)
-# C=3 ceiling (~836). C=2 (k=608 shape-4): cluster inner 22ms vs cuSOLVER 48ms =
-# 2.19x. C=3 (k=768 shape-10): after the FUSED single-pass symv, 63.7ms vs 67.3ms
-# = 1.06x (was 0.81x with the split symv) -- now a thin win; measured end-to-end.
-_MEGA_CLUST_KMAX = 836          # C=3 ceiling (k=608 C=2, k=768 C=3)
-# route the k>448 reduced blocks (k=608 shape-4 C=2, k=768 shape-10 C=3) to the
-# cluster inner solve. Flag so the path can be disabled without editing routing.
+# Ceiling extended from 836 (C=3) to fit the n=2048 sign-DC depth-1 halves (k~1030-
+# 1124, brief-55). C=2 (k=608 shape-4): cluster inner 22ms vs cuSOLVER 48ms = 2.19x.
+# C=3 (k=768 shape-10): after the FUSED single-pass symv, 63.7ms vs 67.3ms = 1.06x
+# (was 0.81x with the split symv). C=6 (k~1117 shape-5 halves): brief-47 measured the
+# cluster 1.32x faster than cuSOLVER on isolated 1117-blocks (64ms vs 84ms). The
+# per-CTA packed-FP16 half-triangle shrinks ~tri(k)/C, so C=6 keeps k=1117 at
+# 624403/6=104068 halves = ~203KB/CTA < 228KB (see _mega_clust_C). RISK: the coarser
+# cluster eigenvectors must feed the sign-DC projector membership cleanly -- verified
+# via the _SIGN_DC_LARGE_DBG orth/fallback sweep.
+_MEGA_CLUST_KMAX = 1150         # C<=6 ceiling (k=608 C=2, k=768 C=3, k~1117 C=6)
+# route the k>448 reduced blocks (k=608 shape-4 C=2, k=768 shape-10 C=3, k~1117
+# shape-5 halves C=6) to the cluster inner solve. Flag so the path can be disabled
+# without editing routing.
 _LR_CLUST_ENABLED = True
 _mega_clust_bounds_cache: dict = {}
 
 
 def _mega_clust_C(k: int) -> int:
-    """Smallest cluster size C in {2,3,4} whose per-CTA packed-FP16 half-triangle
+    """Smallest cluster size C in {2,3,4,5,6} whose per-CTA packed-FP16 half-triangle
     (~tri(k)/C halves) fits the ~228KB SMEM cap. C=2 for k<=~682 (k=608), C=3 for
-    k<=~836 (k=768). Returns 0 if even C=4 can't fit (caller stays on cuSOLVER)."""
+    k<=~836 (k=768), C=5 for k<=~1043, C=6 for k<=~1150 (k~1117 shape-5 halves; tri
+    /6 = 104068 halves = ~203KB/CTA). Returns 0 if even C=6 can't fit (caller stays
+    on cuSOLVER). The peer-map arrays (AhP[8]/triLoP[8]) and red[1024]/pscr[C] all
+    accommodate C up to 8, so C=5/6 need no kernel-side change beyond the ceiling."""
     tri = k * (k + 1) // 2
-    for C in (2, 3, 4):
+    for C in (2, 3, 4, 5, 6):
         if (tri + C - 1) // C <= _SMEM_CAP_HALVES:
             return C
     return 0
@@ -2843,7 +2853,7 @@ _SIGN_DC_LARGE_PR_LO = 150.0   # participation-ratio floor for the large-n dense
                                # are below and route earlier).
 _sign_dc_rec_omega_cache: dict = {}   # (b,m,K,dev) -> fixed random projection blocks
 _sign_dc_eye_cache: dict = {}         # (m,dev) -> identity for the shift
-_SIGN_DC_LARGE_DBG = False            # set True to print orth/eigr/fallback diagnostics
+_SIGN_DC_LARGE_DBG = True             # set True to print orth/eigr/fallback diagnostics
 # SINGLE-LEVEL N-way spectral divide for n=2048 (vs the depth-1 binary split): splits
 # the whole n x n block into _SIGN_DC_NWAYS pieces at once (nways-1 Ritz-estimated
 # shifts), each piece to the cluster/mega base. 1 = binary depth-1 (2 blocks -> cuSOLVER
