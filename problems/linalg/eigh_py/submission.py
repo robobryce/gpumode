@@ -2855,6 +2855,15 @@ _SIGN_DC_MW_MARGIN = 0.06   # oversample margin for the N-way piece width K =
                             # ceil(m/nways) + ceil(margin*m). Ritz shifts are less
                             # balanced than the binary median, so a bit more margin.
 _SIGN_DC_RITZ_PROJ = 256    # random Rayleigh-Ritz projection dim for shift estimation
+# brief-54: precision of the sign-DC large-k GEMMs -- the A@U subspace lift
+# (A_blk @ Ustk, the biggest GEMM: at n=2048 it is 2048x2048 @ 2048x1117) and the
+# reduced-block build (Ustk^T @ AU). These run under _LR_TF32 (plain 1-pass TF32)
+# today. brief-54 found (shape 10) that a large-k batched GEMM can pick a slow
+# 1-pass-TF32 cutlass tiling that the FP32-accurate 3xTF32 hi/lo split flips to a
+# faster one. Probe whether the k=1117 A@U lift hits the same. CRITICAL: membership
+# (selp/selm rank-select) depends on Vstk<-gstk<-Bstk<-AU, so any precision change
+# here must NOT tip the membership -> outer gate fallback. "fp32"|"tf32"|"3xtf32".
+_SIGN_DC_AV_MODE = "3xtf32"  # sign-DC A@U lift + reduced-block build precision
 
 
 def _sign_dc_omega(b, n, K, dev):
@@ -2934,11 +2943,11 @@ def _sign_dc_solve(af, n, dev):
     # so 2b CTAs fill the 148 SMs better than two b-CTA launches (~9% measured). The
     # A@U half is done on each b-block (both share af, so no b*n*n repeat of af) then
     # concatenated for the stacked reduced Gram + eigh.
-    with _LR_TF32():
-        AU = torch.bmm(af, Ustk[:b])
-        AU = torch.cat([AU, torch.bmm(af, Ustk[b:])], dim=0)
-        Bstk = torch.bmm(Ustk.transpose(-1, -2), AU)
-        Bstk = 0.5 * (Bstk + Bstk.transpose(-1, -2))
+    # brief-54: A@U lift (af @ Ustk) + reduced-block build at _SIGN_DC_AV_MODE.
+    AU = _lr_lift_gemm(af, Ustk[:b], _SIGN_DC_AV_MODE)
+    AU = torch.cat([AU, _lr_lift_gemm(af, Ustk[b:], _SIGN_DC_AV_MODE)], dim=0)
+    Bstk = _lr_lift_gemm(Ustk.transpose(-1, -2), AU, _SIGN_DC_AV_MODE)
+    Bstk = 0.5 * (Bstk + Bstk.transpose(-1, -2))
     try:
         lstk, gstk = _lr_reduced_eigh(Bstk)
     except Exception:
@@ -3072,11 +3081,12 @@ def _sign_dc_block_eigh(A_blk, dev):
                         passes=_SIGN_DC_CQR_PASSES)               # (2B, m, K)
     torch.backends.cuda.matmul.allow_tf32 = _gp
     # reduced K x K blocks (both halves stacked): B+ = U+^T A U+, B- = U-^T A U-.
-    with _LR_TF32():
-        AU = torch.bmm(A_blk, Ustk[:B])
-        AU = torch.cat([AU, torch.bmm(A_blk, Ustk[B:])], dim=0)
-        Bstk = torch.bmm(Ustk.transpose(-1, -2), AU)
-        Bstk = 0.5 * (Bstk + Bstk.transpose(-1, -2))
+    # brief-54: the A@U lift (A_blk @ Ustk, 2048x2048 @ 2048x1117 at n=2048 -- the
+    # biggest GEMM on this path) + the reduced-block build run at _SIGN_DC_AV_MODE.
+    AU = _lr_lift_gemm(A_blk, Ustk[:B], _SIGN_DC_AV_MODE)
+    AU = torch.cat([AU, _lr_lift_gemm(A_blk, Ustk[B:], _SIGN_DC_AV_MODE)], dim=0)
+    Bstk = _lr_lift_gemm(Ustk.transpose(-1, -2), AU, _SIGN_DC_AV_MODE)
+    Bstk = 0.5 * (Bstk + Bstk.transpose(-1, -2))
     # RECURSE on the K x K reduced blocks -> full 2B*K eigendecomposition.
     lstk, gstk = _sign_dc_block_eigh(Bstk, dev)
     torch.backends.cuda.matmul.allow_tf32 = True
