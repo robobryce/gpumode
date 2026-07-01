@@ -2047,13 +2047,14 @@ def _lr_lift_gemm(A, B, mode):
 # not pass an explicit per-shape mode; the live callers pass _lr_dom_gram_mode_for.
 _LR_DOM_GRAM_MODE = "fp32"   # dominant power-step CQR2 Gram Q^T Q precision
 _LR_VD_LIFT_MODE = "fp32"    # Vd = Qd @ G lift GEMM precision
-# brief-54: the A@Omega range-finder / A@Qd power / A@Qd Rayleigh / A@Vc complement
-# matvecs are the LAST big FP32-SIMT GEMMs left in the low-rank path (brief-44 moved
-# the dominant Gram + Vd lift to 3xTF32 but explicitly LEFT these four A@X matvecs on
-# FP32-SIMT). Each is an n*n @ n*k batched GEMM (A is n*n, X is n*k) -- on B200
-# FP32-SIMT runs ~40 TFLOPS while FP32-accurate 3xTF32 (Ozaki hi+lo split, ~6e-6 rel)
-# runs ~8-10x faster on the TF32 tensor cores and stays inside the orth/eigen gates
-# (plain TF32 at ~3e-4 does NOT -> mass fallback). "fp32" | "tf32" | "3xtf32".
+# brief-54: precision of the four A@X matvecs (A@Omega range-finder, A@Qd power,
+# A@Qd Rayleigh, A@Vc complement); each is an n*n @ n*k batched GEMM. brief-54
+# MEASURED that these ALREADY ran on plain-TF32 tensor cores in the parent (they
+# are plain bmm inside the _LR_TF32 allow_tf32=True scope -- NOT FP32-SIMT as the
+# brief assumed). So the real trade is 1-pass TF32 (fastest GEMM) vs 3-pass
+# FP32-accurate 3xTF32 (~6e-6, ~1.7x the GEMM cost). Plain TF32 is gate-clean and
+# fastest on every low-rank route EXCEPT the n=1024 near-rank case (see
+# _lr_av_mode_for). "fp32" | "tf32" | "3xtf32". Default = tf32 (parent's mode).
 _LR_AV_MODE = "tf32"         # A@X (range-finder / power / Rayleigh) matvec precision
 # brief-54: the Qd-projection GEMMs R <- R - Qd(Qd^T R) (building the complement
 # basis Vc orthogonal to the dominant subspace, run TWICE) are the FP32-SIMT
