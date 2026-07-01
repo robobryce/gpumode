@@ -1955,12 +1955,42 @@ _MIXED_PEEL_HOM_MAX = 3.0     # only peel a HETEROGENEOUS batch (max/min PR >= t
 # two-level projector path (measured ~2x cuSOLVER on clustered512). STEP-2
 # extension probe (mixed512 b640): dense-only peel = -24.3ms; dense + clustered
 # two-level = -25.3ms (an extra ~1.0ms). The rankdef/nearrank window [62,100)
-# k=384 was REFUTED (22/77 gate-fallback -> +6.9ms LOSS) and psd/rowscale [25,48)
-# is 100% fallback, so ONLY dense + clustered are peeled; everything else is the
-# cuSOLVER floor. The clustered detector runs on the NON-dense remainder only
-# (the dense subset is already removed) and the two-level path is itself
-# per-matrix residual-gated -> a misdetection falls back to cuSOLVER (no regress).
+# k=384 was REFUTED (22/77 gate-fallback -> +6.9ms LOSS).
 _MIXED_PEEL_CLUSTERED = True
+
+# PSD PEEL BAND (brief 33). The ~76 psd matrices in the mixed512 batch sit in
+# their OWN clean PR window [40,44] -- distinctly BELOW the dense window [48,62)
+# and ABOVE rowscale [25,29] (measured; a [37,48) window captures psd with a
+# safety gap on both sides and NEVER catches dense or rowscale). psd here is
+# cond=2, generated as (g@g^T)/n with g column-scaled by logspace(0,-2,512), so
+# its spectrum is concentrated but NOT tiny-rank: the effective rank at the
+# gate-relevant ~1e-2 relative precision is ~210 eigenvalues (not O(50-150)), so
+# a SMALL k under-projects it. brief-28 used the DENSE k=352/384 and got 100%
+# fallback -- NOT because psd resists low-rank but because k=352 is ABOVE the
+# split-mega inner-solve orthogonality ceiling (~k=300 on this psd data: k=320
+# power=1 -> orth 0.09, k=352 -> orth 4.57 = 100% fallback), while k below ~256
+# leaves the eigen residual above the gate (k=192 -> eig 3e-2 > 9.2e-3).
+#   PSD FALLBACK-vs-k probe (mixed512 b640 psd subset, 76 mats, power=1):
+#     k    fallback  LR_ms   eig_max   orth_max   (cuSOLVER-gathered = 33.0ms)
+#     64   76/76     43.1    3.7e-1    5.5e-3
+#     128  76/76     43.9    1.1e-1    7.0e-3
+#     192  76/76     46.9    3.0e-2    4.2e-3
+#     256   0/76     11.8    8.7e-3    3.4e-3   <-- CLEAN win: eig clears AND orth ok
+#     320  76/76     46.8    4.4e-3    9.3e-2   <-- above orth ceiling
+#     352  76/76     48.3    4.2e-3    4.6e+0
+# k=256 power=1 is the ONLY sweet spot: eig needs k>=256, orth needs k<=~300.
+# End-to-end (mixed512 b640): parent peel 135.4ms -> +psd(k256,p1) 127.4ms =
+# -8.0ms (-5.9%), check=True (scaled_orth 58.5 unchanged, scaled_eig 142 < gate).
+# ROWSCALE ([25,29], 46 mats) was REFUTED: its subset clears only at k=192 power=2
+# (1/46 fallback) but end-to-end +psd+rowscale = 138.3ms > psd-only 127.4ms (the
+# 46-mat subset's cuSOLVER marginal ~28ms doesn't overcome the LR ~19ms floor +
+# fallbacks) -> rowscale stays on cuSOLVER. Runtime-structural (PR window), the
+# subset call is per-matrix residual-gated -> reseed/misclass falls back safely.
+_MIXED_PEEL_PSD = True
+_MIXED_PEEL_PSD_PR_LO = 37.0  # psd window low edge (psd PR ~[40,44]; rowscale ~[25,29] below)
+_MIXED_PEEL_PSD_PR_HI = 48.0  # psd window high edge (dense ~[51.6,58.1] above; == dense LO)
+_MIXED_PEEL_PSD_K = 256       # psd dominant rank: smallest k that clears the eigen
+                              # gate while staying under the inner-solve orth ceiling
 
 
 def _mixed_peel_count(pr: torch.Tensor) -> int:
@@ -1992,6 +2022,21 @@ def _eigh_mixed_peel(a: torch.Tensor, pr: torch.Tensor) -> output_t:
     Q.index_copy_(0, gidx, Qs)
     L.index_copy_(0, gidx, Ls)
     taken |= dense_mask
+    # 1b) PSD subset -> split-mega low-rank at its OWN smaller k (brief 33). psd
+    # sits in a distinct lower PR window [37,48) than the dense [48,62); its
+    # spectrum is concentrated (cond=2 (g@g^T)/n) so a rank-k=256 block + cheap
+    # tail clears the gate ~2.8x faster than cuSOLVER on this subset. The window
+    # is disjoint from the dense window (already removed) and from rowscale below
+    # 37, so it never re-routes a dense/rowscale matrix; residual-gated internally.
+    if _MIXED_PEEL_PSD:
+        psd_mask = (pr >= _MIXED_PEEL_PSD_PR_LO) & (pr < _MIXED_PEEL_PSD_PR_HI) & (~taken)
+        pidx = torch.nonzero(psd_mask, as_tuple=False).flatten()
+        if pidx.numel() > 0:
+            a_psd = af.index_select(0, pidx).contiguous()
+            Qp, Lp = _eigh_lowrank_safe(a_psd, _MIXED_PEEL_PSD_K, power=1)
+            Q.index_copy_(0, pidx, Qp)
+            L.index_copy_(0, pidx, Lp)
+            taken |= psd_mask
     # 2) clustered (2-level, A^2~I) subset -> two-level projector path (~2x
     # cuSOLVER). Detected on the NON-dense remainder only. Self residual-gated.
     if _MIXED_PEEL_CLUSTERED:
