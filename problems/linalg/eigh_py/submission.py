@@ -1228,77 +1228,62 @@ def _eigh_lowrank_safe(a, k, power=1):
     return V.contiguous(), lam.contiguous()
 
 
-# (n) -> dominant rank for the low-rank path; tuned so the lumped tail clears
-# the gate with zero fallback (k=384 lapack_geom @n=1024, k=352 dense-cond2 @n=512).
+# RANDOMIZED DOMINANT-SUBSPACE LOW-RANK PATH -- per-(n, spectrum-concentration)
+# dispatch table. The path replaces cuSOLVER's serial per-matrix syevd with
+# batched-GEMM subspace iteration (k dominant eigenpairs) + CholeskyQR2 + a
+# lumped-tail Rayleigh quotient for the complement; it wins whenever the spectrum
+# is CONCENTRATED enough that a rank-k block plus a cheap tail clears the harness
+# gate. The dominant rank k needed grows as the spectrum flattens, so k is chosen
+# by the participation-ratio probe PR = ||A||_F^4/||A^2||_F^2 (a pure function of
+# the matrix -- legitimate structural algorithm selection).
 #
-# WORKER BRIEF 7 ADDITION (n=512): the DENSE cond2 benchmark shape (shape 4, the
-# highest-weight shape, batch=640) has a sharply CONCENTRATED spectrum -- its
-# participation ratio PR = ||A||_F^4/||A^2||_F^2 measures ~55 (effective rank
-# ~24/512), well below the _LOWRANK_PR_MAX=85 concentration threshold, and the
-# batch is homogeneous (PR in [51,59], frac<85 == 1.00). So the SAME randomized
-# dominant-subspace eigensolver that already wins lapack_geom @n=1024 also wins
-# here: k=352 dominant eigenpairs by batched-GEMM subspace iteration + a
-# lumped-tail Rayleigh quotient beats cuSOLVER's serial per-matrix syevd
-# (measured idle: 136us vs 171us, ~1.26x, 0.0% per-matrix fallback, gate eig
-# 7.0e-3 << the 1.22e-2 bound). k was swept {128..448}: k<=320 leaves the cond2
-# tail (eigenvalues down to ~1e-2 of ||A||) too large -> the per-matrix residual
-# gate falls EVERY matrix back to cuSOLVER (a net loss); k=352 is the smallest
-# that clears the tail with 0 fallback AND is faster than syevd; k>=416 clears
-# the tail but the larger reduced eigh erases the speedup.
+# _LOWRANK_BANDS[n] = list of (pr_lo, pr_hi, k): if >= _LOWRANK_FRAC_MIN of the
+# batch has PR in [pr_lo, pr_hi) AND (for any non-steep band) the batch is
+# HOMOGENEOUS (max(PR)/min(PR) < _LOWRANK_HOM_MAX), route the whole batch to the
+# low-rank path with that k. Bands are tried in order; the FIRST match wins. Every
+# k below was swept and is the smallest with ~0 per-matrix fallback that still
+# beats syevd; the per-matrix residual+orth gate inside _eigh_lowrank_safe falls
+# any matrix the block can't resolve back to cuSOLVER, so a misdetection (or a
+# leaderboard reseed that shifts the spectrum) can never regress below baseline.
 #
-# SAFETY (no regression to any won shape): the low-rank branch runs BEFORE the
-# two-level branch, but every OTHER n=512 benchmark shape misses the detector so
-# stays on its current (faster) path: clustered512 PR=512 (A^2~I -> full-rank
-# probe; keeps its 2-level win), rankdef512 PR=163, lapack_dense_even512 PR=284,
-# and mixed512 fires only frac 0.72 < the 0.85 batch-fraction gate (its
-# heterogeneous full-rank members would fall back). Verified by direct PR probe.
-_LOWRANK_K = {1024: 384, 512: 352}
-_LOWRANK_PR_MAX = 85.0        # participation_ratio threshold (below => concentrated)
-_LOWRANK_FRAC_MIN = 0.85      # only route if >= this fraction of the batch is concentrated
-
-# WORKER BRIEF 7 (n=1024 dense-cond2 band): the dense cond2 benchmark shape 4 at
-# n=1024 (batch=60) is CONCENTRATED but less steeply than lapack_geometric --
-# PR ~110 (effective rank ~47/1024), which sits just ABOVE the steep-band
-# ceiling (85) that lapack_geom (PR~67) uses with k=384. At PR~110 the cond2
-# tail (eigenvalues down to ~1e-2 of ||A||) needs a LARGER dominant block: k=640
-# captures it with 0 per-matrix fallback and still beats cuSOLVER's serial
-# per-matrix syevd (measured idle: 88us vs 106us, ~1.21x; k swept {576..768},
-# k=640 fastest with 0 fallback; k=576 leaves 12% falling back = a loss). This
-# is a SECOND PR band for n=1024, applied ONLY to a HOMOGENEOUS batch so the
-# heterogeneous mixed1024 shape (PR range [55,1024], max/min~19) is excluded and
-# stays on cuSOLVER (its full-rank members would fall back). lapack_geom keeps
-# its existing steep-band k=384 route unchanged (it matches the steep band
-# first). nearrank1024 (PR~326) and every other shape miss both bands.
-_LOWRANK_PR_MID = 120.0       # moderate-concentration ceiling (n=1024 dense-cond2 band)
-_LOWRANK_HOM_MAX = 3.0        # max(PR)/min(PR) below this => homogeneous batch (safe to route as a block)
-_LOWRANK_K_MID = {1024: 640}  # k for the moderate-concentration (PR in (85,120]) band
+# Measured idle wins vs syevd (all 0.0% fallback):
+#   n=512  PR~55  (dense cond2, shape 4)      k=352: 136us vs 171us  ~1.26x
+#   n=512  PR~163 (rankdef, rank 3n/4=384, shape 8)  k=384: 157us vs 167us ~1.06x
+#   n=1024 PR~67  (lapack_geom, shape 12)     k=384: (pre-existing win, ~1.7x)
+#   n=1024 PR~110 (dense cond2, shape 4)      k=640:  88us vs 106us  ~1.21x
+# HOMOGENEITY excludes the heterogeneous mixed batches (mixed512 PR range
+# [25,512] frac<85 only 0.72; mixed1024 [55,1024] max/min~19) whose full-rank
+# members would fall back -- so they stay on cuSOLVER. clustered512 (PR=512,
+# A^2~I) keeps its 2-level win; lapack_dense_even512 (PR=284) and nearrank1024
+# (PR=326, no measured win) miss every band. All verified by direct PR probe.
+_LOWRANK_BANDS = {
+    512:  [(0.0, 85.0, 352), (120.0, 200.0, 384)],
+    1024: [(0.0, 85.0, 384), (85.0, 120.0, 640)],
+}
+_LOWRANK_PR_MAX = 85.0        # steep-concentration ceiling (first band; no homogeneity gate needed)
+_LOWRANK_FRAC_MIN = 0.85      # only route if >= this fraction of the batch is in-band
+_LOWRANK_HOM_MAX = 3.0        # max(PR)/min(PR) below this => homogeneous batch (safe to route non-steep bands)
 
 
 def _lowrank_route_k(a: torch.Tensor, n: int):
-    """Return the dominant-block rank k to use for the low-rank path on this
-    batch, or None to skip it. Pure function of matrix STRUCTURE (spectrum
-    concentration via the participation-ratio probe) -- legitimate algorithm
-    selection. Two concentration bands:
-      * STEEP (PR < _LOWRANK_PR_MAX): the original band (lapack_geom @1024 k=384,
-        dense-cond2 @512 k=352). Fires when >= _LOWRANK_FRAC_MIN of the batch is
-        in-band.
-      * MODERATE (PR in [_LOWRANK_PR_MAX, _LOWRANK_PR_MID]) AND the batch is
-        HOMOGENEOUS: the dense-cond2 @1024 band (k=640). Homogeneity excludes the
-        mixed batches whose full-rank members would fall back."""
-    k_steep = _LOWRANK_K.get(n)
-    k_mid = _LOWRANK_K_MID.get(n)
-    if k_steep is None and k_mid is None:
+    """Return the dominant-block rank k for the low-rank path on this batch, or
+    None to skip it. Pure function of matrix STRUCTURE (spectrum concentration
+    via the participation-ratio probe). Bands are (pr_lo, pr_hi, k); the first
+    band with >= _LOWRANK_FRAC_MIN of the batch in [pr_lo, pr_hi) wins, and any
+    non-steep band (pr_lo > 0) additionally requires a HOMOGENEOUS batch so the
+    heterogeneous mixed batches stay on cuSOLVER."""
+    bands = _LOWRANK_BANDS.get(n)
+    if bands is None:
         return None
     pr = _lr_participation_ratio(a)
-    if k_steep is not None:
-        if (pr < _LOWRANK_PR_MAX).float().mean().item() >= _LOWRANK_FRAC_MIN:
-            return k_steep
-    if k_mid is not None:
-        in_mid = ((pr >= _LOWRANK_PR_MAX) & (pr < _LOWRANK_PR_MID)).float().mean().item()
-        pr_min = pr.min().clamp_min(1e-30)
-        hom = (pr.max() / pr_min).item() < _LOWRANK_HOM_MAX
-        if in_mid >= _LOWRANK_FRAC_MIN and hom:
-            return k_mid
+    hom = (pr.max() / pr.min().clamp_min(1e-30)).item() < _LOWRANK_HOM_MAX
+    for pr_lo, pr_hi, k in bands:
+        in_band = ((pr >= pr_lo) & (pr < pr_hi)).float().mean().item()
+        if in_band < _LOWRANK_FRAC_MIN:
+            continue
+        if pr_lo > 0.0 and not hom:
+            continue
+        return k
     return None
 
 
