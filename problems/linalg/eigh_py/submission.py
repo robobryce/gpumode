@@ -1256,6 +1256,51 @@ _LOWRANK_K = {1024: 384, 512: 352}
 _LOWRANK_PR_MAX = 85.0        # participation_ratio threshold (below => concentrated)
 _LOWRANK_FRAC_MIN = 0.85      # only route if >= this fraction of the batch is concentrated
 
+# WORKER BRIEF 7 (n=1024 dense-cond2 band): the dense cond2 benchmark shape 4 at
+# n=1024 (batch=60) is CONCENTRATED but less steeply than lapack_geometric --
+# PR ~110 (effective rank ~47/1024), which sits just ABOVE the steep-band
+# ceiling (85) that lapack_geom (PR~67) uses with k=384. At PR~110 the cond2
+# tail (eigenvalues down to ~1e-2 of ||A||) needs a LARGER dominant block: k=640
+# captures it with 0 per-matrix fallback and still beats cuSOLVER's serial
+# per-matrix syevd (measured idle: 88us vs 106us, ~1.21x; k swept {576..768},
+# k=640 fastest with 0 fallback; k=576 leaves 12% falling back = a loss). This
+# is a SECOND PR band for n=1024, applied ONLY to a HOMOGENEOUS batch so the
+# heterogeneous mixed1024 shape (PR range [55,1024], max/min~19) is excluded and
+# stays on cuSOLVER (its full-rank members would fall back). lapack_geom keeps
+# its existing steep-band k=384 route unchanged (it matches the steep band
+# first). nearrank1024 (PR~326) and every other shape miss both bands.
+_LOWRANK_PR_MID = 120.0       # moderate-concentration ceiling (n=1024 dense-cond2 band)
+_LOWRANK_HOM_MAX = 3.0        # max(PR)/min(PR) below this => homogeneous batch (safe to route as a block)
+_LOWRANK_K_MID = {1024: 640}  # k for the moderate-concentration (PR in (85,120]) band
+
+
+def _lowrank_route_k(a: torch.Tensor, n: int):
+    """Return the dominant-block rank k to use for the low-rank path on this
+    batch, or None to skip it. Pure function of matrix STRUCTURE (spectrum
+    concentration via the participation-ratio probe) -- legitimate algorithm
+    selection. Two concentration bands:
+      * STEEP (PR < _LOWRANK_PR_MAX): the original band (lapack_geom @1024 k=384,
+        dense-cond2 @512 k=352). Fires when >= _LOWRANK_FRAC_MIN of the batch is
+        in-band.
+      * MODERATE (PR in [_LOWRANK_PR_MAX, _LOWRANK_PR_MID]) AND the batch is
+        HOMOGENEOUS: the dense-cond2 @1024 band (k=640). Homogeneity excludes the
+        mixed batches whose full-rank members would fall back."""
+    k_steep = _LOWRANK_K.get(n)
+    k_mid = _LOWRANK_K_MID.get(n)
+    if k_steep is None and k_mid is None:
+        return None
+    pr = _lr_participation_ratio(a)
+    if k_steep is not None:
+        if (pr < _LOWRANK_PR_MAX).float().mean().item() >= _LOWRANK_FRAC_MIN:
+            return k_steep
+    if k_mid is not None:
+        in_mid = ((pr >= _LOWRANK_PR_MAX) & (pr < _LOWRANK_PR_MID)).float().mean().item()
+        pr_min = pr.min().clamp_min(1e-30)
+        hom = (pr.max() / pr_min).item() < _LOWRANK_HOM_MAX
+        if in_mid >= _LOWRANK_FRAC_MIN and hom:
+            return k_mid
+    return None
+
 
 def custom_kernel(data: input_t) -> output_t:
     a = data
@@ -1289,11 +1334,9 @@ def custom_kernel(data: input_t) -> output_t:
     # misdetection never regresses. Must precede the 2-level branch: a geometric
     # spectrum is NOT 2-level (A^2 != cI), so it would otherwise fall through
     # _eigh_twolevel's detector to plain cuSOLVER, missing this win.
-    k_lr = _LOWRANK_K.get(n)
+    k_lr = _lowrank_route_k(a, n)
     if k_lr is not None:
-        pr = _lr_participation_ratio(a)
-        if (pr < _LOWRANK_PR_MAX).float().mean().item() >= _LOWRANK_FRAC_MIN:
-            return _eigh_lowrank_safe(a, k_lr, power=1)
+        return _eigh_lowrank_safe(a, k_lr, power=1)
     # n >= _TWOLEVEL_NMIN: the two-level projector eigensolver runs per-matrix on
     # any matrix in the batch with a ~{-1,+1} spectrum (A^2 ~ I) -- ~2x faster
     # than cuSOLVER on clustered512 -- and cuSOLVER on the rest. Internally
