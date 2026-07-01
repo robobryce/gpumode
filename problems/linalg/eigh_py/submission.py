@@ -2008,16 +2008,34 @@ def _matmul_3xtf32(A, B):
     return torch.bmm(Ah, Bh) + torch.bmm(Ah, Bl) + torch.bmm(Al, Bh)
 
 
+def _matmul_2xtf32(A, B):
+    # brief-54 (open #4): TWO-term hi+lo split A @ B on TF32 tensor cores -- keeps
+    # Ah@Bh + Ah@Bl (drops BOTH Al@Bh ~3e-4 and Al@Bl ~1e-8). Accuracy ~3e-4 in the
+    # A-lo direction (between 1-pass TF32 and 3-term 3xTF32), but it is 2 GEMMs, not
+    # 3. The point: brief-54's shape-10 win was the CUTLASS TILING the hi/lo split
+    # triggers (256x256 vs a slow 1-pass pick), NOT the accuracy -- so IF the 2-term
+    # split hits the same good tile it is a cheaper version of the same win. Probed
+    # per-shape (only kept where it wins AND stays gate-clean). allow_tf32 True on entry.
+    mask = ~0x1FFF
+    Ah = (A.view(torch.int32) & mask).view(torch.float32)
+    Bh = (B.view(torch.int32) & mask).view(torch.float32)
+    Bl = B - Bh
+    return torch.bmm(Ah, Bh) + torch.bmm(Ah, Bl)
+
+
 def _lr_lift_gemm(A, B, mode):
     """One low-rank lift/product GEMM A @ B at the requested precision:
-    "fp32" (true FP32-SIMT), "tf32" (single-pass TF32 tensor core), or "3xtf32"
-    (Ozaki hi+lo split, ~FP32 accuracy). allow_tf32 is scoped tightly so no other
-    path's GEMM precision is perturbed."""
+    "fp32" (true FP32-SIMT), "tf32" (single-pass TF32 tensor core), "2xtf32"
+    (2-term hi+lo split), or "3xtf32" (3-term Ozaki hi+lo split, ~FP32 accuracy).
+    allow_tf32 is scoped tightly so no other path's GEMM precision is perturbed."""
     prev = torch.backends.cuda.matmul.allow_tf32
     try:
         if mode == "3xtf32":
             torch.backends.cuda.matmul.allow_tf32 = True
             return _matmul_3xtf32(A, B)
+        if mode == "2xtf32":
+            torch.backends.cuda.matmul.allow_tf32 = True
+            return _matmul_2xtf32(A, B)
         torch.backends.cuda.matmul.allow_tf32 = (mode == "tf32")
         return torch.bmm(A, B)
     finally:
@@ -2106,11 +2124,20 @@ def _lr_av_mode_for(n: int, k: int):
 
 
 def _lr_proj_mode_for(n: int, k: int):
-    """Per-shape precision for the Qd-projection GEMMs R <- R - Qd(Qd^T R). 3xTF32
-    puts them on tensor cores at ~6e-6 (safe for the ill-conditioned Qd, unlike
-    plain TF32); measured per-shape whether the tensor-core gain beats the Ozaki
-    3-pass overhead at each (n, k)."""
-    return _LR_PROJ_MODE
+    """Per-shape precision for the Qd-projection GEMMs R <- R - Qd(Qd^T R) (the
+    complement build, run twice). These are the FP32-SIMT simt_sgemm terms in the
+    profile (~15% of shape 4 dense1024). 3xTF32 (~6e-6, safe for the ill-conditioned
+    Qd -- plain TF32's 3e-4 x kappa breaks V orth) puts them on tensor cores.
+
+    brief-54 MEASURED (t3 fp32-proj vs t4 3xtf32-proj): the n=1024 routes gain from
+    3xTF32 (shape 4 dense1024 nc=416: 48991->48376 -1.3%; shape 12 lapgeom1024
+    nc=640: 33520->33025 -1.5%) because the large-nc projection GEMM amortizes the
+    Ozaki 3-pass split; the n=512 routes LOSE (shape 3 dense512 nc=160: 81222->82216
+    +1.2%; shape 8 rankdef512 nc=128: 91640->93190 +1.7%) -- too small to amortize.
+    Route 3xTF32 for n>=1024, FP32 (parent's mode) for n=512."""
+    if n >= 1024:
+        return "3xtf32"
+    return "fp32"
 
 
 def _lr_project_out(Qd, X, mode):
@@ -2863,7 +2890,11 @@ _SIGN_DC_RITZ_PROJ = 256    # random Rayleigh-Ritz projection dim for shift esti
 # faster one. Probe whether the k=1117 A@U lift hits the same. CRITICAL: membership
 # (selp/selm rank-select) depends on Vstk<-gstk<-Bstk<-AU, so any precision change
 # here must NOT tip the membership -> outer gate fallback. "fp32"|"tf32"|"3xtf32".
-_SIGN_DC_AV_MODE = "3xtf32"  # sign-DC A@U lift + reduced-block build precision
+# brief-54 t8 MEASURED: 3xTF32 here REGRESSES shape5 (+2.3%) and shape11 (+5.3%) --
+# the sign-DC A@U lift already picks the efficient s256x256 TF32 tile (nsys), unlike
+# shape10's k=768 GEMM which hit a slow 1-pass tiling. So keep plain TF32 (parent's
+# _LR_TF32 mode; _lr_lift_gemm(...,"tf32") is byte-identical to the old _LR_TF32 bmm).
+_SIGN_DC_AV_MODE = "tf32"    # sign-DC A@U lift + reduced-block build precision
 
 
 def _sign_dc_omega(b, n, K, dev):
