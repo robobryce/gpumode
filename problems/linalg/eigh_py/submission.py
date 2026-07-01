@@ -1095,24 +1095,42 @@ _MEGA_CLUST_NT = 512
 # is row-distributed across C CTAs, so per-CTA SMEM ~ tri(k)*2B / C must be <= the
 # ~228KB opt-in cap. C=2 fits k<=~682 (k=608 shape-4: 370KB/2=185KB); C=3 fits
 # k<=~836 (k=768 shape-10: 590KB/3=197KB). _mega_clust_C(k) picks the smallest C.
-_SMEM_CAP_HALVES = 116000       # ~228KB / 2B, with margin for the v/p/block-T SMEM
+_SMEM_CAP_HALVES = 111000       # per-CTA packed-FP16 triangle halves cap. Tightened
+                                # from 116000 (brief-55): the host shm = triangle +
+                                # v/p (2*k floats) + block-T; 116000 halves alone is
+                                # ~232KB, so at the C=5 boundary (k~1065-1076) the
+                                # triangle + v/p OVERFLOWS the 228KB opt-in cap ->
+                                # launch fails -> cuSOLVER fallback. 111000 halves
+                                # (~217KB) leaves headroom for v/p+block-T so a chosen
+                                # C always FITS. Preserves k=608->C2, k=768->C3 (shapes
+                                # 4/10) and k~1086->C6 (shape-5 halves, shm 201KB).
 _MEGA_CLUST_KMIN = 449          # k>448 (won't fit one CTA in FP16 -> the k<=448 mega path)
-# C=3 ceiling (~836). C=2 (k=608 shape-4): cluster inner 22ms vs cuSOLVER 48ms =
-# 2.19x. C=3 (k=768 shape-10): after the FUSED single-pass symv, 63.7ms vs 67.3ms
-# = 1.06x (was 0.81x with the split symv) -- now a thin win; measured end-to-end.
-_MEGA_CLUST_KMAX = 836          # C=3 ceiling (k=608 C=2, k=768 C=3)
-# route the k>448 reduced blocks (k=608 shape-4 C=2, k=768 shape-10 C=3) to the
-# cluster inner solve. Flag so the path can be disabled without editing routing.
+# Ceiling extended from 836 (C=3) to fit the n=2048 sign-DC depth-1 halves (k~1030-
+# 1124, brief-55). C=2 (k=608 shape-4): cluster inner 22ms vs cuSOLVER 48ms = 2.19x.
+# C=3 (k=768 shape-10): after the FUSED single-pass symv, 63.7ms vs 67.3ms = 1.06x
+# (was 0.81x with the split symv). C=6 (k~1117 shape-5 halves): brief-47 measured the
+# cluster 1.32x faster than cuSOLVER on isolated 1117-blocks (64ms vs 84ms). The
+# per-CTA packed-FP16 half-triangle shrinks ~tri(k)/C, so C=6 keeps k=1117 at
+# 624403/6=104068 halves = ~203KB/CTA < 228KB (see _mega_clust_C). RISK: the coarser
+# cluster eigenvectors must feed the sign-DC projector membership cleanly -- verified
+# via the _SIGN_DC_LARGE_DBG orth/fallback sweep.
+_MEGA_CLUST_KMAX = 1150         # C<=6 ceiling (k=608 C=2, k=768 C=3, k~1117 C=6)
+# route the k>448 reduced blocks (k=608 shape-4 C=2, k=768 shape-10 C=3, k~1117
+# shape-5 halves C=6) to the cluster inner solve. Flag so the path can be disabled
+# without editing routing.
 _LR_CLUST_ENABLED = True
 _mega_clust_bounds_cache: dict = {}
 
 
 def _mega_clust_C(k: int) -> int:
-    """Smallest cluster size C in {2,3,4} whose per-CTA packed-FP16 half-triangle
+    """Smallest cluster size C in {2,3,4,5,6} whose per-CTA packed-FP16 half-triangle
     (~tri(k)/C halves) fits the ~228KB SMEM cap. C=2 for k<=~682 (k=608), C=3 for
-    k<=~836 (k=768). Returns 0 if even C=4 can't fit (caller stays on cuSOLVER)."""
+    k<=~836 (k=768), C=5 for k<=~1043, C=6 for k<=~1150 (k~1117 shape-5 halves; tri
+    /6 = 104068 halves = ~203KB/CTA). Returns 0 if even C=6 can't fit (caller stays
+    on cuSOLVER). The peer-map arrays (AhP[8]/triLoP[8]) and red[1024]/pscr[C] all
+    accommodate C up to 8, so C=5/6 need no kernel-side change beyond the ceiling."""
     tri = k * (k + 1) // 2
-    for C in (2, 3, 4):
+    for C in (2, 3, 4, 5, 6):
         if (tri + C - 1) // C <= _SMEM_CAP_HALVES:
             return C
     return 0
@@ -2981,7 +2999,7 @@ _SIGN_DC_BASE_MAX = 1300   # blocks <= this go to _lr_reduced_eigh (<=448 one-CT
                           # 449..836 C-CTA cluster, >836 cuSOLVER). At 1300 the n=2048
                           # ~1229-wide halves land on the base solver directly (depth-1,
                           # cuSOLVER halves); no second split (which mixes junk, above).
-_SIGN_DC_REC_MARGIN = 0.045 # oversample margin (fraction of m) added to ceil(m/2) for
+_SIGN_DC_REC_MARGIN = 0.03  # oversample margin (fraction of m) added to ceil(m/2) for
                           # the split width K. The sign(A - trace/m*I) split of a
                           # semicircle (GOE) spectrum is well-BALANCED (measured max_side
                           # ~1030 for the n=2048 shape5 seed, m/2=1024), so a small margin
@@ -2999,7 +3017,31 @@ _SIGN_DC_REC_NS_ITERS = 16  # NS sign iters for the split. A semicircle (GOE) sp
                           # 1.2e-3 (gate 1.8e-2), shape5 136/128/125/123/122ms, 0 fallback
                           # at all. 16 keeps a ~25x orth margin (reseed-safe) near the
                           # knee (12->16 costs ~2ms for a much safer margin).
-_SIGN_DC_REC_POWER_ITERS = 6   # A^2 power iters for the shifted-block spectral-norm scale
+_SIGN_DC_REC_POWER_ITERS = 4   # A^2 power iters for the shifted-block spectral-norm scale
+# brief-55: finishing NS orthonormalization step count for the LARGE-n path (shape 5),
+# separate from _SIGN_DC_FINAL_NS (the n=512 shape-11 path). None -> use the shared
+# constant. The C-CTA cluster base leaves the assembled Q at orth ~0.65 (full-rank,
+# smin 0.715, MEASURED); it is inside the NS convergence radius but needs several
+# quadratically-converging steps to reach the gate (1 step suffices only for the
+# cuSOLVER base's ~1e-3 start). No effect on shape 11 (its own _SIGN_DC_FINAL_NS).
+_SIGN_DC_LARGE_FINAL_NS = 8
+# brief-55: finishing orthonormalizer for the large-n path. "ns" = Newton-Schulz
+# (needs ~8 steps from the cluster base's orth-0.65 start); "cqr" = shifted
+# CholeskyQR2 -- MEASURED both slower (transposed-RHS trsm on 2048x2048) AND less
+# accurate (shift=1e-4 floors orth ~1e-2) than NS here, so "ns" is kept.
+_SIGN_DC_LARGE_FINISH = "cqrns"
+# brief-55: CQR pass count for the "cqrns" finish (robust from-orth>1 contraction).
+_SIGN_DC_LARGE_CQR_PASSES = 1
+# precision of the finishing-NS GEMMs (Gram + Q@Gram): "tf32x3" (3xTF32 Ozaki,
+# ~FP32 acc, ~3 GEMMs/op), "tf32" (1-pass plain TF32, ~3e-4 rel, 1 GEMM/op), "fp32"
+# (SIMT). The finishing NS just orthonormalizes an already-full-rank Q, so plain TF32
+# (cheapest tensor-core) may floor orth low enough under the 1.8e-2 gate -- tested.
+_SIGN_DC_LARGE_FINISH_PREC = "tf32"
+# brief-55: number of TRAILING finishing-NS steps run at 3xTF32 (Ozaki, ~FP32 acc) to
+# polish orth below the plain-TF32 floor (~1.7e-2, right at the gate). The leading
+# (_SIGN_DC_LARGE_FINAL_NS - this) steps stay plain-TF32 (cheap). Only meaningful when
+# _SIGN_DC_LARGE_FINISH_PREC != "tf32x3".
+_SIGN_DC_LARGE_FINISH_POLISH = 1
 _SIGN_DC_LARGE_N = {2048}   # dense-class n routed to the recursive path (shape 5).
                             # n=1024 is handled by the mixed-peel/single-level probes;
                             # the recursive path is guarded to these n only so shape 11
@@ -3033,6 +3075,36 @@ _SIGN_DC_RITZ_PROJ = 256    # random Rayleigh-Ritz projection dim for shift esti
 # shape10's k=768 GEMM which hit a slow 1-pass tiling. So keep plain TF32 (parent's
 # _LR_TF32 mode; _lr_lift_gemm(...,"tf32") is byte-identical to the old _LR_TF32 bmm).
 _SIGN_DC_AV_MODE = "tf32"    # sign-DC A@U lift + reduced-block build precision
+# brief-55: eigenvalue-side membership consistency for the projector rank-select.
+# Only matters when the base solver's eigenvectors are ~1e-2 orthonormal (the C-CTA
+# cluster at K~1117), where a near-sigma eigenvector leaks into both halves and the
+# raw membership topk picks duplicate columns. The weight downweights a candidate
+# whose eigenvalue side disagrees with its projector half, breaking the +/- tie.
+# _SIGN_DC_SIDE_W sets the sigmoid transition width in mean-eigenvalue-spacing units
+# (larger = sharper split at sigma). No effect on the cuSOLVER-base paths (their
+# membership is already crisp; the correct-side copy always wins the tie anyway).
+# brief-55: re-orthonormalize the base solver's eigenvectors (N CholeskyQR passes,
+# 0 = off) before the projector-membership assembly. Fixes the C-CTA cluster base's
+# ~1e-2 gstk orth that makes the membership double-pick near-sigma eigenvectors.
+_SIGN_DC_BASE_REORTH = 0
+# brief-55: per-half orthonormalization of the candidate eigenvector blocks (Vp/Vm,
+# 2048 x 1117) before membership (N CholeskyQR passes, 0 = off). This is the robust
+# fix for the C-CTA cluster base's fuzzy eigvecs: it guarantees within-half orthonorm,
+# and P+ _|_ P- gives cross-half, so the topk can no longer double-pick a near-sigma
+# eigenvector. Distinct from _SIGN_DC_BASE_REORTH (which orthonormalized the K x K
+# gstk -- a no-op because the cluster gstk is genuinely non-orthogonal in near-
+# degenerate clusters; the tall Vp/Vm block is full-column-rank so CQR2 works there).
+_SIGN_DC_HALF_REORTH = 0
+_SIGN_DC_SIDE_MEMBERSHIP = False
+_SIGN_DC_SIDE_W = 40.0
+# brief-55: COUNT-based per-half rank-select (vs a global topk over both halves).
+# Picks exactly n+ candidates from the + half and (m-n+) from the - half, where
+# n+ = round((m + trace(sign))/2). Because P+ and P- project onto ORTHOGONAL
+# subspaces, per-half selection makes the assembled basis orthogonal even when the
+# base solver's eigenvectors are only ~1e-2 orthonormal -- the failure the global
+# topk hits (double-picking a near-sigma eigenvector). Guarded by the outer residual
+# gate + cuSOLVER fallback, so an off-by-a-few count estimate falls back safely.
+_SIGN_DC_COUNT_SELECT = False
 
 
 def _sign_dc_omega(b, n, K, dev):
@@ -3258,8 +3330,53 @@ def _sign_dc_block_eigh(A_blk, dev):
     Bstk = 0.5 * (Bstk + Bstk.transpose(-1, -2))
     # RECURSE on the K x K reduced blocks -> full 2B*K eigendecomposition.
     lstk, gstk = _sign_dc_block_eigh(Bstk, dev)
+    # brief-55: re-orthonormalize the base solver's eigenvectors before assembly.
+    # The C-CTA cluster base (K~1117) returns gstk only ~1e-2 orthonormal (its
+    # twisted-factorization stage-3 gives near-degenerate eigenvectors a fuzzy angle);
+    # cuSOLVER at K<=300 returns ~1e-6. That ~1e-2 fuzz is what lets a near-sigma
+    # eigenvector's + and - copies both score high in the membership -> the topk
+    # double-picks -> near-duplicate column -> orth ~2 -> full fallback (t1/t2). A
+    # single CholeskyQR2 pass drives gstk to ~1e-6 (it is well-conditioned + full rank
+    # -- orth 1e-2, NOT rank-deficient), which sharpens the membership so the topk
+    # separates real from junk/duplicate cleanly. gstk columns still span the same
+    # eigenspaces (orthonormalizing within a near-degenerate cluster keeps them
+    # B_stk-eigenvectors to Rayleigh accuracy), and the OUTER Rayleigh recomputes L on
+    # the assembled Q anyway. Cheap: a K x K Gram+Cholesky+trsm on 2B blocks.
+    if _SIGN_DC_BASE_REORTH:
+        _gpb = torch.backends.cuda.matmul.allow_tf32
+        torch.backends.cuda.matmul.allow_tf32 = True
+        gstk = _sign_dc_cqr(gstk, passes=_SIGN_DC_BASE_REORTH)
+        torch.backends.cuda.matmul.allow_tf32 = _gpb
+    if _SIGN_DC_LARGE_DBG:
+        import sys as _sys
+        _gp2 = torch.backends.cuda.matmul.allow_tf32
+        torch.backends.cuda.matmul.allow_tf32 = True
+        Kk = gstk.shape[-1]
+        eyeK = torch.eye(Kk, device=dev, dtype=gstk.dtype)
+        g_orth = torch.linalg.matrix_norm(torch.bmm(gstk.transpose(-1, -2), gstk) - eyeK, ord=1, dim=(-2, -1))
+        g_res = torch.linalg.matrix_norm(torch.bmm(Bstk, gstk) - gstk * lstk.unsqueeze(-2), ord=1, dim=(-2, -1))
+        b_l1 = torch.linalg.matrix_norm(Bstk, ord=1, dim=(-2, -1)).clamp_min(1e-30)
+        torch.backends.cuda.matmul.allow_tf32 = _gp2
+        _sys.stderr.write(f"[SIGNDC_BASE_DBG] m={m} K={Kk} base_gstk_orth_max={g_orth.max().item():.4g} "
+                          f"base_gstk_eigr_rel_max={(g_res/b_l1).max().item():.4g}\n")
+        _sys.stderr.flush()
     torch.backends.cuda.matmul.allow_tf32 = True
     Vstk = torch.bmm(Ustk, gstk)               # (2B, m, K) candidate eigenvectors
+    # brief-55: per-half orthonormalization of the candidate eigenvector blocks
+    # BEFORE membership. Vp = U+ @ G+ (2048 x 1117) has the n+ real + eigenvectors
+    # plus ~90 oversample-junk columns. The C-CTA cluster's G is only ~1e-2 orthonorm
+    # (near-degenerate eigvecs get a fuzzy angle), and the fuzz is amplified in the
+    # near-sigma columns where the membership then double-picks. Orthonormalizing the
+    # FULL tall Vp/Vm block (CholeskyQR2, generically full-column-rank) makes ALL
+    # candidates within each half mutually orthonormal; combined with P+ _|_ P- (the
+    # halves span orthogonal invariant subspaces), any m columns selected -- one from
+    # each -- are then mutually orthonormal, so the topk can no longer produce a
+    # near-duplicate. The junk columns become orthonormal too but keep LOW membership
+    # (they aren't in the +/- invariant subspace), so the topk still drops them. lp/lm
+    # stay the reduced eigenvalues (rotated only within degenerate clusters); the OUTER
+    # Rayleigh recomputes L on the assembled Q, so their exact values are irrelevant.
+    if _SIGN_DC_HALF_REORTH:
+        Vstk = _sign_dc_cqr(Vstk, passes=_SIGN_DC_HALF_REORTH)
     Vp, Vm = Vstk[:B], Vstk[B:]
     lp, lm = lstk[:B], lstk[B:]
     # projector membership (of the SHIFTED sign): ~1 for a real eigenvector of that
@@ -3267,6 +3384,67 @@ def _sign_dc_block_eigh(A_blk, dev):
     selp = _pp(Vp).norm(dim=1)                 # (B, K)
     selm = _pm(Vm).norm(dim=1)                 # (B, K)
     torch.backends.cuda.matmul.allow_tf32 = _gp
+    # EIGENVALUE-SIDE membership consistency (brief-55): when the base solver's
+    # eigenvectors are only ~1e-2 orthonormal (the C-CTA cluster at K~1117, vs
+    # ~1e-6 for cuSOLVER at K<=300), a real eigenvector whose eigenvalue sits near
+    # the split shift sigma leaks into BOTH halves with membership ~0.7-0.9 -> the
+    # raw topk picks both copies -> the assembled Q has a near-duplicate column ->
+    # orth blows to ~2 -> full cuSOLVER fallback (brief-47 / brief-55 t1). But the
+    # reduced eigenvalue lp/lm IS the A_blk eigenvalue, and a genuine + eigenvector
+    # has lp>sigma (a - eigenvector lm<sigma). Downweight a candidate that projects
+    # into a half whose sign disagrees with its eigenvalue side, so each near-sigma
+    # eigenvector is kept in exactly ONE half (the higher-scored, correct-side copy).
+    # sigma_blk = trace/m == the mean eigenvalue (== the split shift). The weight is
+    # a smooth step in units of the local eigenvalue scale so it never hard-drops a
+    # genuine near-sigma eigenvector, only breaks the +/- tie. gstk orth ~1e-2 and
+    # eigr ~2e-3 are BOTH clean; the ONLY failure mode is duplicate selection, which
+    # this resolves without touching the (correct) eigenpairs.
+    if _SIGN_DC_SIDE_MEMBERSHIP:
+        sigma_blk = A_blk.diagonal(dim1=-2, dim2=-1).mean(dim=-1, keepdim=True)  # (B,1)
+        escale = (lp.amax(dim=-1) - lp.amin(dim=-1)).clamp_min(1e-30) / m         # (B,)
+        w = (_SIGN_DC_SIDE_W / escale).view(B, 1)
+        wp = torch.sigmoid((lp - sigma_blk) * w)   # ~1 if lp>sigma (correct + side)
+        wm = torch.sigmoid((sigma_blk - lm) * w)   # ~1 if lm<sigma (correct - side)
+        selp = selp * wp
+        selm = selm * wm
+    if _SIGN_DC_COUNT_SELECT:
+        # COUNT-BASED per-half selection (brief-55): pick exactly n+ from the + half
+        # and (m-n+) from the - half, INSTEAD of a global topk over both. The + and -
+        # invariant subspaces are orthogonal by construction (P+ P- = 0), so selecting
+        # within each half separately makes the assembled basis orthogonal AS LONG AS
+        # a near-sigma eigenvector isn't taken by BOTH halves. A global topk CAN take
+        # both copies (each with membership ~0.7-0.9) of a near-sigma eigenvector ->
+        # near-duplicate column -> orth ~2 -> fallback (t1/t2). The per-half split
+        # respects the subspace dimensions (n+ = (m + trace(sign))/2), so a genuine +
+        # eigenvector near sigma is picked in the + half's top-n+ and its leaked -
+        # copy loses to the genuine - eigenvectors in the - half's top-(m-n+). Junk
+        # oversample columns (~90/half) lose to the real ones in either half. n+ is
+        # derived from the sign trace; the residual gate + cuSOLVER fallback still
+        # catches any matrix whose count estimate is off (correctness preserved).
+        trS = X.diagonal(dim1=-2, dim2=-1).sum(dim=-1)      # (B,) ~ n+ - n-
+        nplus = torch.round((m + trS) / 2.0).clamp(0, m).to(torch.int64)  # (B,)
+        # gather per-matrix (variable n+ across the batch): sort each half's membership
+        # descending; take the first nplus[b] from +, first (m-nplus[b]) from -.
+        ip = torch.argsort(selp, dim=-1, descending=True)   # (B,K)
+        im = torch.argsort(selm, dim=-1, descending=True)   # (B,K)
+        ar = torch.arange(m, device=dev).view(1, m)         # (1,m)
+        # column j<nplus -> take +half rank j; else -> -half rank (j-nplus).
+        npv = nplus.view(B, 1)
+        from_plus = ar < npv                                # (B,m)
+        rank_p = ar.clamp_max(K - 1)                        # +half rank for j<nplus
+        rank_m = (ar - npv).clamp(0, K - 1)                 # -half rank for j>=nplus
+        gi_p = torch.gather(ip, 1, rank_p)                  # (B,m) col-index into Vp/lp
+        gi_m = torch.gather(im, 1, rank_m)                  # (B,m) col-index into Vm/lm
+        sel_from_p = from_plus                              # (B,m) bool
+        gi = torch.where(sel_from_p, gi_p, gi_m)            # (B,m) index into that half
+        Gp = torch.gather(Vp, 2, gi.unsqueeze(1).expand(B, m, m))
+        Gm = torch.gather(Vm, 2, gi.unsqueeze(1).expand(B, m, m))
+        Lp = torch.gather(lp, 1, gi)
+        Lm = torch.gather(lm, 1, gi)
+        selmask = sel_from_p.unsqueeze(1)                   # (B,1,m)
+        G = torch.where(selmask, Gp, Gm)
+        lam = torch.where(sel_from_p, Lp, Lm)
+        return lam, G
     Vall = torch.cat([Vp, Vm], dim=-1)         # m x 2K
     Lall = torch.cat([lp, lm], dim=-1)         # 2K
     mem = torch.cat([selp, selm], dim=-1)      # 2K
@@ -3377,6 +3555,57 @@ def _sign_dc_multiway(A_blk, dev, nways):
     return lam, G
 
 
+def _sign_dc_large_finish(Q):
+    """Finishing orthonormalization of the assembled large-n eigenvector matrix Q
+    (b, n, n) before the Rayleigh L + gate. brief-55: with the C-CTA cluster base the
+    assembled Q's orth START varies with the spectrum's near-sigma density -- most
+    seeds ~0.65 (inside the NS convergence radius), but some seeds have a matrix whose
+    near-sigma +/- overlap pushes orth > 1, where plain Newton-Schulz DIVERGES (1/8
+    fallback on a reseed sweep at NS-sign=16). Modes:
+      "ns"    : mixed NS (leading plain-TF32 + trailing 3xTF32 polish) -- fast, but only
+                safe when the start is < 1 (needs a sharper sign / more NS-sign iters).
+      "cqrns" : ONE shifted CholeskyQR pass FIRST (Q is full-rank, smin~0.7, so Cholesky
+                is well-posed from ANY orth incl >1 -> pulls it to the ~1e-2 shift floor),
+                THEN the 3xTF32 NS polish (floor -> ~1e-5). Reseed-robust regardless of
+                sign sharpness because CQR (not NS) does the from->1 contraction.
+    _SIGN_DC_LARGE_FINAL_NS is the NS step count; _SIGN_DC_LARGE_FINISH_POLISH the # of
+    trailing 3xTF32 steps."""
+    _nfin = _SIGN_DC_LARGE_FINAL_NS if _SIGN_DC_LARGE_FINAL_NS is not None else _SIGN_DC_FINAL_NS
+    if _nfin <= 0 and _SIGN_DC_LARGE_FINISH != "cqrns":
+        return Q
+    _gp = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = True
+    _polish = _SIGN_DC_LARGE_FINISH_POLISH
+    _fp = _SIGN_DC_LARGE_FINISH_PREC
+    if _SIGN_DC_LARGE_FINISH == "cqrns":
+        # robust contraction from any starting orth via CQR (handles orth>1), then NS
+        # polish. _SIGN_DC_LARGE_CQR_PASSES CQR passes, then `polish` 3xTF32 NS steps.
+        Q = _sign_dc_cqr(Q, passes=_SIGN_DC_LARGE_CQR_PASSES)
+        for _ in range(_polish):
+            g = _gram_3xtf32_sym(Q)
+            Q = 1.5 * Q - 0.5 * _matmul_3xtf32(Q, g)
+        torch.backends.cuda.matmul.allow_tf32 = _gp
+        return Q
+    if _SIGN_DC_LARGE_FINISH == "cqr":
+        Q = _sign_dc_cqr(Q, passes=_nfin)
+        torch.backends.cuda.matmul.allow_tf32 = _gp
+        return Q
+    # "ns": mixed-precision NS (leading plain-TF32, trailing `polish` 3xTF32).
+    for _i in range(_nfin):
+        hi = (_i >= _nfin - _polish)
+        if hi or _fp == "tf32x3":
+            g = _gram_3xtf32_sym(Q)
+            Q = 1.5 * Q - 0.5 * _matmul_3xtf32(Q, g)
+        else:
+            _pp2 = torch.backends.cuda.matmul.allow_tf32
+            torch.backends.cuda.matmul.allow_tf32 = (_fp == "tf32")
+            g = torch.bmm(Q.transpose(-1, -2), Q)
+            Q = 1.5 * Q - 0.5 * torch.bmm(Q, g)
+            torch.backends.cuda.matmul.allow_tf32 = _pp2
+    torch.backends.cuda.matmul.allow_tf32 = _gp
+    return Q
+
+
 def _sign_dc_solve_large(af, n, dev):
     """Batched spectral divide-and-conquer eigh for the large-n dense class (n=2048)
     via the RECURSIVE shifted matrix-sign block eigensolver. Returns (Q, L, AQ, order)
@@ -3390,15 +3619,20 @@ def _sign_dc_solve_large(af, n, dev):
     else:
         lam, G = _sign_dc_block_eigh(af, dev)  # (b, n), (b, n, n) -- all n eigenpairs (depth-1)
     Q = G
-    # finishing Newton-Schulz orthonormalization (cleans the TF32-sign bases' orth to
-    # ~1e-4), Gram + Q@Gram in 3xTF32 (~FP32 accuracy at ~1.6x FP32-SIMT).
+    # finishing Newton-Schulz orthonormalization (cleans the sign bases' orth), Gram +
+    # Q@Gram in 3xTF32 (~FP32 accuracy at ~1.6x FP32-SIMT).
+    # brief-55: with the C-CTA cluster base (K~1117), the assembled Q can start at orth
+    # ~0.65 (vs ~1e-3 with a cuSOLVER base) because the cluster's twisted-factorization
+    # gives the dense near-degenerate sub-spectrum only ~1e-2-orthonormal eigenvectors,
+    # so near-sigma +/- candidates land at ~45deg. MEASURED (SIGNDC_RANK_DBG): the
+    # assembled Q is FULL RANK there -- smallest singular value 0.715, NOT ~0 -- so it
+    # is NOT missing an eigenvector or carrying an exact duplicate; it is merely non-
+    # orthonormal, and orth 0.65 < 1 is inside the NS convergence radius. One NS step
+    # (the cuSOLVER-base default) is not enough (NS is quadratic: 0.65 -> ~0.2 -> ...),
+    # so the large-n finish takes more steps to drive orth below the gate. Cheap: each
+    # step is 2 n x n GEMMs on b=8.
     _gp = torch.backends.cuda.matmul.allow_tf32
-    if _SIGN_DC_FINAL_NS > 0:
-        torch.backends.cuda.matmul.allow_tf32 = True
-        for _ in range(_SIGN_DC_FINAL_NS):
-            g = _gram_3xtf32_sym(Q)
-            Q = 1.5 * Q - 0.5 * _matmul_3xtf32(Q, g)
-        torch.backends.cuda.matmul.allow_tf32 = _gp
+    Q = _sign_dc_large_finish(Q)
     # Rayleigh-quotient re-eval of L on the orthonormalized Q; A@Q on TF32 feeds both
     # the Rayleigh L and the caller's eigen-residual gate (column-aligned by order).
     torch.backends.cuda.matmul.allow_tf32 = True
