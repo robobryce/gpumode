@@ -2875,7 +2875,15 @@ _SIGN_DC_RITZ_PROJ = 256    # random Rayleigh-Ritz projection dim for shift esti
 # brief-55: re-orthonormalize the base solver's eigenvectors (N CholeskyQR passes,
 # 0 = off) before the projector-membership assembly. Fixes the C-CTA cluster base's
 # ~1e-2 gstk orth that makes the membership double-pick near-sigma eigenvectors.
-_SIGN_DC_BASE_REORTH = 2
+_SIGN_DC_BASE_REORTH = 0
+# brief-55: per-half orthonormalization of the candidate eigenvector blocks (Vp/Vm,
+# 2048 x 1117) before membership (N CholeskyQR passes, 0 = off). This is the robust
+# fix for the C-CTA cluster base's fuzzy eigvecs: it guarantees within-half orthonorm,
+# and P+ _|_ P- gives cross-half, so the topk can no longer double-pick a near-sigma
+# eigenvector. Distinct from _SIGN_DC_BASE_REORTH (which orthonormalized the K x K
+# gstk -- a no-op because the cluster gstk is genuinely non-orthogonal in near-
+# degenerate clusters; the tall Vp/Vm block is full-column-rank so CQR2 works there).
+_SIGN_DC_HALF_REORTH = 2
 _SIGN_DC_SIDE_MEMBERSHIP = False
 _SIGN_DC_SIDE_W = 40.0
 # brief-55: COUNT-based per-half rank-select (vs a global topk over both halves).
@@ -3142,6 +3150,21 @@ def _sign_dc_block_eigh(A_blk, dev):
         _sys.stderr.flush()
     torch.backends.cuda.matmul.allow_tf32 = True
     Vstk = torch.bmm(Ustk, gstk)               # (2B, m, K) candidate eigenvectors
+    # brief-55: per-half orthonormalization of the candidate eigenvector blocks
+    # BEFORE membership. Vp = U+ @ G+ (2048 x 1117) has the n+ real + eigenvectors
+    # plus ~90 oversample-junk columns. The C-CTA cluster's G is only ~1e-2 orthonorm
+    # (near-degenerate eigvecs get a fuzzy angle), and the fuzz is amplified in the
+    # near-sigma columns where the membership then double-picks. Orthonormalizing the
+    # FULL tall Vp/Vm block (CholeskyQR2, generically full-column-rank) makes ALL
+    # candidates within each half mutually orthonormal; combined with P+ _|_ P- (the
+    # halves span orthogonal invariant subspaces), any m columns selected -- one from
+    # each -- are then mutually orthonormal, so the topk can no longer produce a
+    # near-duplicate. The junk columns become orthonormal too but keep LOW membership
+    # (they aren't in the +/- invariant subspace), so the topk still drops them. lp/lm
+    # stay the reduced eigenvalues (rotated only within degenerate clusters); the OUTER
+    # Rayleigh recomputes L on the assembled Q, so their exact values are irrelevant.
+    if _SIGN_DC_HALF_REORTH:
+        Vstk = _sign_dc_cqr(Vstk, passes=_SIGN_DC_HALF_REORTH)
     Vp, Vm = Vstk[:B], Vstk[B:]
     lp, lm = lstk[:B], lstk[B:]
     # projector membership (of the SHIFTED sign): ~1 for a real eigenvector of that
