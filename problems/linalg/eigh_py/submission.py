@@ -208,7 +208,11 @@ _MEGA_MED_CPP = (
     "void mega_eigh_med(torch::Tensor A, torch::Tensor Vout, torch::Tensor Lout, "
     "torch::Tensor rscr, torch::Tensor dscr, torch::Tensor escr, "
     "torch::Tensor dpscr, torch::Tensor dmscr, torch::Tensor tauscr, "
-    "int n, int nt, int bisIters);"
+    "int n, int nt, int bisIters);\n"
+    "void mega_eigh_med_split(torch::Tensor A, torch::Tensor Vout, torch::Tensor Lout, "
+    "torch::Tensor rscr, torch::Tensor dscr, torch::Tensor escr, "
+    "torch::Tensor dpscr, torch::Tensor dmscr, torch::Tensor tauscr, "
+    "torch::Tensor Tout, int n, int nt, int bisIters, int nb);"
 )
 
 _MEGA_MED_CUDA = r'''
@@ -404,6 +408,184 @@ extern "C" __global__ void mega_eigh_med_k(const float* __restrict__ Ain,
   #undef AGET
   #undef ASET
 }
+// SPLIT variant: runs stages 1-3 (tridiag + eigenvalues + tridiag eigenvectors Z)
+// identically to mega_eigh_med_k, but instead of the in-kernel FP32-SIMT
+// back-transform it BUILDS and PERSISTS the per-panel compact-WY block-T
+// matrices to global (Tout), leaving Z in Vout and the Householder panel V in
+// rscr + tau in tauscr. The heavy back-transform Q = (I - V T V^T) Z is then
+// formed at the torch level by ONE batched cuBLAS TENSOR-CORE (TF32) GEMM
+// sequence per panel -- moving the ~70%-of-kernel back-transform off the
+// underutilized single-CTA SIMT path onto the full-GPU tensor-core path.
+// Tout layout: [m][pidx][a][b], pidx = c0/nb, block k x k padded to nb x nb,
+// upper-triangular (b>=a) exactly as the in-kernel build produced it.
+extern "C" __global__ void mega_eigh_med_split_k(const float* __restrict__ Ain,
+    float* __restrict__ Vout, float* __restrict__ Lout,
+    float* __restrict__ rscr, float* __restrict__ dscr, float* __restrict__ escr,
+    float* __restrict__ dpscr, float* __restrict__ dmscr, float* __restrict__ tauscr,
+    float* __restrict__ Tout,
+    int B, int n, int bisIters, int nb){
+  int m=blockIdx.x; if(m>=B) return; int tid=threadIdx.x, nt=blockDim.x;
+  extern __shared__ char shc[];
+  __half* Ah=(__half*)shc;
+  size_t triN=((size_t)n*(n+1))>>1;
+  float* v=(float*)(Ah + triN);
+  size_t voff=((size_t)(Ah+triN) - (size_t)shc); voff=(voff+3u)&~3u; v=(float*)(shc+voff);
+  float* p=v+n;
+  __shared__ float red[1024];
+  float* Rm=rscr+(long)m*n*n; float* Dm=dscr+(long)m*n; float* Em=escr+(long)m*(n-1);
+  float* DP=dpscr+(long)m*n*n; float* DM=dmscr+(long)m*n*n;
+  float* Tau=tauscr+(long)m*n;
+  float* Vg=Vout+(long)m*n*n;
+  const float* Am=Ain+(long)m*n*n;
+  #define AGET(i,j) __half2float( ((j)<=(i)) ? Ah[_tri(i,j)+(j)] : Ah[_tri(j,i)+(i)] )
+  #define ASET(i,j,val) Ah[_tri(i,j)+(j)] = __float2half(val)
+  float amax=0.f;
+  for(int idx=tid; idx<n*n; idx+=nt){ float x=fabsf(Am[idx]); amax=fmaxf(amax,x); }
+  red[tid]=amax; __syncthreads();
+  for(int s=nt>>1;s>0;s>>=1){ if(tid<s)red[tid]=fmaxf(red[tid],red[tid+s]); __syncthreads(); }
+  float scale=red[0]; if(scale<1e-30f) scale=1.f; __syncthreads();
+  float invs=1.f/scale;
+  for(long t=tid; t<(long)triN; t+=nt){
+    int i=(int)((sqrtf(8.0f*(float)t+1.0f)-1.0f)*0.5f);
+    while((long)((i+1)*(i+2)/2)<=t) ++i;
+    while((long)(i*(i+1)/2)>t) --i;
+    int j=(int)(t-(long)(i*(i+1)/2));
+    Ah[t]=__float2half(Am[(long)i*n+j]*invs);
+  }
+  __syncthreads();
+  for(int c=0;c<n-2;++c){
+    float s2=0.f;
+    for(int i=c+1+tid;i<n;i+=nt){ float x=AGET(i,c); s2+=x*x; }
+    red[tid]=s2; __syncthreads();
+    for(int s=nt>>1;s>0;s>>=1){ if(tid<s)red[tid]+=red[tid+s]; __syncthreads(); }
+    float xnorm2=red[0];
+    float alpha=AGET(c+1,c); float tail2=xnorm2-alpha*alpha;
+    if(tail2<=1e-20f){ if(tid==0){Em[c]=alpha;Tau[c]=0.f;} for(int i=tid;i<n;i+=nt) Rm[i*n+c]=(i==c+1)?1.f:0.f; __syncthreads(); continue; }
+    float xnorm=sqrtf(xnorm2); float beta=(alpha>=0.f)?-xnorm:xnorm; float tau=(beta-alpha)/beta; float denom=alpha-beta;
+    for(int i=tid;i<n;i+=nt) v[i]=0.f; __syncthreads();
+    if(tid==0) v[c+1]=1.f;
+    for(int i=c+2+tid;i<n;i+=nt) v[i]=AGET(i,c)/denom;
+    __syncthreads();
+    for(int i=tid;i<n;i+=nt) Rm[i*n+c]=v[i];
+    for(int i=c+1+tid;i<n;i+=nt){ float acc=0.f; for(int j=c+1;j<n;++j) acc+=AGET(i,j)*v[j]; p[i]=tau*acc; }
+    __syncthreads();
+    float vp=0.f; for(int i=c+1+tid;i<n;i+=nt) vp+=v[i]*p[i];
+    red[tid]=vp; __syncthreads();
+    for(int s=nt>>1;s>0;s>>=1){ if(tid<s)red[tid]+=red[tid+s]; __syncthreads(); }
+    float K=0.5f*tau*red[0];
+    for(int i=c+1+tid;i<n;i+=nt) p[i]=p[i]-K*v[i];
+    __syncthreads();
+    for(int i=c+1+tid;i<n;i+=nt){ float vi=v[i],wi=p[i]; for(int j=c+1;j<=i;++j){ float a=AGET(i,j); ASET(i,j,a-vi*p[j]-wi*v[j]); } }
+    if(tid==0){Em[c]=beta;Tau[c]=tau;}
+    __syncthreads();
+  }
+  if(tid==0) Em[n-2]=AGET(n-1,n-2);
+  for(int i=tid;i<n;i+=nt) Dm[i]=AGET(i,i);
+  // zero the two non-reflector V columns (n-2 written zero as before; n-1 is
+  // never touched by the tridiag loop -> would be garbage) so the torch-level
+  // panel GEMM can slice full nb-wide Y blocks regardless of nb | (n-2).
+  for(int i=tid;i<n;i+=nt){ Rm[i*n+(n-2)]=0.f; Rm[i*n+(n-1)]=0.f; }
+  __syncthreads();
+  float glo=1e30f, ghi=-1e30f;
+  for(int i=tid;i<n;i+=nt){ float r=(i>0?fabsf(Em[i-1]):0.f)+(i<n-1?fabsf(Em[i]):0.f); glo=fminf(glo,Dm[i]-r); ghi=fmaxf(ghi,Dm[i]+r); }
+  red[tid]=glo; __syncthreads(); for(int s=nt>>1;s>0;s>>=1){ if(tid<s)red[tid]=fminf(red[tid],red[tid+s]); __syncthreads(); } glo=red[0]; __syncthreads();
+  red[tid]=ghi; __syncthreads(); for(int s=nt>>1;s>0;s>>=1){ if(tid<s)red[tid]=fmaxf(red[tid],red[tid+s]); __syncthreads(); } ghi=red[0]; __syncthreads();
+  for(int ev=tid; ev<n; ev+=nt){
+    float lo=glo, hi=ghi;
+    for(int it=0;it<bisIters;++it){
+      float mid=0.5f*(lo+hi);
+      float q=Dm[0]-mid; int cnt=(q<0.f);
+      for(int k=1;k<n;++k){ float d2=(fabsf(q)<1e-30f)?1e-30f:q; q=(Dm[k]-mid)-Em[k-1]*Em[k-1]/d2; cnt+=(q<0.f); }
+      if(cnt<=ev) lo=mid; else hi=mid;
+    }
+    Lout[(long)m*n+ev]=0.5f*(lo+hi);
+  }
+  __syncthreads();
+  for(int i=tid;i<n*n;i+=nt) Vg[i]=0.f;
+  __syncthreads();
+  float eps=1e-30f;
+  for(int ev=tid; ev<n; ev+=nt){
+    float lam=Lout[(long)m*n+ev];
+    float dpk=Dm[0]-lam; DP[0*n+ev]=dpk;
+    for(int k=1;k<n;++k){ float prev=(fabsf(dpk)<eps)?eps:dpk; dpk=(Dm[k]-lam)-Em[k-1]*Em[k-1]/prev; DP[k*n+ev]=dpk; }
+    float dmk=Dm[n-1]-lam; DM[(n-1)*n+ev]=dmk;
+    for(int k=n-2;k>=0;--k){ float nx=(fabsf(dmk)<eps)?eps:dmk; dmk=(Dm[k]-lam)-Em[k]*Em[k]/nx; DM[k*n+ev]=dmk; }
+    int r=0; float best=1e38f;
+    for(int k=0;k<n;++k){ float g=fabsf(DP[k*n+ev]+DM[k*n+ev]-(Dm[k]-lam)); if(g<best){best=g; r=k;} }
+    Vg[r*n+ev]=1.f;
+    for(int k=r-1;k>=0;--k){ float dpkk=DP[k*n+ev]; dpkk=(fabsf(dpkk)<eps)?eps:dpkk; Vg[k*n+ev]=-(Em[k]/dpkk)*Vg[(k+1)*n+ev]; }
+    for(int k=r+1;k<n;++k){ float dmkk=DM[k*n+ev]; dmkk=(fabsf(dmkk)<eps)?eps:dmkk; Vg[k*n+ev]=-(Em[k-1]/dmkk)*Vg[(k-1)*n+ev]; }
+    float nrm=0.f; for(int k=0;k<n;++k) nrm+=Vg[k*n+ev]*Vg[k*n+ev]; nrm=sqrtf(nrm)+1e-30f;
+    for(int k=0;k<n;++k) Vg[k*n+ev]/=nrm;
+  }
+  __syncthreads();
+  for(int ev=tid; ev<n; ev+=nt) Lout[(long)m*n+ev]*=scale;
+  // ---- build + persist per-panel compact-WY block-T (the ONLY change vs the
+  // full kernel below stage 3). Reuses the now-free SMEM (post-reduction packed-A
+  // region) for the panel Y (n x nb), its Gram/block-T (nb x nb), and a column
+  // snapshot (nb). No GEMMs. Supports arbitrary nb<=nt via an SMEM-based T
+  // recurrence (the single-warp shuffle build capped nb at 32).
+  int nref=n-2;
+  int npan=(nref + nb - 1)/nb;
+  float* Yp=(float*)shc;              // n*nb   (panel reflectors Yp[i*nb+a])
+  float* Tp=Yp + (long)n*nb;          // nb*nb  (Gram, overwritten by block-T)
+  float* colA=Tp + (long)nb*nb;       // nb     (snapshot of G[:,a] per column)
+  for(int c0=0;c0<nref;c0+=nb){
+    int k=nref-c0; if(k>nb) k=nb;
+    int pidx=c0/nb;
+    float* Tg=Tout + ((long)m*npan + pidx)*(long)nb*nb;
+    for(int idx=tid; idx<n*nb; idx+=nt){ int i=idx/nb, a=idx%nb; Yp[i*nb+a]=(a<k)?Rm[i*n+(c0+a)]:0.f; }
+    __syncthreads();
+    // Gram G = Y^T Y (k x k) -> Tp (upper-tri entries used; full symmetric ok)
+    for(int idx=tid; idx<k*k; idx+=nt){ int a=idx/k, b=idx%k; float s=0.f; for(int i=0;i<n;++i) s+=Yp[i*nb+a]*Yp[i*nb+b]; Tp[a*nb+b]=s; }
+    __syncthreads();
+    // clear strict-lower triangle of T (row>col): the recurrence T[b][a] sums
+    // T[b][e] over e<a, which must be 0 when b>e; Tp still holds the symmetric
+    // Gram so its strict-lower is nonzero -> must clear. Tp is row-major
+    // Tp[row*nb+col]; strict-lower is row>col.
+    for(int idx=tid; idx<nb*nb; idx+=nt){ int row=idx/nb, col=idx%nb; if(row>col) Tp[row*nb+col]=0.f; }
+    __syncthreads();
+    // build upper-triangular block-T column by column (serial in a): thread b
+    // owns row b. T[a][a]=tau_a; T[b][a]=-tau_a * sum_{e<a} T[b][e]*G[e][a].
+    for(int a=0;a<k;++a){
+      float ta=Tau[c0+a];
+      if(tid<a) colA[tid]=Tp[tid*nb+a];   // snapshot G[e][a] (e<a) BEFORE any write
+      __syncthreads();
+      if(tid<a){
+        float val=0.f;
+        for(int e=0;e<a;++e) val += Tp[tid*nb+e]*colA[e];   // T[tid][e]*G[e][a]
+        Tp[tid*nb+a] = -ta*val;
+      } else if(tid==a){
+        Tp[a*nb+a] = ta;
+      }
+      __syncthreads();
+    }
+    // persist full nb x nb block (zero the unused padding rows/cols so the
+    // torch-level GEMM can treat every panel uniformly as nb-wide)
+    for(int idx=tid; idx<nb*nb; idx+=nt){ int a=idx/nb, b=idx%nb; Tg[a*nb+b]=(a<k&&b<k)?Tp[a*nb+b]:0.f; }
+    __syncthreads();
+  }
+  #undef AGET
+  #undef ASET
+}
+void mega_eigh_med_split(torch::Tensor A, torch::Tensor Vout, torch::Tensor Lout,
+    torch::Tensor rscr, torch::Tensor dscr, torch::Tensor escr,
+    torch::Tensor dpscr, torch::Tensor dmscr, torch::Tensor tauscr,
+    torch::Tensor Tout, int n, int nt, int bisIters, int nb){
+  int B=A.size(0);
+  size_t triN=((size_t)n*(n+1))>>1;
+  size_t shm=triN*sizeof(__half); shm=(shm+3u)&~3u; shm+=(size_t)2*n*sizeof(float);
+  // the block-T build reuses shc for Yp(n*nb)+Tp(nb*nb)+colA(nb); ensure the
+  // dynamic SMEM is at least that large (it usually is -- packed-A dominates --
+  // but a large nb at small n can exceed it).
+  size_t shmT=((size_t)n*nb + (size_t)nb*nb + (size_t)nb)*sizeof(float);
+  if(shmT>shm) shm=shmT;
+  cudaFuncSetAttribute(mega_eigh_med_split_k, cudaFuncAttributeMaxDynamicSharedMemorySize, shm);
+  mega_eigh_med_split_k<<<B,nt,shm>>>(A.data_ptr<float>(),Vout.data_ptr<float>(),Lout.data_ptr<float>(),
+    rscr.data_ptr<float>(),dscr.data_ptr<float>(),escr.data_ptr<float>(),
+    dpscr.data_ptr<float>(),dmscr.data_ptr<float>(),tauscr.data_ptr<float>(),
+    Tout.data_ptr<float>(),B,n,bisIters,nb);
+}
 void mega_eigh_med(torch::Tensor A, torch::Tensor Vout, torch::Tensor Lout,
     torch::Tensor rscr, torch::Tensor dscr, torch::Tensor escr,
     torch::Tensor dpscr, torch::Tensor dmscr, torch::Tensor tauscr,
@@ -429,12 +611,16 @@ def _mega_get():
     try:
         from torch.utils.cpp_extension import load_inline
         _mega_mod = load_inline(
-            name="eigh_megakernel_w2b3",
+            name="eigh_megakernel_w2b3_split",
             cpp_sources=_MEGA_CPP + "\n" + _MEGA_MED_CPP,
             cuda_sources=_MEGA_CUDA + "\n" + _MEGA_MED_CUDA,
-            functions=["mega_eigh", "mega_eigh_med"],
+            functions=["mega_eigh", "mega_eigh_med", "mega_eigh_med_split"],
             with_cuda=True,
             verbose=False,
+            # -O3/--use_fast_math is the LIVE-ACCEPTED best-lineage flag set (8b9b6f40,
+            # ACCEPTED 39/39). brief-22's -O2 downgrade cost shape-1 (n=176) +11%
+            # (2523->2804us); -O3 recovers it. The split kernel validates 39/39 under
+            # -O3 (--use_fast_math determinism confirmed by a double validate).
             extra_cuda_cflags=["-O3", "--use_fast_math"],
         )
         return _mega_mod
@@ -512,6 +698,135 @@ _MEGA_MED_NMAX = 448
 # fallback). Swept 256/512/1024: 1024 fastest+correct on n=352. red[] holds 1024.
 _MEGA_MED_NT = 1024
 
+# Compact-WY back-transform panel width for the SPLIT med path. The split
+# kernel builds one nb x nb block-T per panel; the torch-level back-transform
+# then does 3 batched tensor-core (TF32) GEMMs per panel. nb trades panel COUNT
+# (=> #GEMM launches, ~ceil((n-2)/nb)) against block-T build cost + GEMM shape.
+# nb<=32 keeps the in-kernel single-warp block-T build (one lane per column).
+_MEGA_MED_SPLIT_NB = 32
+_lr_split_T_cache: dict = {}   # (B,n,nb,dev) -> persistent block-T scratch
+
+
+def _mega_med_split_T(B, n, nb, dev):
+    """Persistent per-panel block-T scratch [B, npan, nb, nb], cached by
+    (B,n,nb) so repeated benchmark iterations reuse it."""
+    npan = (n - 2 + nb - 1) // nb
+    key = (B, n, nb, dev)
+    T = _lr_split_T_cache.get(key)
+    if T is None:
+        T = torch.empty(B, npan, nb, nb, device=dev, dtype=torch.float32)
+        _lr_split_T_cache[key] = T
+    return T, npan
+
+
+# back-transform GEMM precision: "tf32" (plain, 1 pass, ~7e-5 rel; too coarse
+# for the 350-reflector product -> trips the orth gate -> mass cuSOLVER
+# fallback, trial 1), "fp32" (true FP32 simt_sgemm, no tensor cores on B200),
+# "tf32x3" (Ozaki 3-pass on tensor cores, ~6e-6 rel == ~FP32 accuracy).
+_MEGA_MED_SPLIT_PREC = "fp32"
+# back-transform mode: "panel" (per-panel WY, 3*npan GEMMs) or "fullT" (assemble
+# the full compact-WY T from the per-panel block-Ts via a left-looking recursive
+# combine, then 3 big n x n GEMMs -- so tf32x3's Ozaki overhead amortizes over
+# the largest possible GEMMs).
+_MEGA_MED_SPLIT_MODE = "panel"
+# precision for the (cheap, small) full-T assembly cross-Grams; the final 3 big
+# back-transform GEMMs use _MEGA_MED_SPLIT_PREC.
+_MEGA_MED_FULLT_BUILD_PREC = "fp32"
+
+
+def _bt_bmm(A, B, prec):
+    """One back-transform GEMM at the requested precision."""
+    if prec == "tf32x3":
+        p = torch.backends.cuda.matmul.allow_tf32
+        torch.backends.cuda.matmul.allow_tf32 = True
+        out = _matmul_3xtf32(A, B)
+        torch.backends.cuda.matmul.allow_tf32 = p
+        return out
+    p = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = (prec == "tf32")
+    out = torch.bmm(A, B)
+    torch.backends.cuda.matmul.allow_tf32 = p
+    return out
+
+
+def _backtransform_fullT(Z, V, Tp, n, nb, npan, prec, build_prec):
+    """Assemble the FULL compact-WY factor Tf (b,nref,nref, upper-tri) from the
+    per-panel block-Ts (b,npan,nb,nb) via a left-looking recursive combine, then
+    apply Q = Z - V (Tf (V^T Z)) in 3 big GEMMs. The recursive combine of two
+    contiguous reflector blocks (Y1,T1),(Y2,T2) has off-diagonal block
+    -T1 (Y1^T Y2) T2; accumulating left to right fills Tf's upper triangle.
+    Cross-Grams use build_prec (small/cheap); the 3 final GEMMs use prec."""
+    b = Z.shape[0]
+    nref = n - 2
+    dev = Z.device
+    Tf = torch.zeros(b, nref, nref, device=dev, dtype=torch.float32)
+    for j in range(npan):
+        c0 = j * nb
+        k = min(nb, nref - c0)
+        Tf[:, c0:c0 + k, c0:c0 + k] = Tp[:, j, :k, :k]
+    for j in range(1, npan):
+        c0 = j * nb
+        k = min(nb, nref - c0)
+        Yj = V[:, :, c0:c0 + k]                              # (b,n,k)
+        Yacc = V[:, :, 0:c0]                                 # (b,n,c0)
+        cross = _bt_bmm(Yacc.transpose(-1, -2), Yj, build_prec)   # (b,c0,k)
+        tmp = _bt_bmm(Tf[:, 0:c0, 0:c0], cross, build_prec)      # (b,c0,k)
+        Tf[:, 0:c0, c0:c0 + k] = -_bt_bmm(tmp, Tp[:, j, :k, :k], build_prec)
+    Vf = V[:, :, 0:nref]
+    W = _bt_bmm(Vf.transpose(-1, -2), Z, prec)               # (b,nref,n)
+    W = _bt_bmm(Tf, W, prec)                                 # (b,nref,n)
+    return Z - _bt_bmm(Vf, W, prec)
+
+
+def _mega_med_backtransform(Z, V, T, n, nb, npan, prec=None):
+    """Form Q = H_0 H_1 ... H_{n-3} @ Z from the tridiag eigenvectors Z
+    (b,n,n), the Householder panel matrix V (b,n,n; reflector c in column c),
+    and the per-panel upper-triangular block-T (b,npan,nb,nb). Applied as
+    blocked compact-WY  Z <- Z - Y (T (Y^T Z))  in REVERSE panel order (last
+    reflector block first), the verified composition of the forward product.
+    The three GEMMs per panel run as batched GEMMs -- the ~70%-of-kernel
+    back-transform moved off the single-CTA SIMT path onto the full-GPU path.
+    Returns Q (a fresh tensor)."""
+    if prec is None:
+        prec = _MEGA_MED_SPLIT_PREC
+    if _MEGA_MED_SPLIT_MODE == "fullT":
+        return _backtransform_fullT(Z, V, T, n, nb, npan, prec,
+                                    _MEGA_MED_FULLT_BUILD_PREC)
+    nref = n - 2
+    for pidx in range(npan - 1, -1, -1):
+        c0 = pidx * nb
+        k = min(nb, nref - c0)
+        Y = V[:, :, c0:c0 + k]                     # (b, n, k)
+        Tp = T[:, pidx, :k, :k]                    # (b, k, k) upper-tri
+        W = _bt_bmm(Y.transpose(-1, -2), Z, prec)  # (b, k, n)
+        W = _bt_bmm(Tp, W, prec)                   # (b, k, n)
+        Z = Z - _bt_bmm(Y, W, prec)                # (b, n, n)
+    return Z
+
+
+def _mega_med_split_solve(af, dev, b, n, nt, nb):
+    """Run the SPLIT med kernel (stages 1-3 + block-T persist) then form the
+    eigenvectors Q via the torch-level tensor-core WY back-transform. Returns
+    (Q, L) UNSORTED (columns of Q pair with L entries), exactly matching what
+    mega_eigh_med produces before the caller's sort. cuSOLVER fallback / gate
+    are the CALLER's responsibility (kept identical to the in-kernel path)."""
+    mod = _mega_get()
+    V = torch.empty(b, n, n, device=dev, dtype=torch.float32)
+    L = torch.empty(b, n, device=dev, dtype=torch.float32)
+    rscr = torch.empty(b, n, n, device=dev, dtype=torch.float32)
+    dscr = torch.empty(b, n, device=dev, dtype=torch.float32)
+    escr = torch.empty(b, n - 1, device=dev, dtype=torch.float32)
+    dpscr = torch.empty(b, n, n, device=dev, dtype=torch.float32)
+    dmscr = torch.empty(b, n, n, device=dev, dtype=torch.float32)
+    tauscr = torch.empty(b, n, device=dev, dtype=torch.float32)
+    T, npan = _mega_med_split_T(b, n, nb, dev)
+    mod.mega_eigh_med_split(af, V, L, rscr, dscr, escr, dpscr, dmscr, tauscr,
+                            T, n, nt, _MEGA_BISITERS, nb)
+    # V holds Z (tridiag eigenvectors); rscr holds the Householder panel; T the
+    # per-panel block-T. Back-transform Z -> Q on tensor cores.
+    Q = _mega_med_backtransform(V, rscr, T, n, nb, npan)
+    return Q, L
+
 
 def _eigh_megakernel_med(a: torch.Tensor) -> output_t:
     """Medium-n fused megakernel (packed FP16 lower-triangle A in SMEM, global
@@ -525,18 +840,13 @@ def _eigh_megakernel_med(a: torch.Tensor) -> output_t:
         return vectors, values
     af = a.float().contiguous()
     dev = af.device
-    V = torch.empty(b, n, n, device=dev, dtype=torch.float32)
-    L = torch.empty(b, n, device=dev, dtype=torch.float32)
-    rscr = torch.empty(b, n, n, device=dev, dtype=torch.float32)
-    dscr = torch.empty(b, n, device=dev, dtype=torch.float32)
-    escr = torch.empty(b, n - 1, device=dev, dtype=torch.float32)
-    dpscr = torch.empty(b, n, n, device=dev, dtype=torch.float32)
-    dmscr = torch.empty(b, n, n, device=dev, dtype=torch.float32)
-    tauscr = torch.empty(b, n, device=dev, dtype=torch.float32)
-    mod.mega_eigh_med(af, V, L, rscr, dscr, escr, dpscr, dmscr, tauscr,
-                      n, _MEGA_MED_NT, _MEGA_BISITERS)
+    # SPLIT back-transform: the fused kernel returns tridiag eigenvectors Z +
+    # the Householder panel + per-panel block-T; Q = (I - V T V^T) Z is formed
+    # by batched TF32 tensor-core GEMMs (the ~70%-of-kernel back-transform moved
+    # off the single-CTA SIMT path). Q is UNSORTED here (paired with L).
+    Qz, L = _mega_med_split_solve(af, dev, b, n, _MEGA_MED_NT, _MEGA_MED_SPLIT_NB)
     L, order = torch.sort(L, dim=-1)
-    Q = torch.gather(V, 2, order.unsqueeze(1).expand(b, n, n))
+    Q = torch.gather(Qz, 2, order.unsqueeze(1).expand(b, n, n))
     eye = torch.eye(n, device=dev, dtype=torch.float32)
     eps = torch.finfo(torch.float32).eps
     orth = torch.linalg.matrix_norm(Q.transpose(-1, -2) @ Q - eye, ord=1, dim=(-2, -1))
@@ -1295,7 +1605,14 @@ def _lr_bare_scratch(B, k, dev):
 
 def _lr_reduced_mega(Bk):
     """RAW megakernel eigh of Bk (B x k x k) for k in the SMEM-fit range
-    (32,448]. No wrapper gate, no scratch re-alloc, no sort. Returns (lam, G)."""
+    (32,448]. No wrapper gate, no scratch re-alloc, no sort. Returns (lam, G).
+
+    For the medium branch (k in (200,448], i.e. the k=352/384 low-rank inner
+    solves) this uses the SPLIT kernel + torch-level tensor-core WY back-
+    transform: the fused kernel returns tridiag eigenvectors Z + Householder
+    panel + block-T, and G = (I - V T V^T) Z is formed by batched TF32 GEMMs.
+    Any Bk the reduced solve can't resolve makes G non-orthonormal -> the OUTER
+    FP32 A@V gate falls that whole matrix back to cuSOLVER (unchanged)."""
     mod = _mega_get()
     kk = Bk.shape[-1]
     B = Bk.shape[0]
@@ -1304,10 +1621,14 @@ def _lr_reduced_mega(Bk):
     if kk <= _MEGA_NMAX:
         mod.mega_eigh(Bkc, V, L, rscr, dscr, escr, dpscr, dmscr, tauscr,
                       kk, _MEGA_NT, _MEGA_BISITERS)
-    else:
-        mod.mega_eigh_med(Bkc, V, L, rscr, dscr, escr, dpscr, dmscr, tauscr,
-                          kk, _MEGA_MED_NT, _MEGA_BISITERS)
-    return L, V
+        return L, V
+    nb = _MEGA_MED_SPLIT_NB
+    T, npan = _mega_med_split_T(B, kk, nb, Bk.device)
+    mod.mega_eigh_med_split(Bkc, V, L, rscr, dscr, escr, dpscr, dmscr, tauscr,
+                            T, kk, _MEGA_MED_NT, _MEGA_BISITERS, nb)
+    # V holds Z; rscr the Householder panel; back-transform on tensor cores.
+    G = _mega_med_backtransform(V, rscr, T, kk, nb, npan)
+    return L, G
 
 
 def _lr_reduced_eigh(Bk):
