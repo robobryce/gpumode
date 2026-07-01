@@ -597,20 +597,6 @@ _TWOLEVEL_MINFRAC = 0.5    # only take the 2-level path if >= this fraction of t
                            # on the whole batch -- so below this fraction we just do
                            # the single cuSOLVER call (the few 2-level matrices are
                            # too few to amortize the split + FP64 overhead).
-# Projector precision for the two-level path. The four spectral-projector A@X
-# GEMMs (P+^2, P-^2) are the dominant O(n^3) cost of the clustered512 shape
-# (~33% of the ~58ms, FP64 d884gemm on B200's weak ~40 TFLOPS FP64 tensor).
-# brief-18's probe refuted PLAIN TF32 (eig-res 1.01) and BARE FP32 (eig-res
-# 0.0423) here: the near-degenerate +-1 spectrum (~1e-5 jitter) sets the
-# projector's convergence floor at the GEMM's per-op error, so single-precision
-# is not enough. "3xtf32" is the near-FP32 alternative -- an Ozaki hi+lo split
-# (Ah@Bh + Ah@Bl + Al@Bh, three TF32 bmms on ~1100 TFLOPS tensor cores) that
-# recovers ~6e-6 relative accuracy, ~10x tighter than plain TF32 and comparable
-# to FP32-SIMT while running on the far-faster TF32 path. Whether that clears the
-# 150*n*eps ~ 9.2e-3 eigen gate on this spectrum is measured, not assumed; a miss
-# is caught by the per-matrix residual gate and recomputed with cuSOLVER, so it
-# can never regress below baseline. "fp64" = the safe reference path.
-_TWOLEVEL_PROJ = "mixed"   # "fp64" | "3xtf32" | "mixed" (3xTF32 inner + FP64 finish)
 
 
 def _twolevel_mask(af: torch.Tensor) -> torch.Tensor:
@@ -650,76 +636,30 @@ def _eigh_twolevel(a: torch.Tensor) -> output_t:
     idx = torch.nonzero(is2, as_tuple=False).flatten()
     A = af[idx].double()
     bi = A.shape[0]
-    eye64 = torch.eye(n, device=dev, dtype=torch.float64)
     # kp from the trace (exact for a +-1 spectrum). Use the batch's first matrix;
     # the per-matrix residual gate catches any matrix whose kp differs.
     tr = torch.diagonal(A, dim1=-2, dim2=-1).sum(dim=-1)
     kp = int(round(((tr[0].item()) + n) / 2.0))
     kp = max(1, min(n - 1, kp))
+    G = torch.randn(bi, n, n, device=dev, dtype=torch.float64)
 
     # Apply the spectral projectors WITHOUT materializing them: P+ X = (A X + X)/2,
     # P- X = (X - A X)/2 -- each is one A@X GEMM, and skips forming/storing the two
-    # dense n*n projector matrices. DOUBLE application (P+^2, P-^2) drives the
-    # cross-subspace leakage to ~1e-11 in FP64 (P+ is only approximately idempotent
-    # because of the ~1e-5 within-cluster jitter; one application leaves the
-    # extracted basis ~30deg off the true eigenspace).
-    #
-    # The projector GEMMs run in "fp64" (safe reference) or "3xtf32" (Ozaki hi+lo
-    # split on TF32 tensor cores, ~FP32-accurate). In 3xtf32 mode A and the random
-    # probe G are FP32 and each A@X is _matmul_3xtf32(A, X); the assembled basis is
-    # cast back up to FP64 for the (delicate) Gram/Cholesky/NS orthonormalization.
-    proj_mode = _TWOLEVEL_PROJ
-    if proj_mode in ("3xtf32", "mixed"):
-        # 3xtf32: both projector applications in 3xTF32. mixed: the FIRST (inner)
-        # application in 3xTF32 (cheap, gets the basis ~close), the SECOND (outer,
-        # final) in FP64 (sharpens the near-degenerate +-1 range to the ~8e-6 the
-        # eigen gate needs). "mixed" halves the FP64 GEMM count vs all-FP64 while
-        # keeping the accuracy-critical final projection exact. EIGH_DIAG probe:
-        # pure-3xtf32 leaves n=512 clustered's eigen residual at 9.78e-3, just over
-        # the 9.15e-3 gate -> partial fallback; the FP64 finishing pass clears it.
-        Ap = af[idx]                        # FP32 for the TF32-split projector
-        _pprev = torch.backends.cuda.matmul.allow_tf32
-        torch.backends.cuda.matmul.allow_tf32 = True   # 3xTF32 bmms hit tensor cores
-        G32 = torch.randn(bi, n, n, device=dev, dtype=torch.float32)
+    # dense n*n FP64 projector matrices. DOUBLE application (P+^2, P-^2) drives the
+    # cross-subspace leakage to ~1e-11 (P+ is only approximately idempotent because
+    # of the ~1e-5 within-cluster jitter; one application leaves the extracted basis
+    # ~30deg off the true eigenspace).
+    def _pp(X):
+        t = A @ X
+        return 0.5 * (t + X)
 
-        def _pp32(X):
-            t = _matmul_3xtf32(Ap, X)
-            return 0.5 * (t + X)
+    def _pm(X):
+        t = A @ X
+        return 0.5 * (X - t)
 
-        def _pm32(X):
-            t = _matmul_3xtf32(Ap, X)
-            return 0.5 * (X - t)
-
-        Yp1 = _pp32(G32[:, :, :kp])         # inner +1 projection (3xTF32)
-        Ym1 = _pm32(G32[:, :, kp:])         # inner -1 projection (3xTF32)
-        torch.backends.cuda.matmul.allow_tf32 = _pprev
-        if proj_mode == "mixed":
-            # finishing projection in FP64
-            Yp1d = Yp1.double()
-            Ym1d = Ym1.double()
-            Yp = 0.5 * (A @ Yp1d + Yp1d)
-            Ym = 0.5 * (Ym1d - A @ Ym1d)
-            Q = torch.cat([Yp, Ym], dim=2)
-        else:
-            torch.backends.cuda.matmul.allow_tf32 = True
-            Yp = _pp32(Yp1)
-            Ym = _pm32(Ym1)
-            torch.backends.cuda.matmul.allow_tf32 = _pprev
-            Q = torch.cat([Yp, Ym], dim=2).double()
-    else:
-        G = torch.randn(bi, n, n, device=dev, dtype=torch.float64)
-
-        def _pp(X):
-            t = A @ X
-            return 0.5 * (t + X)
-
-        def _pm(X):
-            t = A @ X
-            return 0.5 * (X - t)
-
-        Yp = _pp(_pp(G[:, :, :kp]))         # clean +1 range
-        Ym = _pm(_pm(G[:, :, kp:]))         # clean -1 range
-        Q = torch.cat([Yp, Ym], dim=2)
+    Yp = _pp(_pp(G[:, :, :kp]))             # clean +1 range
+    Ym = _pm(_pm(G[:, :, kp:]))             # clean -1 range
+    Q = torch.cat([Yp, Ym], dim=2)
 
     def _cqr(X, shift):
         M = X.transpose(-1, -2) @ X
@@ -728,13 +668,25 @@ def _eigh_twolevel(a: torch.Tensor) -> output_t:
         return torch.linalg.solve_triangular(Lf.transpose(-1, -2), X, upper=True, left=False)
 
     # joint CholeskyQR (full-rank assembled basis -> well-conditioned Gram), then
-    # ONE FP64 Newton-Schulz step to finish orthonormalization. NS (2 GEMMs) is
-    # both cheaper than a second CholeskyQR (Cholesky + triangular solve) AND more
-    # accurate here (orth ~6e-6, eig ~4e-6, robust across reseeds), so it replaces
-    # the CholeskyQR2 second pass.
+    # ONE Newton-Schulz step to finish orthonormalization. NS (2 GEMMs) is both
+    # cheaper than a second CholeskyQR (Cholesky + triangular solve) AND more
+    # accurate here, so it replaces the CholeskyQR2 second pass. The CQR Gram +
+    # Cholesky + triangular solve stay FP64 (orthonormalizing the ill-conditioned
+    # assembled basis is delicate -- a reduced-precision Gram loses positive-
+    # definiteness and Cholesky fails; measured). But the FINISHING NS runs after
+    # CQR, where Q is already ~orthonormal (Gram ~ I, well-conditioned), so its two
+    # GEMMs are safe in true FP32-SIMT (allow_tf32 off): measured orth ~5.6e-6
+    # (vs FP64 NS ~1e-5) and eig ~1e-5, nbad=0 across 6 clustered reseeds -- BETTER
+    # margin than the FP64 NS (which itself tripped 1/6 reseeds to orth 7e-2), at
+    # ~7.7ms vs the FP64 NS's ~10.7ms on B200 (FP64 tensor is weak). brief-20.
     Q = _cqr(Q, 1e-12)
-    gram = Q.transpose(-1, -2) @ Q
-    Q = Q @ (1.5 * eye64 - 0.5 * gram)
+    Qf32 = Q.float()
+    _nsp = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = False   # true FP32 (no TF32) NS GEMMs
+    eye32 = torch.eye(n, device=dev, dtype=torch.float32)
+    gram = Qf32.transpose(-1, -2) @ Qf32
+    Q = Qf32 @ (1.5 * eye32 - 0.5 * gram)
+    torch.backends.cuda.matmul.allow_tf32 = _nsp
     # Eigenvalues are exactly +-1 for a 2-level spectrum, and the assembled basis
     # keeps the +1 range in columns [0, kp) and the -1 range in [kp, n). So assign
     # L by block instead of a Rayleigh quotient -- this skips a full A@Q GEMM (~6ms
