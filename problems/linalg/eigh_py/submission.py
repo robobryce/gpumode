@@ -1167,7 +1167,10 @@ def _lowrank_eigh(a, k, power=1):
         Qd = _lr_cholesky_qr2(torch.bmm(a, Omega))
         for _ in range(power):
             Qd = _lr_cholesky_qr2(torch.bmm(a, Qd))
-        Bk = torch.bmm(torch.bmm(Qd.transpose(-1, -2), a), Qd)
+        # A@Qd is computed here and REUSED below (both to form Bk and to build
+        # A@Vd = (A@Qd)@G cheaply, so the residual gate needs no separate A@V).
+        AQd = torch.bmm(a, Qd)
+        Bk = torch.bmm(Qd.transpose(-1, -2), AQd)
         Bk = 0.5 * (Bk + Bk.transpose(-1, -2))
         try:
             lam_d, G = torch.linalg.eigh(Bk)
@@ -1179,6 +1182,7 @@ def _lowrank_eigh(a, k, power=1):
         _p = torch.backends.cuda.matmul.allow_tf32
         torch.backends.cuda.matmul.allow_tf32 = False     # FP32: Vd orthonormal
         Vd = torch.bmm(Qd, G)
+        AVd = torch.bmm(AQd, G)                           # A@Vd == (A@Qd)@G (cheap k-GEMM)
         torch.backends.cuda.matmul.allow_tf32 = _p
         nc = n - k
         if nc > 0:
@@ -1193,31 +1197,45 @@ def _lowrank_eigh(a, k, power=1):
             AVc = torch.bmm(a, Vc)
             lam_c = (AVc * Vc).sum(dim=-2)
             V = torch.cat([Vd, Vc], dim=-1)
+            AV = torch.cat([AVd, AVc], dim=-1)
             lam = torch.cat([lam_d, lam_c], dim=-1)
         else:
-            V, lam = Vd, lam_d
+            V, lam, AV = Vd, lam_d, AVd
         order = torch.argsort(lam, dim=-1)
         lam = torch.gather(lam, -1, order)
-        V = torch.gather(V, -1, order.unsqueeze(1).expand(B, n, n))
-    return V, lam
+        oexp = order.unsqueeze(1).expand(B, n, n)
+        V = torch.gather(V, -1, oexp)
+        AV = torch.gather(AV, -1, oexp)
+    return V, lam, AV
 
 
 def _eigh_lowrank_safe(a, k, power=1):
     B, n, _ = a.shape
     try:
         with _LR_TF32():
-            V, lam = _lowrank_eigh(a, k, power)
+            V, lam, AV = _lowrank_eigh(a, k, power)
     except Exception:
         w, q = torch.linalg.eigh(a)
         return q.contiguous(), w.contiguous()
     with torch.no_grad():
-        ad = a.double(); Vd = V.double(); wd = lam.double()
-        anorm = torch.linalg.matrix_norm(ad, ord=1, dim=(-2, -1)).clamp_min(1e-30)
-        eig = torch.linalg.matrix_norm(ad @ Vd - Vd * wd.unsqueeze(-2), ord=1, dim=(-2, -1)) / anorm
-        orth = torch.linalg.matrix_norm(
-            Vd.transpose(-1, -2) @ Vd - torch.eye(n, device=a.device, dtype=torch.float64),
-            ord=1, dim=(-2, -1))
+        # CHEAP FP32 per-matrix residual gate (brief-7 t4): the eigen residual
+        # reuses the A@V already computed inside _lowrank_eigh (== (A@Qd)@G for
+        # the dominant block + A@Vc for the complement) -- NO separate n*n GEMM,
+        # and no FP64 recompute (the old gate cast A/V to FP64 and ran two n*n
+        # FP64 d884gemms ~9.6% of the dense-1024 kernel; FP64 is ~40 TFLOPS on
+        # B200 vs ~1100 TF32). FP32 rounding (~1e-4 rel) is far below the gate
+        # thresholds (150*n*eps ~ 9.2e-3 at n=512), so the pass/fail decision is
+        # identical to the FP64 gate but nearly free. Orthogonality uses one FP32
+        # V^T V GEMM (true FP32, allow_tf32 off, so the ~n column dot products do
+        # not accumulate TF32 error above the 80*n*eps ~ 4.9e-3 bound).
         eps = torch.finfo(torch.float32).eps
+        eye = torch.eye(n, device=a.device, dtype=torch.float32)
+        anorm = torch.linalg.matrix_norm(a, ord=1, dim=(-2, -1)).clamp_min(1e-30)
+        eig = torch.linalg.matrix_norm(AV - V * lam.unsqueeze(-2), ord=1, dim=(-2, -1)) / anorm
+        _p = torch.backends.cuda.matmul.allow_tf32
+        torch.backends.cuda.matmul.allow_tf32 = False
+        orth = torch.linalg.matrix_norm(V.transpose(-1, -2) @ V - eye, ord=1, dim=(-2, -1))
+        torch.backends.cuda.matmul.allow_tf32 = _p
         bad = (~torch.isfinite(eig)) | (~torch.isfinite(orth)) \
             | (eig > 150.0 * n * eps) | (orth > 80.0 * n * eps)
     if bool(bad.any().item()):
