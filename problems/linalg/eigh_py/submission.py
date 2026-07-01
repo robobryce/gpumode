@@ -1157,29 +1157,6 @@ def _lr_participation_ratio(a):
     return (fro2 * fro2) / a2f2
 
 
-def _lr_reduced_eigh(Bk):
-    """Eigendecomposition of the small symmetric REDUCED matrix Bk (B x k x k)
-    inside the low-rank path (brief-7 t5). Bk is a dense symmetric Rayleigh
-    projection -- exactly the regime where brief-3's fused medium-n megakernel
-    beats cuSOLVER (1.5-1.8x at k=352..448, since cuSOLVER loops syevd
-    per-matrix). Route k in the megakernel fit range to it; the megakernel
-    wrappers carry their own per-matrix residual gate + cuSOLVER fallback, so a
-    Bk the FP16 reduction can't resolve is handled internally (never wrong).
-    k > _MEGA_MED_NMAX (e.g. k=640 for dense1024) stays on cuSOLVER (a packed
-    FP16 k*k does not fit one CTA's SMEM). Returns (lam ascending, G) matching
-    torch.linalg.eigh(Bk)."""
-    kk = Bk.shape[-1]
-    Bk = Bk.contiguous()
-    if 32 < kk <= _MEGA_NMAX:
-        G, lam = _eigh_megakernel(Bk)
-        return lam, G
-    if _MEGA_NMAX < kk <= _MEGA_MED_NMAX:
-        G, lam = _eigh_megakernel_med(Bk)
-        return lam, G
-    lam, G = torch.linalg.eigh(Bk)
-    return lam, G
-
-
 def _lowrank_eigh(a, k, power=1):
     B, n, _ = a.shape
     dev = a.device
@@ -1196,7 +1173,7 @@ def _lowrank_eigh(a, k, power=1):
         Bk = torch.bmm(Qd.transpose(-1, -2), AQd)
         Bk = 0.5 * (Bk + Bk.transpose(-1, -2))
         try:
-            lam_d, G = _lr_reduced_eigh(Bk)
+            lam_d, G = torch.linalg.eigh(Bk)
         except Exception:
             kk = Bk.shape[-1]
             jit = 1e-6 * Bk.diagonal(dim1=-2, dim2=-1).abs().amax(-1).clamp_min(1e-30)
@@ -1287,19 +1264,25 @@ def _eigh_lowrank_safe(a, k, power=1):
 # any matrix the block can't resolve back to cuSOLVER, so a misdetection (or a
 # leaderboard reseed that shifts the spectrum) can never regress below baseline.
 #
-# Measured idle wins vs syevd (all 0.0% fallback):
-#   n=512  PR~55  (dense cond2, shape 4)      k=352: 136us vs 171us  ~1.26x
-#   n=512  PR~163 (rankdef, rank 3n/4=384, shape 8)  k=384: 157us vs 167us ~1.06x
-#   n=1024 PR~67  (lapack_geom, shape 12)     k=384: (pre-existing win, ~1.7x)
-#   n=1024 PR~110 (dense cond2, shape 4)      k=640:  88us vs 106us  ~1.21x
-# HOMOGENEITY excludes the heterogeneous mixed batches (mixed512 PR range
-# [25,512] frac<85 only 0.72; mixed1024 [55,1024] max/min~19) whose full-rank
-# members would fall back -- so they stay on cuSOLVER. clustered512 (PR=512,
-# A^2~I) keeps its 2-level win; lapack_dense_even512 (PR=284) and nearrank1024
-# (PR=326, no measured win) miss every band. All verified by direct PR probe.
+# Measured idle wins vs syevd (all 0.0% fallback; k RE-SWEPT under the cheap FP32
+# gate of brief-7 t4, which shifted a couple optima):
+#   n=512  PR~55  (dense cond2, shape 3)             k=352: 130us vs 171us ~1.32x
+#   n=512  PR~163 (rankdef, rank 3n/4=384, shape 8)  k=384: 151us vs 167us ~1.11x
+#   n=1024 PR~67  (lapack_geom, shape 12)            k=384: (pre-existing win)
+#   n=1024 PR~110 (dense cond2, shape 4)             k=608:  82us vs 106us ~1.29x
+#   n=1024 PR~326 (nearrank, rank 3n/4=768, shape 10) k=768: 103us vs 105us ~1.02x
+# rankdef512 / nearrank1024 have EXACT rank 3n/4 so k must equal that rank (k
+# above -> the extra dominant cols put nonzero structure in the complement ->
+# 100% fallback); the band's pr window brackets each shape's PR. HOMOGENEITY
+# excludes the heterogeneous mixed batches (mixed512 PR range [25,512] frac<85
+# only 0.72; mixed1024 [55,1024] max/min~19; both re-probed under the cheap gate
+# as a per-matrix SPLIT and still a LOSS -- batched cuSOLVER on the whole batch
+# beats gather+low-rank+cuSOLVER-rest) -> they stay on cuSOLVER. clustered512
+# (PR=512, A^2~I) keeps its 2-level win; lapack_dense_even512 (PR=284) misses
+# every band. All verified by direct PR probe.
 _LOWRANK_BANDS = {
     512:  [(0.0, 85.0, 352), (120.0, 200.0, 384)],
-    1024: [(0.0, 85.0, 384), (85.0, 120.0, 640)],
+    1024: [(0.0, 85.0, 384), (85.0, 120.0, 608), (200.0, 400.0, 768)],
 }
 _LOWRANK_PR_MAX = 85.0        # steep-concentration ceiling (first band; no homogeneity gate needed)
 _LOWRANK_FRAC_MIN = 0.85      # only route if >= this fraction of the batch is in-band
