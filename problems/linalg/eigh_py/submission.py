@@ -1157,6 +1157,29 @@ def _lr_participation_ratio(a):
     return (fro2 * fro2) / a2f2
 
 
+def _lr_reduced_eigh(Bk):
+    """Eigendecomposition of the small symmetric REDUCED matrix Bk (B x k x k)
+    inside the low-rank path (brief-7 t5). Bk is a dense symmetric Rayleigh
+    projection -- exactly the regime where brief-3's fused medium-n megakernel
+    beats cuSOLVER (1.5-1.8x at k=352..448, since cuSOLVER loops syevd
+    per-matrix). Route k in the megakernel fit range to it; the megakernel
+    wrappers carry their own per-matrix residual gate + cuSOLVER fallback, so a
+    Bk the FP16 reduction can't resolve is handled internally (never wrong).
+    k > _MEGA_MED_NMAX (e.g. k=640 for dense1024) stays on cuSOLVER (a packed
+    FP16 k*k does not fit one CTA's SMEM). Returns (lam ascending, G) matching
+    torch.linalg.eigh(Bk)."""
+    kk = Bk.shape[-1]
+    Bk = Bk.contiguous()
+    if 32 < kk <= _MEGA_NMAX:
+        G, lam = _eigh_megakernel(Bk)
+        return lam, G
+    if _MEGA_NMAX < kk <= _MEGA_MED_NMAX:
+        G, lam = _eigh_megakernel_med(Bk)
+        return lam, G
+    lam, G = torch.linalg.eigh(Bk)
+    return lam, G
+
+
 def _lowrank_eigh(a, k, power=1):
     B, n, _ = a.shape
     dev = a.device
@@ -1173,7 +1196,7 @@ def _lowrank_eigh(a, k, power=1):
         Bk = torch.bmm(Qd.transpose(-1, -2), AQd)
         Bk = 0.5 * (Bk + Bk.transpose(-1, -2))
         try:
-            lam_d, G = torch.linalg.eigh(Bk)
+            lam_d, G = _lr_reduced_eigh(Bk)
         except Exception:
             kk = Bk.shape[-1]
             jit = 1e-6 * Bk.diagonal(dim1=-2, dim2=-1).abs().amax(-1).clamp_min(1e-30)
