@@ -2376,7 +2376,10 @@ def _eigh_lowrank_safe(a, k, power=1, dom_gram_mode=None, vd_lift_mode=None):
         # flipping ~640/640 gate decisions -> spurious cuSOLVER fallbacks.
         _p = torch.backends.cuda.matmul.allow_tf32
         torch.backends.cuda.matmul.allow_tf32 = True
-        orth = torch.linalg.matrix_norm(_gram_3xtf32(V) - eye, ord=1, dim=(-2, -1))
+        # brief-46: V^TV is a Gram (symmetric), so the symmetric-aware 3xTF32 form
+        # (2 bmms, numerically identical to the 3-bmm _gram_3xtf32) gives the same
+        # gate decision at one fewer tensor-core bmm on the V^TV orth check.
+        orth = torch.linalg.matrix_norm(_gram_3xtf32_sym(V) - eye, ord=1, dim=(-2, -1))
         torch.backends.cuda.matmul.allow_tf32 = _p
         bad = (~torch.isfinite(eig)) | (~torch.isfinite(orth)) \
             | (eig > 150.0 * n * eps) | (orth > 80.0 * n * eps)
@@ -2821,7 +2824,10 @@ def _sign_dc_solve(af, n, dev):
         _p2 = torch.backends.cuda.matmul.allow_tf32
         torch.backends.cuda.matmul.allow_tf32 = True
         for _ in range(_SIGN_DC_FINAL_NS):
-            g = _gram_3xtf32(Q)
+            # brief-46: the finishing-NS Gram g = Q^T Q is symmetric, so the
+            # symmetric-aware 3xTF32 form (2 bmms, identical ~6e-6 accuracy) does
+            # this n*n Gram at one fewer tensor-core bmm than the 3-bmm variant.
+            g = _gram_3xtf32_sym(Q)
             Q = 1.5 * Q - 0.5 * _matmul_3xtf32(Q, g)
         torch.backends.cuda.matmul.allow_tf32 = _p2
     # Rayleigh-quotient re-eval of L on the orthonormalized Q (eigenvalues are the
@@ -2863,7 +2869,10 @@ def _eigh_sign_dc(a: torch.Tensor) -> output_t:
     eye = torch.eye(n, device=dev, dtype=torch.float32)
     _gp = torch.backends.cuda.matmul.allow_tf32
     torch.backends.cuda.matmul.allow_tf32 = True
-    orth = torch.linalg.matrix_norm(_gram_3xtf32(Q) - eye, ord=1, dim=(-2, -1))
+    # brief-46: the sign-DC orth gate's Q^T Q is a Gram, so the symmetric-aware
+    # 3xTF32 form (2 bmms, identical gate decision) runs the n*n orth check at one
+    # fewer tensor-core bmm.
+    orth = torch.linalg.matrix_norm(_gram_3xtf32_sym(Q) - eye, ord=1, dim=(-2, -1))
     torch.backends.cuda.matmul.allow_tf32 = _gp
     eigr = torch.linalg.matrix_norm(AQ - Q * L.unsqueeze(-2), ord=1, dim=(-2, -1))
     a_l1 = torch.linalg.matrix_norm(af, ord=1, dim=(-2, -1)).clamp_min(1e-30)
