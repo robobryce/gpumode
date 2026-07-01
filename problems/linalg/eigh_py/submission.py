@@ -659,17 +659,42 @@ def _eigh_megakernel(a: torch.Tensor) -> output_t:
     # recon 400*n*eps, orth 100*n*eps) at ~0.6-0.75x, so a matrix that comfortably
     # passes the harness is NOT spuriously fallen back (which would waste the FP16
     # speedup) yet anything actually close to failing -- or non-finite -- is caught.
+    #
+    # The reconstruction residual recon=||Q L Q^T - A||_1 is NOT recomputed here:
+    # it is REDUNDANT given the eigen (eigr) and orthogonality (orth) gates. The
+    # exact identity Q L Q^T - A = (A Q - Q L) Q^T - A (Q Q^T - I) means a bad
+    # reconstruction MUST come from either a bad eigen-residual E=AQ-QL (the E Q^T
+    # term) or a non-orthonormal Q (the A(QQ^T-I) term) -- both of which the
+    # retained gates catch. Measured on the thin-margin shapes (n=176 dense,
+    # lapack_dense_even/random_symmetric) under column-rotation AND column-norm
+    # corruption: ZERO matrices had recon over its 300*n*eps trigger while eigr &
+    # orth both passed (rotation drives eigr past its gate first, recon max
+    # 1.19e-2 < eigr max 2.11e-2; column scaling drives orth to fire on 40/40).
+    # So dropping recon's second (Q*L)@Q^T GEMM + its matrix_norm keeps the gate's
+    # safety while removing one O(n^3) batched GEMM per call; the per-matrix
+    # cuSOLVER fallback still catches any true miss. (Live-clean recon max on the
+    # good factorization: n=176 8.7e-4 << 6.3e-3 gate, ~7x margin.)
     eye = torch.eye(n, device=dev, dtype=torch.float32)
     eps = torch.finfo(torch.float32).eps
+    # Orthogonality GEMM Q^T@Q stays TRUE FP32 (allow_tf32 off): TF32's ~3e-4/op
+    # error accumulates over the n column dot-products above the orth bound (the
+    # low-rank + two-level gates both measured this -> spurious mass fallback).
+    _gp = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = False
     orth = torch.linalg.matrix_norm(Q.transpose(-1, -2) @ Q - eye, ord=1, dim=(-2, -1))
+    # Eigen-gate GEMM af@Q feeds ONLY the pass/fail decision, so it runs on TF32
+    # tensor cores (same as the two-level gate): TF32's ~3e-4/op error is far below
+    # the 150*n*eps ~ 3.1e-3 (n=176) eigen gate. Measured on the megakernel outputs
+    # (good + column-rotated near-threshold): TF32 vs FP32 eigr differs by <=6e-5,
+    # 0 pass/fail flips on GOOD matrices; the only near-threshold flip fell ONE
+    # extra borderline matrix back to cuSOLVER (safe direction, never a miss).
+    torch.backends.cuda.matmul.allow_tf32 = True
     aq = af @ Q
+    torch.backends.cuda.matmul.allow_tf32 = _gp
     eigr = torch.linalg.matrix_norm(aq - Q * L.unsqueeze(-2), ord=1, dim=(-2, -1))
-    recon = torch.linalg.matrix_norm(
-        (Q * L.unsqueeze(-2)) @ Q.transpose(-1, -2) - af, ord=1, dim=(-2, -1))
     a_l1 = torch.linalg.matrix_norm(af, ord=1, dim=(-2, -1)).clamp_min(1e-30)
     bad = ((orth > 75.0 * n * eps)
-           | (eigr / a_l1 > 150.0 * n * eps)
-           | (recon / a_l1 > 300.0 * n * eps))
+           | (eigr / a_l1 > 150.0 * n * eps))
     bad = bad | ~torch.isfinite(L).all(dim=-1) | ~torch.isfinite(Q).all(dim=(-2, -1))
     if bool(bad.any()):
         idx = torch.nonzero(bad, as_tuple=False).flatten()
@@ -847,17 +872,25 @@ def _eigh_megakernel_med(a: torch.Tensor) -> output_t:
     Qz, L = _mega_med_split_solve(af, dev, b, n, _MEGA_MED_NT, _MEGA_MED_SPLIT_NB)
     L, order = torch.sort(L, dim=-1)
     Q = torch.gather(Qz, 2, order.unsqueeze(1).expand(b, n, n))
+    # Recon=||Q L Q^T - A||_1 is REDUNDANT given eigr + orth and is NOT recomputed
+    # here (see _eigh_megakernel for the exact identity + the corruption sweep that
+    # measured ZERO recon-only misses). Dropping it removes the second (Q*L)@Q^T
+    # O(n^3) GEMM from this gate; the per-matrix cuSOLVER fallback still catches any
+    # true miss. Measured n=352 clean recon max 1.20e-3 << 1.26e-2 gate (~10x).
     eye = torch.eye(n, device=dev, dtype=torch.float32)
     eps = torch.finfo(torch.float32).eps
+    # orth GEMM true FP32; eigen-gate af@Q on TF32 tensor cores (gate-only, error
+    # far below 150*n*eps). Same as _eigh_megakernel + the two-level gate.
+    _gp = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = False
     orth = torch.linalg.matrix_norm(Q.transpose(-1, -2) @ Q - eye, ord=1, dim=(-2, -1))
+    torch.backends.cuda.matmul.allow_tf32 = True
     aq = af @ Q
+    torch.backends.cuda.matmul.allow_tf32 = _gp
     eigr = torch.linalg.matrix_norm(aq - Q * L.unsqueeze(-2), ord=1, dim=(-2, -1))
-    recon = torch.linalg.matrix_norm(
-        (Q * L.unsqueeze(-2)) @ Q.transpose(-1, -2) - af, ord=1, dim=(-2, -1))
     a_l1 = torch.linalg.matrix_norm(af, ord=1, dim=(-2, -1)).clamp_min(1e-30)
     bad = ((orth > 75.0 * n * eps)
-           | (eigr / a_l1 > 150.0 * n * eps)
-           | (recon / a_l1 > 300.0 * n * eps))
+           | (eigr / a_l1 > 150.0 * n * eps))
     bad = bad | ~torch.isfinite(L).all(dim=-1) | ~torch.isfinite(Q).all(dim=(-2, -1))
     if bool(bad.any()):
         idx = torch.nonzero(bad, as_tuple=False).flatten()
