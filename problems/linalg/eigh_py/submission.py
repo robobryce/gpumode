@@ -2754,7 +2754,7 @@ _SIGN_DC_REC_NS_ITERS = 16  # NS sign iters for the split. A semicircle (GOE) sp
                           # 1.2e-3 (gate 1.8e-2), shape5 136/128/125/123/122ms, 0 fallback
                           # at all. 16 keeps a ~25x orth margin (reseed-safe) near the
                           # knee (12->16 costs ~2ms for a much safer margin).
-_SIGN_DC_REC_POWER_ITERS = 12  # A^2 power iters for the shifted-block spectral-norm scale
+_SIGN_DC_REC_POWER_ITERS = 6   # A^2 power iters for the shifted-block spectral-norm scale
 _SIGN_DC_LARGE_N = {2048}   # dense-class n routed to the recursive path (shape 5).
                             # n=1024 is handled by the mixed-peel/single-level probes;
                             # the recursive path is guarded to these n only so shape 11
