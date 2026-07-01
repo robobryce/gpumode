@@ -2018,7 +2018,7 @@ def _lr_lift_gemm(A, B, mode):
 # of "fp32" | "tf32" | "3xtf32"; the residual+orth gate inside _eigh_lowrank_safe
 # falls any matrix a reduced-precision factor cannot resolve back to cuSOLVER, so
 # nothing here can produce an invalid result (only a wasted double-solve).
-_LR_DOM_GRAM_MODE = "tf32"   # dominant power-step CQR2 Gram Q^T Q precision
+_LR_DOM_GRAM_MODE = "fp32"   # dominant power-step CQR2 Gram Q^T Q precision
 _LR_VD_LIFT_MODE = "tf32"    # Vd = Qd @ G lift GEMM precision
 
 
