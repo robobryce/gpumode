@@ -1343,32 +1343,29 @@ def _lowrank_eigh(a, k, power=1):
             Bk = Bk + jit.view(-1, 1, 1) * torch.eye(kk, device=dev, dtype=Bk.dtype)
             lam_d, G = torch.linalg.eigh(Bk)
         _p = torch.backends.cuda.matmul.allow_tf32
-        torch.backends.cuda.matmul.allow_tf32 = True
-        # Vd = Qd @ G, the lift of the reduced eigenvectors G back to full n. Both
-        # Qd (orthonormal FP32) and G (orthonormal from eigh) are WELL-conditioned
-        # (kappa=1), so the product is computed in 3xTF32 (Ozaki split, ~FP32
-        # accuracy) instead of FP32-SIMT: a single one-shot n*k @ k*k GEMM where
-        # 3xTF32 beats the simt_sgemm path. 3xTF32 Vd matches FP32 Vd's
-        # orthogonality EXACTLY (probed, same fallback count) whereas plain TF32
-        # breaks the orthogonality gate (orth 1.34, brief-7 t7). brief-16 t9.
-        Vd = _matmul_3xtf32(Qd, G)
+        torch.backends.cuda.matmul.allow_tf32 = False     # FP32: Vd MUST be orthonormal
+        # Vd = Qd @ G lift. Kept FP32: 3xTF32 here (Qd, G both well-conditioned,
+        # numerically identical to FP32) was MEASURED net-neutral (t9) -- this
+        # n*k @ k*k GEMM is too small to amortize the Ozaki split overhead at
+        # b640 (unlike the ~2x-larger gate V^TV GEMM where 3xTF32 won). Plain TF32
+        # is unsafe (breaks orthogonality, orth 1.34, brief-7 t7).
+        Vd = torch.bmm(Qd, G)
         # A@Vd == (A@Qd)@G feeds ONLY the residual gate (its ~3e-4 TF32 error is
         # far below the 9.2e-3 gate), so it runs on plain TF32 tensor cores.
+        torch.backends.cuda.matmul.allow_tf32 = True
         AVd = torch.bmm(AQd, G)
         torch.backends.cuda.matmul.allow_tf32 = _p
         nc = n - k
         if nc > 0:
             R = torch.randn(B, n, nc, device=dev, generator=g)
             _prev = torch.backends.cuda.matmul.allow_tf32
-            torch.backends.cuda.matmul.allow_tf32 = True
-            # The Qd-projections (R - Qd Qd^T R) run in 3xTF32 (Ozaki split): they
-            # must leave only NEGLIGIBLE Qd-leakage in the complement (plain TF32's
-            # ~3e-4 leakage x kappa(Qd) breaks cross-block orthogonality of
-            # V=[Vd,Vc], orth ~0.5 -> fallback), but 3xTF32's ~6e-6 leakage is as
-            # clean as FP32 while the projection GEMMs run ~1.6x faster off the
-            # FP32-SIMT path. The Qtd = Qd^T is materialized contiguous once.
-            Qtd = Qd.transpose(-1, -2).contiguous()
-            R = R - _matmul_3xtf32(Qd, _matmul_3xtf32(Qtd, R))
+            torch.backends.cuda.matmul.allow_tf32 = False
+            # The Qd-projections (R - Qd Qd^T R) stay FP32. 3xTF32 here was safe
+            # (~6e-6 Qd-leakage, as clean as FP32) but net-neutral (t9): the
+            # projection GEMMs are too small to amortize the split overhead at
+            # b640. Plain TF32 is UNSAFE -- its ~3e-4 leakage x kappa(Qd) breaks
+            # cross-block orthogonality of V=[Vd,Vc] (orth ~0.5 -> fallback).
+            R = R - torch.bmm(Qd, torch.bmm(Qd.transpose(-1, -2), R))
             # The complement basis Vc spans the ORTHOGONAL complement of the
             # (already-projected-out) dominant subspace, built from a random
             # matrix -> WELL-conditioned, so its CQR2 Gram tolerates plain TF32
@@ -1377,7 +1374,7 @@ def _lowrank_eigh(a, k, power=1):
             # the final one 1-pass raised live fallbacks on shapes 8/12, t5); the
             # Gram uses plain TF32 (3xTF32 there net-lost, t7).
             Vc = _lr_cholesky_qr2(R, shift=1e-4, gram_mode="tf32")
-            Vc = Vc - _matmul_3xtf32(Qd, _matmul_3xtf32(Qtd, Vc))
+            Vc = Vc - torch.bmm(Qd, torch.bmm(Qd.transpose(-1, -2), Vc))
             Vc = _lr_cholesky_qr2(Vc, shift=1e-5, gram_mode="tf32")
             torch.backends.cuda.matmul.allow_tf32 = _prev
             AVc = torch.bmm(a, Vc)
