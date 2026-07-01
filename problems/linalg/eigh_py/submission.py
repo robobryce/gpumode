@@ -2206,7 +2206,7 @@ def _lr_cholesky_qr2(Y, passes=2, shift=1e-5, tf32_gram=False, gram_mode=None):
 # + the sign-DC PR floor), NOT the returned factors or the residual gate, so it is
 # ROUTING-SAFE: 3xTF32 (~6e-6) leaves PR bit-stable so routing is unchanged, while
 # moving the square GEMM onto TF32 tensor cores. "fp32"|"tf32"|"3xtf32".
-_LR_PR_PROBE_MODE = "3xtf32"
+_LR_PR_PROBE_MODE = "tf32"
 
 
 @torch.no_grad()
