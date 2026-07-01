@@ -610,7 +610,7 @@ _TWOLEVEL_MINFRAC = 0.5    # only take the 2-level path if >= this fraction of t
 # 150*n*eps ~ 9.2e-3 eigen gate on this spectrum is measured, not assumed; a miss
 # is caught by the per-matrix residual gate and recomputed with cuSOLVER, so it
 # can never regress below baseline. "fp64" = the safe reference path.
-_TWOLEVEL_PROJ = "3xtf32"  # "fp64" | "3xtf32" (near-FP32 tensor-core projector)
+_TWOLEVEL_PROJ = "mixed"   # "fp64" | "3xtf32" | "mixed" (3xTF32 inner + FP64 finish)
 
 
 def _twolevel_mask(af: torch.Tensor) -> torch.Tensor:
@@ -668,26 +668,44 @@ def _eigh_twolevel(a: torch.Tensor) -> output_t:
     # split on TF32 tensor cores, ~FP32-accurate). In 3xtf32 mode A and the random
     # probe G are FP32 and each A@X is _matmul_3xtf32(A, X); the assembled basis is
     # cast back up to FP64 for the (delicate) Gram/Cholesky/NS orthonormalization.
-    proj_3xtf32 = (_TWOLEVEL_PROJ == "3xtf32")
-    if proj_3xtf32:
+    proj_mode = _TWOLEVEL_PROJ
+    if proj_mode in ("3xtf32", "mixed"):
+        # 3xtf32: both projector applications in 3xTF32. mixed: the FIRST (inner)
+        # application in 3xTF32 (cheap, gets the basis ~close), the SECOND (outer,
+        # final) in FP64 (sharpens the near-degenerate +-1 range to the ~8e-6 the
+        # eigen gate needs). "mixed" halves the FP64 GEMM count vs all-FP64 while
+        # keeping the accuracy-critical final projection exact. EIGH_DIAG probe:
+        # pure-3xtf32 leaves n=512 clustered's eigen residual at 9.78e-3, just over
+        # the 9.15e-3 gate -> partial fallback; the FP64 finishing pass clears it.
         Ap = af[idx]                        # FP32 for the TF32-split projector
-        G = torch.randn(bi, n, n, device=dev, dtype=torch.float32)
         _pprev = torch.backends.cuda.matmul.allow_tf32
         torch.backends.cuda.matmul.allow_tf32 = True   # 3xTF32 bmms hit tensor cores
+        G32 = torch.randn(bi, n, n, device=dev, dtype=torch.float32)
 
-        def _pp(X):
+        def _pp32(X):
             t = _matmul_3xtf32(Ap, X)
             return 0.5 * (t + X)
 
-        def _pm(X):
+        def _pm32(X):
             t = _matmul_3xtf32(Ap, X)
             return 0.5 * (X - t)
 
-        Yp = _pp(_pp(G[:, :, :kp]))         # clean +1 range
-        Ym = _pm(_pm(G[:, :, kp:]))         # clean -1 range
-        Q = torch.cat([Yp, Ym], dim=2)
+        Yp1 = _pp32(G32[:, :, :kp])         # inner +1 projection (3xTF32)
+        Ym1 = _pm32(G32[:, :, kp:])         # inner -1 projection (3xTF32)
         torch.backends.cuda.matmul.allow_tf32 = _pprev
-        Q = Q.double()                      # lift to the Gram/Cholesky/NS precision
+        if proj_mode == "mixed":
+            # finishing projection in FP64
+            Yp1d = Yp1.double()
+            Ym1d = Ym1.double()
+            Yp = 0.5 * (A @ Yp1d + Yp1d)
+            Ym = 0.5 * (Ym1d - A @ Ym1d)
+            Q = torch.cat([Yp, Ym], dim=2)
+        else:
+            torch.backends.cuda.matmul.allow_tf32 = True
+            Yp = _pp32(Yp1)
+            Ym = _pm32(Ym1)
+            torch.backends.cuda.matmul.allow_tf32 = _pprev
+            Q = torch.cat([Yp, Ym], dim=2).double()
     else:
         G = torch.randn(bi, n, n, device=dev, dtype=torch.float64)
 
