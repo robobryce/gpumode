@@ -2018,8 +2018,11 @@ def _lr_lift_gemm(A, B, mode):
 # of "fp32" | "tf32" | "3xtf32"; the residual+orth gate inside _eigh_lowrank_safe
 # falls any matrix a reduced-precision factor cannot resolve back to cuSOLVER, so
 # nothing here can produce an invalid result (only a wasted double-solve).
-_LR_DOM_GRAM_MODE = "3xtf32"   # dominant power-step CQR2 Gram Q^T Q precision
-_LR_VD_LIFT_MODE = "fp32"      # Vd = Qd @ G lift GEMM precision
+# Per-pass dominant CQR2 Gram schedule: pass 1 FP32 (ill-conditioned input),
+# pass 2 TF32 (well-conditioned after pass-1 self-correction). Puts half the
+# dominant-Gram work on tensor cores safely.
+_LR_DOM_GRAM_MODE = ("fp32", "tf32")   # dominant power-step CQR2 Gram Q^T Q precision
+_LR_VD_LIFT_MODE = "fp32"              # Vd = Qd @ G lift GEMM precision
 
 
 def _lr_cholesky_qr2(Y, passes=2, shift=1e-5, tf32_gram=False, gram_mode=None):
@@ -2036,16 +2039,28 @@ def _lr_cholesky_qr2(Y, passes=2, shift=1e-5, tf32_gram=False, gram_mode=None):
     # tf32_gram=True is the back-compat alias for gram_mode="tf32". The
     # triangular solve is not a GEMM, so Q always leaves solve_triangular in true
     # FP32 regardless of gram_mode.
+    #
+    # gram_mode may be a PER-PASS tuple/list (brief-44): CholeskyQR2 mathematically
+    # self-corrects CONDITIONING -- after pass 1, Q1 = Q0 R0^-1 has kappa(Q1)~1
+    # regardless of kappa(Q0). So pass 1's Gram (on the ILL-conditioned input, where
+    # TF32's ~3e-4 x kappa blows up -> t1 fallback) needs FP32/3xTF32, but pass 2's
+    # Gram (on the now well-conditioned Q1) safely tolerates plain TF32. A per-pass
+    # ("fp32","tf32") schedule thus puts HALF the dominant-Gram work on the ~9x
+    # tensor-core path while keeping the ill-conditioned pass-1 Gram accurate.
     if gram_mode is None:
         gram_mode = "tf32" if tf32_gram else "fp32"
+    if isinstance(gram_mode, (list, tuple)):
+        pass_modes = [gram_mode[min(i, len(gram_mode) - 1)] for i in range(passes)]
+    else:
+        pass_modes = [gram_mode] * passes
     Q = Y
     c = Y.shape[-1]
     eye = torch.eye(c, device=Y.device, dtype=Y.dtype)
     prev = torch.backends.cuda.matmul.allow_tf32
-    torch.backends.cuda.matmul.allow_tf32 = (gram_mode in ("tf32", "3xtf32"))
     try:
-        for _ in range(passes):
-            if gram_mode == "3xtf32":
+        for pm in pass_modes:
+            torch.backends.cuda.matmul.allow_tf32 = (pm in ("tf32", "3xtf32"))
+            if pm == "3xtf32":
                 G = _gram_3xtf32(Q)
             else:
                 G = torch.bmm(Q.transpose(-1, -2), Q)
@@ -2195,10 +2210,14 @@ def _lr_reduced_eigh(Bk):
     return lam, G
 
 
-def _lowrank_eigh(a, k, power=1):
+def _lowrank_eigh(a, k, power=1, dom_gram_mode=None, vd_lift_mode=None):
     B, n, _ = a.shape
     dev = a.device
     k = min(k, n)
+    if dom_gram_mode is None:
+        dom_gram_mode = _LR_DOM_GRAM_MODE
+    if vd_lift_mode is None:
+        vd_lift_mode = _LR_VD_LIFT_MODE
     g = torch.Generator(device=dev).manual_seed(1234567)
     Omega = torch.randn(B, n, k, device=dev, generator=g)
     with torch.no_grad():
@@ -2218,7 +2237,7 @@ def _lowrank_eigh(a, k, power=1):
         # only has to SPAN the subspace (re-orthonormalized by the power CQR2 below).
         Qd = _lr_cholesky_qr2(torch.bmm(a, Omega), passes=1)
         for _ in range(power):
-            Qd = _lr_cholesky_qr2(torch.bmm(a, Qd), gram_mode=_LR_DOM_GRAM_MODE)
+            Qd = _lr_cholesky_qr2(torch.bmm(a, Qd), gram_mode=dom_gram_mode)
         # A@Qd is computed here and REUSED below (both to form Bk and to build
         # A@Vd = (A@Qd)@G cheaply, so the residual gate needs no separate A@V).
         AQd = torch.bmm(a, Qd)
@@ -2237,7 +2256,7 @@ def _lowrank_eigh(a, k, power=1):
         # n*k @ k*k product is WELL-conditioned -- the regime where TF32's ~3e-4/op
         # error does not compound. Routing it to TF32 tensor cores (~8-10x the
         # FP32-SIMT rate) is the lever; the orth gate catches any Vd that drifts.
-        Vd = _lr_lift_gemm(Qd, G, _LR_VD_LIFT_MODE)
+        Vd = _lr_lift_gemm(Qd, G, vd_lift_mode)
         # A@Vd == (A@Qd)@G feeds ONLY the residual gate (its ~3e-4 TF32 error is
         # far below the 9.2e-3 gate), so it runs on plain TF32 tensor cores.
         torch.backends.cuda.matmul.allow_tf32 = True
@@ -2280,11 +2299,11 @@ def _lowrank_eigh(a, k, power=1):
     return V, lam, AV
 
 
-def _eigh_lowrank_safe(a, k, power=1):
+def _eigh_lowrank_safe(a, k, power=1, dom_gram_mode=None, vd_lift_mode=None):
     B, n, _ = a.shape
     try:
         with _LR_TF32():
-            V, lam, AV = _lowrank_eigh(a, k, power)
+            V, lam, AV = _lowrank_eigh(a, k, power, dom_gram_mode, vd_lift_mode)
     except Exception:
         w, q = torch.linalg.eigh(a)
         return q.contiguous(), w.contiguous()
