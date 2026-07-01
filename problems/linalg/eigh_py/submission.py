@@ -1217,6 +1217,56 @@ def _lr_reduced_mega(Bk):
     return L, V
 
 
+# Spectral 2-way split of a k>448 reduced block into two <=448 sub-blocks, each
+# megakernel'd (brief 11 direction 2). Unlike the nested subspace solve (trial 2,
+# a LOSSY rank-k2 truncation that regressed), this covers ALL k eigenvalues: a
+# matrix-sign projector P+/P- splits the spectrum at sigma=mean(eig) into the
+# above-sigma and below-sigma invariant subspaces (each ~k/2 columns <=448), the
+# two sub-blocks C+=Y+^T Bk Y+, C-=Y-^T Bk Y- go to the megakernel, and the
+# eigenvectors are lifted back Y+/-@G+/-. sign(M) is built by scaled Newton-Schulz
+# (X<-1.5X-0.5X^3, inverse-free, all TF32 GEMMs). Fixed half-widths keep it
+# batched; any matrix whose true above-sigma count strays from k//2 (so a sub-block
+# mixes subspaces -> non-orthonormal lift) is caught by the OUTER FP32 A@V gate and
+# falls back to cuSOLVER, so it can never produce a wrong result.
+_LR_SPLIT_NS = 8          # Newton-Schulz sign iterations
+
+
+def _lr_reduced_split(Bk):
+    B, k, _ = Bk.shape
+    dev = Bk.device
+    eye = torch.eye(k, device=dev, dtype=torch.float32)
+    prev = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = True
+    sigma = torch.diagonal(Bk, dim1=-2, dim2=-1).mean(dim=-1)     # mean eigenvalue
+    M = Bk - sigma.view(B, 1, 1) * eye
+    # scale so ||X||_2 < sqrt(3) (NS sign convergence); ||M||_F is an upper bound
+    s = torch.linalg.matrix_norm(M, ord='fro', dim=(-2, -1)).clamp_min(1e-20)
+    X = M / s.view(B, 1, 1)
+    for _ in range(_LR_SPLIT_NS):
+        X = 1.5 * X - 0.5 * torch.bmm(torch.bmm(X, X), X)
+    Pp = 0.5 * (eye + X)                                          # projector, eig>sigma
+    kp = (k + 1) // 2
+    km = k - kp
+    g = torch.Generator(device=dev).manual_seed(13572468)
+    Omp = torch.randn(B, k, kp, device=dev, generator=g)
+    Omm = torch.randn(B, k, km, device=dev, generator=g)
+    torch.backends.cuda.matmul.allow_tf32 = False        # bases must be orthonormal
+    Yp = _lr_cholesky_qr2(torch.bmm(Pp, Omp), shift=1e-4)          # range(P+)
+    Ym = _lr_cholesky_qr2(Omm - torch.bmm(Pp, Omm), shift=1e-4)    # range(P-) = (I-P+)
+    torch.backends.cuda.matmul.allow_tf32 = True
+    Cp = torch.bmm(Yp.transpose(-1, -2), torch.bmm(Bk, Yp)); Cp = 0.5 * (Cp + Cp.transpose(-1, -2))
+    Cm = torch.bmm(Ym.transpose(-1, -2), torch.bmm(Bk, Ym)); Cm = 0.5 * (Cm + Cm.transpose(-1, -2))
+    lamp, Gp = _lr_reduced_mega(Cp)
+    lamm, Gm = _lr_reduced_mega(Cm)
+    torch.backends.cuda.matmul.allow_tf32 = False
+    Vp = torch.bmm(Yp, Gp)
+    Vm = torch.bmm(Ym, Gm)
+    torch.backends.cuda.matmul.allow_tf32 = prev
+    G = torch.cat([Vp, Vm], dim=-1)
+    lam = torch.cat([lamp, lamm], dim=-1)
+    return lam, G
+
+
 def _lr_reduced_eigh(Bk):
     """Eigendecomposition of the reduced symmetric block Bk (B x k x k). Returns
     (lam, G) in the torch.linalg.eigh convention (Bk @ G[:,:,i] = lam[:,i] *
@@ -1230,15 +1280,19 @@ def _lr_reduced_eigh(Bk):
     kk = Bk.shape[-1]
     if mod is not None and 32 < kk <= _MEGA_MED_NMAX:
         return _lr_reduced_mega(Bk)
-    # k > 448: the packed-FP16 megakernel overflows one CTA's SMEM, and every
-    # non-cuSOLVER inner solver tried for this regime was MEASURED slower than
-    # cuSOLVER's syevd loop: cusolverDnXsyevBatched hits the same syevd machinery
-    # (trial 4/5, neutral), the nested randomized-subspace reduced solve regressed
-    # +60-96% (trial 2), and the Python blocked-Householder _eigh_custom pipeline
-    # regressed 5.4x (trial 6, latency-bound per-column Python loop). So k>448
-    # stays on cuSOLVER (the floor) -- a genuine batched tensor-core k>448 primitive
-    # (a fused SMEM megakernel that tiles k>448, or a spectral 2-way split into two
-    # <=448 blocks each megakernel'd) remains open for a follow-up.
+    # k > 448 (dense1024 k=608, nearrank1024 k=768): the packed-FP16 megakernel
+    # overflows one CTA's SMEM. PROBE (trial 7): spectral 2-way split into two
+    # <=448 sub-blocks (kp=k//2, km=k-kp; 304/304 for k=608, 384/384 for k=768),
+    # each megakernel'd -- the brief's named tensor-core primitive. Falls back to
+    # cuSOLVER on error; the outer FP32 A@V gate catches any matrix whose split
+    # mixes subspaces. (Earlier k>448 solvers refuted: nested subspace +60-96% t2,
+    # Xsyev neutral t4/5, _eigh_custom 5.4x t6.)
+    if mod is not None and kk > _MEGA_MED_NMAX and (kk + 1) // 2 <= _MEGA_MED_NMAX:
+        try:
+            return _lr_reduced_split(Bk)
+        except Exception:
+            lam, G = torch.linalg.eigh(Bk)
+            return lam, G
     lam, G = torch.linalg.eigh(Bk)
     return lam, G
 
