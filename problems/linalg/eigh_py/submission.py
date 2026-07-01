@@ -1918,6 +1918,16 @@ _MIXED_PEEL_MIN_COUNT = 128   # min dense-window matrices to fire (~2x the ~64
                               # cuSOLVER-knee break-even; below it the peel loses)
 _MIXED_PEEL_HOM_MAX = 3.0     # only peel a HETEROGENEOUS batch (max/min PR >= this);
                               # a homogeneous batch is _lowrank_route_k's job
+# Also peel the CLUSTERED (2-level, A^2~I) matrices in the mixed batch to the
+# two-level projector path (measured ~2x cuSOLVER on clustered512). STEP-2
+# extension probe (mixed512 b640): dense-only peel = -24.3ms; dense + clustered
+# two-level = -25.3ms (an extra ~1.0ms). The rankdef/nearrank window [62,100)
+# k=384 was REFUTED (22/77 gate-fallback -> +6.9ms LOSS) and psd/rowscale [25,48)
+# is 100% fallback, so ONLY dense + clustered are peeled; everything else is the
+# cuSOLVER floor. The clustered detector runs on the NON-dense remainder only
+# (the dense subset is already removed) and the two-level path is itself
+# per-matrix residual-gated -> a misdetection falls back to cuSOLVER (no regress).
+_MIXED_PEEL_CLUSTERED = True
 
 
 def _mixed_peel_count(pr: torch.Tensor) -> int:
@@ -1937,21 +1947,36 @@ def _eigh_mixed_peel(a: torch.Tensor, pr: torch.Tensor) -> output_t:
     gate resolve faster."""
     b, n, _ = a.shape
     dev = a.device
-    dense_mask = (pr >= _MIXED_PEEL_PR_LO) & (pr < _MIXED_PEEL_PR_HI)
-    gidx = torch.nonzero(dense_mask, as_tuple=False).flatten()
-    ridx = torch.nonzero(~dense_mask, as_tuple=False).flatten()
+    af = a.float().contiguous()
     Q = torch.empty(b, n, n, device=dev, dtype=torch.float32)
     L = torch.empty(b, n, device=dev, dtype=torch.float32)
-    # dense subset -> split-mega low-rank (residual-gated internally)
-    a_sub = a.index_select(0, gidx).contiguous()
+    taken = torch.zeros(b, dtype=torch.bool, device=dev)
+    # 1) dense subset -> split-mega low-rank (residual-gated internally)
+    dense_mask = (pr >= _MIXED_PEEL_PR_LO) & (pr < _MIXED_PEEL_PR_HI)
+    gidx = torch.nonzero(dense_mask, as_tuple=False).flatten()
+    a_sub = af.index_select(0, gidx).contiguous()
     Qs, Ls = _eigh_lowrank_safe(a_sub, _MIXED_PEEL_K, power=1)
     Q.index_copy_(0, gidx, Qs)
     L.index_copy_(0, gidx, Ls)
-    # rest -> batched cuSOLVER (the structure-independent floor; the probe showed
-    # no Python-level partition of the non-dense classes beats one cuSOLVER call
-    # on them -- brief-10 -- so the rest stays whole)
+    taken |= dense_mask
+    # 2) clustered (2-level, A^2~I) subset -> two-level projector path (~2x
+    # cuSOLVER). Detected on the NON-dense remainder only. Self residual-gated.
+    if _MIXED_PEEL_CLUSTERED:
+        rest_mask = ~taken
+        is2 = _twolevel_mask(af) & rest_mask
+        cidx = torch.nonzero(is2, as_tuple=False).flatten()
+        if cidx.numel() > 0:
+            a_cl = af.index_select(0, cidx).contiguous()
+            Qc, Lc = _eigh_twolevel(a_cl)
+            Q.index_copy_(0, cidx, Qc)
+            L.index_copy_(0, cidx, Lc)
+            taken |= is2
+    # 3) rest -> batched cuSOLVER (the structure-independent floor; the probe
+    # showed no Python-level partition of the remaining classes beats one
+    # cuSOLVER call on them -- brief-10 -- so the rest stays whole)
+    ridx = torch.nonzero(~taken, as_tuple=False).flatten()
     if ridx.numel() > 0:
-        a_rest = a.index_select(0, ridx).contiguous()
+        a_rest = af.index_select(0, ridx).contiguous()
         Lr, Qr = torch.linalg.eigh(a_rest)
         Q.index_copy_(0, ridx, Qr)
         L.index_copy_(0, ridx, Lr)
