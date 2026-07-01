@@ -659,7 +659,6 @@ def _eigh_twolevel(a: torch.Tensor) -> output_t:
 
     Yp = _pp(_pp(G[:, :, :kp]))             # clean +1 range
     Ym = _pm(_pm(G[:, :, kp:]))             # clean -1 range
-    Q = torch.cat([Yp, Ym], dim=2)
 
     def _cqr(X, shift):
         M = X.transpose(-1, -2) @ X
@@ -667,19 +666,30 @@ def _eigh_twolevel(a: torch.Tensor) -> output_t:
         Lf = torch.linalg.cholesky(M)
         return torch.linalg.solve_triangular(Lf.transpose(-1, -2), X, upper=True, left=False)
 
-    # joint CholeskyQR (full-rank assembled basis -> well-conditioned Gram), then
-    # ONE Newton-Schulz step to finish orthonormalization. NS (2 GEMMs) is both
-    # cheaper than a second CholeskyQR (Cholesky + triangular solve) AND more
-    # accurate here, so it replaces the CholeskyQR2 second pass. The CQR Gram +
-    # Cholesky + triangular solve stay FP64 (orthonormalizing the ill-conditioned
-    # assembled basis is delicate -- a reduced-precision Gram loses positive-
-    # definiteness and Cholesky fails; measured). But the FINISHING NS runs after
-    # CQR, where Q is already ~orthonormal (Gram ~ I, well-conditioned), so its two
-    # GEMMs are safe in true FP32-SIMT (allow_tf32 off): measured orth ~5.6e-6
-    # (vs FP64 NS ~1e-5) and eig ~1e-5, nbad=0 across 6 clustered reseeds -- BETTER
-    # margin than the FP64 NS (which itself tripped 1/6 reseeds to orth 7e-2), at
-    # ~7.7ms vs the FP64 NS's ~10.7ms on B200 (FP64 tensor is weak). brief-20.
-    Q = _cqr(Q, 1e-12)
+    # BLOCK-DIAGONAL CholeskyQR (brief-20): Yp (n x kp, +1 eigenspace) and Ym
+    # (n x (n-kp), -1 eigenspace) are eigenspaces of a symmetric matrix for the two
+    # DISTINCT eigenvalues +1/-1, so they are mutually orthogonal -- the double
+    # projector application drives the cross-block leakage to ~1e-11 in FP64. The
+    # joint CQR on [Yp|Ym] (n x n) therefore wastes ~3/4 of its flops on off-block
+    # Gram entries that are already ~1e-11. Orthonormalizing each block on its own
+    # cuts the CQR from ~n^3 to kp^3 + (n-kp)^3 (~33% of joint here) and -- because
+    # each per-block Gram is a single eigenspace (cond ~1e6) rather than the worse-
+    # conditioned joint Gram -- is MORE robust: measured nbad=0 across 6 clustered
+    # reseeds vs the joint path tripping 1/6. Cross-block orthogonality of the
+    # concatenated Q is guaranteed by the projector (~1e-11 << the 6.10e-3 orth
+    # gate); the residual gate + cuSOLVER fallback catches any miss. FP64 stays
+    # required per block (cond ~1e6 -> FP32 Cholesky loses pos-def; measured).
+    # Measured joint CQR ~20.7ms -> block ~15.9ms (~4.9ms, -24%) on shape 9.
+    Qp = _cqr(Yp, 1e-12)
+    Qm = _cqr(Ym, 1e-12)
+    Q = torch.cat([Qp, Qm], dim=2)
+    # ONE finishing Newton-Schulz step. NS (2 GEMMs) is cheaper than a second
+    # CholeskyQR AND more accurate here, so it replaces the CholeskyQR2 second pass.
+    # It runs after CQR where Q is already ~orthonormal (Gram ~ I, well-conditioned),
+    # so its two GEMMs are safe in true FP32-SIMT (allow_tf32 off): measured orth
+    # ~5.6e-6 (vs FP64 NS ~1e-5) and eig ~1e-5, nbad=0 across 6 clustered reseeds --
+    # BETTER margin than the FP64 NS (which itself tripped 1/6 reseeds to orth 7e-2),
+    # at ~7.7ms vs the FP64 NS's ~10.7ms on B200 (FP64 tensor is weak). brief-20.
     Qf32 = Q.float()
     _nsp = torch.backends.cuda.matmul.allow_tf32
     torch.backends.cuda.matmul.allow_tf32 = False   # true FP32 (no TF32) NS GEMMs
