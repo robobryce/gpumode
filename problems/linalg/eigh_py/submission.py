@@ -2683,6 +2683,113 @@ def _mixed_peel_count(pr: torch.Tensor) -> int:
     return int(((pr >= _MIXED_PEEL_PR_LO) & (pr < _MIXED_PEEL_PR_HI)).sum().item())
 
 
+# Whether the mixed-peel "rest"/unmatched subset is solved by ONE batched
+# cluster-megakernel eigh launch (brief 56) instead of the per-matrix cuSOLVER
+# syevd loop torch.linalg.eigh(a_rest) internally runs. The cluster kernel is a
+# true batched dense symmetric eigensolver for n in (448,836] (C-CTA thread-block
+# cluster; n=512 -> C=2), so the ~250 rest matrices collapse from thousands of
+# sub-5us syevd launches (brief-53 measured 7.75ms of launch-latency idle on
+# shape 6) into one launch. Residual-gated per matrix with a cuSOLVER fallback,
+# so a hard/ill-conditioned leftover the FP16-packed cluster reduction can't
+# resolve still falls back rather than returning wrong (identical correctness to
+# the per-matrix eigh it replaces).
+_MIXED_PEEL_REST_BATCHED = True
+# Newton-Schulz FP32-orthonormalization steps applied to the cluster kernel's raw
+# eigenvectors before the gate. The FP16-packed cluster reduction leaves the
+# eigenvectors slightly non-orthonormal (measured: repeated/degenerate spectra go
+# to orth~0.96, near-rank ~1e-2) -- 2 NS steps (each 2 TF32 GEMMs, ~0.5ms for the
+# ~250-matrix rest) drive orth to ~7e-6, the SAME recipe environment.md prescribes
+# (bulk work reduced-precision, Q through an FP32 orthonormalization). Without it
+# repeated/nearrank/rankdef ALL fall back to the per-matrix cuSOLVER syevd this
+# path exists to eliminate (~5ms per fallen-back matrix). NS is pure GEMM so it is
+# far cheaper than the CholeskyQR2 (Gram+Cholesky+trsm, ~11ms) that gives the same
+# orthogonality; measured NSx2 fallback 0 at 63.8ms vs cuSOLVER 74.8ms on shape 6.
+_REST_NS_STEPS = 2
+# Eigen-residual gate for the rest batch, as a multiple of n*eps*||A||_1. The
+# HARNESS eigen gate is 200*n*eps (reference.py _EIGEN_RTOL_FACTOR); the cluster+NS
+# result's worst rest matrix (a "band" leftover) sits at ~168*n*eps -- correct
+# under the harness bound but over the default 150 the fully-fp32 megakernel paths
+# use. Gate at 185 (< 200 harness, ~7.5% margin) so the correct band matrices are
+# NOT spuriously fallen back (which would cost ~5ms each on cuSOLVER and erase the
+# batched win) while anything genuinely failing (or non-finite) still falls back.
+_REST_EIGEN_GATE = 185.0
+_REST_ORTH_GATE = 75.0
+# Cluster size C for the rest-batch cluster kernel. _mega_clust_C picks the
+# SMALLEST C that fits SMEM (C=2 for n=512), but at n=512 the tridiagonalization
+# parallelizes better across MORE CTAs: measured cluster C=3 51.9ms vs C=2 60.4ms
+# vs C=4 65.5ms on the ~250-matrix rest. 0 = use _mega_clust_C's default.
+_REST_CLUST_C = 3
+
+
+def _eigh_rest_batched(a_rest: torch.Tensor) -> output_t:
+    """Batched dense eigh of the mixed-peel rest subset (a_rest: m x n x n, n in
+    the cluster range) via ONE cluster-megakernel launch + FP32 Newton-Schulz
+    orthonormalization + Rayleigh-quotient eigenvalues + per-matrix residual gate
+    + cuSOLVER fallback. Returns (Q, L) with L ascending and Q's columns the
+    matching eigenvectors -- gate-verified to the same harness bounds as
+    torch.linalg.eigh(a_rest), so correctness is identical. Sets a module-level
+    counter _LAST_REST_FALLBACK to the number of matrices that fell back."""
+    global _LAST_REST_FALLBACK
+    _LAST_REST_FALLBACK = -1
+    mod = _mega_get()
+    b, n, _ = a_rest.shape
+    af = a_rest.float().contiguous()
+    dev = af.device
+    C = _REST_CLUST_C if _REST_CLUST_C > 0 else _mega_clust_C(n)
+    # Guard C actually fits SMEM at this n (fall to the auto pick otherwise).
+    if C <= 0 or (n * (n + 1) // 2 + C - 1) // C > _SMEM_CAP_HALVES:
+        C = _mega_clust_C(n)
+    # Only the cluster window is a batched kernel; anything else stays cuSOLVER.
+    if (mod is None or not _MIXED_PEEL_REST_BATCHED or C <= 0
+            or not hasattr(mod, "mega_eigh_clust_split")
+            or not (_MEGA_CLUST_KMIN <= n <= _MEGA_CLUST_KMAX)):
+        Lr, Qr = torch.linalg.eigh(af)
+        return Qr.contiguous(), Lr.contiguous()
+    try:
+        _, Q = _lr_reduced_clust(af, C)   # (lam, G) UNSORTED, batched, one launch
+    except Exception:
+        Lr, Qr = torch.linalg.eigh(af)
+        return Qr.contiguous(), Lr.contiguous()
+    eye = torch.eye(n, device=dev, dtype=torch.float32)
+    eps = torch.finfo(torch.float32).eps
+    _gp = torch.backends.cuda.matmul.allow_tf32
+    # FP32 Newton-Schulz orthonormalization: Q <- Q (1.5 I - 0.5 QᵀQ), pure TF32
+    # GEMMs. The cluster kernel's columns are ~unit-norm so no pre-scaling needed.
+    torch.backends.cuda.matmul.allow_tf32 = True
+    for _ in range(_REST_NS_STEPS):
+        G = Q.transpose(-1, -2) @ Q
+        Q = Q @ (1.5 * eye - 0.5 * G)
+    # Eigenvalues by Rayleigh quotient L_i = q_iᵀ A q_i (diag(QᵀAQ)); AQ is reused
+    # by the eigen gate below (one GEMM, not two).
+    AQ = af @ Q
+    L = (Q * AQ).sum(dim=-2)
+    torch.backends.cuda.matmul.allow_tf32 = _gp
+    L, order = torch.sort(L, dim=-1)
+    Q = torch.gather(Q, 2, order.unsqueeze(1).expand(b, n, n)).contiguous()
+    AQ = torch.gather(AQ, 2, order.unsqueeze(1).expand(b, n, n))
+    # Per-matrix residual gate. orth GEMM true FP32 (TF32 accumulation error trips
+    # the orth bound spuriously); eigen residual reuses the sorted AQ. recon is
+    # redundant given eigr + orth (see _eigh_megakernel).
+    torch.backends.cuda.matmul.allow_tf32 = False
+    orth = torch.linalg.matrix_norm(Q.transpose(-1, -2) @ Q - eye, ord=1, dim=(-2, -1))
+    torch.backends.cuda.matmul.allow_tf32 = _gp
+    eigr = torch.linalg.matrix_norm(AQ - Q * L.unsqueeze(-2), ord=1, dim=(-2, -1))
+    a_l1 = torch.linalg.matrix_norm(af, ord=1, dim=(-2, -1)).clamp_min(1e-30)
+    bad = ((orth > _REST_ORTH_GATE * n * eps) | (eigr / a_l1 > _REST_EIGEN_GATE * n * eps))
+    bad = bad | ~torch.isfinite(L).all(dim=-1) | ~torch.isfinite(Q).all(dim=(-2, -1))
+    nbad = int(bad.sum().item())
+    _LAST_REST_FALLBACK = nbad
+    if nbad > 0:
+        idx = torch.nonzero(bad, as_tuple=False).flatten()
+        Lf, Qf = torch.linalg.eigh(af[idx])
+        Q[idx] = Qf
+        L[idx] = Lf
+    return Q.contiguous(), L.contiguous()
+
+
+_LAST_REST_FALLBACK = -1
+
+
 def _eigh_mixed_peel(a: torch.Tensor, pr: torch.Tensor) -> output_t:
     """Per-matrix structural router for the heterogeneous n=512 mixed batch:
     PEEL the dense-concentrated subset (PR in the tight dense window) to the
@@ -2743,13 +2850,19 @@ def _eigh_mixed_peel(a: torch.Tensor, pr: torch.Tensor) -> output_t:
             Q.index_copy_(0, cidx, Qc)
             L.index_copy_(0, cidx, Lc)
             taken |= is2
-    # 3) rest -> batched cuSOLVER (the structure-independent floor; the probe
-    # showed no Python-level partition of the remaining classes beats one
-    # cuSOLVER call on them -- brief-10 -- so the rest stays whole)
+    # 3) rest -> ONE batched cluster-megakernel eigh launch (brief 56) instead of
+    # torch.linalg.eigh(a_rest)'s per-matrix cuSOLVER syevd loop. The rest is the
+    # heterogeneous leftover (spectrum/rankdef/nearrank/repeated/band/rowscale,
+    # ~250 matrices at n=512) that no fast path caught; brief-53 measured its
+    # per-matrix syevd loop as ~7.75ms of sub-5us launch-latency idle on shape 6.
+    # n=512 is in the cluster window (449,836] so the whole rest batch resolves in
+    # one C=2 cluster kernel launch. Per-matrix residual-gated with a cuSOLVER
+    # fallback (a hard leftover the FP16 cluster reduction can't resolve still
+    # falls back), so correctness is identical to the per-matrix eigh it replaces.
     ridx = torch.nonzero(~taken, as_tuple=False).flatten()
     if ridx.numel() > 0:
         a_rest = af.index_select(0, ridx).contiguous()
-        Lr, Qr = torch.linalg.eigh(a_rest)
+        Qr, Lr = _eigh_rest_batched(a_rest)
         Q.index_copy_(0, ridx, Qr)
         L.index_copy_(0, ridx, Lr)
     return Q.contiguous(), L.contiguous()
