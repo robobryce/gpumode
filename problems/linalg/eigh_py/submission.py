@@ -1344,18 +1344,17 @@ def _lowrank_eigh(a, k, power=1):
             R = R - torch.bmm(Qd, torch.bmm(Qd.transpose(-1, -2), R))
             # The complement basis Vc spans the ORTHOGONAL complement of the
             # (already-projected-out) dominant subspace, built from a random
-            # matrix -> WELL-conditioned, so its CQR Gram tolerates plain TF32
-            # (~9x off the FP32-SIMT path). The projections (R - Qd Qd^T R) stay
-            # FP32 (allow_tf32=False here) -- TF32 there leaves TF32-level Qd
-            # leakage, breaking cross-block orthogonality of V=[Vd,Vc] (orth ~0.5,
-            # probed). Structure: CQR2(2-pass) -> RE-PROJECT (essential: CQR
-            # re-introduces Qd leakage; dropping the re-project gives orth ~8) ->
-            # a final 1-PASS CQR cleanup (the re-projected Vc is already nearly
-            # orthonormal, so one pass suffices -- probed 0 fallback on shapes
-            # 4/12, saving one Gram+Cholesky+trsm on the nc-column block).
+            # matrix -> WELL-conditioned, so its CQR2 Gram tolerates plain TF32
+            # (~9x off the FP32-SIMT path) at orth <=5.6e-3 (0-1 fallback across
+            # the low-rank shapes). The projections (R - Qd Qd^T R) stay FP32
+            # (allow_tf32=False here) -- TF32 there leaves TF32-level Qd leakage,
+            # breaking cross-block orthogonality of V=[Vd,Vc] (orth ~0.5, probed).
+            # Both complement CQR passes stay 2-pass: making the final one 1-pass
+            # raised live fallbacks on rankdef512 (shape8) + lapgeom1024 (shape12)
+            # -> net loss (brief-16 t5).
             Vc = _lr_cholesky_qr2(R, shift=1e-4, gram_mode="tf32")
             Vc = Vc - torch.bmm(Qd, torch.bmm(Qd.transpose(-1, -2), Vc))
-            Vc = _lr_cholesky_qr2(Vc, shift=1e-5, passes=1, gram_mode="tf32")
+            Vc = _lr_cholesky_qr2(Vc, shift=1e-5, gram_mode="tf32")
             torch.backends.cuda.matmul.allow_tf32 = _prev
             AVc = torch.bmm(a, Vc)
             lam_c = (AVc * Vc).sum(dim=-2)
