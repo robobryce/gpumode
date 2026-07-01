@@ -2844,6 +2844,13 @@ _SIGN_DC_REC_NS_ITERS = 30  # NS sign iters for the split. A semicircle (GOE) sp
                           # at all. 16 keeps a ~25x orth margin (reseed-safe) near the
                           # knee (12->16 costs ~2ms for a much safer margin).
 _SIGN_DC_REC_POWER_ITERS = 6   # A^2 power iters for the shifted-block spectral-norm scale
+# brief-55: finishing NS orthonormalization step count for the LARGE-n path (shape 5),
+# separate from _SIGN_DC_FINAL_NS (the n=512 shape-11 path). None -> use the shared
+# constant. The C-CTA cluster base leaves the assembled Q at orth ~0.65 (full-rank,
+# smin 0.715, MEASURED); it is inside the NS convergence radius but needs several
+# quadratically-converging steps to reach the gate (1 step suffices only for the
+# cuSOLVER base's ~1e-3 start). No effect on shape 11 (its own _SIGN_DC_FINAL_NS).
+_SIGN_DC_LARGE_FINAL_NS = 6
 _SIGN_DC_LARGE_N = {2048}   # dense-class n routed to the recursive path (shape 5).
                             # n=1024 is handled by the mixed-peel/single-level probes;
                             # the recursive path is guarded to these n only so shape 11
@@ -3356,12 +3363,23 @@ def _sign_dc_solve_large(af, n, dev):
     else:
         lam, G = _sign_dc_block_eigh(af, dev)  # (b, n), (b, n, n) -- all n eigenpairs (depth-1)
     Q = G
-    # finishing Newton-Schulz orthonormalization (cleans the TF32-sign bases' orth to
-    # ~1e-4), Gram + Q@Gram in 3xTF32 (~FP32 accuracy at ~1.6x FP32-SIMT).
+    # finishing Newton-Schulz orthonormalization (cleans the sign bases' orth), Gram +
+    # Q@Gram in 3xTF32 (~FP32 accuracy at ~1.6x FP32-SIMT).
+    # brief-55: with the C-CTA cluster base (K~1117), the assembled Q can start at orth
+    # ~0.65 (vs ~1e-3 with a cuSOLVER base) because the cluster's twisted-factorization
+    # gives the dense near-degenerate sub-spectrum only ~1e-2-orthonormal eigenvectors,
+    # so near-sigma +/- candidates land at ~45deg. MEASURED (SIGNDC_RANK_DBG): the
+    # assembled Q is FULL RANK there -- smallest singular value 0.715, NOT ~0 -- so it
+    # is NOT missing an eigenvector or carrying an exact duplicate; it is merely non-
+    # orthonormal, and orth 0.65 < 1 is inside the NS convergence radius. One NS step
+    # (the cuSOLVER-base default) is not enough (NS is quadratic: 0.65 -> ~0.2 -> ...),
+    # so the large-n finish takes more steps to drive orth below the gate. Cheap: each
+    # step is 2 n x n GEMMs on b=8.
     _gp = torch.backends.cuda.matmul.allow_tf32
-    if _SIGN_DC_FINAL_NS > 0:
+    _nfin = _SIGN_DC_LARGE_FINAL_NS if _SIGN_DC_LARGE_FINAL_NS is not None else _SIGN_DC_FINAL_NS
+    if _nfin > 0:
         torch.backends.cuda.matmul.allow_tf32 = True
-        for _ in range(_SIGN_DC_FINAL_NS):
+        for _ in range(_nfin):
             g = _gram_3xtf32_sym(Q)
             Q = 1.5 * Q - 0.5 * _matmul_3xtf32(Q, g)
         torch.backends.cuda.matmul.allow_tf32 = _gp
