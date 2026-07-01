@@ -2581,9 +2581,13 @@ def _eigh_mixed_peel(a: torch.Tensor, pr: torch.Tensor) -> output_t:
 # ---------------------------------------------------------------------------
 _SIGN_DC_N = 512          # routed only at n=512 (the shape-11 dense-even class)
 _SIGN_DC_K = 300          # oversized subspace width (>= max +count/-count over the
-                          # batch; +count ~ n/2 +- ~24 for a random-sign even spectrum,
-                          # so 300 covers it with margin and both K-blocks fit the
-                          # medium megakernel's n<=448 range)
+                          # batch; +count ~ n/2 +- ~38 for a random-sign even spectrum,
+                          # shape-11 seed max kp/km 294/293). K=300 gives 0 gate-fallback
+                          # with headroom for a reseed that shifts +count higher, and
+                          # measured EQUAL to K=288/294 at the benchmark level (the block
+                          # eigh is the wall; K in [288,300] all land ~110ms), so the
+                          # extra margin is free. Both K-blocks fit the megakernel's
+                          # n<=448 range. Matrices with +count>K fall to cuSOLVER.
 _SIGN_DC_NS_ITERS = 20    # Newton-Schulz sign iterations (each = 2 batched GEMMs).
                           # The near-zero eigenvalues plateau |X| below 1 (they need
                           # ~22 quadratic steps to fully resolve), but the projector
