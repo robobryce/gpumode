@@ -2642,7 +2642,6 @@ def _sign_dc_solve(af, n, dev):
     owns the per-matrix residual gate + cuSOLVER fallback."""
     b = af.shape[0]
     K = _SIGN_DC_K
-    eye_n = torch.eye(n, device=dev, dtype=torch.float32).expand(b, n, n)
     _gp = torch.backends.cuda.matmul.allow_tf32
     torch.backends.cuda.matmul.allow_tf32 = True
     # spectral-norm scale via A^2 power iteration (sign-robust for indefinite A)
@@ -2653,16 +2652,25 @@ def _sign_dc_solve(af, n, dev):
         v = v / v.norm(dim=1, keepdim=True).clamp_min(1e-30)
     nrm2 = (v.transpose(-1, -2) @ (af @ (af @ v))).abs().reshape(b, 1, 1).clamp_min(1e-30)
     scale = nrm2.sqrt() * 1.02
-    # Newton-Schulz sign iteration X <- 1.5 X - 0.5 X^3
+    # Newton-Schulz sign iteration X <- 1.5 X - 0.5 X^3, the scale+subtract FUSED into
+    # the second GEMM via baddbmm (beta*X + alpha*(X@X2)) -- one kernel instead of a
+    # GEMM plus two elementwise passes over the b*n*n tensor per iter.
     X = af / scale
     for _ in range(_SIGN_DC_NS_ITERS):
-        X = 1.5 * X - 0.5 * (X @ (X @ X))
-    Pp = 0.5 * (eye_n + X)
-    Pm = 0.5 * (eye_n - X)
+        X2 = torch.bmm(X, X)
+        X = torch.baddbmm(X, X, X2, beta=1.5, alpha=-0.5)
+    # Spectral projectors are NOT materialized: P+ @ M = 0.5*(M + X@M) and
+    # P- @ M = 0.5*(M - X@M), so the subspace probes and the membership test apply
+    # the sign directly to their (thin) operands -- no full n*n P+/P- tensors.
+    def _pp(M):
+        return torch.baddbmm(M, X, M, beta=0.5, alpha=0.5)
+
+    def _pm(M):
+        return torch.baddbmm(M, X, M, beta=0.5, alpha=-0.5)
     # oversized invariant-subspace bases (batched CholeskyQR, NOT cuSOLVER QR)
     Om, Om2 = _sign_dc_omega(b, n, K, dev)
-    Up = _sign_dc_cqr(torch.bmm(Pp, Om))
-    Um = _sign_dc_cqr(torch.bmm(Pm, Om2))
+    Up = _sign_dc_cqr(_pp(Om))
+    Um = _sign_dc_cqr(_pm(Om2))
     torch.backends.cuda.matmul.allow_tf32 = _gp
     # reduced K x K blocks -> fused tensor-core megakernel (raw, unsorted, ungated)
     with _LR_TF32():
@@ -2680,8 +2688,8 @@ def _sign_dc_solve(af, n, dev):
     Vp = torch.bmm(Up, gp)                     # n x K candidate + eigenvectors
     Vm = torch.bmm(Um, gm)                     # n x K candidate - eigenvectors
     # projector membership: ~1 for a real eigenvector of that block, ~0 for padding
-    selp = torch.bmm(Pp, Vp).norm(dim=1)       # (b, K)
-    selm = torch.bmm(Pm, Vm).norm(dim=1)       # (b, K)
+    selp = _pp(Vp).norm(dim=1)                 # (b, K)
+    selm = _pm(Vm).norm(dim=1)                 # (b, K)
     torch.backends.cuda.matmul.allow_tf32 = _gp
     Vall = torch.cat([Vp, Vm], dim=-1)         # n x 2K
     Lall = torch.cat([lp, lm], dim=-1)         # 2K
@@ -2689,22 +2697,29 @@ def _sign_dc_solve(af, n, dev):
     topi = mem.topk(n, dim=-1).indices         # the n true eigenpairs
     Q = torch.gather(Vall, 2, topi.unsqueeze(1).expand(b, n, n))
     L = torch.gather(Lall, 1, topi)
-    # finishing FP32 Newton-Schulz orthonormalization (cleans TF32-sign orth to ~1e-4)
+    # finishing Newton-Schulz orthonormalization (cleans the TF32-sign bases' ~1e-2
+    # orth to ~1e-4). The Gram + Q@Gram GEMMs run in 3xTF32 (Ozaki hi+lo split, ~FP32
+    # accuracy at ~1.6x the FP32-SIMT rate) instead of true FP32-SIMT -- the two n*n
+    # simt_sgemm terms were ~10% of the shape.
     if _SIGN_DC_FINAL_NS > 0:
         _p2 = torch.backends.cuda.matmul.allow_tf32
-        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cuda.matmul.allow_tf32 = True
         for _ in range(_SIGN_DC_FINAL_NS):
-            g = torch.bmm(Q.transpose(-1, -2), Q)
-            Q = 1.5 * Q - 0.5 * torch.bmm(Q, g)
+            g = _gram_3xtf32(Q)
+            Q = 1.5 * Q - 0.5 * _matmul_3xtf32(Q, g)
         torch.backends.cuda.matmul.allow_tf32 = _p2
     # Rayleigh-quotient re-eval of L on the orthonormalized Q (eigenvalues are the
     # diagonal of Q^T A Q; feeds the gate + output). A@Q on TF32 (gate-precision).
+    # AQ is gathered by the SAME sort order as Q so the caller's eigen-residual gate
+    # can reuse it column-aligned (no second A@Q GEMM).
     torch.backends.cuda.matmul.allow_tf32 = True
     AQ = af @ Q
     torch.backends.cuda.matmul.allow_tf32 = _gp
     L = (Q * AQ).sum(dim=1)
     L, order = torch.sort(L, dim=-1)
-    Q = torch.gather(Q, 2, order.unsqueeze(1).expand(b, n, n))
+    oexp = order.unsqueeze(1).expand(b, n, n)
+    Q = torch.gather(Q, 2, oexp)
+    AQ = torch.gather(AQ, 2, oexp)
     return Q, L, AQ, order
 
 
@@ -2717,23 +2732,24 @@ def _eigh_sign_dc(a: torch.Tensor) -> output_t:
     dev = a.device
     af = a.float().contiguous()
     try:
-        Q, L, _AQ, _order = _sign_dc_solve(af, n, dev)
+        Q, L, AQ, _order = _sign_dc_solve(af, n, dev)
     except Exception:
         Lc, Qc = torch.linalg.eigh(af)
         return Qc.contiguous(), Lc.contiguous()
-    # per-matrix residual gate (harness-level). Orthogonality GEMM stays true FP32
-    # (TF32 accumulates over n column dot-products above the orth bound); the eigen
-    # gate A@Q recompute runs on TF32 tensor cores (gate-only, error far below the
-    # eigen bound). Same gate structure as the low-rank / two-level paths.
+    # per-matrix residual gate (harness-level). The ORTHOGONALITY Gram Q^T Q runs in
+    # 3xTF32 (Ozaki hi+lo split -- ~FP32 accuracy at ~1.6x the FP32-SIMT rate; plain
+    # single-pass TF32 accumulates over n column dot-products above the orth bound and
+    # is unsafe, as the low-rank gate measured). The eigen residual REUSES the A@Q the
+    # solver already computed for the Rayleigh L (== AQ, sorted by the same order), so
+    # the gate adds no extra n*n GEMM. Same gate thresholds as the low-rank/two-level
+    # paths; any miss falls that matrix back to cuSOLVER.
     eps = torch.finfo(torch.float32).eps
     eye = torch.eye(n, device=dev, dtype=torch.float32)
     _gp = torch.backends.cuda.matmul.allow_tf32
-    torch.backends.cuda.matmul.allow_tf32 = False
-    orth = torch.linalg.matrix_norm(Q.transpose(-1, -2) @ Q - eye, ord=1, dim=(-2, -1))
     torch.backends.cuda.matmul.allow_tf32 = True
-    aq = af @ Q
+    orth = torch.linalg.matrix_norm(_gram_3xtf32(Q) - eye, ord=1, dim=(-2, -1))
     torch.backends.cuda.matmul.allow_tf32 = _gp
-    eigr = torch.linalg.matrix_norm(aq - Q * L.unsqueeze(-2), ord=1, dim=(-2, -1))
+    eigr = torch.linalg.matrix_norm(AQ - Q * L.unsqueeze(-2), ord=1, dim=(-2, -1))
     a_l1 = torch.linalg.matrix_norm(af, ord=1, dim=(-2, -1)).clamp_min(1e-30)
     bad = ((orth > 75.0 * n * eps) | (eigr / a_l1 > 150.0 * n * eps)
            | ~torch.isfinite(L).all(dim=-1) | ~torch.isfinite(Q).all(dim=(-2, -1)))
