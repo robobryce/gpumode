@@ -1229,8 +1229,30 @@ def _eigh_lowrank_safe(a, k, power=1):
 
 
 # (n) -> dominant rank for the low-rank path; tuned so the lumped tail clears
-# the gate with zero fallback on lapack_geom (k=384 at n=1024).
-_LOWRANK_K = {1024: 384}
+# the gate with zero fallback (k=384 lapack_geom @n=1024, k=352 dense-cond2 @n=512).
+#
+# WORKER BRIEF 7 ADDITION (n=512): the DENSE cond2 benchmark shape (shape 4, the
+# highest-weight shape, batch=640) has a sharply CONCENTRATED spectrum -- its
+# participation ratio PR = ||A||_F^4/||A^2||_F^2 measures ~55 (effective rank
+# ~24/512), well below the _LOWRANK_PR_MAX=85 concentration threshold, and the
+# batch is homogeneous (PR in [51,59], frac<85 == 1.00). So the SAME randomized
+# dominant-subspace eigensolver that already wins lapack_geom @n=1024 also wins
+# here: k=352 dominant eigenpairs by batched-GEMM subspace iteration + a
+# lumped-tail Rayleigh quotient beats cuSOLVER's serial per-matrix syevd
+# (measured idle: 136us vs 171us, ~1.26x, 0.0% per-matrix fallback, gate eig
+# 7.0e-3 << the 1.22e-2 bound). k was swept {128..448}: k<=320 leaves the cond2
+# tail (eigenvalues down to ~1e-2 of ||A||) too large -> the per-matrix residual
+# gate falls EVERY matrix back to cuSOLVER (a net loss); k=352 is the smallest
+# that clears the tail with 0 fallback AND is faster than syevd; k>=416 clears
+# the tail but the larger reduced eigh erases the speedup.
+#
+# SAFETY (no regression to any won shape): the low-rank branch runs BEFORE the
+# two-level branch, but every OTHER n=512 benchmark shape misses the detector so
+# stays on its current (faster) path: clustered512 PR=512 (A^2~I -> full-rank
+# probe; keeps its 2-level win), rankdef512 PR=163, lapack_dense_even512 PR=284,
+# and mixed512 fires only frac 0.72 < the 0.85 batch-fraction gate (its
+# heterogeneous full-rank members would fall back). Verified by direct PR probe.
+_LOWRANK_K = {1024: 384, 512: 352}
 _LOWRANK_PR_MAX = 85.0        # participation_ratio threshold (below => concentrated)
 _LOWRANK_FRAC_MIN = 0.85      # only route if >= this fraction of the batch is concentrated
 
