@@ -682,15 +682,27 @@ def _eigh_twolevel(a: torch.Tensor) -> output_t:
     # Measured joint CQR ~20.7ms -> block ~15.9ms (~4.9ms, -24%) on shape 9.
     Qp = _cqr(Yp, 1e-12)
     Qm = _cqr(Ym, 1e-12)
-    Q = torch.cat([Qp, Qm], dim=2)
-    # The block-diagonal CQR already leaves each block orthonormal to ~1e-6 (single-
-    # eigenspace Gram, cond ~1e6) and the two blocks mutually orthogonal to ~1e-11
-    # (projector), so the assembled Q is orthonormal enough to clear the orth gate
-    # WITHOUT a finishing Newton-Schulz pass: measured orth <= 0.265*gate (max over
-    # 6 clustered reseeds, nbad=0) -- vs the joint CQR, which needed the NS (skip-NS
-    # tripped the joint path on the benchmark seed). Dropping the NS removes its two
-    # ~n^3 FP32-SIMT GEMMs (~6.9ms on shape 9). The per-matrix residual gate +
-    # cuSOLVER fallback below still catches any matrix that misses. brief-20.
+    # ONE finishing Newton-Schulz step per block. NS (2 GEMMs) is cheaper than a
+    # second CholeskyQR AND more accurate here, so it replaces the CholeskyQR2
+    # second pass. It runs after CQR where each block is already ~orthonormal (its
+    # Gram ~ I), so the two GEMMs are safe in true FP32-SIMT (allow_tf32 off). Done
+    # PER-BLOCK (on the kp- and (n-kp)-column blocks separately) rather than on the
+    # joint n x n Q: the two blocks are mutually orthogonal to ~1e-11 (projector), so
+    # the joint NS Gram's off-block entries are already ~0 and computing them is
+    # wasted -- block NS costs kp^3 + (n-kp)^3 vs the joint n^3. Measured: joint NS
+    # ~7.8ms -> block NS ~5.3ms (concat included), AND better orth margin (max
+    # 0.037*gate over 6 clustered reseeds vs the joint NS's 0.12, nbad=0 for both).
+    # The per-matrix residual gate + cuSOLVER fallback below catches any miss.
+    def _ns_block(Qb):
+        Qf = Qb.float()
+        eyek = torch.eye(Qf.shape[-1], device=dev, dtype=torch.float32)
+        gram = Qf.transpose(-1, -2) @ Qf
+        return Qf @ (1.5 * eyek - 0.5 * gram)
+
+    _nsp = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = False   # true FP32 (no TF32) NS GEMMs
+    Q = torch.cat([_ns_block(Qp), _ns_block(Qm)], dim=2)
+    torch.backends.cuda.matmul.allow_tf32 = _nsp
     # Eigenvalues are exactly +-1 for a 2-level spectrum, and the assembled basis
     # keeps the +1 range in columns [0, kp) and the -1 range in [kp, n). So assign
     # L by block instead of a Rayleigh quotient -- this skips a full A@Q GEMM (~6ms
