@@ -683,20 +683,14 @@ def _eigh_twolevel(a: torch.Tensor) -> output_t:
     Qp = _cqr(Yp, 1e-12)
     Qm = _cqr(Ym, 1e-12)
     Q = torch.cat([Qp, Qm], dim=2)
-    # ONE finishing Newton-Schulz step. NS (2 GEMMs) is cheaper than a second
-    # CholeskyQR AND more accurate here, so it replaces the CholeskyQR2 second pass.
-    # It runs after CQR where Q is already ~orthonormal (Gram ~ I, well-conditioned),
-    # so its two GEMMs are safe in true FP32-SIMT (allow_tf32 off): measured orth
-    # ~5.6e-6 (vs FP64 NS ~1e-5) and eig ~1e-5, nbad=0 across 6 clustered reseeds --
-    # BETTER margin than the FP64 NS (which itself tripped 1/6 reseeds to orth 7e-2),
-    # at ~7.7ms vs the FP64 NS's ~10.7ms on B200 (FP64 tensor is weak). brief-20.
-    Qf32 = Q.float()
-    _nsp = torch.backends.cuda.matmul.allow_tf32
-    torch.backends.cuda.matmul.allow_tf32 = False   # true FP32 (no TF32) NS GEMMs
-    eye32 = torch.eye(n, device=dev, dtype=torch.float32)
-    gram = Qf32.transpose(-1, -2) @ Qf32
-    Q = Qf32 @ (1.5 * eye32 - 0.5 * gram)
-    torch.backends.cuda.matmul.allow_tf32 = _nsp
+    # The block-diagonal CQR already leaves each block orthonormal to ~1e-6 (single-
+    # eigenspace Gram, cond ~1e6) and the two blocks mutually orthogonal to ~1e-11
+    # (projector), so the assembled Q is orthonormal enough to clear the orth gate
+    # WITHOUT a finishing Newton-Schulz pass: measured orth <= 0.265*gate (max over
+    # 6 clustered reseeds, nbad=0) -- vs the joint CQR, which needed the NS (skip-NS
+    # tripped the joint path on the benchmark seed). Dropping the NS removes its two
+    # ~n^3 FP32-SIMT GEMMs (~6.9ms on shape 9). The per-matrix residual gate +
+    # cuSOLVER fallback below still catches any matrix that misses. brief-20.
     # Eigenvalues are exactly +-1 for a 2-level spectrum, and the assembled basis
     # keeps the +1 range in columns [0, kp) and the -1 range in [kp, n). So assign
     # L by block instead of a Rayleigh quotient -- this skips a full A@Q GEMM (~6ms
