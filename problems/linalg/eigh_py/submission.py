@@ -2741,12 +2741,14 @@ _SIGN_DC_REC_MARGIN = 0.10  # oversample margin (fraction of m) added to ceil(m/
                           # exceeds K (the true per-side count is variable; oversampling
                           # + membership rank-select makes the fixed-K launch exact).
                           # K = ceil(m/2) + ceil(margin*m); n=2048 -> K=1229.
-_SIGN_DC_REC_NS_ITERS = 45  # NS sign iters for the split. A semicircle (GOE) spectrum
-                          # has its HIGHEST eigenvalue density at the median shift sigma,
-                          # so the near-sigma eigenvalues (relative gap ~1/m) need many
-                          # NS steps to reach a clean +-1 sign (a fuzzy sign there makes
-                          # P+/P- overlap -> non-orthonormal selected Q). 45 gives
-                          # orth ~1.2e-4 on shape5 (gate 1.8e-2), 0 fallback.
+_SIGN_DC_REC_NS_ITERS = 16  # NS sign iters for the split. A semicircle (GOE) spectrum
+                          # has its highest eigenvalue density at the median shift sigma,
+                          # so near-sigma eigenvalues get a fuzzy sign -> some P+/P-
+                          # overlap; the finishing FP32 NS + membership + gate absorb it.
+                          # Swept 45/28/22/16/12 -> orth_max 1.2e-4/3.9e-4/4.6e-4/7.4e-4/
+                          # 1.2e-3 (gate 1.8e-2), shape5 136/128/125/123/122ms, 0 fallback
+                          # at all. 16 keeps a ~25x orth margin (reseed-safe) near the
+                          # knee (12->16 costs ~2ms for a much safer margin).
 _SIGN_DC_REC_POWER_ITERS = 12  # A^2 power iters for the shifted-block spectral-norm scale
 _SIGN_DC_LARGE_N = {2048}   # dense-class n routed to the recursive path (shape 5).
                             # n=1024 is handled by the mixed-peel/single-level probes;
@@ -2757,6 +2759,7 @@ _SIGN_DC_LARGE_PR_LO = 150.0   # participation-ratio floor for the large-n dense
                                # are below and route earlier).
 _sign_dc_rec_omega_cache: dict = {}   # (b,m,K,dev) -> fixed random projection blocks
 _sign_dc_eye_cache: dict = {}         # (m,dev) -> identity for the shift
+_SIGN_DC_LARGE_DBG = False            # set True to print orth/eigr/fallback diagnostics
 
 
 def _sign_dc_omega(b, n, K, dev):
@@ -3047,6 +3050,13 @@ def _eigh_sign_dc_large(a: torch.Tensor) -> output_t:
     a_l1 = torch.linalg.matrix_norm(af, ord=1, dim=(-2, -1)).clamp_min(1e-30)
     bad = ((orth > 75.0 * n * eps) | (eigr / a_l1 > 150.0 * n * eps)
            | ~torch.isfinite(L).all(dim=-1) | ~torch.isfinite(Q).all(dim=(-2, -1)))
+    if _SIGN_DC_LARGE_DBG:
+        import sys as _sys
+        _sys.stderr.write(
+            f"[SIGNDC_LARGE_DBG] n={n} b={b} orth_gate={75.0*n*eps:.4g} orth_max={orth.max().item():.4g} "
+            f"eigr_gate={150.0*n*eps:.4g} eigr_rel_max={(eigr/a_l1).max().item():.4g} "
+            f"nbad={int(bad.sum().item())}/{b}\n")
+        _sys.stderr.flush()
     if bool(bad.any()):
         idx = torch.nonzero(bad, as_tuple=False).flatten()
         Lf, Qf = torch.linalg.eigh(af[idx])
