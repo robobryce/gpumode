@@ -2770,7 +2770,7 @@ _SIGN_DC_LARGE_DBG = False            # set True to print orth/eigr/fallback dia
 # shifts), each piece to the cluster/mega base. 1 = binary depth-1 (2 blocks -> cuSOLVER
 # at >836); 3 = 3-way (~683-wide pieces -> cluster base, no reduced-block recursion so
 # no junk propagation). nways trades more sign functions for a smaller/faster base solve.
-_SIGN_DC_NWAYS = 3
+_SIGN_DC_NWAYS = 1
 _SIGN_DC_MW_MARGIN = 0.06   # oversample margin for the N-way piece width K =
                             # ceil(m/nways) + ceil(margin*m). Ritz shifts are less
                             # balanced than the binary median, so a bit more margin.
