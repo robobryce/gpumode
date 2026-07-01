@@ -1197,7 +1197,10 @@ def _mega_med_split_T(B, n, nb, dev):
 # for the 350-reflector product -> trips the orth gate -> mass cuSOLVER
 # fallback, trial 1), "fp32" (true FP32 simt_sgemm, no tensor cores on B200),
 # "tf32x3" (Ozaki 3-pass on tensor cores, ~6e-6 rel == ~FP32 accuracy).
-_MEGA_MED_SPLIT_PREC = "tf32x3"  # brief-54 probe: back-transform WY GEMMs -> 3xTF32
+_MEGA_MED_SPLIT_PREC = "fp32"
+# brief-54 t13: 3xTF32 (tf32x3) here REGRESSES all megakernel/cluster shapes +6..20%
+# -- the back-transform is a PANEL LOOP (3 GEMMs x npan), so 3xTF32 triples MANY
+# GEMMs; the tiling-win is only for single one-shot large-nc GEMMs. Keep fp32.
 # back-transform mode: "panel" (per-panel WY, 3*npan GEMMs) or "fullT" (assemble
 # the full compact-WY T from the per-panel block-Ts via a left-looking recursive
 # combine, then 3 big n x n GEMMs -- so tf32x3's Ozaki overhead amortizes over
@@ -2197,6 +2200,15 @@ def _lr_cholesky_qr2(Y, passes=2, shift=1e-5, tf32_gram=False, gram_mode=None):
     return Q
 
 
+# brief-54: precision of the participation-ratio probe's A@A GEMM. This GEMM is
+# a big n*n @ n*n square (2048^3 FP32-SIMT at n=2048, shape 5 -- the simt_sgemm nnn
+# 128x128x16 in that profile). It feeds ONLY the routing decision (PR vs band edges
+# + the sign-DC PR floor), NOT the returned factors or the residual gate, so it is
+# ROUTING-SAFE: 3xTF32 (~6e-6) leaves PR bit-stable so routing is unchanged, while
+# moving the square GEMM onto TF32 tensor cores. "fp32"|"tf32"|"3xtf32".
+_LR_PR_PROBE_MODE = "3xtf32"
+
+
 @torch.no_grad()
 def _lr_participation_ratio(a):
     """Cheap concentration / effective-rank probe (W2's handoff, the routing
@@ -2204,10 +2216,14 @@ def _lr_participation_ratio(a):
     (sum lambda^2)^2 / sum lambda^4. Low <=> energy in few eigenvalues
     (low-rank-winnable). One A@A GEMM + two Frobenius reductions, ~0.5ms.
     Measured at n=1024: geometric spectrum ~67 (stable across seeds), flat/dense
-    ~110, near-rank ~326 -- a clean separation at threshold ~85."""
+    ~110, near-rank ~326 -- a clean separation at threshold ~85.
+
+    brief-54: the A@A GEMM runs at _LR_PR_PROBE_MODE (3xTF32 tensor cores by
+    default -- routing-safe, feeds no returned factor); at n=2048 this is the big
+    2048^3 square GEMM that was FP32-SIMT."""
     af = a.float()
     fro2 = (af * af).sum((-1, -2))
-    a2 = torch.bmm(af, af)
+    a2 = _lr_lift_gemm(af, af, _LR_PR_PROBE_MODE)
     a2f2 = (a2 * a2).sum((-1, -2)).clamp_min(1e-30)
     return (fro2 * fro2) / a2f2
 
