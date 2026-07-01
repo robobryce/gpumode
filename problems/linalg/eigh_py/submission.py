@@ -1197,7 +1197,7 @@ def _mega_med_split_T(B, n, nb, dev):
 # for the 350-reflector product -> trips the orth gate -> mass cuSOLVER
 # fallback, trial 1), "fp32" (true FP32 simt_sgemm, no tensor cores on B200),
 # "tf32x3" (Ozaki 3-pass on tensor cores, ~6e-6 rel == ~FP32 accuracy).
-_MEGA_MED_SPLIT_PREC = "fp32"
+_MEGA_MED_SPLIT_PREC = "tf32x3"  # brief-54 probe: back-transform WY GEMMs -> 3xTF32
 # back-transform mode: "panel" (per-panel WY, 3*npan GEMMs) or "fullT" (assemble
 # the full compact-WY T from the per-panel block-Ts via a left-looking recursive
 # combine, then 3 big n x n GEMMs -- so tf32x3's Ozaki overhead amortizes over
