@@ -2055,6 +2055,14 @@ _LR_VD_LIFT_MODE = "fp32"    # Vd = Qd @ G lift GEMM precision
 # runs ~8-10x faster on the TF32 tensor cores and stays inside the orth/eigen gates
 # (plain TF32 at ~3e-4 does NOT -> mass fallback). "fp32" | "tf32" | "3xtf32".
 _LR_AV_MODE = "tf32"         # A@X (range-finder / power / Rayleigh) matvec precision
+# brief-54: the Qd-projection GEMMs R <- R - Qd(Qd^T R) (building the complement
+# basis Vc orthogonal to the dominant subspace, run TWICE) are the FP32-SIMT
+# simt_sgemm GEMMs that PERSIST in the shape-8/10 profile after the A@X matvecs
+# went to TF32 (~9-10% of shape 10). They involve the ILL-conditioned Qd
+# (kappa 1e3-1e4), so plain TF32's ~3e-4 leakage x kappa breaks V=[Vd,Vc]
+# cross-block orth -> fallback (parent measured this UNSAFE). 3xTF32 (~6e-6) is
+# safe. "fp32" | "tf32" | "3xtf32".
+_LR_PROJ_MODE = "3xtf32"     # Qd-projection (complement build) GEMM precision
 
 
 def _lr_dom_gram_mode_for(n: int, k: int):
@@ -2094,6 +2102,21 @@ def _lr_av_mode_for(n: int, k: int):
     if n >= 1024 and k >= 768:
         return "3xtf32"
     return "tf32"
+
+
+def _lr_proj_mode_for(n: int, k: int):
+    """Per-shape precision for the Qd-projection GEMMs R <- R - Qd(Qd^T R). 3xTF32
+    puts them on tensor cores at ~6e-6 (safe for the ill-conditioned Qd, unlike
+    plain TF32); measured per-shape whether the tensor-core gain beats the Ozaki
+    3-pass overhead at each (n, k)."""
+    return _LR_PROJ_MODE
+
+
+def _lr_project_out(Qd, X, mode):
+    """X - Qd @ (Qd^T @ X), the projection onto the orthogonal complement of the
+    dominant subspace span(Qd), with both GEMMs at `mode` precision."""
+    QtX = _lr_lift_gemm(Qd.transpose(-1, -2), X, mode)
+    return X - _lr_lift_gemm(Qd, QtX, mode)
 
 
 def _lr_cholesky_qr2(Y, passes=2, shift=1e-5, tf32_gram=False, gram_mode=None):
@@ -2283,7 +2306,7 @@ def _lr_reduced_eigh(Bk):
 
 
 def _lowrank_eigh(a, k, power=1, dom_gram_mode=None, vd_lift_mode=None,
-                  av_mode=None):
+                  av_mode=None, proj_mode=None):
     B, n, _ = a.shape
     dev = a.device
     k = min(k, n)
@@ -2293,6 +2316,8 @@ def _lowrank_eigh(a, k, power=1, dom_gram_mode=None, vd_lift_mode=None,
         vd_lift_mode = _LR_VD_LIFT_MODE
     if av_mode is None:
         av_mode = _LR_AV_MODE
+    if proj_mode is None:
+        proj_mode = _LR_PROJ_MODE
     g = torch.Generator(device=dev).manual_seed(1234567)
     Omega = torch.randn(B, n, k, device=dev, generator=g)
     with torch.no_grad():
@@ -2345,12 +2370,13 @@ def _lowrank_eigh(a, k, power=1, dom_gram_mode=None, vd_lift_mode=None,
             R = torch.randn(B, n, nc, device=dev, generator=g)
             _prev = torch.backends.cuda.matmul.allow_tf32
             torch.backends.cuda.matmul.allow_tf32 = False
-            # The Qd-projections (R - Qd Qd^T R) stay FP32. 3xTF32 here was safe
-            # (~6e-6 Qd-leakage, as clean as FP32) but net-neutral (t9): the
-            # projection GEMMs are too small to amortize the split overhead at
-            # b640. Plain TF32 is UNSAFE -- its ~3e-4 leakage x kappa(Qd) breaks
-            # cross-block orthogonality of V=[Vd,Vc] (orth ~0.5 -> fallback).
-            R = R - torch.bmm(Qd, torch.bmm(Qd.transpose(-1, -2), R))
+            # brief-54: the Qd-projections (R - Qd Qd^T R, run TWICE) at proj_mode.
+            # They involve the ILL-conditioned Qd (kappa 1e3-1e4), so plain TF32's
+            # ~3e-4 leakage x kappa breaks V=[Vd,Vc] cross-block orth (orth ~0.5 ->
+            # fallback) -- parent kept them FP32-SIMT. 3xTF32 (~6e-6 Qd-leakage, as
+            # clean as FP32) puts them on tensor cores; whether that beats the
+            # 3-pass Ozaki overhead at each (n,k) is measured per-shape.
+            R = _lr_project_out(Qd, R, proj_mode)
             # The complement basis Vc spans the ORTHOGONAL complement of the
             # (already-projected-out) dominant subspace, built from a random
             # matrix -> WELL-conditioned, so its CQR2 Gram tolerates plain TF32
@@ -2359,7 +2385,7 @@ def _lowrank_eigh(a, k, power=1, dom_gram_mode=None, vd_lift_mode=None,
             # the final one 1-pass raised live fallbacks on shapes 8/12, t5); the
             # Gram uses plain TF32 (3xTF32 there net-lost, t7).
             Vc = _lr_cholesky_qr2(R, shift=1e-4, gram_mode="tf32")
-            Vc = Vc - torch.bmm(Qd, torch.bmm(Qd.transpose(-1, -2), Vc))
+            Vc = _lr_project_out(Qd, Vc, proj_mode)
             Vc = _lr_cholesky_qr2(Vc, shift=1e-5, gram_mode="tf32")
             torch.backends.cuda.matmul.allow_tf32 = _prev
             # brief-54: A@Vc complement Rayleigh matvec at av_mode (3xTF32). Feeds
@@ -2380,12 +2406,12 @@ def _lowrank_eigh(a, k, power=1, dom_gram_mode=None, vd_lift_mode=None,
 
 
 def _eigh_lowrank_safe(a, k, power=1, dom_gram_mode=None, vd_lift_mode=None,
-                       av_mode=None):
+                       av_mode=None, proj_mode=None):
     B, n, _ = a.shape
     try:
         with _LR_TF32():
             V, lam, AV = _lowrank_eigh(a, k, power, dom_gram_mode, vd_lift_mode,
-                                       av_mode)
+                                       av_mode, proj_mode)
     except Exception:
         w, q = torch.linalg.eigh(a)
         return q.contiguous(), w.contiguous()
@@ -2600,6 +2626,8 @@ _MIXED_PEEL_DOM_GRAM_MODE = "3xtf32"
 # fastest on the n=512 routes (the mixed dense subset mirrors shape 3, gate-clean
 # at tf32); the extra 3xTF32 Ozaki passes only cost more here. Keep plain TF32.
 _MIXED_PEEL_AV_MODE = "tf32"
+# brief-54: Qd-projection precision for the mixed-peel low-rank subsets (n=512).
+_MIXED_PEEL_PROJ_MODE = "3xtf32"
 
 
 def _mixed_peel_count(pr: torch.Tensor) -> int:
@@ -2632,7 +2660,8 @@ def _eigh_mixed_peel(a: torch.Tensor, pr: torch.Tensor) -> output_t:
     a_sub = af.index_select(0, gidx).contiguous()
     Qs, Ls = _eigh_lowrank_safe(a_sub, _MIXED_PEEL_K, power=1,
                                 dom_gram_mode=_MIXED_PEEL_DOM_GRAM_MODE,
-                                av_mode=_MIXED_PEEL_AV_MODE)
+                                av_mode=_MIXED_PEEL_AV_MODE,
+                                proj_mode=_MIXED_PEEL_PROJ_MODE)
     Q.index_copy_(0, gidx, Qs)
     L.index_copy_(0, gidx, Ls)
     taken |= dense_mask
@@ -2649,7 +2678,8 @@ def _eigh_mixed_peel(a: torch.Tensor, pr: torch.Tensor) -> output_t:
             a_psd = af.index_select(0, pidx).contiguous()
             Qp, Lp = _eigh_lowrank_safe(a_psd, _MIXED_PEEL_PSD_K, power=1,
                                         dom_gram_mode=_MIXED_PEEL_DOM_GRAM_MODE,
-                                        av_mode=_MIXED_PEEL_AV_MODE)
+                                        av_mode=_MIXED_PEEL_AV_MODE,
+                                        proj_mode=_MIXED_PEEL_PROJ_MODE)
             Q.index_copy_(0, pidx, Qp)
             L.index_copy_(0, pidx, Lp)
             taken |= psd_mask
@@ -3321,7 +3351,8 @@ def custom_kernel(data: input_t) -> output_t:
         # net-neutral over the dominant-Gram 3xTF32 win (confirms brief-16 t9).
         return _eigh_lowrank_safe(a, k_lr, power=1,
                                   dom_gram_mode=_lr_dom_gram_mode_for(n, k_lr),
-                                  av_mode=_lr_av_mode_for(n, k_lr))
+                                  av_mode=_lr_av_mode_for(n, k_lr),
+                                  proj_mode=_lr_proj_mode_for(n, k_lr))
     # MIXED-BATCH DENSE PEEL (brief 28): a heterogeneous n=512 mixed batch (the
     # benchmark's shape 6) whose whole-batch low-rank route was (correctly)
     # refused above by the homogeneity gate still has a large DENSE subset that
