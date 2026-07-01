@@ -2736,11 +2736,16 @@ _SIGN_DC_BASE_MAX = 1300   # blocks <= this go to _lr_reduced_eigh (<=448 one-CT
                           # 449..836 C-CTA cluster, >836 cuSOLVER). At 1300 the n=2048
                           # ~1229-wide halves land on the base solver directly (depth-1,
                           # cuSOLVER halves); no second split (which mixes junk, above).
-_SIGN_DC_REC_MARGIN = 0.10  # oversample margin (fraction of m) added to ceil(m/2) for
-                          # the split width K, absorbing shift-imbalance so neither side
-                          # exceeds K (the true per-side count is variable; oversampling
-                          # + membership rank-select makes the fixed-K launch exact).
-                          # K = ceil(m/2) + ceil(margin*m); n=2048 -> K=1229.
+_SIGN_DC_REC_MARGIN = 0.045 # oversample margin (fraction of m) added to ceil(m/2) for
+                          # the split width K. The sign(A - trace/m*I) split of a
+                          # semicircle (GOE) spectrum is well-BALANCED (measured max_side
+                          # ~1030 for the n=2048 shape5 seed, m/2=1024), so a small margin
+                          # suffices -- the cuSOLVER base cost is ~K^3, so shrinking K
+                          # toward the true half-count is the dominant win. K = ceil(m/2)
+                          # + ceil(margin*m); n=2048 -> K=1117 (~87 slack over 1030, ~2x
+                          # the ~sqrt(n)~45 balance fluctuation). Swept 0.10/0.05/0.035
+                          # -> shape5 123/111/107ms; any matrix whose side > K just falls
+                          # back to cuSOLVER via the gate (correctness preserved).
 _SIGN_DC_REC_NS_ITERS = 16  # NS sign iters for the split. A semicircle (GOE) spectrum
                           # has its highest eigenvalue density at the median shift sigma,
                           # so near-sigma eigenvalues get a fuzzy sign -> some P+/P-
@@ -2954,6 +2959,13 @@ def _sign_dc_block_eigh(A_blk, dev):
     for _ in range(_SIGN_DC_REC_NS_ITERS):
         X2 = torch.bmm(X, X)
         X = torch.baddbmm(X, X, X2, beta=1.5, alpha=-0.5)
+    if _SIGN_DC_LARGE_DBG:
+        import sys as _sys
+        trS = X.diagonal(dim1=-2, dim2=-1).sum(dim=-1)   # ~ n+ - n-
+        npos = ((m + trS) / 2.0)
+        _sys.stderr.write(f"[SIGNDC_SPLIT_DBG] m={m} B={B} n+_range=[{npos.min().item():.1f},{npos.max().item():.1f}] "
+                          f"(m/2={m/2:.0f}) max_side={torch.maximum(npos, m-npos).max().item():.1f}\n")
+        _sys.stderr.flush()
 
     def _pp(M):
         return torch.baddbmm(M, X, M, beta=0.5, alpha=0.5)
