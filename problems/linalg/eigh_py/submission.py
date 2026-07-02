@@ -3475,7 +3475,7 @@ _SIGN_DC_FINAL_NS = 1     # finishing FP32 NS orthonormalization steps on Q
 # 5 bmm) vs "tf32" (1-pass TF32, 2 bmm, ~2x cheaper) -- Q is already near-orthonormal
 # from the sign-DC so a plain-TF32 NS refinement may hold the orth gate at half the
 # cost. Gated: any matrix a cheaper finish leaves above the orth bound falls back.
-_SIGN_DC_FINISH_PREC = "tf32x3"
+_SIGN_DC_FINISH_PREC = "tf32x3_delta"
 # brief-87: the sign-DC internal residual-GATE factors. The FROZEN reference.py checker
 # gates orth at _ORTH_RTOL_FACTOR=100 * n * eps and eigen at _EIGEN_RTOL_FACTOR=200 * n
 # * eps (measured from reference.py). The submission's internal gate was set at 75/150
