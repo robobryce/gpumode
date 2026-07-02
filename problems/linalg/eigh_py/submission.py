@@ -581,6 +581,11 @@ void mega_eigh_med_split(torch::Tensor A, torch::Tensor Vout, torch::Tensor Lout
   size_t shmT=((size_t)n*nb + (size_t)nb*nb + (size_t)nb)*sizeof(float);
   if(shmT>shm) shm=shmT;
   cudaFuncSetAttribute(mega_eigh_med_split_k, cudaFuncAttributeMaxDynamicSharedMemorySize, shm);
+  // brief-83: prefer the MAX SMEM carveout so the driver reserves the full opt-in
+  // SMEM region (up to ~228KB on sm_100). At nt=512 this lets 2 CTAs (2 x ~98KB =
+  // ~196KB) co-reside per SM, doubling resident warps to hide the CTA-barrier
+  // stall that dominated the 1-CTA/SM regime (t1 ncu: 66.7% barrier-latency).
+  cudaFuncSetAttribute(mega_eigh_med_split_k, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
   mega_eigh_med_split_k<<<B,nt,shm>>>(A.data_ptr<float>(),Vout.data_ptr<float>(),Lout.data_ptr<float>(),
     rscr.data_ptr<float>(),dscr.data_ptr<float>(),escr.data_ptr<float>(),
     dpscr.data_ptr<float>(),dmscr.data_ptr<float>(),tauscr.data_ptr<float>(),
@@ -1070,13 +1075,23 @@ def _eigh_megakernel(a: torch.Tensor) -> output_t:
 # n=512 (packed 260KB) overflows the 228KB cap -> stays on cuSOLVER (the reduction
 # cannot fit one CTA in FP16; FP8 reduction measured too inaccurate -> 100% gate).
 _MEGA_MED_NMAX = 448
-# threads per CTA for the medium-n kernel. ncu on n=352 b40 showed the kernel is
-# LATENCY-bound (3.2% SM throughput, 12.5% occupancy, barrier+SMEM-scoreboard
-# stalls dominate) -- more warps per CTA hide that latency. MUST be a power of 2:
-# the red[] tree reduction (for s=nt>>1; s>0; s>>=1) silently drops elements at
-# non-power-of-2 thread counts (NT=768 produced garbage -> 100% cuSOLVER
-# fallback). Swept 256/512/1024: 1024 fastest+correct on n=352. red[] holds 1024.
-_MEGA_MED_NT = 1024
+# threads per CTA for the medium-n kernel. MUST be a power of 2: the red[] tree
+# reduction (for s=nt>>1; s>0; s>>=1) silently drops elements at non-power-of-2
+# thread counts (NT=768 produced garbage -> 100% cuSOLVER fallback). red[] holds
+# 1024.
+# brief-83 t1 ncu (shape11, 1280-matrix full-grid regime): the kernel is capped
+# at 1 CTA/SM by registers (56/thr x 1024 = 57344; 2 blocks = 114688 > 65536
+# register file -> Block Limit Registers=1) AND by SMEM (92.7KB dyn; the driver
+# only reserved a 102.4KB carveout -> Block Limit Shared Mem=1). Occupancy 50%,
+# 66.7% CTA-barrier stall -- with only 1 CTA/SM there is NO sibling CTA whose
+# warps can hide the barrier latency of the serial tridiag. Dropping to 512
+# threads makes registers allow 2 resident blocks (56 x 512 x 2 = 57344 < 65536)
+# and, with the max SMEM carveout the launcher now requests (2 x ~98KB = 196KB <
+# 228KB opt-in), 2 DIFFERENT matrices become co-resident so the scheduler hides
+# each CTA's barrier stall behind the other's compute. The prior 256/512/1024
+# sweep picked 1024 on n=352 b40 (a 40-CTA grid where occupancy is irrelevant);
+# shape 11's 1280-CTA grid is the regime where the occupancy win appears.
+_MEGA_MED_NT = 512
 
 # Compact-WY back-transform panel width for the SPLIT med path. The split
 # kernel builds one nb x nb block-T per panel; the torch-level back-transform
