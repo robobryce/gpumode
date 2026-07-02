@@ -2523,7 +2523,7 @@ _LAST_CQR_TOT = -1      # batch size of the last gated CQR call
 # brief-110: conditioning-gate margin for the COMPLEMENT 2nd CQR call (compl_pass2).
 # A matrix skips pass 2 when its predicted 1-pass orth kd^2*n*eps < margin*(80*n*eps),
 # i.e. kd^2 < margin*80. None disables the gate (parent's unconditional 2-pass).
-_LR_COMPL_COND_MARGIN = None
+_LR_COMPL_COND_MARGIN = 1.0
 
 
 def _lr_cqr_diag_emit(label, ipass, L, Q, n_matrices_hi):
