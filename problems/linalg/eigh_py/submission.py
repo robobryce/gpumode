@@ -6722,7 +6722,7 @@ __device__ __forceinline__ void mwjac_solve32(
                                 // all 32 rows) -> unpadded stride-32 = all same bank.
   __shared__ float As[NN * LD];
   __shared__ float Vs[NN * LD];
-  __shared__ float redOff[NW], redNrm[NW];   // block-reduction scratch (gate)
+  __shared__ float redOff[NW], redNrm[NW], redNf[NW];   // block-reduction scratch (gate)
   int tid = threadIdx.x;
   int warp = tid >> 5, lane = tid & 31;
   // cooperative load A -> SMEM (padded), V = I
@@ -6788,23 +6788,30 @@ __device__ __forceinline__ void mwjac_solve32(
   // caught + falls back. Orthogonality of Q is guaranteed by construction (product of
   // exact Givens rotations; measured orth 1.3e-5, 35x under gate).
   {
-    float off2 = 0.0f, nrm2 = 0.0f;
+    float off2 = 0.0f, nrm2 = 0.0f, nf = 0.0f;   // nf: non-finite accumulator (A & V)
     for (int idx = tid; idx < NN * NN; idx += NW * 32) {
       int i = idx / NN, j = idx % NN;
       float v = As[i * LD + j]; float v2 = v * v; nrm2 += v2;
       if (i != j) off2 += v2;
+      float vv = Vs[i * LD + j];
+      nf += (isfinite(v) ? 0.0f : 1.0f) + (isfinite(vv) ? 0.0f : 1.0f);
     }
     #pragma unroll
-    for (int o = 16; o > 0; o >>= 1) { off2 += __shfl_down_sync(FULL, off2, o); nrm2 += __shfl_down_sync(FULL, nrm2, o); }
-    if (lane == 0) { redOff[warp] = off2; redNrm[warp] = nrm2; }
+    for (int o = 16; o > 0; o >>= 1) {
+      off2 += __shfl_down_sync(FULL, off2, o);
+      nrm2 += __shfl_down_sync(FULL, nrm2, o);
+      nf   += __shfl_down_sync(FULL, nf, o);
+    }
+    if (lane == 0) { redOff[warp] = off2; redNrm[warp] = nrm2; redNf[warp] = nf; }
     __syncthreads();
     if (tid == 0) {
-      float toff = 0.0f, tnrm = 0.0f;
+      float toff = 0.0f, tnrm = 0.0f, tnf = 0.0f;
       #pragma unroll
-      for (int w = 0; w < NW; ++w) { toff += redOff[w]; tnrm += redNrm[w]; }
-      // relative Frobenius eigen-residual^2 = toff/tnrm; flag bad if > (1e-4)^2.
+      for (int w = 0; w < NW; ++w) { toff += redOff[w]; tnrm += redNrm[w]; tnf += redNf[w]; }
+      // relative Frobenius eigen-residual^2 = toff/tnrm; flag bad if > (1e-4)^2 OR any
+      // non-finite A/V entry (folds the torch isfinite checks into the kernel).
       float rel2 = toff / (tnrm + 1e-30f);
-      Bad[blockIdx.x] = (rel2 > 1.0e-8f || !isfinite(rel2)) ? 1.0f : 0.0f;
+      Bad[blockIdx.x] = (rel2 > 1.0e-8f || !isfinite(rel2) || tnf > 0.5f) ? 1.0f : 0.0f;
     }
   }
   // eigenvalues = diag(As); IN-KERNEL sort (ascending) by rank, scatter V columns.
@@ -6956,10 +6963,11 @@ def _eigh_mw_jacobi(a: torch.Tensor) -> output_t:
     Bad = torch.zeros(b, device=dev, dtype=torch.float32)       # in-kernel gate flag
     mod.mw_jacobi_eigh(af, Q, L, Bad, n, _MWJAC_SWEEPS)
     # The kernel computes the per-matrix eigen-residual gate IN-KERNEL (exact
-    # Frobenius identity, conservative threshold) and Q's orthogonality is
-    # guaranteed by construction -> no torch gate GEMMs/norms (removes ~13 host
-    # launches on this tiny shape). Only a finiteness backstop + the Bad flag remain.
-    bad = (Bad > 0.5) | ~torch.isfinite(L).all(dim=-1) | ~torch.isfinite(Q).all(dim=(-2, -1))
+    # Frobenius identity, conservative threshold) AND the A/V non-finite check, and
+    # Q's orthogonality is guaranteed by construction -> NO torch gate GEMMs/norms and
+    # NO torch isfinite reductions (removes ~20 host launches on this tiny shape).
+    # Only the Bad flag read + a single any() sync remain.
+    bad = Bad > 0.5
     import os as _os
     if _os.environ.get("MWJAC_DBG"):
         import sys as _sys
