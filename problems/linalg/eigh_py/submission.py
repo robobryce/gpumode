@@ -5969,7 +5969,8 @@ _WJAC_CUDA = r'''
 // Round-robin (circle method) partner of player `p` in round `r`, padded size nP
 // (even). player 0 is fixed at position 0; player p>0 at position
 // pos = ((p-1) - r) mod (nP-1) + 1. Pairs = (pos, nP-1-pos). Returns the PLAYER at
-// the paired position (deterministic -> recomputed per lane, no shuffle needed).
+// the paired position. When called with COMPILE-TIME p,r,nP (unrolled loops) this
+// folds to a constant so register arrays indexed by it stay in REGISTERS.
 __device__ __forceinline__ int wjac_partner(int p, int r, int nP) {
   int m = nP - 1;
   int pos = (p == 0) ? 0 : (((p - 1 - r) % m + m) % m + 1);
@@ -5977,45 +5978,48 @@ __device__ __forceinline__ int wjac_partner(int p, int r, int nP) {
   return (pp == 0) ? 0 : (((pp - 1 + r) % m) + 1);
 }
 
-// One WARP per matrix. Lane l owns row l of A (Ar) and row l of V (Vr), V init=I.
-// Two-sided cyclic Jacobi with the round-robin (Brent-Luk) parallel ordering:
-// per round every lane is in exactly one disjoint (p,q) pair. Fully register-
-// resident: the only cross-lane traffic is __shfl_sync (no SMEM, no barriers).
-// LEAN: no full-row temp arrays. The column update visits each column-pair ONCE
-// (from the LOW column j<pj) and writes both Ar[j],Ar[pj] from snapshotted
-// scalars -> 2 temps, not a 32-float shadow row. partner/low-role are RECOMPUTED
-// locally (wjac_partner) so only (c,s) is shuffled per source lane.
-extern "C" __global__ void warp_jacobi_eigh_k(
-    const float* __restrict__ Ain, float* __restrict__ Vout,
-    float* __restrict__ Lout, int B, int n, int sweeps) {
+// One WARP per matrix, n=32. Lane l owns row l of A (Ar) and row l of V (Vr).
+// Two-sided cyclic Jacobi with the round-robin (Brent-Luk) parallel ordering.
+// TRULY REGISTER-RESIDENT: both the sweep and the 31-round loop are UNROLLED with
+// COMPILE-TIME bounds, so the partner-column index pj=wjac_partner(j,r,32) folds
+// to a constant and every Ar[]/Vr[] access is a compile-time-constant index ->
+// nvcc keeps Ar,Vr in registers (no local-memory backing). The two remaining
+// DYNAMIC reads (my diagonal A[lane][lane] and my off-diagonal A[lane][partner],
+// both indexed by the runtime `partner`) are done via a masked reduction over
+// constant-indexed Ar[k] (a 32-way select tree, register-only) -- NOT Ar[partner]
+// (which would force the whole array to local memory). No SMEM, no __syncthreads,
+// no cross-block sync; the only cross-lane traffic is __shfl_sync.
+template<int SW>
+__device__ __forceinline__ void wjac_solve32(
+    const float* __restrict__ Am, float* __restrict__ Vm, float* __restrict__ Lm,
+    int lane) {
   const unsigned FULL = 0xffffffffu;
-  int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;   // global warp id
-  int lane = threadIdx.x & 31;
-  if (warp >= B) return;
-  const float* Am = Ain + (long)warp * n * n;
-  // Load row `lane` of A into registers; V row = e_lane.
-  float Ar[32];
-  float Vr[32];
+  const int NN = 32;
+  float Ar[NN];
+  float Vr[NN];
   #pragma unroll
-  for (int j = 0; j < 32; ++j) {
-    Ar[j] = (lane < n && j < n) ? Am[(long)lane * n + j] : ((lane == j) ? 1.0f : 0.0f);
-    Vr[j] = (lane == j) ? 1.0f : 0.0f;
-  }
-  int nP = (n + 1) & ~1;                      // even padded size (>= n)
-  for (int sw = 0; sw < sweeps; ++sw) {
-    for (int r = 0; r < nP - 1; ++r) {
-      int partner = wjac_partner(lane, r, nP);
-      bool amLow = lane < partner;            // low member computes the rotation
-      // ---- rotation: low member p uses app=Ar[lane], aqq from partner's diag,
-      // apq=Ar[partner]=A[p][q]. Both members compute the SAME (c,s) redundantly so
-      // lane `lane` holds the rotation of the pair containing player `lane`.
-      float aqq_from_partner = __shfl_sync(FULL, Ar[lane], partner);  // partner's diag
+  for (int j = 0; j < NN; ++j) { Ar[j] = Am[lane * NN + j]; Vr[j] = (lane == j) ? 1.0f : 0.0f; }
+  #pragma unroll 1
+  for (int sw = 0; sw < SW; ++sw) {
+    #pragma unroll
+    for (int r = 0; r < NN - 1; ++r) {
+      int partner = wjac_partner(lane, r, NN);   // dynamic (depends on lane)
+      bool amLow = lane < partner;
+      // my diagonal A[lane][lane] and off-diagonal A[lane][partner] via masked
+      // reduction over constant-indexed Ar[k] (register-only, no Ar[dynamic]).
+      float mydiag = 0.0f, apq = 0.0f;
+      #pragma unroll
+      for (int k = 0; k < NN; ++k) {
+        float ak = Ar[k];
+        mydiag += (k == lane)    ? ak : 0.0f;
+        apq    += (k == partner) ? ak : 0.0f;    // A[lane][partner] (== A[p][q] by symm)
+      }
+      float aqq_from_partner = __shfl_sync(FULL, mydiag, partner);  // partner's diagonal
       float c = 1.0f, s = 0.0f;
       {
-        float app = amLow ? Ar[lane] : aqq_from_partner;   // A[p][p]
-        float aqq = amLow ? aqq_from_partner : Ar[lane];   // A[q][q]
-        float apq = Ar[partner];                           // A[p][q] (symmetry)
-        if (partner < n && fabsf(apq) > 1e-30f * (fabsf(app) + fabsf(aqq) + 1e-30f)) {
+        float app = amLow ? mydiag : aqq_from_partner;
+        float aqq = amLow ? aqq_from_partner : mydiag;
+        if (fabsf(apq) > 1e-30f * (fabsf(app) + fabsf(aqq) + 1e-30f)) {
           float tau = (aqq - app) / (2.0f * apq);
           float t = (tau >= 0.0f) ? 1.0f / (tau + sqrtf(1.0f + tau * tau))
                                   : -1.0f / (-tau + sqrtf(1.0f + tau * tau));
@@ -6023,47 +6027,58 @@ extern "C" __global__ void warp_jacobi_eigh_k(
           s = t * c;
         }
       }
-      __syncwarp();
-      // ---- COLUMN update A<-A*J (and V<-V*J). For column j: its pair's rotation is
-      // held by lane j; partner column pj=wjac_partner(j). low col: c*A[j]-s*A[pj];
-      // high col: s*A[pj]+c*A[j]. Snapshot old row FIRST (shadow) to avoid RAW.
-      float oldA[32], oldV[32];
+      // ---- COLUMN update A<-A*J and V<-V*J. Column j pairs with the COMPILE-TIME
+      // constant pj=wjac_partner(j,r,32); rotation held by lane j (shfl c,s from j).
+      // Snapshot old row (register copy) to avoid RAW; all indices constant.
+      float oldA[NN], oldV[NN];
       #pragma unroll
-      for (int j = 0; j < 32; ++j) { oldA[j] = Ar[j]; oldV[j] = Vr[j]; }
+      for (int j = 0; j < NN; ++j) { oldA[j] = Ar[j]; oldV[j] = Vr[j]; }
       #pragma unroll
-      for (int j = 0; j < 32; ++j) {
+      for (int j = 0; j < NN; ++j) {
         float cj = __shfl_sync(FULL, c, j);
         float sj = __shfl_sync(FULL, s, j);
-        int pj = wjac_partner(j, r, nP);
-        if (j < n && pj < n) {
-          if (j < pj) { Ar[j] = cj * oldA[j] - sj * oldA[pj]; Vr[j] = cj * oldV[j] - sj * oldV[pj]; }
-          else        { Ar[j] = sj * oldA[pj] + cj * oldA[j]; Vr[j] = sj * oldV[pj] + cj * oldV[j]; }
-        }
+        const int pj = wjac_partner(j, r, NN);   // COMPILE-TIME constant
+        if (j < pj) { Ar[j] = cj * oldA[j] - sj * oldA[pj]; Vr[j] = cj * oldV[j] - sj * oldV[pj]; }
+        else        { Ar[j] = sj * oldA[pj] + cj * oldA[j]; Vr[j] = sj * oldV[pj] + cj * oldV[j]; }
       }
-      __syncwarp();
-      // ---- ROW update A<-J^T*A: each lane combines its row with its partner's row
-      // using its OWN pair's (c,s). low: newrow=c*row-s*prow; high: newrow=s*prow+c*row.
-      // V rows are NOT row-rotated (V<-V*J only). Snapshot partner's FULL row FIRST
-      // (all 32 shuffles) then combine -> no read-after-write hazard on Ar[j].
-      float prow[32];
+      // ---- ROW update A<-J^T*A: combine my row with partner's row using MY (c,s).
+      // Snapshot partner's full row (32 shfls, constant indices) then combine.
+      float prow[NN];
       #pragma unroll
-      for (int j = 0; j < 32; ++j) prow[j] = __shfl_sync(FULL, Ar[j], partner);
-      if (partner < n) {
-        #pragma unroll
-        for (int j = 0; j < 32; ++j) {
-          if (j < n) Ar[j] = amLow ? (c * Ar[j] - s * prow[j]) : (s * prow[j] + c * Ar[j]);
-        }
-      }
-      __syncwarp();
+      for (int j = 0; j < NN; ++j) prow[j] = __shfl_sync(FULL, Ar[j], partner);
+      #pragma unroll
+      for (int j = 0; j < NN; ++j) Ar[j] = amLow ? (c * Ar[j] - s * prow[j]) : (s * prow[j] + c * Ar[j]);
     }
   }
-  // eigenvalue for player `lane` = A[lane][lane]; eigenvector = column `lane` of V,
-  // i.e. entry V[i][lane]=Vr[lane] over lanes i. Write V row-major (lane i -> row i)
-  // so Vout[:, :, l] is eigenvector l; L[warp][lane] = Ar[lane].
-  if (lane < n) Lout[(long)warp * n + lane] = Ar[lane];
-  float* Vm = Vout + (long)warp * n * n;
+  // eigenvalue for player `lane` = A[lane][lane] (masked reduction); eigenvector =
+  // column `lane` of V -> write V row-major (lane i -> row i) so Vm[:, l] is eigvec l.
+  float mydiag = 0.0f;
   #pragma unroll
-  for (int j = 0; j < 32; ++j) if (lane < n && j < n) Vm[(long)lane * n + j] = Vr[j];
+  for (int k = 0; k < NN; ++k) mydiag += (k == lane) ? Ar[k] : 0.0f;
+  Lm[lane] = mydiag;
+  #pragma unroll
+  for (int j = 0; j < NN; ++j) Vm[lane * NN + j] = Vr[j];
+}
+
+extern "C" __global__ void warp_jacobi_eigh_k(
+    const float* __restrict__ Ain, float* __restrict__ Vout,
+    float* __restrict__ Lout, int B, int n, int sweeps) {
+  int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;   // global warp id
+  int lane = threadIdx.x & 31;
+  if (warp >= B || n != 32) return;
+  const float* Am = Ain + (long)warp * 32 * 32;
+  float* Vm = Vout + (long)warp * 32 * 32;
+  float* Lm = Lout + (long)warp * 32;
+  // dispatch a compile-time SWEEPS instantiation (register-resident requires the
+  // round loop unrolled at a constant bound; SWEEPS is small -> a short switch).
+  switch (sweeps) {
+    case 4:  wjac_solve32<4>(Am, Vm, Lm, lane); break;
+    case 5:  wjac_solve32<5>(Am, Vm, Lm, lane); break;
+    case 6:  wjac_solve32<6>(Am, Vm, Lm, lane); break;
+    case 7:  wjac_solve32<7>(Am, Vm, Lm, lane); break;
+    case 8:  wjac_solve32<8>(Am, Vm, Lm, lane); break;
+    default: wjac_solve32<6>(Am, Vm, Lm, lane); break;
+  }
 }
 
 void warp_jacobi_eigh(torch::Tensor A, torch::Tensor Vout, torch::Tensor Lout,
@@ -6112,7 +6127,9 @@ def _eigh_warp_jacobi(a: torch.Tensor) -> output_t:
     Falls back wholesale to cuSOLVER if the extension is unavailable."""
     mod = _wjac_get()
     b, n, _ = a.shape
-    if mod is None:
+    if mod is None or n != 32:
+        # the register-resident kernel is n=32-specialized; anything else (rare
+        # reseed to n<32) takes cuSOLVER directly (the batched-Jacobi floor).
         values, vectors = torch.linalg.eigh(a)
         return vectors, values
     af = a.float().contiguous()
