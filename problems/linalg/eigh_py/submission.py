@@ -4229,7 +4229,7 @@ _SIGN_DC_K = 300          # oversized subspace width (>= max +count/-count over 
 # the quadratic stages. The per-matrix residual gate + cuSOLVER fallback is
 # unchanged (runs on the reassembled full batch), so any misbucketed matrix still
 # falls back -- no correctness risk, no regression below the cuSOLVER floor.
-_SIGN_DC_BUCKETS = 1        # 1 = single global-K pipeline (parent behavior).
+_SIGN_DC_BUCKETS = 2        # 1 = single global-K pipeline (parent behavior).
                             # >=2 = adaptive: split batch into this many max_side buckets.
 _SIGN_DC_BUCKET_MARGIN = 14 # K for a bucket = ceil(bucket max_side) + this margin,
                             # capped at _SIGN_DC_K. 14 keeps the same 0-fallback safety
