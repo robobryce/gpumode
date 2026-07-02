@@ -2516,7 +2516,47 @@ def _lr_project_out(Qd, X, mode):
         torch.backends.cuda.matmul.allow_tf32 = prev
 
 
-def _lr_cholesky_qr2(Y, passes=2, shift=1e-5, tf32_gram=False, gram_mode=None):
+_LR_CQR_DIAG = bool(__import__("os").environ.get("LR_CQR_DIAG"))
+_LR_CQR_DIAG_SEEN: set = set()      # (label, ipass, B, n, k) already emitted this process
+
+
+def _lr_cqr_diag_emit(label, ipass, L, Q, n_matrices_hi):
+    """Env-gated (LR_CQR_DIAG) per-pass conditioning + orth probe for the
+    CholeskyQR passes. `L` is the Cholesky factor of the (shifted) Gram after
+    this pass's potrf; its diagonal ratio kd = max/min diag estimates kappa(Q)
+    (kappa(G) ~ kd^2 since G = L L^T). `Q` is the basis AFTER this pass's trsm;
+    orth = max over the batch of ||Q^T Q - I||_1. Prints the distribution of the
+    condition estimate (min/median/p90/max over the batch) and the achieved orth.
+    Diagnostic ONLY -- gated off by default so the hot path is unchanged."""
+    import sys
+    key = (label, ipass, Q.shape[0], Q.shape[-2], Q.shape[-1])
+    if key in _LR_CQR_DIAG_SEEN:
+        return
+    _LR_CQR_DIAG_SEEN.add(key)
+    with torch.no_grad():
+        d = L.diagonal(dim1=-2, dim2=-1).abs().clamp_min(1e-30)
+        kd = (d.amax(-1) / d.amin(-1))            # per-matrix kappa(Q) estimate
+        g = torch.bmm(Q.transpose(-1, -2), Q)
+        eyeq = torch.eye(Q.shape[-1], device=Q.device, dtype=Q.dtype)
+        orth = torch.linalg.matrix_norm(g - eyeq, ord=1, dim=(-2, -1))
+        eps = torch.finfo(torch.float32).eps
+        n = Q.shape[-2]
+        gate = 80.0 * n * eps
+        kd_sorted = kd.sort().values
+        B = kd.shape[0]
+        p50 = kd_sorted[B // 2].item()
+        p90 = kd_sorted[min(B - 1, (B * 9) // 10)].item()
+        n_over = int((orth > gate).sum().item())
+        sys.stderr.write(
+            f"[LR_CQR_DIAG] label={label} pass={ipass} B={B} n={n} k={Q.shape[-1]} "
+            f"kappa(min/p50/p90/max)={kd.amin().item():.3g}/{p50:.3g}/{p90:.3g}/{kd.amax().item():.3g} "
+            f"orth(max)={orth.amax().item():.4g} orth_gate(80*n*eps)={gate:.4g} "
+            f"n_over_gate={n_over}/{B}\n")
+        sys.stderr.flush()
+
+
+def _lr_cholesky_qr2(Y, passes=2, shift=1e-5, tf32_gram=False, gram_mode=None,
+                     diag_label=None):
     # gram_mode selects the precision of the Gram G = Q^T Q (the dominant
     # FP32-SIMT cost of the CholeskyQR2 orthonormalization):
     #   "fp32"    - true FP32 simt_sgemm (default; the accurate, slow path).
@@ -2550,7 +2590,7 @@ def _lr_cholesky_qr2(Y, passes=2, shift=1e-5, tf32_gram=False, gram_mode=None):
     prev = torch.backends.cuda.matmul.allow_tf32
     _fmod = _fused_cqr_get() if _FUSED_CQR_SHIFT else None
     try:
-        for pm in pass_modes:
+        for _ip, pm in enumerate(pass_modes):
             torch.backends.cuda.matmul.allow_tf32 = (pm in ("tf32", "3xtf32"))
             if pm == "3xtf32":
                 # symmetric-aware 3xTF32 Gram: 2 bmms (vs 3), same ~6e-6 accuracy.
@@ -2567,6 +2607,8 @@ def _lr_cholesky_qr2(Y, passes=2, shift=1e-5, tf32_gram=False, gram_mode=None):
                 dm = G.diagonal(dim1=-2, dim2=-1).abs().amax(-1).clamp_min(1e-30)
                 L = torch.linalg.cholesky(G + (shift * dm).view(-1, 1, 1) * eye)
             Q = torch.linalg.solve_triangular(L, Q.transpose(-1, -2), upper=False).transpose(-1, -2)
+            if _LR_CQR_DIAG and diag_label is not None:
+                _lr_cqr_diag_emit(diag_label, _ip, L, Q, None)
     finally:
         torch.backends.cuda.matmul.allow_tf32 = prev
     return Q
@@ -2783,9 +2825,11 @@ def _lowrank_eigh(a, k, power=1, dom_gram_mode=None, vd_lift_mode=None,
         # at av_mode (FP32-accurate 3xTF32 on tensor cores by default). Each is an
         # n*n @ n*k batched GEMM previously on FP32-SIMT (simt_sgemm); 3xTF32 keeps
         # ~6e-6 accuracy (orth/eigen gates tolerate it) at ~8-10x the SIMT rate.
-        Qd = _lr_cholesky_qr2(_lr_lift_gemm(a, Omega, av_mode), passes=1)
+        Qd = _lr_cholesky_qr2(_lr_lift_gemm(a, Omega, av_mode), passes=1,
+                              diag_label="rangefinder")
         for _ in range(power):
-            Qd = _lr_cholesky_qr2(_lr_lift_gemm(a, Qd, av_mode), gram_mode=dom_gram_mode)
+            Qd = _lr_cholesky_qr2(_lr_lift_gemm(a, Qd, av_mode), gram_mode=dom_gram_mode,
+                                  diag_label="dom_power")
         # A@Qd is computed here and REUSED below (both to form Bk and to build
         # A@Vd = (A@Qd)@G cheaply, so the residual gate needs no separate A@V).
         AQd = _lr_lift_gemm(a, Qd, av_mode)
@@ -2829,9 +2873,11 @@ def _lowrank_eigh(a, k, power=1, dom_gram_mode=None, vd_lift_mode=None,
             # the low-rank shapes). Both complement CQR passes stay 2-pass (making
             # the final one 1-pass raised live fallbacks on shapes 8/12, t5); the
             # Gram uses plain TF32 (3xTF32 there net-lost, t7).
-            Vc = _lr_cholesky_qr2(R, shift=1e-4, gram_mode="tf32")
+            Vc = _lr_cholesky_qr2(R, shift=1e-4, gram_mode="tf32",
+                                  diag_label="compl_pass1")
             Vc = _lr_project_out(Qd, Vc, proj_mode)
-            Vc = _lr_cholesky_qr2(Vc, shift=1e-5, gram_mode="tf32")
+            Vc = _lr_cholesky_qr2(Vc, shift=1e-5, gram_mode="tf32",
+                                  diag_label="compl_pass2")
             torch.backends.cuda.matmul.allow_tf32 = _prev
             # brief-54: A@Vc complement Rayleigh matvec at av_mode (3xTF32). Feeds
             # lam_c = diag(Vc^T A Vc) and the complement's eigen-gate residual.
