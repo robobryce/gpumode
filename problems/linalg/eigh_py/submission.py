@@ -3060,6 +3060,14 @@ _MIXED_PEEL_AV_MODE = "tf32"
 # t4 measured 3xTF32 net-neutral here (projections too small to amortize Ozaki);
 # keep FP32 (parent's mode) for the minimal-diff keeper.
 _MIXED_PEEL_PROJ_MODE = "fp32"
+# brief-77: how the dense (k352) + psd (k256) low-rank subsets are combined.
+#   "bucketed" - separate _lowrank_eigh per subset at its OWN k (k-dependent CQR2 +
+#                reduced-eigh megakernel stay bucketed, compute-identical to the
+#                parent's two calls), FUSED gate/sync/gather/scatter over the union.
+#   "pad"      - ONE _lowrank_eigh at max-k=352 over dense+psd (psd padded up). Trial
+#                measures the padding-waste-vs-launch-saving tradeoff (psd at k=352
+#                is above its ~300 orth ceiling -> mass fallback per the PSD probe).
+_MIXED_PEEL_FUSE_MODE = "pad"
 
 
 def _mixed_peel_count(pr: torch.Tensor) -> int:
@@ -3206,22 +3214,41 @@ def _eigh_mixed_peel(a: torch.Tensor, pr: torch.Tensor) -> output_t:
     # so each matrix is solved at its OWN k with math identical to the separate
     # calls; only the shared per-call overhead is removed.
     dense_mask = (pr >= _MIXED_PEEL_PR_LO) & (pr < _MIXED_PEEL_PR_HI)
-    _buckets = [(torch.nonzero(dense_mask, as_tuple=False).flatten(), _MIXED_PEEL_K)]
     psd_mask = None
     if _MIXED_PEEL_PSD:
         psd_mask = (pr >= _MIXED_PEEL_PSD_PR_LO) & (pr < _MIXED_PEEL_PSD_PR_HI) & (~dense_mask)
-        pidx = torch.nonzero(psd_mask, as_tuple=False).flatten()
-        if pidx.numel() > 0:
-            _buckets.append((pidx, _MIXED_PEEL_PSD_K))
-    Qm, Lm, midx = _eigh_lowrank_safe_multi(af, _buckets, power=1,
-                                            dom_gram_mode=_MIXED_PEEL_DOM_GRAM_MODE,
-                                            av_mode=_MIXED_PEEL_AV_MODE,
-                                            proj_mode=_MIXED_PEEL_PROJ_MODE)
-    Q.index_copy_(0, midx, Qm)
-    L.index_copy_(0, midx, Lm)
-    taken |= dense_mask
-    if psd_mask is not None:
-        taken |= psd_mask
+    if _MIXED_PEEL_FUSE_MODE == "pad" and psd_mask is not None:
+        # brief-77 trial-1 (MEASURE the padding variant the brief names): route
+        # dense+psd through ONE _eigh_lowrank_safe at max-k (352). psd's effective
+        # dominant rank is padded UP to 352; the PSD probe table predicts psd at
+        # k=352 blows its ~300 inner-solve orth ceiling (orth ~4.6) -> mass gate
+        # fallback. This trial measures that padding-waste-vs-launch-saving tradeoff
+        # end-to-end rather than reasoning it. midx = combined index for one scatter.
+        both_mask = dense_mask | psd_mask
+        midx = torch.nonzero(both_mask, as_tuple=False).flatten()
+        a_both = af.index_select(0, midx).contiguous()
+        Qm, Lm = _eigh_lowrank_safe(a_both, _MIXED_PEEL_K, power=1,
+                                    dom_gram_mode=_MIXED_PEEL_DOM_GRAM_MODE,
+                                    av_mode=_MIXED_PEEL_AV_MODE,
+                                    proj_mode=_MIXED_PEEL_PROJ_MODE)
+        Q.index_copy_(0, midx, Qm)
+        L.index_copy_(0, midx, Lm)
+        taken |= both_mask
+    else:
+        _buckets = [(torch.nonzero(dense_mask, as_tuple=False).flatten(), _MIXED_PEEL_K)]
+        if psd_mask is not None:
+            pidx = torch.nonzero(psd_mask, as_tuple=False).flatten()
+            if pidx.numel() > 0:
+                _buckets.append((pidx, _MIXED_PEEL_PSD_K))
+        Qm, Lm, midx = _eigh_lowrank_safe_multi(af, _buckets, power=1,
+                                                dom_gram_mode=_MIXED_PEEL_DOM_GRAM_MODE,
+                                                av_mode=_MIXED_PEEL_AV_MODE,
+                                                proj_mode=_MIXED_PEEL_PROJ_MODE)
+        Q.index_copy_(0, midx, Qm)
+        L.index_copy_(0, midx, Lm)
+        taken |= dense_mask
+        if psd_mask is not None:
+            taken |= psd_mask
     # 2) clustered (2-level, A^2~I) subset -> two-level projector path (~2x
     # cuSOLVER). Detected on the NON-dense remainder only. Self residual-gated.
     if _MIXED_PEEL_CLUSTERED:
