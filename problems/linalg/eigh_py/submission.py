@@ -4204,7 +4204,7 @@ def _eigh_mixed_peel(a: torch.Tensor, pr: torch.Tensor) -> output_t:
 # leaderboard-reseed-safe.
 # ---------------------------------------------------------------------------
 _SIGN_DC_N = 512          # routed only at n=512 (the shape-11 dense-even class)
-_SIGN_DC_K = 288          # oversized subspace width (>= max +count/-count over the
+_SIGN_DC_K = 300          # oversized subspace width (>= max +count/-count over the
                           # batch; +count ~ n/2 +- ~38 for a random-sign even spectrum,
                           # shape-11 seed max kp/km 294/293). K=300 gives 0 gate-fallback
                           # with headroom for a reseed that shifts +count higher, and
@@ -4212,6 +4212,30 @@ _SIGN_DC_K = 288          # oversized subspace width (>= max +count/-count over 
                           # eigh is the wall; K in [288,300] all land ~110ms), so the
                           # extra margin is free. Both K-blocks fit the megakernel's
                           # n<=448 range. Matrices with +count>K fall to cuSOLVER.
+# brief-117: PER-MATRIX ADAPTIVE K via bucketing. Shape 11's true per-matrix
+# max_side (= max(#+eigs, #-eigs), measured from the sign trace) is tightly
+# concentrated: p0=256 p50=263.6 p90=273.8 p99=283 p100=287.6 over 640 matrices.
+# The K-dependent stages (proj_cqr trsm/Gram/Chol, lift-build, mega_eigh, member
+# back-transform) scale ~QUADRATICALLY in K, so a matrix with max_side ~262 wastes
+# work at the global K=300. BUT each cuSOLVER fallback costs ~4ms (n=512 syevd +
+# serialized launch), and the near-median (near-zero magnitude) eigenvalue sign
+# ambiguity means K must exceed a matrix's max_side by an OVERSAMPLING margin
+# (~10-14) for the projector/CQR to resolve cleanly (K=288 with margin 0.4 over
+# p100 already gives 4-5 fallbacks). So: split the batch by max_side into buckets,
+# each solved by the full reduced pipeline at its OWN K = bucket_ceiling + margin.
+# The WIDE bucket keeps K=_SIGN_DC_K (300, margin 12 over p100) so the hard
+# matrices never fall back; the NARROW bucket(s) run the easy majority at a smaller
+# K (still margin >= _SIGN_DC_BUCKET_MARGIN over that bucket's max_side) to shave
+# the quadratic stages. The per-matrix residual gate + cuSOLVER fallback is
+# unchanged (runs on the reassembled full batch), so any misbucketed matrix still
+# falls back -- no correctness risk, no regression below the cuSOLVER floor.
+_SIGN_DC_BUCKETS = 1        # 1 = single global-K pipeline (parent behavior).
+                            # >=2 = adaptive: split batch into this many max_side buckets.
+_SIGN_DC_BUCKET_MARGIN = 14 # K for a bucket = ceil(bucket max_side) + this margin,
+                            # capped at _SIGN_DC_K. 14 keeps the same 0-fallback safety
+                            # the global K=300 has over p100 (287.6 + 12.4).
+_SIGN_DC_BUCKET_MIN = 32    # never route a bucket below this many matrices (a tiny
+                            # bucket underfills the megakernel -> merge it up into wide).
 _SIGN_DC_NS_ITERS = 10    # Newton-Schulz sign iterations (each = 2 batched GEMMs).
                           # The near-zero eigenvalues plateau |X| below 1 (they need
                           # ~22 quadratic steps to fully resolve), but the projector
@@ -5587,6 +5611,103 @@ class _sdc_timer:
             d[1] += 1
 
 
+def _sign_dc_reduced(af, X, K, n, dev):
+    """Stages 3-6 of the sign-DC pipeline on a (sub-)batch: given af (b,n,n) and its
+    converged matrix-sign X (b,n,n), form the +/- invariant-subspace bases at width
+    K, lift to the reduced K x K blocks, megakernel-eigh them, and membership-select
+    the n true eigenpairs. Returns (Q, L) with Q (b,n,n), L (b,n) -- FULL width n
+    regardless of K (the membership topk drops the padding). K is a per-call width so
+    the caller can BUCKET the batch by rank and run each bucket at its own K.
+    _pp/_pm are the (non-materialized) spectral projectors P+ M = 0.5*(M + X@M),
+    P- M = 0.5*(M - X@M)."""
+    b = af.shape[0]
+    _gp = torch.backends.cuda.matmul.allow_tf32
+    _proj_lpdt = ({"bf16": torch.bfloat16, "fp16": torch.float16}
+                  .get(_SIGN_DC_PROJ_PREC))
+    if _proj_lpdt is not None:
+        _Xl = X.to(_proj_lpdt)
+
+    def _pp(M):
+        if _proj_lpdt is not None:
+            XM = torch.bmm(_Xl, M.to(_proj_lpdt)).float()
+            return 0.5 * M + 0.5 * XM
+        return torch.baddbmm(M, X, M, beta=0.5, alpha=0.5)
+
+    def _pm(M):
+        if _proj_lpdt is not None:
+            XM = torch.bmm(_Xl, M.to(_proj_lpdt)).float()
+            return 0.5 * M - 0.5 * XM
+        return torch.baddbmm(M, X, M, beta=0.5, alpha=-0.5)
+    # oversized invariant-subspace bases (batched CholeskyQR, NOT cuSOLVER QR). Both
+    # bases are the SAME (n x K) shape, so STACK them (2b x n x K) and run one CQR +
+    # one A@U GEMM instead of two -- better GPU fill, half the launch overhead.
+    Om, Om2 = _sign_dc_omega(b, n, K, dev)
+    with _sdc_timer("3_proj_cqr"):
+        torch.backends.cuda.matmul.allow_tf32 = True
+        if _SIGN_DC_FUSE_PROJ:
+            # brief-87: FUSE the two projector applies into ONE wide GEMM. P+@Om and
+            # P-@Om2 both need X @ (thin), so X @ [Om | Om2] is a single (b,n,n)@(b,n,2K)
+            # GEMM (better tensor-core fill + one launch) instead of two (b,n,n)@(b,n,K).
+            XOm = torch.bmm(X, torch.cat([Om, Om2], dim=-1))       # (b, n, 2K)
+            Pp = 0.5 * (Om + XOm[..., :K])                          # P+ @ Om
+            Pm = 0.5 * (Om2 - XOm[..., K:])                         # P- @ Om2
+            Ustk = _sign_dc_cqr(torch.cat([Pp, Pm], dim=0),
+                                passes=_SIGN_DC_CQR_PASSES,
+                                ns_refine=_SIGN_DC_CQR_NS_REFINE)     # (2b, n, K)
+        else:
+            Ustk = _sign_dc_cqr(torch.cat([_pp(Om), _pm(Om2)], dim=0),
+                                passes=_SIGN_DC_CQR_PASSES,
+                                ns_refine=_SIGN_DC_CQR_NS_REFINE)     # (2b, n, K)
+        torch.backends.cuda.matmul.allow_tf32 = _gp
+    # reduced K x K blocks -> fused tensor-core megakernel (raw, unsorted, ungated).
+    # Both blocks solved in ONE stacked (2b, K, K) megakernel launch: one-CTA-per-matrix,
+    # so 2b CTAs fill the 148 SMs better than two b-CTA launches (~9% measured). The
+    # A@U half is done on each b-block (both share af, so no b*n*n repeat of af) then
+    # concatenated for the stacked reduced Gram + eigh.
+    # brief-54: A@U lift (af @ Ustk) + reduced-block build at _SIGN_DC_AV_MODE.
+    with _sdc_timer("4_lift_build"):
+        AU = _lr_lift_gemm(af, Ustk[:b], _SIGN_DC_AV_MODE)
+        AU = torch.cat([AU, _lr_lift_gemm(af, Ustk[b:], _SIGN_DC_AV_MODE)], dim=0)
+        Bstk = _lr_lift_gemm(Ustk.transpose(-1, -2), AU, _SIGN_DC_AV_MODE)
+        if not _SIGN_DC_SKIP_BSYM:
+            Bstk = 0.5 * (Bstk + Bstk.transpose(-1, -2))
+    with _sdc_timer("5_mega_eigh"):
+      try:
+        # fast_reduce=True (brief-83 t12): the CLEAN warp-shuffle sum (_mega_fast_sum)
+        # IS gate-safe for shape 11 (0/640 fallback, orth cleaned by the finishing NS).
+        lstk, gstk = _lr_reduced_eigh(Bstk, bt_prec=_SIGN_DC_BT_PREC,
+                                      fast_reduce=True)
+      except Exception:
+        lstk, gstk = torch.linalg.eigh(Bstk)
+    with _sdc_timer("6_member_topk"):
+        torch.backends.cuda.matmul.allow_tf32 = True
+        Up, Um = Ustk[:b], Ustk[b:]
+        # brief-103: back-transform to candidate eigenvectors, optionally in fp16
+        # (2x tf32 rate). gate-guarded; parent "tf32" is byte-identical to the bmm.
+        Vstk = _lr_lift_gemm(Ustk, gstk, _SIGN_DC_BT_LIFT)  # (2b, n, K)
+        Vp, Vm = Vstk[:b], Vstk[b:]
+        lp, lm = lstk[:b], lstk[b:]
+        # projector membership: ~1 for a real eigenvector of that block, ~0 for padding
+        if _SIGN_DC_FUSE_MEMBERSHIP:
+            # brief-96: X@Vp and X@Vm share the SAME X -> one wide X@[Vp|Vm] GEMM
+            # (b,n,n)@(b,n,2K) instead of two (b,n,n)@(b,n,K) baddbmms. Then
+            # P+ Vp = 0.5*(Vp + (X@Vp)), P- Vm = 0.5*(Vm - (X@Vm)).
+            XVpm = torch.bmm(X, torch.cat([Vp, Vm], dim=-1))   # (b, n, 2K)
+            selp = (0.5 * (Vp + XVpm[..., :K])).norm(dim=1)    # (b, K)
+            selm = (0.5 * (Vm - XVpm[..., K:])).norm(dim=1)    # (b, K)
+        else:
+            selp = _pp(Vp).norm(dim=1)                 # (b, K)
+            selm = _pm(Vm).norm(dim=1)                 # (b, K)
+        torch.backends.cuda.matmul.allow_tf32 = _gp
+        Vall = torch.cat([Vp, Vm], dim=-1)         # n x 2K
+        Lall = torch.cat([lp, lm], dim=-1)         # 2K
+        mem = torch.cat([selp, selm], dim=-1)      # 2K
+        topi = mem.topk(n, dim=-1).indices         # the n true eigenpairs
+        Q = torch.gather(Vall, 2, topi.unsqueeze(1).expand(b, n, n))
+        L = torch.gather(Lall, 1, topi)
+    return Q, L
+
+
 def _sign_dc_solve(af, n, dev):
     """Batched spectral divide-and-conquer eigh via the matrix sign function.
     Returns (Q, L) UNSORTED-then-sorted (columns of Q pair with L); the CALLER
@@ -5630,100 +5751,54 @@ def _sign_dc_solve(af, n, dev):
                           f"max_side={maxside.max().item():.1f} (K margin={K - maxside.max().item():.1f}) "
                           f"pct[{_pct}] buckets8[{_bstr}]\n")
         _sys.stderr.flush()
-    # Spectral projectors are NOT materialized: P+ @ M = 0.5*(M + X@M) and
-    # P- @ M = 0.5*(M - X@M), so the subspace probes and the membership test apply
-    # the sign directly to their (thin) operands -- no full n*n P+/P- tensors.
-    # brief-103: _SIGN_DC_PROJ_PREC="fp16"/"bf16" runs the X@M projector-apply GEMM
-    # in half precision (fp32 accumulate) and does the 0.5*M +/- 0.5*(X@M) combine
-    # in fp32; "tf32" (default) keeps the byte-identical baddbmm-fused form.
-    _proj_lpdt = ({"bf16": torch.bfloat16, "fp16": torch.float16}
-                  .get(_SIGN_DC_PROJ_PREC))
-    if _proj_lpdt is not None:
-        _Xl = X.to(_proj_lpdt)
-
-    def _pp(M):
-        if _proj_lpdt is not None:
-            XM = torch.bmm(_Xl, M.to(_proj_lpdt)).float()
-            return 0.5 * M + 0.5 * XM
-        return torch.baddbmm(M, X, M, beta=0.5, alpha=0.5)
-
-    def _pm(M):
-        if _proj_lpdt is not None:
-            XM = torch.bmm(_Xl, M.to(_proj_lpdt)).float()
-            return 0.5 * M - 0.5 * XM
-        return torch.baddbmm(M, X, M, beta=0.5, alpha=-0.5)
-    # oversized invariant-subspace bases (batched CholeskyQR, NOT cuSOLVER QR). Both
-    # bases are the SAME (n x K) shape, so STACK them (2b x n x K) and run one CQR +
-    # one A@U GEMM instead of two -- better GPU fill, half the launch overhead.
-    Om, Om2 = _sign_dc_omega(b, n, K, dev)
-    with _sdc_timer("3_proj_cqr"):
-        if _SIGN_DC_FUSE_PROJ:
-            # brief-87: FUSE the two projector applies into ONE wide GEMM. P+@Om and
-            # P-@Om2 both need X @ (thin), so X @ [Om | Om2] is a single (b,n,n)@(b,n,2K)
-            # GEMM (better tensor-core fill + one launch) instead of two (b,n,n)@(b,n,K).
-            XOm = torch.bmm(X, torch.cat([Om, Om2], dim=-1))       # (b, n, 2K)
-            Pp = 0.5 * (Om + XOm[..., :K])                          # P+ @ Om
-            Pm = 0.5 * (Om2 - XOm[..., K:])                         # P- @ Om2
-            Ustk = _sign_dc_cqr(torch.cat([Pp, Pm], dim=0),
-                                passes=_SIGN_DC_CQR_PASSES,
-                                ns_refine=_SIGN_DC_CQR_NS_REFINE)     # (2b, n, K)
-        else:
-            Ustk = _sign_dc_cqr(torch.cat([_pp(Om), _pm(Om2)], dim=0),
-                                passes=_SIGN_DC_CQR_PASSES,
-                                ns_refine=_SIGN_DC_CQR_NS_REFINE)     # (2b, n, K)
-    torch.backends.cuda.matmul.allow_tf32 = _gp
-    # reduced K x K blocks -> fused tensor-core megakernel (raw, unsorted, ungated).
-    # Both blocks solved in ONE stacked (2b, K, K) megakernel launch: one-CTA-per-matrix,
-    # so 2b CTAs fill the 148 SMs better than two b-CTA launches (~9% measured). The
-    # A@U half is done on each b-block (both share af, so no b*n*n repeat of af) then
-    # concatenated for the stacked reduced Gram + eigh.
-    # brief-54: A@U lift (af @ Ustk) + reduced-block build at _SIGN_DC_AV_MODE.
-    with _sdc_timer("4_lift_build"):
-        AU = _lr_lift_gemm(af, Ustk[:b], _SIGN_DC_AV_MODE)
-        AU = torch.cat([AU, _lr_lift_gemm(af, Ustk[b:], _SIGN_DC_AV_MODE)], dim=0)
-        Bstk = _lr_lift_gemm(Ustk.transpose(-1, -2), AU, _SIGN_DC_AV_MODE)
-        if not _SIGN_DC_SKIP_BSYM:
-            Bstk = 0.5 * (Bstk + Bstk.transpose(-1, -2))
-    with _sdc_timer("5_mega_eigh"):
-      try:
-        # fast_reduce=True (brief-83 t12): the CLEAN warp-shuffle sum (_mega_fast_sum)
-        # IS gate-safe for shape 11. EIGH_DIAG measurement over 2 full runs: 0/640
-        # fallback every iteration, orth_max ~2.0e-3 (vs the exact tree's ~3.4-4.4e-3)
-        # against the binding orth bound 4.578e-3 -- the finishing 3xTF32 Newton-Schulz
-        # cleans the slightly-reassociated eigenvectors to EVEN MORE orthonormal here.
-        # (The earlier t4 +38% regression was an artifact of t4's heavier different-
-        # pairing _mega_block_reduce helper, NOT fast-reduce itself.) shape11
-        # 84995->83930, geomean 27862->27824, still 39/39, 0 fallback.
-        lstk, gstk = _lr_reduced_eigh(Bstk, bt_prec=_SIGN_DC_BT_PREC,
-                                      fast_reduce=True)
-      except Exception:
-        lstk, gstk = torch.linalg.eigh(Bstk)
-    with _sdc_timer("6_member_topk"):
-        torch.backends.cuda.matmul.allow_tf32 = True
-        Up, Um = Ustk[:b], Ustk[b:]
-        # brief-103: back-transform to candidate eigenvectors, optionally in fp16
-        # (2x tf32 rate). gate-guarded; parent "tf32" is byte-identical to the bmm.
-        Vstk = _lr_lift_gemm(Ustk, gstk, _SIGN_DC_BT_LIFT)  # (2b, n, K)
-        Vp, Vm = Vstk[:b], Vstk[b:]
-        lp, lm = lstk[:b], lstk[b:]
-        # projector membership: ~1 for a real eigenvector of that block, ~0 for padding
-        if _SIGN_DC_FUSE_MEMBERSHIP:
-            # brief-96: X@Vp and X@Vm share the SAME X -> one wide X@[Vp|Vm] GEMM
-            # (b,n,n)@(b,n,2K) instead of two (b,n,n)@(b,n,K) baddbmms. Then
-            # P+ Vp = 0.5*(Vp + (X@Vp)), P- Vm = 0.5*(Vm - (X@Vm)).
-            XVpm = torch.bmm(X, torch.cat([Vp, Vm], dim=-1))   # (b, n, 2K)
-            selp = (0.5 * (Vp + XVpm[..., :K])).norm(dim=1)    # (b, K)
-            selm = (0.5 * (Vm - XVpm[..., K:])).norm(dim=1)    # (b, K)
-        else:
-            selp = _pp(Vp).norm(dim=1)                 # (b, K)
-            selm = _pm(Vm).norm(dim=1)                 # (b, K)
-        torch.backends.cuda.matmul.allow_tf32 = _gp
-        Vall = torch.cat([Vp, Vm], dim=-1)         # n x 2K
-        Lall = torch.cat([lp, lm], dim=-1)         # 2K
-        mem = torch.cat([selp, selm], dim=-1)      # 2K
-        topi = mem.topk(n, dim=-1).indices         # the n true eigenpairs
-        Q = torch.gather(Vall, 2, topi.unsqueeze(1).expand(b, n, n))
-        L = torch.gather(Lall, 1, topi)
+    # Reduced-block solve (stages 3-6): projector bases -> CQR -> reduced K x K eigh
+    # -> membership select. brief-117: PER-MATRIX ADAPTIVE K. The K-dependent stages
+    # scale ~quadratically in K but each cuSOLVER fallback costs ~4ms, so a single
+    # global K must stay wide (300, margin 12 over the batch max_side 287.6) to avoid
+    # inducing fallbacks. Instead SPLIT the batch by per-matrix max_side (from the
+    # sign trace) into _SIGN_DC_BUCKETS buckets, run each at its OWN K = ceil(bucket
+    # max_side) + margin (still capped at the safe global K), and reassemble. The easy
+    # majority (max_side ~262) runs the quadratic stages at a smaller K; the hard
+    # matrices keep the wide K -> 0 induced fallbacks. The residual gate below is
+    # unchanged (runs on the reassembled batch), so misbucketing is caught -> no
+    # regression. _SIGN_DC_BUCKETS == 1 is the byte-identical single-pipeline path.
+    if _SIGN_DC_BUCKETS <= 1:
+        Q, L = _sign_dc_reduced(af, X, K, n, dev)
+    else:
+        import math as _math
+        # per-matrix captured rank (max of the +/- side, from the sign trace)
+        trX = X.diagonal(dim1=-2, dim2=-1).sum(dim=-1)
+        npos = (n + trX) * 0.5
+        maxside = torch.maximum(npos, n - npos)                 # (b,)
+        # bucket by evenly-spaced max_side edges between the batch min and the global
+        # ceiling; assign each matrix to the smallest bucket whose K covers it.
+        ms_max = float(maxside.max().item())
+        ms_min = float(maxside.min().item())
+        nb = int(_SIGN_DC_BUCKETS)
+        # candidate bucket UPPER edges (max_side ceilings), ascending; last == ms_max
+        edges = [ms_min + (ms_max - ms_min) * (i + 1) / nb for i in range(nb)]
+        Q = af.new_zeros((b, n, n))
+        L = af.new_zeros((b, n))
+        assigned = torch.zeros(b, dtype=torch.bool, device=dev)
+        lo = -1.0
+        for bi, hi in enumerate(edges):
+            if bi == nb - 1:
+                sel = (~assigned)
+            else:
+                sel = (~assigned) & (maxside <= hi + 1e-3)
+            cnt = int(sel.sum().item())
+            if cnt == 0:
+                continue
+            # this bucket's K: cover its widest matrix + oversampling margin, cap at K
+            kb = min(K, int(_math.ceil(min(hi, ms_max))) + int(_SIGN_DC_BUCKET_MARGIN))
+            kb = max(64, kb)
+            idx = torch.nonzero(sel, as_tuple=False).flatten()
+            Qb, Lb = _sign_dc_reduced(af[idx].contiguous(), X[idx].contiguous(),
+                                      kb, n, dev)
+            Q[idx] = Qb
+            L[idx] = Lb
+            assigned |= sel
+            lo = hi
     # finishing Newton-Schulz orthonormalization (cleans the TF32-sign bases' ~1e-2
     # orth to ~1e-4). The Gram + Q@Gram GEMMs run in 3xTF32 (Ozaki hi+lo split, ~FP32
     # accuracy at ~1.6x the FP32-SIMT rate) instead of true FP32-SIMT -- the two n*n
