@@ -62,33 +62,40 @@ _MEGA_CUDA = r'''
 #include <torch/extension.h>
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
-// brief-83 LEVER B: warp-shuffle block reductions. The old red[] tree reduction
-// (for s=nt>>1;s>0;s>>=1){ ...; __syncthreads(); }) costs log2(nt) barriers per
-// reduction -- 9 barriers at nt=512, and the tridiag loop runs TWO such reductions
-// per column x ~298 columns => ~5300 barriers, the bulk of the 66.7%-barrier stall.
-// A warp-shuffle reduction needs ZERO barriers within a warp (5 shfl steps), then
-// ONE __syncthreads to combine the <=32 per-warp partials -- 9 barriers -> 1 per
-// reduction. `red` is a >=32-float scratch (the caller's red[] SMEM); op selects
-// sum(0)/min(1)/max(2). All threads call; returns the reduced value to every thread.
-__device__ __forceinline__ float _mega_warp_reduce(float v, int op){
-  #pragma unroll
-  for(int o=16;o>0;o>>=1){
-    float t=__shfl_down_sync(0xffffffffu, v, o);
-    v = (op==0)?(v+t):((op==1)?fminf(v,t):fmaxf(v,t));
-  }
-  return v;
+// brief-83 LEVER B: BIT-IDENTICAL barrier-lean block reduction. The old red[] tree
+// (red[tid]=v; __syncthreads(); for(s=nt>>1;s>0;s>>=1){ if(tid<s)red[tid]OPred[tid+s];
+// __syncthreads(); }) costs 1 + log2(nt) barriers per reduction -- 10 at nt=512, and
+// the tridiag loop runs TWO sum-reductions per column x ~298 columns => ~5900
+// barriers, the bulk of the 66.7%-barrier stall (t1 ncu).
+//
+// A plain warp-shuffle tree (reduce each warp, then combine partials) uses a
+// DIFFERENT summation pairing than the shared-mem tree, and brief-83 t4 MEASURED
+// that reassociation shifting the tridiag inner products enough to drift the Sturm
+// eigenvalues past shape-11's eigr gate (~3.6e-3, near the bound) -> mass cuSOLVER
+// fallback (+38%). So this variant preserves the EXACT (i, i+s) pairing of the old
+// tree: the cross-warp steps (s>=32) still run red[tid]OP=red[tid+s] in shared mem
+// (bit-identical), but the intra-warp tail (s=16..1, all lanes 0..31 of warp 0)
+// runs as __shfl_down_sync with offset s -- pairing lane i with lane i+s, the SAME
+// arithmetic as red[i]OP=red[i+s] with ZERO barriers. So 5 of the intra-warp
+// barriers vanish while every partial sum is computed in the identical order ->
+// gate-safe. Net: 10 barriers -> 6 (1 store-sync + 4 cross-warp for nt=512 + 1
+// broadcast). `red` is the caller's >=nt-float SMEM; op = sum(0)/min(1)/max(2).
+// All threads must call; returns the reduced value to every thread.
+__device__ __forceinline__ float _mega_reduce_op(float a, float b, int op){
+  return (op==0)?(a+b):((op==1)?fminf(a,b):fmaxf(a,b));
 }
 __device__ __forceinline__ float _mega_block_reduce(float v, int op, float* red, int tid, int nt){
-  int lane=tid&31, wid=tid>>5;
-  v=_mega_warp_reduce(v,op);
-  if(lane==0) red[wid]=v;
-  __syncthreads();
-  int nw=(nt+31)>>5;
-  // warp 0 reduces the nw per-warp partials (nw<=32 for nt<=1024) then broadcasts
-  // through red[0]; a second __syncthreads makes red[0] visible to all threads.
-  float r = (tid<nw)?red[tid]:((op==0)?0.f:((op==1)? 1e30f : -1e30f));
-  if(wid==0) r=_mega_warp_reduce(r,op);
-  if(tid==0) red[0]=r;
+  red[tid]=v; __syncthreads();
+  // cross-warp tree steps (s >= 32): identical pairing to the old loop.
+  for(int s=nt>>1; s>=32; s>>=1){ if(tid<s) red[tid]=_mega_reduce_op(red[tid],red[tid+s],op); __syncthreads(); }
+  // intra-warp tail (s = 16..1) via shuffle over lanes 0..31 -- same (i,i+s) pairing,
+  // no barriers. Only warp 0 (tid<32) participates; it writes red[0] at the end.
+  if(tid<32){
+    float r=red[tid];
+    #pragma unroll
+    for(int s=16;s>0;s>>=1){ float t=__shfl_down_sync(0xffffffffu,r,s); r=_mega_reduce_op(r,t,op); }
+    if(tid==0) red[0]=r;
+  }
   __syncthreads();
   return red[0];
 }
