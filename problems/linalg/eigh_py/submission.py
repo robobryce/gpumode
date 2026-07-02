@@ -3704,6 +3704,7 @@ def _sign_dc_omega(b, n, K, dev):
 _FUSED_CQR_CPP = r"""
 #include <torch/extension.h>
 torch::Tensor fused_gram_chol(torch::Tensor Q, double shift);
+void add_shifted_diag(torch::Tensor G, double shift);
 """
 
 _FUSED_CQR_CUDA = r"""
@@ -3853,6 +3854,38 @@ extern "C" __global__ void fused_gram_chol_kernel(
     }
 }
 
+// One CTA per matrix. Adds shift * max_i|G[i,i]| to the diagonal of a (B,k,k)
+// batch IN PLACE, fusing the diag/abs/amax/clamp/mul/add/eye elementwise chain
+// (~6-7 tiny torch launches) into ONE launch. This does not touch the (slow to
+// beat) cuSOLVER potrf or the trsm -- it only removes the dependency-gap launches
+// between the Gram bmm and the potrf.
+extern "C" __global__ void add_shifted_diag_kernel(
+        float* __restrict__ G, int B, int k, float shift) {
+    const int mat = blockIdx.x;
+    if (mat >= B) return;
+    const int tid = threadIdx.x, nt = blockDim.x;
+    float* Gm = G + (long)mat * k * k;
+    __shared__ float red[1024];
+    float lm = 0.0f;
+    for (int i = tid; i < k; i += nt) lm = fmaxf(lm, fabsf(Gm[(long)i * k + i]));
+    red[tid] = lm;
+    __syncthreads();
+    for (int s = nt >> 1; s > 0; s >>= 1) {
+        if (tid < s) red[tid] = fmaxf(red[tid], red[tid + s]);
+        __syncthreads();
+    }
+    float sh = shift * fmaxf(red[0], 1e-30f);
+    for (int i = tid; i < k; i += nt) Gm[(long)i * k + i] += sh;
+}
+
+void add_shifted_diag(torch::Tensor G, double shift) {
+    TORCH_CHECK(G.dim() == 3 && G.size(1) == G.size(2), "G must be (B,k,k)");
+    TORCH_CHECK(G.scalar_type() == torch::kFloat32, "G must be float32");
+    int B = G.size(0), k = G.size(1);
+    int nt = 256;
+    add_shifted_diag_kernel<<<B, nt>>>(G.data_ptr<float>(), B, k, (float)shift);
+}
+
 torch::Tensor fused_gram_chol(torch::Tensor Q, double shift) {
     TORCH_CHECK(Q.dim() == 3, "Q must be (B,n,k)");
     TORCH_CHECK(Q.scalar_type() == torch::kFloat32, "Q must be float32");
@@ -3897,7 +3930,7 @@ def _fused_cqr_get():
             name="fused_cqr_b92",
             cpp_sources=_FUSED_CQR_CPP,
             cuda_sources=_FUSED_CQR_CUDA,
-            functions=["fused_gram_chol"],
+            functions=["fused_gram_chol", "add_shifted_diag"],
             with_cuda=True,
             verbose=False,
             extra_cuda_cflags=["-O3", "--use_fast_math"],
@@ -3908,8 +3941,13 @@ def _fused_cqr_get():
         return None
 
 
-# Master switch + minimum k for the fused Gram+Cholesky path inside _sign_dc_cqr.
-_FUSED_CQR_GRAMCHOL = True
+# Master switch for the fused whole-Gram+Cholesky path inside _sign_dc_cqr (t1-t3:
+# occupancy-bound single-CTA Cholesky, ~7x slower than cuSOLVER's batched potrf --
+# left OFF). _FUSED_CQR_SHIFT fuses ONLY the diag/abs/amax/clamp/mul/add/eye chain
+# between the Gram bmm and the potrf into one launch, keeping the fast library
+# potrf+trsm -- targets the ~10ms host-dispatch gap in proj_cqr, not the kernels.
+_FUSED_CQR_GRAMCHOL = False
+_FUSED_CQR_SHIFT = True
 
 
 def _sign_dc_cqr(Y, passes=2, shift=1e-4, ns_refine=0):
@@ -3931,9 +3969,9 @@ def _sign_dc_cqr(Y, passes=2, shift=1e-4, ns_refine=0):
     c = Y.shape[-1]
     eyek = torch.eye(c, device=Y.device, dtype=Y.dtype)
     n_chol = passes - ns_refine
-    _fmod = _fused_cqr_get() if _FUSED_CQR_GRAMCHOL else None
+    _fmod = (_fused_cqr_get() if (_FUSED_CQR_GRAMCHOL or _FUSED_CQR_SHIFT) else None)
     for _ in range(n_chol):
-        if _fmod is not None:
+        if _fmod is not None and _FUSED_CQR_GRAMCHOL:
             # brief-92: fused Gram + shifted-Cholesky in ONE launch (packed k*k
             # factor resident in SMEM, no HBM round-trip between the Gram and the
             # potrf). Falls back to torch on any exception (shape/compile).
@@ -3943,6 +3981,13 @@ def _sign_dc_cqr(Y, passes=2, shift=1e-4, ns_refine=0):
                 G = torch.bmm(Qc.transpose(-1, -2), Qc)
                 dm = G.diagonal(dim1=-2, dim2=-1).abs().amax(-1).clamp_min(1e-30)
                 L = torch.linalg.cholesky(G + (shift * dm).view(-1, 1, 1) * eyek)
+        elif _fmod is not None and _FUSED_CQR_SHIFT:
+            # brief-92: fuse the diag/abs/amax/clamp/mul/add/eye shift chain (~6-7 tiny
+            # launches) into ONE add_shifted_diag launch on G, keeping torch's Gram
+            # bmm + the fast cuSOLVER potrf. Targets proj_cqr's ~10ms host-dispatch gap.
+            G = torch.bmm(Qc.transpose(-1, -2), Qc)
+            _fmod.add_shifted_diag(G, float(shift))
+            L = torch.linalg.cholesky(G)
         else:
             G = torch.bmm(Qc.transpose(-1, -2), Qc)
             dm = G.diagonal(dim1=-2, dim2=-1).abs().amax(-1).clamp_min(1e-30)
