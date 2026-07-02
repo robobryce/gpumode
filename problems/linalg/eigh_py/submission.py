@@ -778,70 +778,53 @@ extern "C" __global__ void mega_eigh_clust_split_k(
   for(int i=r0;i<r1;++i){ for(int j=tid;j<=i;j+=nt){ AOWNSET(i,j, Am[(long)i*n+j]*invs); } }
   __syncthreads();
 
-  // ============ Stage 1: Householder tridiagonalization (2-SYNC/col) =============
-  // brief-95: the parent needs 4 cross-cluster cl.sync per column (norm, v-broadcast,
-  // p-exchange, end-of-column trailing-update order). We cut this to 2 with NO added
-  // per-column work by two fusions:
-  //  (F1) BROADCAST the RAW column x (pre-Householder) together with the norm partial
-  //       in ONE sync, instead of a separate norm sync then v-broadcast sync. Each CTA
-  //       then knows xnorm (sum of C partials) AND has the full x vector, so it forms
-  //       the Householder vector v = x/(alpha-beta) LOCALLY. Same data volume, 2->1.
-  //  (F2) FOLD the end-of-column trailing-update ordering into the NEXT column's (F1)
-  //       sync: after the local rank-2 trailing update, compute the next column's owned
-  //       x + norm partial from the just-updated Ah and stage it; the same cl.sync that
-  //       broadcasts next-x also orders this column's trailing writes.
-  // Net: sync 1 = {norm partial + raw-x broadcast + prev trailing-update order},
-  //      sync 2 = {p exchange}. 4 -> 2 cross-cluster syncs/column. clx is DOUBLE-
-  //      BUFFERED (clx2[c&1]) so staging column c+1 never aliases the peer read of
-  //      column c (no WAR barrier needed). PB unused on this path.
-  (void)PB;
-  // Stage RAW column c's owned x into v[]+vgm and (s2, alpha) into clx2[buf]; caller
-  // issues cl.sync then reads clx2[buf] peers + vgm next iteration.
-  #define STAGE_XNORM(c,buf) do{                                                     \
-      int _c=(c); int _is=(r0>_c+1)?r0:(_c+1); bool _act=(r1>_c+1);                  \
-      int _own=0; for(int rr=0;rr<C;++rr){ if(_c+1>=bnd[rr]&&_c+1<bnd[rr+1]){_own=rr;break;} } \
-      bool _lead=((int)R==_own);                                                     \
-      float _s2=0.f;                                                                 \
-      if(_act) for(int i=_is+tid;i<r1;i+=nt){ float x=AOWN(i,_c); v[i]=x; vgm[i]=x; _s2+=x*x; } \
-      _s2=_clsum(_s2, red, tid, nt);                                                 \
-      if(tid==0){ clx2[(buf)][0]=_s2; if(_lead) clx2[(buf)][1]=AOWN(_c+1,_c); }        \
-      __threadfence(); __syncthreads();                                              \
-    }while(0)
-  STAGE_XNORM(0, 0);
-  cl.sync();                                  // prime: col-0 norm + raw-x broadcast (buf 0)
+  // ============ Stage 1: Householder tridiagonalization ============
   for(int c=0;c<n-2;++c){
-    int rb=c&1;                               // read buffer for column c
     bool active = (r1 > c+1);
     int is=(r0>c+1)?r0:(c+1);
+    float s2=0.f;
+    if(active) for(int i=is+tid;i<r1;i+=nt){ float x=AOWN(i,c); s2+=x*x; }
+    s2 = _clsum(s2, red, tid, nt);
     int ownerC1=0; { for(int rr=0;rr<C;++rr){ if(c+1>=bnd[rr] && c+1<bnd[rr+1]){ ownerC1=rr; break; } } }
-    bool lead = ((int)R==ownerC1);
-    // read the C peer partials (norm + alpha) exchanged by the previous fused sync.
+    // stage this CTA's partial s2 (clx[0]) + alpha=AOWN(c+1,c) on the owner (clx[1])
+    // into peer-visible SMEM; cluster.sync orders the DSMEM peer reads below.
+    if(tid==0){ clx[0]=s2; if((int)R==ownerC1) clx[1]=AOWN(c+1,c); }
+    __syncthreads();
+    cl.sync();
     float xnorm2=0.f, alpha=0.f;
     for(int rr=0;rr<C;++rr){
-      volatile float (*peer)[2] = (volatile float(*)[2])cl.map_shared_rank(clx2, rr);
-      xnorm2 += peer[rb][0];
-      if(rr==ownerC1) alpha = peer[rb][1];
+      volatile float* peerx = (volatile float*)cl.map_shared_rank(clx, rr);
+      xnorm2 += peerx[0];
+      if(rr==ownerC1) alpha = peerx[1];
     }
-    for(int i=tid;i<n;i+=nt) if(i<r0||i>=r1) v[i]=vgm[i];   // full raw x now local
-    __syncthreads();
+    bool lead = ((int)R==ownerC1);
     float tail2 = xnorm2 - alpha*alpha;
     if(tail2<=1e-20f){
       if(tid==0 && lead){ Em[c]=alpha; Tau[c]=0.f; }
       if(active) for(int i=r0+tid;i<r1;i+=nt) Rm[i*n+c]=(i==c+1)?1.f:0.f;
-      __syncthreads();
-      if(c+1<n-2){ STAGE_XNORM(c+1, rb^1); }
-      cl.sync();
+      __syncthreads(); cl.sync();
       continue;
     }
     float xnorm=sqrtf(xnorm2); float beta=(alpha>=0.f)?-xnorm:xnorm; float tau=(beta-alpha)/beta; float denom=alpha-beta;
-    // form Householder v LOCALLY from the broadcast raw x (v[] currently holds x).
-    for(int i=tid;i<n;i+=nt){
-      float xi=v[i];
-      v[i] = (i<=c)?0.f : ((i==c+1)?1.f : xi/denom);
+    for(int i=r0+tid;i<r1;i+=nt){
+      float vi = (i<=c)?0.f : ((i==c+1)?1.f : AOWN(i,c)/denom);
+      v[i]=vi; Rm[i*n+c]=vi; vgm[i]=vi;      // stage owned v into GLOBAL
     }
-    for(int i=r0+tid;i<r1;i+=nt) Rm[i*n+c]=v[i];    // owned reflector col c
+    __threadfence();                          // publish owned-v global writes to peers
     __syncthreads();
-    // symv p = tau*A@v (identical no-atomic symmetric dot product to the parent).
+    cl.sync();
+    // Cross-CTA v exchange via GLOBAL staging (vgm) + threadfence -- the DSMEM
+    // map_shared_rank peer read raced (non-deterministic tridiag; brief-21 same),
+    // so read every NON-owned v row from GLOBAL after the fenced cluster barrier.
+    // Generic over C: this CTA owns [r0,r1); all other rows come from vgm.
+    for(int i=tid;i<n;i+=nt) if(i<r0||i>=r1) v[i]=vgm[i];
+    __syncthreads();
+    // symv p = tau*A@v, no-atomic symmetric dot product. Owned active row i:
+    //   p[i] = sum_{j<=i} A[i][j] v[j]  (lower, local)  + sum_{j>i} A[j][i] v[j] (upper)
+    // FUSED single row loop (one pass over owned rows, matching the fast C=2 path):
+    // lower + local-upper from this CTA's Ah, then each PEER rank rr>R contributes
+    // its rows [bnd[rr],bnd[rr+1]) from its Ah via map_shared_rank. AhPeer[rr] is
+    // resolved once outside the row loop (peer map is per-rank, not per-row).
     volatile __half* AhP[8]; long triLoP[8];
     for(int rr=(int)R+1; rr<C; ++rr){ AhP[rr]=(volatile __half*)cl.map_shared_rank(Ah, rr); triLoP[rr]=((long)bnd[rr]*(bnd[rr]+1))/2; }
     if(active) for(int i=is+tid; i<r1; i+=nt){
@@ -852,11 +835,13 @@ extern "C" __global__ void mega_eigh_clust_split_k(
         volatile __half* AhPeer=AhP[rr]; long tlp=triLoP[rr];
         for(int j=bnd[rr];j<bnd[rr+1];++j){ __half hh=AhPeer[((long)j*(j+1))/2 - tlp + i]; acc += __half2float(hh)*v[j]; }
       }
-      p[i]=tau*acc; pgm[i]=p[i];
+      p[i]=tau*acc; pgm[i]=p[i];                           // stage owned p into GLOBAL pfull (disjoint)
     }
-    __threadfence();
+    __threadfence();                          // publish owned-p global writes to peers
     __syncthreads();
-    cl.sync();                                // sync 2: p exchange
+    cl.sync();
+    // Cross-CTA p exchange via GLOBAL pfull (pgm[0..n)) + threadfence. Read every
+    // NON-owned active row's p from pfull (generic over C).
     for(int i=(c+1)+tid;i<n;i+=nt) if(i<r0||i>=r1) p[i]=pgm[i];
     __syncthreads();
     float vp=0.f;
@@ -869,12 +854,8 @@ extern "C" __global__ void mega_eigh_clust_split_k(
     if(active) for(int i=iu+tid;i<r1;i+=nt){ float vi=v[i],wi=p[i]; for(int j=c+1;j<=i;++j){ float a=AOWN(i,j); AOWNSET(i,j, a-vi*p[j]-wi*v[j]); } }
     if(tid==0 && lead){ Em[c]=beta; Tau[c]=tau; }
     __syncthreads();
-    // FUSE (F2): next column's raw x + norm partial from the just-updated Ah; the
-    // cl.sync below orders this trailing update AND broadcasts the next raw x.
-    if(c+1<n-2){ STAGE_XNORM(c+1, rb^1); }
-    cl.sync();                                // sync 1(next): trailing-order + next norm/x
+    cl.sync();
   }
-  #undef STAGE_XNORM
   { int ownerLast=C-1; if(tid==0 && (int)R==ownerLast){ Em[n-2]=AOWN(n-1,n-2); } }
   for(int i=r0+tid;i<r1;i+=nt) Dm[i]=AOWN(i,i);
   // zero the two non-reflector V columns (as mega_eigh_med_split_k does) so the
