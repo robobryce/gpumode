@@ -475,6 +475,7 @@ extern "C" __global__ void mega_eigh_med_split_k(const float* __restrict__ Ain,
   // rebuild reuses shc from the base, well below the packed-A region).
   __half* vh=(__half*)(p+n);
   __half* ph=vh+n;
+  __shared__ float red[1024];
   float* Rm=rscr+(long)m*n*n; float* Dm=dscr+(long)m*n; float* Em=escr+(long)m*(n-1);
   float* DP=dpscr+(long)m*n*n; float* DM=dmscr+(long)m*n*n;
   float* Tau=tauscr+(long)m*n;
@@ -531,41 +532,45 @@ extern "C" __global__ void mega_eigh_med_split_k(const float* __restrict__ Ain,
       for(int s=nt>>1;s>0;s>>=1){ if(tid<s)red[tid]+=red[tid+s]; __syncthreads(); }
       vpr=red[0]; }
     float K=0.5f*tau*vpr;
-    for(int i=c+1+tid;i<n;i+=nt) p[i]=p[i]-K*v[i];
-    // brief-108: trailing symmetric rank-2 update A[i][j] -= v[i]p[j]+p[i]v[j]
-    // (j<=i, contiguous row-i packed storage). This is the O(n^2)/column
-    // GEMM-shaped panel update that dominates the ALU-bound reduction (ncu: 56.8%
-    // barrier stall but ALU the top pipe at 46.8% SM). f16upd does it in half2:
-    // read 2 packed A halves + broadcast v[i]/p[i] as half2, form
-    // A2 - vi2*P2 - wi2*V2 in FP16 arithmetic (2 FMAs/instr, half the ALU ops and
-    // no per-element half<->float conversion). vh/ph are the FP16 shadows of the
-    // FINAL v,p (p already has -K*v applied). Tail j (odd count / j==i) done
-    // scalar. FP32 accumulate is not needed here (each output is a - two products,
-    // not a long dot-product) so pure FP16 is the max ALU cut; the sign-DC eigr
-    // gate + cuSOLVER fallback backstops any drift. The FP32 path is byte-identical
-    // to the parent.
+    // brief-108: fold the FP16-shadow fill (vh,ph) into the SAME p-=K*v pass so the
+    // ONE existing __syncthreads below makes p AND the shadows block-visible -- no
+    // extra barrier (t2 added one/column and it hurt this barrier-bound kernel).
+    if(f16upd){ for(int i=c+1+tid;i<n;i+=nt){ float pi=p[i]-K*v[i]; p[i]=pi; ph[i]=__float2half(pi); vh[i]=__float2half(v[i]); } }
+    else      { for(int i=c+1+tid;i<n;i+=nt) p[i]=p[i]-K*v[i]; }
+    __syncthreads();
+    // trailing symmetric rank-2 update A[i][j] -= v[i]p[j]+p[i]v[j] (j<=i, contiguous
+    // row-i packed storage). This is the O(n^2)/column GEMM-shaped panel update. ncu
+    // (parent, shape11): 56.8% barrier stall but ALU is the top pipe (46.8% SM), so
+    // reducing its ALU op-count is the compute lever the brief tests. f16upd does it
+    // in half2: read 2 packed A halves + broadcast v[i]/p[i] as half2, form
+    // A2 - vi2*P2 - wi2*V2 in FP16 (2 FMAs/instr, half the ALU ops + no per-element
+    // half<->float convert). Pure FP16 (each output is a - two products, not a long
+    // dot-product); the sign-DC eigr gate + cuSOLVER fallback backstops any drift.
+    // The FP32 branch is byte-identical to the parent.
     if(f16upd){
-      __syncthreads();
-      for(int i=tid;i<n;i+=nt){ vh[i]=__float2half(v[i]); ph[i]=__float2half(p[i]); }
-      __syncthreads();
       for(int i=c+1+tid;i<n;i+=nt){
-        __half vi=vh[i], wi=ph[i];
-        __half2 vi2=__half2half2(vi), wi2=__half2half2(wi);
-        __half* row=&Ah[_tri(i,0)];           // row i base; entry j at row[j]
+        __half2 vi2=__half2half2(vh[i]), wi2=__half2half2(ph[i]);
+        long bi=_tri(i,0);                     // row i base half-index; entry j at Ah[bi+j]
+        __half* row=&Ah[bi];
         int j=c+1;
-        // align the vectorized run to an even j so half2 loads are 2-aligned
+        // Vectorize the ARITHMETIC in half2 for EVERY row (2 FMAs/instr): the
+        // v[i]p[j]+p[i]v[j] products are the ALU work. vh/ph are 4B-aligned bases so
+        // their half2 loads need only even j. Ah's packed row base bi=i(i+1)/2 has
+        // varying parity, so Ah stays SCALAR half loads/stores (always 2B-aligned,
+        // no misalignment) packed into a half2 -- this keeps the ALU op-count halved
+        // for all rows without the alignment restriction. The odd-count tail (and
+        // j==i) is scalar. Pure FP16 update; sign-DC gate + cuSOLVER fallback backstop.
         if(j & 1){ float a=__half2float(row[j]); row[j]=__float2half(a - v[i]*p[j] - p[i]*v[j]); ++j; }
         for(; j+1<=i; j+=2){
-          __half2 A2 = *(__half2*)&row[j];
+          __half2 A2 = __halves2half2(row[j], row[j+1]);
           __half2 P2 = __halves2half2(ph[j], ph[j+1]);
           __half2 V2 = __halves2half2(vh[j], vh[j+1]);
           A2 = __hsub2(__hsub2(A2, __hmul2(vi2, P2)), __hmul2(wi2, V2));
-          *(__half2*)&row[j] = A2;
+          row[j] = __low2half(A2); row[j+1] = __high2half(A2);
         }
         for(; j<=i; ++j){ float a=__half2float(row[j]); row[j]=__float2half(a - v[i]*p[j] - p[i]*v[j]); }
       }
     } else {
-      __syncthreads();
       for(int i=c+1+tid;i<n;i+=nt){ float vi=v[i],wi=p[i]; for(int j=c+1;j<=i;++j){ float a=AGET(i,j); ASET(i,j,a-vi*p[j]-wi*v[j]); } }
     }
     if(tid==0){Em[c]=beta;Tau[c]=tau;}
@@ -673,10 +678,13 @@ void mega_eigh_med_split(torch::Tensor A, torch::Tensor Vout, torch::Tensor Lout
   int B=A.size(0);
   size_t triN=((size_t)n*(n+1))>>1;
   size_t shm=triN*sizeof(__half); shm=(shm+3u)&~3u; shm+=(size_t)2*n*sizeof(float);
-  // brief-108: reserve the FP16 shadows vh,ph (2*n halves) that follow p, used by
-  // the half2 rank-2 update (f16upd). Always reserved so the pointer arithmetic is
-  // valid; the block-T rebuild region (Yp+Gp+Tp) sits below this and is unaffected.
-  shm += (size_t)2*n*sizeof(__half);
+  // brief-108: reserve the FP16 shadows vh,ph (2*n halves) that follow p ONLY when
+  // f16upd (bit1) is requested -- otherwise the FP32 path never touches them, and
+  // reserving the bytes unconditionally can push a large-n block (n=352) over the
+  // 228KB opt-in cap and drop it from 2->1 CTA/SM (t2 regression). The kernel only
+  // dereferences vh/ph inside the `if(f16upd)` branch, so the pointers being past
+  // the reserved region in the FP32 path is harmless.
+  if((fastRed>>1)&1) shm += (size_t)2*n*sizeof(__half);
   // the block-T build reuses shc for Yp(n*nb)+Gp(nb*nb)+Tp(nb*nb); ensure the
   // dynamic SMEM is at least that large (it usually is -- packed-A dominates --
   // but a large nb at small n can exceed it).
