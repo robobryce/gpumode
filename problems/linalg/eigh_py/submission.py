@@ -503,7 +503,12 @@ extern "C" __global__ void mega_eigh_med_split_k(const float* __restrict__ Ain,
     __syncthreads();
     for(int i=tid;i<n;i+=nt) Rm[i*n+c]=v[i];
     for(int i=c+1+tid;i<n;i+=nt){ float acc=0.f; for(int j=c+1;j<n;++j) acc+=AGET(i,j)*v[j]; p[i]=tau*acc; }
-    __syncthreads();
+    // brief-83 t13: NO barrier here. The vp dot-product reads only each thread's OWN
+    // p[i] (same stride it just wrote) and the shared v (already synced by the v-fill
+    // barrier), so p need not be block-visible yet. The vp reduction's own leading
+    // __syncthreads (fast: _mega_fast_sum; exact: red[tid]=vp;sync) plus the barrier
+    // after p-=K*v order the cross-thread p reads for the rank-2 update. Removes 1
+    // __syncthreads/column (~298). Pure ordering -- byte-identical, gate-safe.
     float vp=0.f; for(int i=c+1+tid;i<n;i+=nt) vp+=v[i]*p[i];
     float vpr;
     if(fastRed){ vpr=_mega_fast_sum(vp,red,tid,nt); }
