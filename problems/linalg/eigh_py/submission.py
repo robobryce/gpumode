@@ -3499,6 +3499,8 @@ _SIGN_DC_CQR_NS_REFINE = 0
 # the shifted Cholesky) and precision-safe (the GEMM keeps FP32/tensor-core accuracy)
 # -- unlike the NS refinement (t5) which diverged on the rank-deficient bases.
 _SIGN_DC_CQR_INV_GEMM = False
+# brief-87: fuse the two projector applies P+@Om, P-@Om2 into one wide X@[Om|Om2] GEMM.
+_SIGN_DC_FUSE_PROJ = True
 _SIGN_DC_CQR_PASSES = 2   # subspace-basis CholeskyQR passes. REQUIRED at 2: the
                           # projected bases P+/- @ Omega are rank-deficient (the K
                           # oversample exceeds the true subspace rank), and 1 shifted
@@ -3844,9 +3846,20 @@ def _sign_dc_solve(af, n, dev):
     # one A@U GEMM instead of two -- better GPU fill, half the launch overhead.
     Om, Om2 = _sign_dc_omega(b, n, K, dev)
     with _sdc_timer("3_proj_cqr"):
-        Ustk = _sign_dc_cqr(torch.cat([_pp(Om), _pm(Om2)], dim=0),
-                            passes=_SIGN_DC_CQR_PASSES,
-                            ns_refine=_SIGN_DC_CQR_NS_REFINE)         # (2b, n, K)
+        if _SIGN_DC_FUSE_PROJ:
+            # brief-87: FUSE the two projector applies into ONE wide GEMM. P+@Om and
+            # P-@Om2 both need X @ (thin), so X @ [Om | Om2] is a single (b,n,n)@(b,n,2K)
+            # GEMM (better tensor-core fill + one launch) instead of two (b,n,n)@(b,n,K).
+            XOm = torch.bmm(X, torch.cat([Om, Om2], dim=-1))       # (b, n, 2K)
+            Pp = 0.5 * (Om + XOm[..., :K])                          # P+ @ Om
+            Pm = 0.5 * (Om2 - XOm[..., K:])                         # P- @ Om2
+            Ustk = _sign_dc_cqr(torch.cat([Pp, Pm], dim=0),
+                                passes=_SIGN_DC_CQR_PASSES,
+                                ns_refine=_SIGN_DC_CQR_NS_REFINE)     # (2b, n, K)
+        else:
+            Ustk = _sign_dc_cqr(torch.cat([_pp(Om), _pm(Om2)], dim=0),
+                                passes=_SIGN_DC_CQR_PASSES,
+                                ns_refine=_SIGN_DC_CQR_NS_REFINE)     # (2b, n, K)
     torch.backends.cuda.matmul.allow_tf32 = _gp
     # reduced K x K blocks -> fused tensor-core megakernel (raw, unsorted, ungated).
     # Both blocks solved in ONE stacked (2b, K, K) megakernel launch: one-CTA-per-matrix,
