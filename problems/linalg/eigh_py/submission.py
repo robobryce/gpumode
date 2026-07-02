@@ -3067,7 +3067,7 @@ _MIXED_PEEL_PROJ_MODE = "fp32"
 #   "pad"      - ONE _lowrank_eigh at max-k=352 over dense+psd (psd padded up). Trial
 #                measures the padding-waste-vs-launch-saving tradeoff (psd at k=352
 #                is above its ~300 orth ceiling -> mass fallback per the PSD probe).
-_MIXED_PEEL_FUSE_MODE = "pad"
+_MIXED_PEEL_FUSE_MODE = "bucketed"
 
 
 def _mixed_peel_count(pr: torch.Tensor) -> int:
