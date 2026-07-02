@@ -3544,11 +3544,13 @@ _SIGN_DC_FUSE_PROJ = False
 # X @ [Vp | Vm] GEMM. Both membership terms (selp = ||P+ Vp||, selm = ||P- Vm||)
 # apply the SAME sign matrix X to a (b,n,K) block; stacking the two RHS blocks into
 # one (b,n,2K) GEMM gives better tensor-core fill + one launch instead of two.
-# nsys/probe (shape 11): the two X@V GEMMs are ~1.06ms -- the single biggest GEMM in
-# the back-transform/Rayleigh/membership region -- so fusing them is the top lever
-# there. Numerically identical (same products, just wider); the norm(dim=1) still
-# runs per half. Off falls back to the two-baddbmm form.
-_SIGN_DC_FUSE_MEMBERSHIP = True
+# nsys/probe (shape 11): the two X@V GEMMs are ~1.06ms. brief-96 MEASURED the wide
+# fused form SLOWER than the two-baddbmm form (1.69ms vs 1.05ms): Vp,Vm are
+# non-contiguous BATCH slices of Vstk, so cat([Vp,Vm],dim=-1) forces a 786MB copy,
+# and splitting the 0.5*(V +/- X@V) into separate elementwise ops materializes
+# intermediates -- both cost more than the two baddbmm epilogues (which fuse the
+# 0.5*V add into the GEMM) save. So the two-baddbmm form is kept (fused already).
+_SIGN_DC_FUSE_MEMBERSHIP = False
 # brief-96: SKIP the explicit 0.5*(B+B^T) symmetrization of the reduced Rayleigh-Ritz
 # block Bstk = Ustk^T A Ustk. The reduced-block eigensolver (mega_eigh_med_split_k)
 # reads Bstk through the AGET(i,j)= (j<=i)? lower[i,j] : lower[j,i] accessor -- it only
