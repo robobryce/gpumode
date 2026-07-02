@@ -5813,6 +5813,246 @@ def _eigh_sign_dc(a: torch.Tensor) -> output_t:
     return Q.contiguous(), L.contiguous()
 
 
+# ---------------------------------------------------------------------------
+# WARP-PER-MATRIX register-resident two-sided cyclic Jacobi eigensolver
+# (brief-113). Targets the tiny n<=32 batched class (shape 0: n=32, b=20) that
+# UNDERFILLS the GPU on cuSOLVER's batched Jacobi (20/148 SMs, ~161us). The
+# lever is FILLING the machine at small batch, not out-imploring syevj per
+# matrix: each WARP (32 lanes) solves one 32x32 symmetric eigenproblem ENTIRELY
+# in registers via warp shuffles -- NO shared memory, NO __syncthreads, NO
+# cross-block sync. Lane l owns row l of A (Ar[32]) and row l of the accumulated
+# rotation V (Vr[32], V init = I). A full Jacobi sweep is the parallel
+# (round-robin / Brent-Luk) ordering: n-1 rounds x n/2 disjoint (p,q) rotations.
+# Because lane index == player index, the rotation of the pair containing column
+# j is held by lane j, so a single __shfl per source lane broadcasts the whole
+# round's rotations column-wise (no SMEM). Packing many warps per CTA (each warp
+# = 1 matrix) gives the scheduler abundant eligible warps at high occupancy that
+# hide each other's shuffle/FMA latency -- the co-residency the SMEM-limited
+# 1-CTA/matrix sibling kernels lacked. Fixed small sweep count clears the loose
+# n<=32 residual gate (eigen ~7.6e-4); the Python wrapper residual-gates per
+# matrix and falls any miss back to cuSOLVER (never regresses below the floor).
+_WJAC_NMAX = 32           # only n<=32 routed to the warp-Jacobi kernel
+_WJAC_SWEEPS = 12         # cyclic-Jacobi sweeps (each = n-1 rounds). Swept below.
+_WJAC_WARPS = 8           # warps (matrices) per CTA -> co-residency at high occ
+_wjac_mod = None
+_wjac_failed = False
+
+_WJAC_CPP = (
+    "void warp_jacobi_eigh(torch::Tensor A, torch::Tensor Vout, torch::Tensor Lout, "
+    "int n, int sweeps, int warpsPerBlock);"
+)
+
+_WJAC_CUDA = r'''
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+// One WARP per matrix. Lane l owns row l of A (Ar) and row l of V (Vr), V init=I.
+// Two-sided cyclic Jacobi with the round-robin (Brent-Luk) parallel ordering:
+// per round every lane is in exactly one disjoint (p,q) pair. Fully register-
+// resident: the only cross-lane traffic is __shfl_sync (no SMEM, no barriers).
+extern "C" __global__ void warp_jacobi_eigh_k(
+    const float* __restrict__ Ain, float* __restrict__ Vout,
+    float* __restrict__ Lout, int B, int n, int sweeps) {
+  const unsigned FULL = 0xffffffffu;
+  int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;   // global warp id
+  int lane = threadIdx.x & 31;
+  if (warp >= B) return;
+  const float* Am = Ain + (long)warp * n * n;
+  // Load row `lane` of A into registers; V row = e_lane.
+  float Ar[32];
+  float Vr[32];
+  #pragma unroll
+  for (int j = 0; j < 32; ++j) {
+    Ar[j] = (lane < n && j < n) ? Am[(long)lane * n + j] : ((lane == j) ? 1.0f : 0.0f);
+    Vr[j] = (lane == j) ? 1.0f : 0.0f;
+  }
+  // Round-robin schedule (circle method): position 0 fixed = player 0; position
+  // t>0 = ((t-1)+r) mod (n-1) + 1. Pairs = (pos, n-1-pos). We need, for THIS lane
+  // (= player `lane`), its position each round; then partner player, and whether
+  // it is the low-index member of its pair (only the low member computes the
+  // angle, then broadcasts). n padded to even nP with dummy players (diag-only,
+  // Ar[dummy cols]=0 above) so nP/2 pairs and nP-1 rounds cover n<=32.
+  int nP = (n + 1) & ~1;                     // even padded size (>= n)
+  for (int sw = 0; sw < sweeps; ++sw) {
+    for (int r = 0; r < nP - 1; ++r) {
+      // position of THIS player `lane` in round r:
+      //   player 0 -> pos 0; player p>0 -> pos = ((p-1) - r) mod (nP-1) + 1
+      int myPos;
+      if (lane == 0) myPos = 0;
+      else {
+        int x = (lane - 1 - r) % (nP - 1);
+        if (x < 0) x += (nP - 1);
+        myPos = x + 1;
+      }
+      int partPos = (nP - 1) - myPos;        // paired position
+      // player at partPos:
+      int partner;
+      if (partPos == 0) partner = 0;
+      else partner = ((partPos - 1 + r) % (nP - 1)) + 1;
+      bool amLow = lane < partner;           // low member computes the rotation
+      // ---- compute rotation (low member), then broadcast (c,s) via shuffle ----
+      // low member p holds app=Ar[p]=Ar[lane], apq=Ar[q]=Ar[partner]; needs
+      // aqq=A[q][q] from lane q (= partner).
+      float aqq_from_partner = __shfl_sync(FULL, Ar[lane], partner);  // partner's diag
+      float c = 1.0f, s = 0.0f;
+      // both members compute the SAME (c,s) redundantly so lane `lane` holds the
+      // rotation of the pair containing player `lane` (needed for column bcast).
+      {
+        int p = amLow ? lane : partner;
+        int q = amLow ? partner : lane;
+        float app = amLow ? Ar[lane] : aqq_from_partner;   // A[p][p]
+        float aqq = amLow ? aqq_from_partner : Ar[lane];   // A[q][q]
+        float apq = Ar[q];   // A[lane][q]; for low member q=partner, for high member q=lane -> Ar[lane]=A[q][q]?? see below
+        // apq must be A[p][q]. low member (lane==p): Ar[q]=Ar[partner]=A[p][q]. OK.
+        // high member (lane==q): needs A[p][q]=A[q][p]=Ar[p]=Ar[partner]. Ar[partner]=A[q][p]. OK (symmetry).
+        apq = Ar[partner];
+        // Jacobi rotation to zero apq.
+        if (fabsf(apq) > 1e-30f * (fabsf(app) + fabsf(aqq) + 1e-30f)) {
+          float tau = (aqq - app) / (2.0f * apq);
+          float t = (tau >= 0.0f) ? 1.0f / (tau + sqrtf(1.0f + tau * tau))
+                                  : -1.0f / (-tau + sqrtf(1.0f + tau * tau));
+          c = rsqrtf(1.0f + t * t);
+          s = t * c;
+        }
+      }
+      // Per-column rotation broadcast: for column j, its pair's rotation is held
+      // by lane j. low-role flag for column j: player j is low iff j < its partner.
+      // We already have amLow per lane; broadcast c,s,partner,amLow indexed by lane.
+      __syncwarp();
+      // ---- COLUMN update: newA[l][j] uses pair(j)'s rotation & partner col ----
+      // Read old row, then overwrite. For column j (low member): A[l][j] = c*A[l][j]-s*A[l][pj];
+      // high member: A[l][j] = s*A[l][pj]+c*A[l][j], where pj=partner of column j.
+      float newAr[32];
+      float newVr[32];
+      #pragma unroll
+      for (int j = 0; j < 32; ++j) { newAr[j] = Ar[j]; newVr[j] = Vr[j]; }
+      #pragma unroll
+      for (int j = 0; j < 32; ++j) {
+        if (j >= n) continue;
+        float cj = __shfl_sync(FULL, c, j);
+        float sj = __shfl_sync(FULL, s, j);
+        int pj = __shfl_sync(FULL, partner, j);
+        int lowj = __shfl_sync(FULL, (int)amLow, j);
+        if (pj >= n) continue;              // dummy partner: no rotation
+        float aj = Ar[j];
+        float apj = Ar[pj];
+        float vj = Vr[j];
+        float vpj = Vr[pj];
+        if (lowj) { newAr[j] = cj * aj - sj * apj; newVr[j] = cj * vj - sj * vpj; }
+        else      { newAr[j] = sj * apj + cj * aj; newVr[j] = sj * vpj + cj * vj; }
+      }
+      #pragma unroll
+      for (int j = 0; j < 32; ++j) { Ar[j] = newAr[j]; Vr[j] = newVr[j]; }
+      __syncwarp();
+      // ---- ROW update: rows p,q combine. Each lane combines its row with its
+      // partner's row using its OWN pair's (c,s). low member: newrow = c*row - s*prow;
+      // high member: newrow = s*prow + c*row. V rows are NOT row-rotated (V<-V*J only).
+      float prow[32];
+      #pragma unroll
+      for (int j = 0; j < 32; ++j) prow[j] = __shfl_sync(FULL, Ar[j], partner);
+      if (partner < n) {
+        #pragma unroll
+        for (int j = 0; j < 32; ++j) {
+          if (j >= n) continue;
+          float rj = Ar[j], pj = prow[j];
+          Ar[j] = amLow ? (c * rj - s * pj) : (s * pj + c * rj);
+        }
+      }
+      __syncwarp();
+    }
+  }
+  // eigenvalue for player `lane` = A[lane][lane]; eigenvector = column `lane` of V,
+  // i.e. entry V[i][lane]=Vr[lane] over lanes i. Write V row-major (lane i -> row i)
+  // so Vout[:, :, l] is eigenvector l; L[warp][lane] = Ar[lane].
+  if (lane < n) Lout[(long)warp * n + lane] = Ar[lane];
+  float* Vm = Vout + (long)warp * n * n;
+  #pragma unroll
+  for (int j = 0; j < 32; ++j) if (lane < n && j < n) Vm[(long)lane * n + j] = Vr[j];
+}
+
+void warp_jacobi_eigh(torch::Tensor A, torch::Tensor Vout, torch::Tensor Lout,
+                      int n, int sweeps, int warpsPerBlock) {
+  int B = A.size(0);
+  int threads = warpsPerBlock * 32;
+  int warpsTotal = B;
+  int blocks = (warpsTotal + warpsPerBlock - 1) / warpsPerBlock;
+  warp_jacobi_eigh_k<<<blocks, threads>>>(
+      A.data_ptr<float>(), Vout.data_ptr<float>(), Lout.data_ptr<float>(), B, n, sweeps);
+}
+'''
+
+
+def _wjac_get():
+    """Lazily compile + cache the warp-per-matrix Jacobi extension. Returns the
+    module, or None on compile failure (caller falls back to cuSOLVER)."""
+    global _wjac_mod, _wjac_failed
+    if _wjac_mod is not None:
+        return _wjac_mod
+    if _wjac_failed:
+        return None
+    try:
+        import os
+        from torch.utils.cpp_extension import load_inline
+        os.environ["TORCH_CUDA_ARCH_LIST"] = "10.0a"
+        _wjac_mod = load_inline(
+            name="warp_jacobi_eigh_b113",
+            cpp_sources=_WJAC_CPP,
+            cuda_sources=_WJAC_CUDA,
+            functions=["warp_jacobi_eigh"],
+            with_cuda=True,
+            verbose=False,
+            extra_cuda_cflags=["-O3", "--use_fast_math"],
+        )
+        return _wjac_mod
+    except Exception:
+        _wjac_failed = True
+        return None
+
+
+def _eigh_warp_jacobi(a: torch.Tensor) -> output_t:
+    """Warp-per-matrix register-resident cyclic-Jacobi eigh for the tiny n<=32
+    batched class. Per-matrix residual+orth gate + cuSOLVER fallback -> never
+    regresses below the cuSOLVER floor and never emits an invalid factorization.
+    Falls back wholesale to cuSOLVER if the extension is unavailable."""
+    mod = _wjac_get()
+    b, n, _ = a.shape
+    if mod is None:
+        values, vectors = torch.linalg.eigh(a)
+        return vectors, values
+    af = a.float().contiguous()
+    dev = af.device
+    V = torch.empty(b, n, n, device=dev, dtype=torch.float32)
+    L = torch.empty(b, n, device=dev, dtype=torch.float32)
+    mod.warp_jacobi_eigh(af, V, L, n, _WJAC_SWEEPS, _WJAC_WARPS)
+    L, order = torch.sort(L, dim=-1)
+    Q = torch.gather(V, 2, order.unsqueeze(1).expand(b, n, n))
+    # per-matrix residual gate (harness-level), fall failures back to cuSOLVER.
+    eps = torch.finfo(torch.float32).eps
+    eye = torch.eye(n, device=dev, dtype=torch.float32)
+    AQ = af @ Q
+    eigr = torch.linalg.matrix_norm(AQ - Q * L.unsqueeze(-2), ord=1, dim=(-2, -1))
+    orth = torch.linalg.matrix_norm(Q.transpose(-1, -2) @ Q - eye, ord=1, dim=(-2, -1))
+    a_l1 = torch.linalg.matrix_norm(af, ord=1, dim=(-2, -1)).clamp_min(1e-30)
+    # gate thresholds ~0.7x the harness gates (eigen 200*n*eps, orth 100*n*eps).
+    bad = ((orth > 70.0 * n * eps) | (eigr / a_l1 > 140.0 * n * eps)
+           | ~torch.isfinite(L).all(dim=-1) | ~torch.isfinite(Q).all(dim=(-2, -1)))
+    import os as _os
+    if _os.environ.get("WJAC_DBG"):
+        import sys as _sys
+        _sys.stderr.write(
+            f"[WJAC_DBG] n={n} b={b} sweeps={_WJAC_SWEEPS} warps={_WJAC_WARPS} "
+            f"orth_gate={70.0*n*eps:.4g} orth_max={orth.max().item():.4g} "
+            f"eigr_gate={140.0*n*eps:.4g} eigr_rel_max={(eigr/a_l1).max().item():.4g} "
+            f"nbad={int(bad.sum().item())}/{b}\n")
+        _sys.flush() if hasattr(_sys, "flush") else _sys.stderr.flush()
+    if bool(bad.any()):
+        idx = torch.nonzero(bad, as_tuple=False).flatten()
+        Lf, Qf = torch.linalg.eigh(af[idx])
+        Q[idx] = Qf
+        L[idx] = Lf
+    return Q.contiguous(), L.contiguous()
+
+
 def custom_kernel(data: input_t) -> output_t:
     a = data
     n = a.shape[-1]
@@ -5822,6 +6062,12 @@ def custom_kernel(data: input_t) -> output_t:
     # goes to its measured-faster validated path; cuSOLVER is the default (the
     # baseline floor), so the router can never regress.
     #
+    # n <= _WJAC_NMAX (tiny class, shape 0 n=32/b=20): WARP-per-matrix register-
+    # resident cyclic Jacobi. cuSOLVER's batched Jacobi underfills the GPU at
+    # small batch (~161us at b=20); packing many warps/CTA fills all SMs SMEM-
+    # free. Residual-gated + cuSOLVER fallback -> can never regress.
+    if n <= _WJAC_NMAX:
+        return _eigh_warp_jacobi(a)
     # n <= _MEGA_NMAX: the fused full-eigh megakernel (one CTA per matrix, the
     # whole eigh resident in SMEM, one launch) -- 2.0x faster than cuSOLVER on
     # the small-n batched shapes, residual-gated for safety.
