@@ -1091,7 +1091,7 @@ _MEGA_MED_NMAX = 448
 # each CTA's barrier stall behind the other's compute. The prior 256/512/1024
 # sweep picked 1024 on n=352 b40 (a 40-CTA grid where occupancy is irrelevant);
 # shape 11's 1280-CTA grid is the regime where the occupancy win appears.
-_MEGA_MED_NT = 512
+_MEGA_MED_NT = 256
 
 # Compact-WY back-transform panel width for the SPLIT med path. The split
 # kernel builds one nb x nb block-T per panel; the torch-level back-transform
