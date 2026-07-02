@@ -4204,7 +4204,7 @@ def _eigh_mixed_peel(a: torch.Tensor, pr: torch.Tensor) -> output_t:
 # leaderboard-reseed-safe.
 # ---------------------------------------------------------------------------
 _SIGN_DC_N = 512          # routed only at n=512 (the shape-11 dense-even class)
-_SIGN_DC_K = 272          # oversized subspace width (>= max +count/-count over the
+_SIGN_DC_K = 296          # oversized subspace width (>= max +count/-count over the
                           # batch; +count ~ n/2 +- ~38 for a random-sign even spectrum,
                           # shape-11 seed max kp/km 294/293). K=300 gives 0 gate-fallback
                           # with headroom for a reseed that shifts +count higher, and
@@ -4242,7 +4242,7 @@ _SIGN_DC_BUCKET_MARGIN = 14 # oversampling margin: a bucket covering max_side<=E
 _SIGN_DC_BUCKET_PLAN_OVERRIDE = None
 _SIGN_DC_MAXSIDE_SPAN = 40  # assumed max_side spread above n/2 (287.6-256 = 31.6 obs;
                             # 40 gives reseed headroom). Auto edges span [n/2, n/2+span].
-_SIGN_DC_NS_ITERS = 16    # Newton-Schulz sign iterations (each = 2 batched GEMMs).
+_SIGN_DC_NS_ITERS = 10    # Newton-Schulz sign iterations (each = 2 batched GEMMs).
                           # The near-zero eigenvalues plateau |X| below 1 (they need
                           # ~22 quadratic steps to fully resolve), but the projector
                           # MEMBERSHIP rank-select tolerates a fuzzy sign, so ~18 iters
