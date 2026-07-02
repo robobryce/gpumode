@@ -3749,23 +3749,24 @@ extern "C" __global__ void fused_gram_chol_kernel(
     __syncthreads();
 
     // ---- Gram accumulation, walked over row-blocks of RB rows ----
+    // Thread t owns the strided set of triangle ROWS {i : i % nt == t}; for each such
+    // row it accumulates the contiguous packed segment Gp[pidx(i,0)..pidx(i,i)] over
+    // the RB rows in the SMEM tile. This avoids the per-entry sqrt index recovery and
+    // gives each thread contiguous writes to its row segment. tile[t*k + i] (row-i's
+    // value, loop-invariant in j) is loaded once per row-block row t.
     for (int r0 = 0; r0 < n; r0 += FUSED_CQR_RB) {
         int rb = min(FUSED_CQR_RB, n - r0);
         // coalesced load of the row-block into SMEM tile (rb x k)
         for (int e = tid; e < rb * k; e += nt) tile[e] = Qm[(long)r0 * k + e];
         __syncthreads();
-        // rank-rb symmetric update of the packed lower triangle
-        for (int e = tid; e < tri; e += nt) {
-            // recover (i,j) from packed index e: i is the row s.t. i(i+1)/2 <= e < (i+1)(i+2)/2
-            // solve i = floor((sqrt(8e+1)-1)/2)
-            int i = (int)((sqrtf(8.0f * e + 1.0f) - 1.0f) * 0.5f);
-            while (pidx(i + 1, 0) <= e) i++;
-            while (pidx(i, 0) > e) i--;
-            int j = e - pidx(i, 0);
-            float acc = 0.0f;
-            #pragma unroll 4
-            for (int t = 0; t < rb; t++) acc += tile[t * k + i] * tile[t * k + j];
-            Gp[e] += acc;
+        for (int i = tid; i < k; i += nt) {
+            float* Gi = Gp + pidx(i, 0);       // contiguous row-i segment [0..i]
+            for (int t = 0; t < rb; t++) {
+                const float* qt = tile + t * k;
+                float qti = qt[i];
+                #pragma unroll 4
+                for (int j = 0; j <= i; j++) Gi[j] += qti * qt[j];
+            }
         }
         __syncthreads();
     }
@@ -3860,7 +3861,7 @@ torch::Tensor fused_gram_chol(torch::Tensor Q, double shift) {
     auto L = torch::empty({B, k, k}, Qc.options());
     int tri = (k * (k + 1)) / 2;
     size_t shbytes = (size_t)(tri + FUSED_CQR_RB * k) * sizeof(float);
-    int nt = 256;
+    int nt = 512;
     static int configured = 0;
     if (!configured) {
         cudaFuncSetAttribute(fused_gram_chol_kernel,
