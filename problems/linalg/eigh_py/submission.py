@@ -62,43 +62,6 @@ _MEGA_CUDA = r'''
 #include <torch/extension.h>
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
-#include <mma.h>
-namespace wmma = nvcuda::wmma;
-// brief-83 LEVER C: WMMA (tensor-core) block-T Gram G = Y^T Y for the compact-WY
-// back-transform. Y is n x nb (nb=32), stored row-major Yp[i*nb+a]. The Gram is a
-// 32x32 = 2x2 grid of 16x16 output tiles; contraction over n in K=8 steps (TF32
-// WMMA is m16n16k8). 4 warps (wid 0..3) each own one output tile and accumulate
-// over the whole column height, then store to Gp. TF32 single-pass here is
-// gate-tolerant: the block-T feeds the WY back-transform which the sign-DC
-// finishing Newton-Schulz re-orthonormalizes (measured separately per trial).
-// fastGram=0 keeps the SIMT Gram (bit-comparable to the pre-WMMA build).
-// Yp MUST be zero-padded to npad = ceil(n/8)*8 rows (leading dim nb) so the K=8
-// WMMA steps never read past the real n rows. nb MUST be a multiple of 16.
-__device__ inline void _mega_wmma_gram(const float* Yp, float* Gp, int npad, int nb,
-                                       int tid){
-  int wid=tid>>5;                       // warp id
-  int nwt=nb/16;                        // tiles per dim (2 for nb=32)
-  int ntile=nwt*nwt;                    // 4 output tiles
-  if(wid<ntile){
-    int tr=wid/nwt, tc=wid%nwt;         // tile row/col
-    wmma::fragment<wmma::accumulator,16,16,8,float> acc;
-    wmma::fill_fragment(acc, 0.0f);
-    // G = Y^T Y: matrix_a = Y^T tile (col_major over Yp gives A[a][i]=Y[i][a]),
-    // matrix_b = Y tile (row_major). Both leading dim nb. K-loop over padded height.
-    for(int k0=0;k0<npad;k0+=8){
-      wmma::fragment<wmma::matrix_a,16,16,8,wmma::precision::tf32,wmma::col_major> fa;
-      wmma::fragment<wmma::matrix_b,16,16,8,wmma::precision::tf32,wmma::row_major> fb;
-      wmma::load_matrix_sync(fa, Yp + (size_t)k0*nb + tr*16, nb);
-      wmma::load_matrix_sync(fb, Yp + (size_t)k0*nb + tc*16, nb);
-      #pragma unroll
-      for(int t=0;t<fa.num_elements;t++) fa.x[t]=wmma::__float_to_tf32(fa.x[t]);
-      #pragma unroll
-      for(int t=0;t<fb.num_elements;t++) fb.x[t]=wmma::__float_to_tf32(fb.x[t]);
-      wmma::mma_sync(acc, fa, fb, acc);
-    }
-    wmma::store_matrix_sync(Gp + (size_t)(tr*16)*nb + tc*16, acc, nb, wmma::mem_row_major);
-  }
-}
 // brief-83 LEVER B: fast warp-shuffle block SUM reduction for mega_eigh_med_split_k's
 // tridiag inner products. The old red[] tree costs 1+log2(nt) barriers/reduction
 // (10 at nt=512); the tridiag runs 2 sum-reductions/column x ~298 cols. A warp-shuffle
@@ -602,12 +565,9 @@ extern "C" __global__ void mega_eigh_med_split_k(const float* __restrict__ Ain,
   // recurrence (the single-warp shuffle build capped nb at 32).
   int nref=n-2;
   int npan=(nref + nb - 1)/nb;
-  // brief-83 LEVER C: Yp is zero-padded to npad = ceil(n/8)*8 rows so the K=8 WMMA
-  // Gram steps never read past n. Padding rows (n..npad-1) are zeroed once.
-  int npad=((n+7)/8)*8;
-  float* Yp=(float*)shc;              // npad*nb (panel reflectors Yp[i*nb+a])
-  float* Gp=Yp + (long)npad*nb;       // nb*nb   (Gram G = Y^T Y, PERSISTENT)
-  float* Tp=Gp + (long)nb*nb;         // nb*nb   (block-T, separate buffer)
+  float* Yp=(float*)shc;              // n*nb   (panel reflectors Yp[i*nb+a])
+  float* Gp=Yp + (long)n*nb;          // nb*nb  (Gram G = Y^T Y, PERSISTENT)
+  float* Tp=Gp + (long)nb*nb;         // nb*nb  (block-T, separate buffer)
   // brief-83 LEVER B: block-T build with a SEPARATE T buffer (Tp) from the Gram
   // (Gp). The old build stored the Gram in Tp then overwrote it column by column,
   // which forced a per-column snapshot of G[:,a] (read-before-write) => 2
@@ -621,23 +581,13 @@ extern "C" __global__ void mega_eigh_med_split_k(const float* __restrict__ Ain,
     int k=nref-c0; if(k>nb) k=nb;
     int pidx=c0/nb;
     float* Tg=Tout + ((long)m*npan + pidx)*(long)nb*nb;
-    // fill Yp over npad rows (real reflector cols for i<n & a<k, else 0); the
-    // padding rows n..npad-1 and cols a>=k are zeroed so both the WMMA and SIMT
-    // Gram see a clean n x k reflector block in an npad x nb padded buffer.
-    for(int idx=tid; idx<npad*nb; idx+=nt){ int i=idx/nb, a=idx%nb; Yp[i*nb+a]=(i<n&&a<k)?Rm[i*n+(c0+a)]:0.f; }
-    // zero Tp (recurrence writes only upper triangle+diagonal; strict-lower must be 0).
-    for(int idx=tid; idx<nb*nb; idx+=nt) Tp[idx]=0.f;
+    for(int idx=tid; idx<n*nb; idx+=nt){ int i=idx/nb, a=idx%nb; Yp[i*nb+a]=(a<k)?Rm[i*n+(c0+a)]:0.f; }
     __syncthreads();
-    // Gram G = Y^T Y (k x k, but computed full nb x nb over the zero-padded Yp).
-    if(fastRed){
-      // WMMA tensor-core Gram (TF32). The padded/zeroed Yp makes the full nb x nb
-      // WMMA product equal the k x k Gram (padding contributes 0). Gate-tolerant
-      // (block-T feeds the NS-cleaned back-transform); guarded to the low-rank/
-      // direct callers via fastRed so shape-11's sign-DC (exact SIMT) is untouched.
-      _mega_wmma_gram(Yp, Gp, npad, nb, tid);
-    } else {
-      for(int idx=tid; idx<k*k; idx+=nt){ int a=idx/k, b=idx%k; float s=0.f; for(int i=0;i<n;++i) s+=Yp[i*nb+a]*Yp[i*nb+b]; Gp[a*nb+b]=s; }
-    }
+    // Gram G = Y^T Y (k x k) -> Gp (upper-tri entries used; full symmetric ok).
+    // Also zero Tp (the recurrence only writes the upper triangle+diagonal; the
+    // strict-lower must be 0 so the persisted block-T is properly upper-triangular).
+    for(int idx=tid; idx<nb*nb; idx+=nt) Tp[idx]=0.f;
+    for(int idx=tid; idx<k*k; idx+=nt){ int a=idx/k, b=idx%k; float s=0.f; for(int i=0;i<n;++i) s+=Yp[i*nb+a]*Yp[i*nb+b]; Gp[a*nb+b]=s; }
     __syncthreads();
     // build upper-triangular block-T column by column (serial in a): thread b
     // owns row b. T[a][a]=tau_a; T[b][a]=-tau_a * sum_{e<a} T[b][e]*G[e][a].
@@ -672,10 +622,9 @@ void mega_eigh_med_split(torch::Tensor A, torch::Tensor Vout, torch::Tensor Lout
   // the block-T build reuses shc for Yp(n*nb)+Gp(nb*nb)+Tp(nb*nb); ensure the
   // dynamic SMEM is at least that large (it usually is -- packed-A dominates --
   // but a large nb at small n can exceed it).
-  // brief-83: block-T build uses Yp(npad*nb, zero-padded for the WMMA Gram) +
-  // Gp(nb*nb, persistent Gram) + Tp(nb*nb, separate block-T).
-  size_t npad=(((size_t)n+7)/8)*8;
-  size_t shmT=(npad*nb + (size_t)2*nb*nb)*sizeof(float);
+  // brief-83: block-T build now uses Yp(n*nb) + Gp(nb*nb, persistent Gram) +
+  // Tp(nb*nb, separate block-T) so the recurrence needs no per-column snapshot.
+  size_t shmT=((size_t)n*nb + (size_t)2*nb*nb)*sizeof(float);
   if(shmT>shm) shm=shmT;
   cudaFuncSetAttribute(mega_eigh_med_split_k, cudaFuncAttributeMaxDynamicSharedMemorySize, shm);
   // brief-83: prefer the MAX SMEM carveout so the driver reserves the full opt-in
@@ -3730,11 +3679,16 @@ def _sign_dc_solve(af, n, dev):
     Bstk = _lr_lift_gemm(Ustk.transpose(-1, -2), AU, _SIGN_DC_AV_MODE)
     Bstk = 0.5 * (Bstk + Bstk.transpose(-1, -2))
     try:
-        # fast_reduce=False: shape-11's eigr gate is razor-close (~3.6e-3); the
-        # warp-shuffle sum reassociation drifts the K=300 eigenvalues past it
-        # (t4: +38% via mass cuSOLVER fallback). Keep the exact tree reduction here.
+        # fast_reduce=True (brief-83 t12): the CLEAN warp-shuffle sum (_mega_fast_sum)
+        # IS gate-safe for shape 11. EIGH_DIAG measurement over 2 full runs: 0/640
+        # fallback every iteration, orth_max ~2.0e-3 (vs the exact tree's ~3.4-4.4e-3)
+        # against the binding orth bound 4.578e-3 -- the finishing 3xTF32 Newton-Schulz
+        # cleans the slightly-reassociated eigenvectors to EVEN MORE orthonormal here.
+        # (The earlier t4 +38% regression was an artifact of t4's heavier different-
+        # pairing _mega_block_reduce helper, NOT fast-reduce itself.) shape11
+        # 84995->83930, geomean 27862->27824, still 39/39, 0 fallback.
         lstk, gstk = _lr_reduced_eigh(Bstk, bt_prec=_SIGN_DC_BT_PREC,
-                                      fast_reduce=False)
+                                      fast_reduce=True)
     except Exception:
         lstk, gstk = torch.linalg.eigh(Bstk)
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -3821,9 +3775,10 @@ def _sign_dc_block_eigh(A_blk, dev):
     B = A_blk.shape[0]
     m = A_blk.shape[-1]
     if m <= _SIGN_DC_BASE_MAX:
-        # exact tree reduction: sign-DC-family membership gates are tight (see the
-        # shape-11 note at the depth-0 call); keep gate-safe on shape 5's path too.
-        return _lr_reduced_eigh(A_blk, fast_reduce=False)
+        # brief-83 t12: fast warp-shuffle reduction (the clean _mega_fast_sum is
+        # gate-safe; shape-11 measurement showed 0 fallback). shape-5's recursion
+        # goes through the same reduced-block megakernel; measured no regression.
+        return _lr_reduced_eigh(A_blk, fast_reduce=True)
     # shift = mean eigenvalue (== trace/m); ~ the median for a roughly-symmetric or
     # roughly-uniform spectrum, so the +/- split is close to balanced.
     sigma = A_blk.diagonal(dim1=-2, dim2=-1).mean(dim=-1).reshape(B, 1, 1)
@@ -4083,8 +4038,9 @@ def _sign_dc_multiway(A_blk, dev, nways):
         AU = torch.cat(AUs, dim=0)
         Bstk = torch.bmm(Ustk.transpose(-1, -2), AU)
         Bstk = 0.5 * (Bstk + Bstk.transpose(-1, -2))
-    # exact tree reduction (sign-DC-family gate safety; see shape-11 note).
-    lstk, gstk = _lr_reduced_eigh(Bstk, fast_reduce=False)   # (nways*B, K), (nways*B, K, K)
+    # brief-83 t12: fast warp-shuffle reduction (clean _mega_fast_sum is gate-safe;
+    # measured no shape-5 regression). Was exact tree; flipped after the shape-11 win.
+    lstk, gstk = _lr_reduced_eigh(Bstk, fast_reduce=True)   # (nways*B, K), (nways*B, K, K)
     torch.backends.cuda.matmul.allow_tf32 = True
     Vstk = torch.bmm(Ustk, gstk)                 # (nways*B, m, K) candidate eigenvectors
     # membership per piece (of that piece's projector)
