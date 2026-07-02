@@ -3419,7 +3419,7 @@ _SIGN_DC_K = 300          # oversized subspace width (>= max +count/-count over 
                           # eigh is the wall; K in [288,300] all land ~110ms), so the
                           # extra margin is free. Both K-blocks fit the megakernel's
                           # n<=448 range. Matrices with +count>K fall to cuSOLVER.
-_SIGN_DC_NS_ITERS = 18    # Newton-Schulz sign iterations (each = 2 batched GEMMs).
+_SIGN_DC_NS_ITERS = 17    # Newton-Schulz sign iterations (each = 2 batched GEMMs).
                           # The near-zero eigenvalues plateau |X| below 1 (they need
                           # ~22 quadratic steps to fully resolve), but the projector
                           # MEMBERSHIP rank-select tolerates a fuzzy sign, so ~18 iters
@@ -3476,6 +3476,18 @@ _SIGN_DC_FINAL_NS = 1     # finishing FP32 NS orthonormalization steps on Q
 # from the sign-DC so a plain-TF32 NS refinement may hold the orth gate at half the
 # cost. Gated: any matrix a cheaper finish leaves above the orth bound falls back.
 _SIGN_DC_FINISH_PREC = "tf32x3_delta"
+# brief-87: the sign-DC internal residual-GATE factors. The FROZEN reference.py checker
+# gates orth at _ORTH_RTOL_FACTOR=100 * n * eps and eigen at _EIGEN_RTOL_FACTOR=200 * n
+# * eps (measured from reference.py). The submission's internal gate was set at 75/150
+# (0.75x the real ceilings) -- conservative headroom. Raising the internal orth factor
+# toward (but safely under) the real 100 lets a fuzzier -> CHEAPER orthonormalization
+# (fewer sign iters) still route through the fast path instead of falling back, WITHOUT
+# risking the real checker (the margin between the internal factor and 100 absorbs the
+# small gap between the internal 3xTF32-Gram orth measure and the checker's own). Every
+# trial that raises these is validated + benchmarked against the REAL eval.py checker,
+# so a too-loose factor shows up as a correctness failure, not a silent pass.
+_SIGN_DC_ORTH_FAC = 90.0    # internal orth gate = _SIGN_DC_ORTH_FAC * n * eps (real: 100)
+_SIGN_DC_EIGR_FAC = 175.0   # internal eigr gate = _SIGN_DC_EIGR_FAC * n * eps (real: 200)
 # brief-87: trailing CQR passes done as cheap Newton-Schulz refinements (2 GEMMs)
 # instead of Cholesky+trsm. The stacked (2b,n,K=300) trsm is the single biggest
 # sub-cost of the pipeline (nsys batch_trsm ~9.5ms across the 2 passes). ns_refine=1
@@ -4409,15 +4421,17 @@ def _eigh_sign_dc(a: torch.Tensor) -> output_t:
     torch.backends.cuda.matmul.allow_tf32 = _gp
     eigr = torch.linalg.matrix_norm(AQ - Q * L.unsqueeze(-2), ord=1, dim=(-2, -1))
     a_l1 = torch.linalg.matrix_norm(af, ord=1, dim=(-2, -1)).clamp_min(1e-30)
-    bad = ((orth > 75.0 * n * eps) | (eigr / a_l1 > 150.0 * n * eps)
+    _orth_gate = _SIGN_DC_ORTH_FAC * n * eps
+    _eigr_gate = _SIGN_DC_EIGR_FAC * n * eps
+    bad = ((orth > _orth_gate) | (eigr / a_l1 > _eigr_gate)
            | ~torch.isfinite(L).all(dim=-1) | ~torch.isfinite(Q).all(dim=(-2, -1)))
     import os as _os
     if _os.environ.get("SIGNDC_DBG"):
         import sys as _sys
         _sys.stderr.write(
             f"[SIGNDC_DBG] n={n} b={b} deg={_SIGN_DC_NS_DEGREE} "
-            f"orth_gate={75.0*n*eps:.4g} orth_max={orth.max().item():.4g} "
-            f"eigr_gate={150.0*n*eps:.4g} eigr_rel_max={(eigr/a_l1).max().item():.4g} "
+            f"orth_gate={_orth_gate:.4g} orth_max={orth.max().item():.4g} "
+            f"eigr_gate={_eigr_gate:.4g} eigr_rel_max={(eigr/a_l1).max().item():.4g} "
             f"nbad={int(bad.sum().item())}/{b}\n")
         _sys.stderr.flush()
     if _os.environ.get("SIGNDC_TIME") and _SIGNDC_TIMERS:
