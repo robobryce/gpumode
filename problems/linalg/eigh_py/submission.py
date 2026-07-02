@@ -3235,7 +3235,15 @@ _SIGN_DC_NS_ITERS = 18    # Newton-Schulz sign iterations (each = 2 batched GEMM
                           # 990099 nbad 1-3), and 14 mass-falls-back (22/640 on the
                           # benchmark seed). So 18 is the safe floor -- 2 fewer batched
                           # GEMMs than 20, do not drop below 18.
-_SIGN_DC_POWER_ITERS = 15 # A^2 power iterations for the spectral-norm scale estimate
+_SIGN_DC_POWER_ITERS = 4  # A^2 power iterations for the spectral-norm scale estimate.
+                          # The scale only needs to be a loose UPPER bound on ||A||_2
+                          # (multiplied by 1.02) so the Newton-Schulz sign iteration
+                          # starts inside its convergence region -- NS is robust to
+                          # over-scaling. brief-72 swept 15/10/7/5/3 over a 5-seed reseed
+                          # sweep: the eigr residual is FLAT (~3.6e-3, identical fallback
+                          # set) from 3 iters up -- the A^2 power estimate converges in
+                          # ~3 iters on the even/gapless spectrum. 4 keeps one iter of
+                          # reseed margin while dropping ~11 iters (~22 batched matvecs).
 _SIGN_DC_FINAL_NS = 1     # finishing FP32 NS orthonormalization steps on Q
 _SIGN_DC_CQR_PASSES = 2   # subspace-basis CholeskyQR passes. REQUIRED at 2: the
                           # projected bases P+/- @ Omega are rank-deficient (the K
