@@ -5951,7 +5951,9 @@ def _eigh_sign_dc(a: torch.Tensor) -> output_t:
 # 1-CTA/matrix sibling kernels lacked. Fixed small sweep count clears the loose
 # n<=32 residual gate (eigen ~7.6e-4); the Python wrapper residual-gates per
 # matrix and falls any miss back to cuSOLVER (never regresses below the floor).
-_WJAC_NMAX = 32           # only n<=32 routed to the warp-Jacobi kernel
+_WJAC_NMAX = 0            # route DISABLED: warp-per-matrix MEASURED to lose to
+                          # cuSOLVER at b=20 (see custom_kernel note). Set to 32 to
+                          # re-enable routing n<=32 to the warp-Jacobi kernel.
 _WJAC_SWEEPS = 6          # cyclic-Jacobi sweeps (each = n-1 rounds). Swept below.
 _WJAC_WARPS = 8           # matrices per CTA. Swept 1/2/4/8. ncu (isolated kernel):
                           # warps=8 -> 340us, warps=1 -> 397us: 8 co-resident warps per
@@ -6204,9 +6206,17 @@ def custom_kernel(data: input_t) -> output_t:
     # baseline floor), so the router can never regress.
     #
     # n <= _WJAC_NMAX (tiny class, shape 0 n=32/b=20): WARP-per-matrix register-
-    # resident cyclic Jacobi. cuSOLVER's batched Jacobi underfills the GPU at
-    # small batch (~161us at b=20); packing many warps/CTA fills all SMs SMEM-
-    # free. Residual-gated + cuSOLVER fallback -> can never regress.
+    # resident cyclic Jacobi (built + validated in brief-113, _eigh_warp_jacobi).
+    # MEASURED to LOSE to cuSOLVER at b=20: the register-resident kernel is ~340us
+    # (nsys, 6 sweeps) vs cuSOLVER's batched-Jacobi 105us -- cuSOLVER uses 16 WARPS
+    # per matrix (512-thread block, ncu (20,1,1)x(32,16,1)) so it both shortens each
+    # matrix's critical path AND fields 320 total warps (occ 25%, 16 warps/SM) vs a
+    # single warp/matrix = 20 total warps (occ 10%, no latency hiding). Plus the
+    # torch gate/sort adds ~15 host launches vs cuSOLVER's 1. Net: routing shape-0
+    # here made the 13-shape geomean 27100 -> 30360 (~+12% REGRESSION). So the route
+    # is DISABLED (_WJAC_NMAX=0) -- the kernel stays banked (validated, gated) for a
+    # future multi-warp-per-matrix redesign, but shape-0 stays on cuSOLVER (no
+    # regression). Flip _WJAC_NMAX back to 32 to re-enable.
     if n <= _WJAC_NMAX:
         return _eigh_warp_jacobi(a)
     # n <= _MEGA_NMAX: the fused full-eigh megakernel (one CTA per matrix, the
