@@ -975,20 +975,18 @@ void mega_eigh_clust_split(torch::Tensor A, torch::Tensor Vout, torch::Tensor Lo
     torch::Tensor vscr, torch::Tensor pscr, torch::Tensor bounds, torch::Tensor Tout,
     int n, int nt, int bisIters, int nb, int C, int PB){
   int B=A.size(0);
-  // Size dynamic SMEM from the LARGEST balanced CTA row-block (must match the
-  // Python bounds). Also ensure the block-T build region (rank 0) fits.
+  // Size dynamic SMEM from the LARGEST CTA row-block. brief-95: read the boundaries
+  // straight from the passed `bounds` tensor (host copy) so the SMEM sizing tracks
+  // WHATEVER split Python chose (storage-balanced OR the C=2 symv-FLOP-balanced b1),
+  // instead of re-deriving the closed form here and risking a mismatch -> overflow.
   size_t myTriMax=0;
   {
-    long triAll=((long)n*(n+1))/2;
-    int prev=0;
-    for(int r=1;r<=C;++r){
-      long target=(triAll*r)/C;
-      int lo=prev, hi=n, x=n;
-      while(lo<=hi){ int mid=(lo+hi)/2; if(((long)mid*(mid+1))/2 >= target){ x=mid; hi=mid-1; } else lo=mid+1; }
-      int bR=(r==C)?n:x;
-      size_t tri = ((size_t)((long)bR*(bR+1)/2)) - ((size_t)((long)prev*(prev+1)/2));
+    torch::Tensor bh = bounds.to(torch::kCPU).contiguous();
+    const int* bp = bh.data_ptr<int>();
+    for(int r=0;r<C;++r){
+      long lo=bp[r], hi=bp[r+1];
+      size_t tri = ((size_t)(hi*(hi+1)/2)) - ((size_t)(lo*(lo+1)/2));
       if(tri>myTriMax) myTriMax=tri;
-      prev=bR;
     }
   }
   size_t voff = myTriMax*sizeof(__half); voff=(voff+15u)&~15u;
@@ -1218,7 +1216,14 @@ _LR_CLUST_ENABLED = True
 # (tri/4=46284 halves=92KB, 2 CTAs), k=768->C6 (49216=98KB, 2 CTAs); k~1117 needs
 # C>8 so stays on the 1-CTA C=6. Extra cross-cluster peers (C4 symv reads 3 peers
 # vs 1) is the cost the benchmark weighs against the 2-CTA occupancy gain.
-_MEGA_CLUST_2CTA = True
+# MEASURED (t13): raising C to fit 2 CTAs/SM DID lift Achieved Occupancy 25%->42%
+# (Block Limit Shared Mem 1->2) BUT eligible-warps stayed 0.27 and the barrier wait
+# ROSE 11.2->24.2 cyc (73.8%): the co-resident CTA is a DIFFERENT cluster that also
+# stalls at the cluster-wide cl.sync (no eligible warps to run), AND the larger C
+# adds cross-cluster barrier participants that lengthen the GPC-wide cl.sync latency.
+# Net regression (s4 +3.8%, s10 +4.9%) -> DISABLED. The 2-CTA occupancy gain does not
+# translate because the stall is the cl.sync latency itself, not a lack of resident warps.
+_MEGA_CLUST_2CTA = False
 _SMEM_2CTA_HALVES = 54000       # per-CTA triangle halves for 2 CTAs/SM (~108KB tri
                                 # + ~5KB v/p = ~113KB < 114KB half of the 228KB cap)
 _mega_clust_bounds_cache: dict = {}
@@ -1244,31 +1249,71 @@ def _mega_clust_C(k: int) -> int:
     return 0
 
 
+# brief-95 open#3 (symv-FLOP balance for C=2): the no-atomic symmetric symv assigns
+# ALL cross (upper) terms to the LOWER-ranked CTA, so for C=2 rank0 does its local
+# triangle PLUS reads all of rank1's rows (b*(n-b) peer FLOP), while rank1 does only
+# its local triangle. The STORAGE-balanced split (b1~n/sqrt2, equal triangles) leaves
+# rank0 ~1.8x rank1's symv FLOP -> rank1 idles at every cl.sync waiting for rank0.
+# rank0's work grows with b1, so the FLOP-min b1 is the SMALLEST that still keeps
+# rank1's triangle (tri(n)-tri(b1)) under the SMEM cap: b1 = smallest x with
+# tri(n)-tri(x) <= cap. That trims rank0's dominance (b=430->385 for k=608: 1.83->1.44)
+# without spilling either CTA. Applied for C==2 only (C>=3 peer structure differs).
+_MEGA_CLUST_FLOPBAL_C2 = True
+
+
+def _clust_b1_flopbal(n: int) -> int:
+    """Smallest b1 in [1,n) with rank1's triangle tri(n)-tri(b1) <= _SMEM_CAP_HALVES,
+    i.e. the symv-FLOP-minimizing C=2 boundary (minimizes rank0's dominant work).
+    Falls back to the storage-balanced b1 if that is already <= the FLOP point."""
+    tri_all = n * (n + 1) // 2
+    # storage-balanced b1 (smallest x with tri(x) >= tri_all/2)
+    lo, hi, sb = 0, n, n
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        if mid * (mid + 1) // 2 >= tri_all // 2:
+            sb = mid; hi = mid - 1
+        else:
+            lo = mid + 1
+    # FLOP-min b1: smallest x with tri(n)-tri(x) <= cap
+    lo, hi, fb = 1, n - 1, sb
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        if tri_all - mid * (mid + 1) // 2 <= _SMEM_CAP_HALVES:
+            fb = mid; hi = mid - 1
+        else:
+            lo = mid + 1
+    return min(sb, fb)   # never larger than storage-balance (keeps rank0 fitting)
+
+
 def _mega_clust_bounds(n: int, C: int, dev) -> torch.Tensor:
-    """Balanced row boundaries [0=b0 < b1 < ... < bC=n] so each CTA's packed
-    lower-triangle storage (tri(b_{r+1})-tri(b_r)) is ~equal. Closed form: b_r is
-    the smallest x with x*(x+1)/2 >= (tri(n)*r)/C. Cached per (n,C,dev). MUST match
+    """Balanced row boundaries [0=b0 < b1 < ... < bC=n]. Default: each CTA's packed
+    lower-triangle STORAGE (tri(b_{r+1})-tri(b_r)) is ~equal (b_r = smallest x with
+    x*(x+1)/2 >= tri(n)*r/C). For C==2 with FLOP-balance enabled, b1 is instead the
+    symv-FLOP-min boundary (see _clust_b1_flopbal). Cached per (n,C,dev). MUST match
     the host SMEM-sizing recompute in mega_eigh_clust_split."""
     key = (n, C, dev)
     b = _mega_clust_bounds_cache.get(key)
     if b is None:
-        tri_all = n * (n + 1) // 2
-        bounds = [0]
-        prev = 0
-        for r in range(1, C + 1):
-            if r == C:
-                bounds.append(n)
-                break
-            target = tri_all * r // C
-            lo, hi, x = prev, n, n
-            while lo <= hi:
-                mid = (lo + hi) // 2
-                if mid * (mid + 1) // 2 >= target:
-                    x = mid; hi = mid - 1
-                else:
-                    lo = mid + 1
-            bounds.append(x)
-            prev = x
+        if C == 2 and _MEGA_CLUST_FLOPBAL_C2:
+            bounds = [0, _clust_b1_flopbal(n), n]
+        else:
+            tri_all = n * (n + 1) // 2
+            bounds = [0]
+            prev = 0
+            for r in range(1, C + 1):
+                if r == C:
+                    bounds.append(n)
+                    break
+                target = tri_all * r // C
+                lo, hi, x = prev, n, n
+                while lo <= hi:
+                    mid = (lo + hi) // 2
+                    if mid * (mid + 1) // 2 >= target:
+                        x = mid; hi = mid - 1
+                    else:
+                        lo = mid + 1
+                bounds.append(x)
+                prev = x
         b = torch.tensor(bounds, device=dev, dtype=torch.int32)
         _mega_clust_bounds_cache[key] = b
     return b
