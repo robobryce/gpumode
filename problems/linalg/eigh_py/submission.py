@@ -682,7 +682,7 @@ _MEGA_CLUST_CPP = (
     "torch::Tensor rscr, torch::Tensor dscr, torch::Tensor escr, "
     "torch::Tensor dpscr, torch::Tensor dmscr, torch::Tensor tauscr, "
     "torch::Tensor vscr, torch::Tensor pscr, torch::Tensor bounds, torch::Tensor Tout, "
-    "int n, int nt, int bisIters, int nb, int C);"
+    "int n, int nt, int bisIters, int nb, int C, int PB);"
 )
 
 _MEGA_CLUST_CUDA = r'''
@@ -726,7 +726,7 @@ extern "C" __global__ void mega_eigh_clust_split_k(
     float* __restrict__ dpscr, float* __restrict__ dmscr, float* __restrict__ tauscr,
     float* __restrict__ vscr, float* __restrict__ pscr, const int* __restrict__ bnd,
     float* __restrict__ Tout,
-    int B, int n, int bisIters, int nb, int C){
+    int B, int n, int bisIters, int nb, int C, int PB){
   cg::cluster_group cl = cg::this_cluster();
   unsigned R = cl.block_rank();               // 0..C-1
   int m = blockIdx.x / C; if(m>=B) return;
@@ -777,84 +777,139 @@ extern "C" __global__ void mega_eigh_clust_split_k(
   for(int i=r0;i<r1;++i){ for(int j=tid;j<=i;j+=nt){ AOWNSET(i,j, Am[(long)i*n+j]*invs); } }
   __syncthreads();
 
-  // ============ Stage 1: Householder tridiagonalization ============
-  for(int c=0;c<n-2;++c){
-    bool active = (r1 > c+1);
-    int is=(r0>c+1)?r0:(c+1);
-    float s2=0.f;
-    if(active) for(int i=is+tid;i<r1;i+=nt){ float x=AOWN(i,c); s2+=x*x; }
-    s2 = _clsum(s2, red, tid, nt);
-    int ownerC1=0; { for(int rr=0;rr<C;++rr){ if(c+1>=bnd[rr] && c+1<bnd[rr+1]){ ownerC1=rr; break; } } }
-    // stage this CTA's partial s2 (clx[0]) + alpha=AOWN(c+1,c) on the owner (clx[1])
-    // into peer-visible SMEM; cluster.sync orders the DSMEM peer reads below.
-    if(tid==0){ clx[0]=s2; if((int)R==ownerC1) clx[1]=AOWN(c+1,c); }
-    __syncthreads();
-    cl.sync();
-    float xnorm2=0.f, alpha=0.f;
-    for(int rr=0;rr<C;++rr){
-      volatile float* peerx = (volatile float*)cl.map_shared_rank(clx, rr);
-      xnorm2 += peerx[0];
-      if(rr==ownerC1) alpha = peerx[1];
-    }
-    bool lead = ((int)R==ownerC1);
-    float tail2 = xnorm2 - alpha*alpha;
-    if(tail2<=1e-20f){
-      if(tid==0 && lead){ Em[c]=alpha; Tau[c]=0.f; }
-      if(active) for(int i=r0+tid;i<r1;i+=nt) Rm[i*n+c]=(i==c+1)?1.f:0.f;
-      __syncthreads(); cl.sync();
-      continue;
-    }
-    float xnorm=sqrtf(xnorm2); float beta=(alpha>=0.f)?-xnorm:xnorm; float tau=(beta-alpha)/beta; float denom=alpha-beta;
-    for(int i=r0+tid;i<r1;i+=nt){
-      float vi = (i<=c)?0.f : ((i==c+1)?1.f : AOWN(i,c)/denom);
-      v[i]=vi; Rm[i*n+c]=vi; vgm[i]=vi;      // stage owned v into GLOBAL
-    }
-    __threadfence();                          // publish owned-v global writes to peers
-    __syncthreads();
-    cl.sync();
-    // Cross-CTA v exchange via GLOBAL staging (vgm) + threadfence -- the DSMEM
-    // map_shared_rank peer read raced (non-deterministic tridiag; brief-21 same),
-    // so read every NON-owned v row from GLOBAL after the fenced cluster barrier.
-    // Generic over C: this CTA owns [r0,r1); all other rows come from vgm.
-    for(int i=tid;i<n;i+=nt) if(i<r0||i>=r1) v[i]=vgm[i];
-    __syncthreads();
-    // symv p = tau*A@v, no-atomic symmetric dot product. Owned active row i:
-    //   p[i] = sum_{j<=i} A[i][j] v[j]  (lower, local)  + sum_{j>i} A[j][i] v[j] (upper)
-    // FUSED single row loop (one pass over owned rows, matching the fast C=2 path):
-    // lower + local-upper from this CTA's Ah, then each PEER rank rr>R contributes
-    // its rows [bnd[rr],bnd[rr+1]) from its Ah via map_shared_rank. AhPeer[rr] is
-    // resolved once outside the row loop (peer map is per-rank, not per-row).
-    volatile __half* AhP[8]; long triLoP[8];
-    for(int rr=(int)R+1; rr<C; ++rr){ AhP[rr]=(volatile __half*)cl.map_shared_rank(Ah, rr); triLoP[rr]=((long)bnd[rr]*(bnd[rr]+1))/2; }
-    if(active) for(int i=is+tid; i<r1; i+=nt){
-      float acc=0.f;
-      for(int j=c;j<=i;++j) acc += AOWN(i,j)*v[j];        // lower (local)
-      for(int j=i+1;j<r1;++j) acc += AOWN(j,i)*v[j];       // upper, local rows
-      for(int rr=(int)R+1; rr<C; ++rr){                    // upper, peer rows
-        volatile __half* AhPeer=AhP[rr]; long tlp=triLoP[rr];
-        for(int j=bnd[rr];j<bnd[rr+1];++j){ __half hh=AhPeer[((long)j*(j+1))/2 - tlp + i]; acc += __half2float(hh)*v[j]; }
+  // ============ Stage 1: BLOCKED (panel/latrd) Householder tridiagonalization ====
+  // LAPACK sytrd/latrd: reduce a PANEL of PB columns accumulating the compact-WY
+  // pair (Y=reflectors in Rm, W=A*v corrections in DP), then apply the trailing
+  // symmetric rank-2b update  Ah := Ah - W Y^T - Y W^T  ONCE PER PANEL. The
+  // packed FP16 triangle Ah is FROZEN within a panel (the per-column symv reads
+  // the panel-start matrix; the accumulated W,Y bring each column up to date), so
+  // the end-of-column trailing-update cross-cluster cl.sync collapses from one per
+  // column to one per panel. Per column there remain 3 cross-cluster syncs (norm
+  // reduction, v broadcast, p+z-vector exchange); the 4th (Ah update ordering) is
+  // now amortized over PB columns. W lives in DP (dpscr, n*n, free until Stage 3);
+  // the small correction b-vectors z1=Y(:,:j)^T v, z2=W(:,:j)^T v are exchanged
+  // through DM (dmscr) staging folded into the p-exchange sync.
+  // W[i,c] := DP[i*n + c] (absolute column index c). z-staging: DM[rr*(2*PB)+..].
+  #define WOWN(i,c) DP[(long)(i)*n + (c)]
+  for(int c0=0;c0<n-2;c0+=PB){
+    int pw = (n-2) - c0; if(pw>PB) pw=PB;     // panel width
+    // ---- per-column reduction within the frozen panel ----
+    for(int jj=0;jj<pw;++jj){
+      int c = c0 + jj;
+      bool active = (r1 > c+1);
+      int is=(r0>c+1)?r0:(c+1);
+      int ownerC1=0; { for(int rr=0;rr<C;++rr){ if(c+1>=bnd[rr] && c+1<bnd[rr+1]){ ownerC1=rr; break; } } }
+      bool lead = ((int)R==ownerC1);
+      // (1) Bring column c up to date w.r.t. this panel's earlier reflectors
+      //     e in [c0,c): Acol_i = AOWN(i,c) - sum_e ( W[i,e]*Y[c,e] + Y[i,e]*W[c,e] ),
+      //     store the updated column into v[] (owned rows only for now) + compute s2.
+      // Y[c,e]=Rm[c*n+e], W[c,e]=DP[c*n+e] (row c, global reads visible to all CTAs).
+      float s2=0.f;
+      if(active) for(int i=is+tid;i<r1;i+=nt){
+        float x=AOWN(i,c);
+        for(int e=c0;e<c;++e) x -= WOWN(i,e)*Rm[(long)c*n+e] + Rm[(long)i*n+e]*WOWN(c,e);
+        v[i]=x;                              // updated column c (owned rows) staged in v
+        s2 += x*x;
       }
-      p[i]=tau*acc; pgm[i]=p[i];                           // stage owned p into GLOBAL pfull (disjoint)
+      s2 = _clsum(s2, red, tid, nt);
+      // alpha = updated A[c+1,c] from the owner CTA (its v[c+1] holds the value)
+      if(tid==0){ clx[0]=s2; if(lead) clx[1]=v[c+1]; }
+      __syncthreads();
+      cl.sync();                             // sync #1: norm reduction + alpha
+      float xnorm2=0.f, alpha=0.f;
+      for(int rr=0;rr<C;++rr){
+        volatile float* peerx = (volatile float*)cl.map_shared_rank(clx, rr);
+        xnorm2 += peerx[0];
+        if(rr==ownerC1) alpha = peerx[1];
+      }
+      float tail2 = xnorm2 - alpha*alpha;
+      if(tail2<=1e-20f){
+        if(tid==0 && lead){ Em[c]=alpha; Tau[c]=0.f; }
+        if(active) for(int i=r0+tid;i<r1;i+=nt){ float vi=(i==c+1)?1.f:0.f; Rm[(long)i*n+c]=vi; WOWN(i,c)=0.f; vgm[i]=vi; }
+        __threadfence(); __syncthreads();
+        cl.sync();                           // sync #2 (degenerate col): publish v/W=0
+        for(int i=tid;i<n;i+=nt) if(i<r0||i>=r1) v[i]=vgm[i];
+        __syncthreads();
+        continue;
+      }
+      float xnorm=sqrtf(xnorm2); float beta=(alpha>=0.f)?-xnorm:xnorm; float tau=(beta-alpha)/beta; float denom=alpha-beta;
+      // (2) Householder vector v_c (owned rows) -> Rm (=Y col c) + global vgm.
+      for(int i=r0+tid;i<r1;i+=nt){
+        float xi = (i>c && i<r1 && active) ? v[i] : 0.f;   // updated column value (owned)
+        float vi = (i<=c)?0.f : ((i==c+1)?1.f : xi/denom);
+        v[i]=vi; Rm[(long)i*n+c]=vi; vgm[i]=vi;
+      }
+      __threadfence(); __syncthreads();
+      cl.sync();                             // sync #2: v broadcast
+      for(int i=tid;i<n;i+=nt) if(i<r0||i>=r1) v[i]=vgm[i];
+      __syncthreads();
+      // (3) symv against the FROZEN Ah: p = A_frozen @ v (owned rows), and the two
+      //     correction b-vectors z1[e]=sum_i Y[i,e] v[i], z2[e]=sum_i W[i,e] v[i]
+      //     over owned rows -> global DM staging (per-rank), folded into sync #3.
+      volatile __half* AhP[8]; long triLoP[8];
+      for(int rr=(int)R+1; rr<C; ++rr){ AhP[rr]=(volatile __half*)cl.map_shared_rank(Ah, rr); triLoP[rr]=((long)bnd[rr]*(bnd[rr]+1))/2; }
+      if(active) for(int i=is+tid; i<r1; i+=nt){
+        float acc=0.f;
+        for(int j=c;j<=i;++j) acc += AOWN(i,j)*v[j];        // lower (local, frozen)
+        for(int j=i+1;j<r1;++j) acc += AOWN(j,i)*v[j];       // upper, local rows
+        for(int rr=(int)R+1; rr<C; ++rr){                    // upper, peer rows
+          volatile __half* AhPeer=AhP[rr]; long tlp=triLoP[rr];
+          for(int j=bnd[rr];j<bnd[rr+1];++j){ __half hh=AhPeer[((long)j*(j+1))/2 - tlp + i]; acc += __half2float(hh)*v[j]; }
+        }
+        p[i]=acc; pgm[i]=acc;                                // raw (untau'd) A@v; tau folded later
+      }
+      // owned-rows partials of z1,z2 (e in [c0,c)) -> DM staging (per-rank block)
+      float* zst = DM + (long)R*(2*(long)PB);
+      for(int e=tid; e<jj; e+=nt){
+        int ce=c0+e; float a1=0.f, a2=0.f;
+        for(int i=r0;i<r1;++i){ float vi=v[i]; a1+=Rm[(long)i*n+ce]*vi; a2+=WOWN(i,ce)*vi; }
+        zst[e]=a1; zst[PB+e]=a2;
+      }
+      __threadfence(); __syncthreads();
+      cl.sync();                             // sync #3: p exchange + z1/z2 exchange
+      for(int i=(c+1)+tid;i<n;i+=nt) if(i<r0||i>=r1) p[i]=pgm[i];
+      __syncthreads();
+      // sum the C per-rank z partials into red[] (z1 in red[0..jj), z2 in red[PB..])
+      if(tid<2*PB){ float acc=0.f; for(int rr=0;rr<C;++rr){ acc += (DM + (long)rr*(2*(long)PB))[tid]; } red[512+tid]=acc; }
+      __syncthreads();
+      // (4) w = tau*( A@v - Y(:,:j)*z2 - W(:,:j)*z1 ), then w -= 0.5 tau (w^T v) v.
+      //     corrections are LOCAL: each CTA updates its owned p rows using owned
+      //     Y,W rows and the broadcast z1,z2. tau folded here (p held raw above).
+      for(int i=(c+1)+tid;i<n;i+=nt){
+        float corr=0.f;
+        for(int e=0;e<jj;++e){ int ce=c0+e; corr += Rm[(long)i*n+ce]*red[512+PB+e] + WOWN(i,ce)*red[512+e]; }
+        p[i] = tau*(p[i] - corr);
+      }
+      __syncthreads();
+      float vp=0.f;
+      for(int i=c+1+tid;i<n;i+=nt) vp+=v[i]*p[i];
+      vp = _clsum(vp, red, tid, nt);
+      float K=0.5f*tau*vp;
+      for(int i=(c+1)+tid;i<n;i+=nt) p[i]=p[i]-K*v[i];   // w = p - K v (full vector, local)
+      __syncthreads();
+      // store W col c for OWNED rows (needed by later panel cols + trailing update)
+      for(int i=r0+tid;i<r1;i+=nt) WOWN(i,c) = (i>c) ? p[i] : 0.f;
+      if(tid==0 && lead){ Em[c]=beta; Tau[c]=tau; }
+      __threadfence(); __syncthreads();
+      // NOTE: no per-column trailing-update cl.sync; Ah stays frozen this panel.
     }
-    __threadfence();                          // publish owned-p global writes to peers
+    // ---- (5) trailing symmetric rank-2b update, ONCE per panel ----
+    //   Ah[i,j] := Ah[i,j] - sum_{e=c0..c0+pw-1} ( Y[i,e] W[j,e] + W[i,e] Y[j,e] )
+    //   over owned rows i (j<=i, j>=c0+1). Reads Y=Rm, W=DP from global (all fenced).
+    cl.sync();                               // sync #P: order all panel W/Y global writes across the cluster before the trailing update
+    int jlo = c0+1;
+    for(int i=r0+tid;i<r1;i+=nt){
+      if(i<jlo) continue;
+      for(int j=jlo;j<=i;++j){
+        float s=0.f;
+        for(int e=c0;e<c0+pw;++e){ s += Rm[(long)i*n+e]*WOWN(j,e) + WOWN(i,e)*Rm[(long)j*n+e]; }
+        AOWNSET(i,j, AOWN(i,j) - s);
+      }
+    }
     __syncthreads();
-    cl.sync();
-    // Cross-CTA p exchange via GLOBAL pfull (pgm[0..n)) + threadfence. Read every
-    // NON-owned active row's p from pfull (generic over C).
-    for(int i=(c+1)+tid;i<n;i+=nt) if(i<r0||i>=r1) p[i]=pgm[i];
-    __syncthreads();
-    float vp=0.f;
-    for(int i=c+1+tid;i<n;i+=nt) vp+=v[i]*p[i];
-    vp = _clsum(vp, red, tid, nt);
-    float K=0.5f*tau*vp;
-    for(int i=c+1+tid;i<n;i+=nt) p[i]=p[i]-K*v[i];
-    __syncthreads();
-    int iu=(r0>c+1)?r0:(c+1);
-    if(active) for(int i=iu+tid;i<r1;i+=nt){ float vi=v[i],wi=p[i]; for(int j=c+1;j<=i;++j){ float a=AOWN(i,j); AOWNSET(i,j, a-vi*p[j]-wi*v[j]); } }
-    if(tid==0 && lead){ Em[c]=beta; Tau[c]=tau; }
-    __syncthreads();
-    cl.sync();
+    cl.sync();                               // publish Ah updates before next panel's frozen reads
   }
+  #undef WOWN
   { int ownerLast=C-1; if(tid==0 && (int)R==ownerLast){ Em[n-2]=AOWN(n-1,n-2); } }
   for(int i=r0+tid;i<r1;i+=nt) Dm[i]=AOWN(i,i);
   // zero the two non-reflector V columns (as mega_eigh_med_split_k does) so the
@@ -954,7 +1009,7 @@ void mega_eigh_clust_split(torch::Tensor A, torch::Tensor Vout, torch::Tensor Lo
     torch::Tensor rscr, torch::Tensor dscr, torch::Tensor escr,
     torch::Tensor dpscr, torch::Tensor dmscr, torch::Tensor tauscr,
     torch::Tensor vscr, torch::Tensor pscr, torch::Tensor bounds, torch::Tensor Tout,
-    int n, int nt, int bisIters, int nb, int C){
+    int n, int nt, int bisIters, int nb, int C, int PB){
   int B=A.size(0);
   // Size dynamic SMEM from the LARGEST balanced CTA row-block (must match the
   // Python bounds). Also ensure the block-T build region (rank 0) fits.
@@ -994,7 +1049,7 @@ void mega_eigh_clust_split(torch::Tensor A, torch::Tensor Vout, torch::Tensor Lo
     rscr.data_ptr<float>(),dscr.data_ptr<float>(),escr.data_ptr<float>(),
     dpscr.data_ptr<float>(),dmscr.data_ptr<float>(),tauscr.data_ptr<float>(),
     vscr.data_ptr<float>(),pscr.data_ptr<float>(),bounds.data_ptr<int>(),
-    Tout.data_ptr<float>(),B,n,bisIters,nb,C);
+    Tout.data_ptr<float>(),B,n,bisIters,nb,C,PB);
 }'''
 
 
@@ -1156,6 +1211,11 @@ _lr_split_T_cache: dict = {}   # (B,n,nb,dev) -> persistent block-T scratch
 # threads per CTA. Same latency-hiding argument as the medium-n kernel; power of 2
 # for the red[] tree reductions. brief-14 swept 256/512/1024 -> 512 best on n=512.
 _MEGA_CLUST_NT = 512
+# Panel width PB for the BLOCKED (latrd) cluster tridiagonalization (brief-95):
+# reduce PB columns between the per-panel cross-cluster trailing-update cl.sync.
+# PB=1 recovers the per-column algorithm; wider PB = fewer trailing-update syncs
+# but more intra-panel correction work + more W/Y global traffic. Swept per brief.
+_MEGA_CLUST_PB = 16
 # Cluster size C (CTAs per matrix) is chosen at RUNTIME per k so ONE compiled
 # kernel serves both shapes: the packed-FP16 k-triangle (tri(k)=k(k+1)/2 halves)
 # is row-distributed across C CTAs, so per-CTA SMEM ~ tri(k)*2B / C must be <= the
@@ -1259,7 +1319,7 @@ def _lr_reduced_clust(Bk, C):
     T, npan = _mega_med_split_T(B, kk, nb, dev)
     mod.mega_eigh_clust_split(Bkc, V, L, rscr, dscr, escr, dpscr, dmscr, tauscr,
                               vscr, pscr, bounds, T, kk, _MEGA_CLUST_NT,
-                              _MEGA_BISITERS, nb, C)
+                              _MEGA_BISITERS, nb, C, _MEGA_CLUST_PB)
     # V holds Z; rscr the Householder panel; T the per-panel block-T -> torch WY.
     G = _mega_med_backtransform(V, rscr, T, kk, nb, npan)
     return L, G
