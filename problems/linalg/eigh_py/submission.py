@@ -62,6 +62,34 @@ _MEGA_CUDA = r'''
 #include <torch/extension.h>
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+// brief-83 LEVER B: fast warp-shuffle block SUM reduction for mega_eigh_med_split_k's
+// tridiag inner products. The old red[] tree costs 1+log2(nt) barriers/reduction
+// (10 at nt=512); the tridiag runs 2 sum-reductions/column x ~298 cols. A warp-shuffle
+// reduction (reduce each warp with 5 shfl steps + no barrier, combine <=32 partials
+// through 1 barrier + a 2nd broadcast barrier) => 2 barriers/reduction.
+//
+// t4 MEASURED this FASTER on the small/low-rank shapes (2/3/8/12, their own gates
+// tolerate the reassociation) but it drifts the sign-DC reduced-block eigenvalues
+// past shape-11's razor-close eigr gate (~3.6e-3) => cuSOLVER fallback (+38%). So
+// the kernel takes a runtime `fastRed` flag: sign-DC (shape 11) passes 0 (exact
+// tree, gate-safe), the low-rank/direct-med callers pass 1 (this fast path).
+__device__ __forceinline__ float _mega_warp_sum(float v){
+  #pragma unroll
+  for(int o=16;o>0;o>>=1) v += __shfl_down_sync(0xffffffffu, v, o);
+  return v;
+}
+__device__ __forceinline__ float _mega_fast_sum(float v, float* red, int tid, int nt){
+  int lane=tid&31, wid=tid>>5;
+  v=_mega_warp_sum(v);
+  if(lane==0) red[wid]=v;
+  __syncthreads();
+  int nw=(nt+31)>>5;
+  float r=(tid<nw)?red[tid]:0.f;
+  if(wid==0) r=_mega_warp_sum(r);
+  if(tid==0) red[0]=r;
+  __syncthreads();
+  return red[0];
+}
 extern "C" __global__ void mega_eigh_k(const float* __restrict__ Ain,
     float* __restrict__ Vout, float* __restrict__ Lout,
     float* __restrict__ rscr, float* __restrict__ dscr, float* __restrict__ escr,
@@ -212,7 +240,7 @@ _MEGA_MED_CPP = (
     "void mega_eigh_med_split(torch::Tensor A, torch::Tensor Vout, torch::Tensor Lout, "
     "torch::Tensor rscr, torch::Tensor dscr, torch::Tensor escr, "
     "torch::Tensor dpscr, torch::Tensor dmscr, torch::Tensor tauscr, "
-    "torch::Tensor Tout, int n, int nt, int bisIters, int nb);"
+    "torch::Tensor Tout, int n, int nt, int bisIters, int nb, int fastRed);"
 )
 
 _MEGA_MED_CUDA = r'''
@@ -423,7 +451,7 @@ extern "C" __global__ void mega_eigh_med_split_k(const float* __restrict__ Ain,
     float* __restrict__ rscr, float* __restrict__ dscr, float* __restrict__ escr,
     float* __restrict__ dpscr, float* __restrict__ dmscr, float* __restrict__ tauscr,
     float* __restrict__ Tout,
-    int B, int n, int bisIters, int nb){
+    int B, int n, int bisIters, int nb, int fastRed){
   int m=blockIdx.x; if(m>=B) return; int tid=threadIdx.x, nt=blockDim.x;
   extern __shared__ char shc[];
   __half* Ah=(__half*)shc;
@@ -456,9 +484,11 @@ extern "C" __global__ void mega_eigh_med_split_k(const float* __restrict__ Ain,
   for(int c=0;c<n-2;++c){
     float s2=0.f;
     for(int i=c+1+tid;i<n;i+=nt){ float x=AGET(i,c); s2+=x*x; }
-    red[tid]=s2; __syncthreads();
-    for(int s=nt>>1;s>0;s>>=1){ if(tid<s)red[tid]+=red[tid+s]; __syncthreads(); }
-    float xnorm2=red[0];
+    float xnorm2;
+    if(fastRed){ xnorm2=_mega_fast_sum(s2,red,tid,nt); }
+    else { red[tid]=s2; __syncthreads();
+      for(int s=nt>>1;s>0;s>>=1){ if(tid<s)red[tid]+=red[tid+s]; __syncthreads(); }
+      xnorm2=red[0]; }
     float alpha=AGET(c+1,c); float tail2=xnorm2-alpha*alpha;
     if(tail2<=1e-20f){ if(tid==0){Em[c]=alpha;Tau[c]=0.f;} for(int i=tid;i<n;i+=nt) Rm[i*n+c]=(i==c+1)?1.f:0.f; __syncthreads(); continue; }
     float xnorm=sqrtf(xnorm2); float beta=(alpha>=0.f)?-xnorm:xnorm; float tau=(beta-alpha)/beta; float denom=alpha-beta;
@@ -475,9 +505,12 @@ extern "C" __global__ void mega_eigh_med_split_k(const float* __restrict__ Ain,
     for(int i=c+1+tid;i<n;i+=nt){ float acc=0.f; for(int j=c+1;j<n;++j) acc+=AGET(i,j)*v[j]; p[i]=tau*acc; }
     __syncthreads();
     float vp=0.f; for(int i=c+1+tid;i<n;i+=nt) vp+=v[i]*p[i];
-    red[tid]=vp; __syncthreads();
-    for(int s=nt>>1;s>0;s>>=1){ if(tid<s)red[tid]+=red[tid+s]; __syncthreads(); }
-    float K=0.5f*tau*red[0];
+    float vpr;
+    if(fastRed){ vpr=_mega_fast_sum(vp,red,tid,nt); }
+    else { red[tid]=vp; __syncthreads();
+      for(int s=nt>>1;s>0;s>>=1){ if(tid<s)red[tid]+=red[tid+s]; __syncthreads(); }
+      vpr=red[0]; }
+    float K=0.5f*tau*vpr;
     for(int i=c+1+tid;i<n;i+=nt) p[i]=p[i]-K*v[i];
     __syncthreads();
     for(int i=c+1+tid;i<n;i+=nt){ float vi=v[i],wi=p[i]; for(int j=c+1;j<=i;++j){ float a=AGET(i,j); ASET(i,j,a-vi*p[j]-wi*v[j]); } }
@@ -582,11 +615,11 @@ extern "C" __global__ void mega_eigh_med_split_k(const float* __restrict__ Ain,
 void mega_eigh_med_split(torch::Tensor A, torch::Tensor Vout, torch::Tensor Lout,
     torch::Tensor rscr, torch::Tensor dscr, torch::Tensor escr,
     torch::Tensor dpscr, torch::Tensor dmscr, torch::Tensor tauscr,
-    torch::Tensor Tout, int n, int nt, int bisIters, int nb){
+    torch::Tensor Tout, int n, int nt, int bisIters, int nb, int fastRed){
   int B=A.size(0);
   size_t triN=((size_t)n*(n+1))>>1;
   size_t shm=triN*sizeof(__half); shm=(shm+3u)&~3u; shm+=(size_t)2*n*sizeof(float);
-  // the block-T build reuses shc for Yp(n*nb)+Tp(nb*nb)+colA(nb); ensure the
+  // the block-T build reuses shc for Yp(n*nb)+Gp(nb*nb)+Tp(nb*nb); ensure the
   // dynamic SMEM is at least that large (it usually is -- packed-A dominates --
   // but a large nb at small n can exceed it).
   // brief-83: block-T build now uses Yp(n*nb) + Gp(nb*nb, persistent Gram) +
@@ -602,7 +635,7 @@ void mega_eigh_med_split(torch::Tensor A, torch::Tensor Vout, torch::Tensor Lout
   mega_eigh_med_split_k<<<B,nt,shm>>>(A.data_ptr<float>(),Vout.data_ptr<float>(),Lout.data_ptr<float>(),
     rscr.data_ptr<float>(),dscr.data_ptr<float>(),escr.data_ptr<float>(),
     dpscr.data_ptr<float>(),dmscr.data_ptr<float>(),tauscr.data_ptr<float>(),
-    Tout.data_ptr<float>(),B,n,bisIters,nb);
+    Tout.data_ptr<float>(),B,n,bisIters,nb,fastRed);
 }
 void mega_eigh_med(torch::Tensor A, torch::Tensor Vout, torch::Tensor Lout,
     torch::Tensor rscr, torch::Tensor dscr, torch::Tensor escr,
@@ -1343,8 +1376,12 @@ def _mega_med_split_solve(af, dev, b, n, nt, nb):
     dmscr = torch.empty(b, n, n, device=dev, dtype=torch.float32)
     tauscr = torch.empty(b, n, device=dev, dtype=torch.float32)
     T, npan = _mega_med_split_T(b, n, nb, dev)
+    # fastRed=1: the direct medium path (shape 2, n=352) is caught by its own
+    # orth/eig/recon gate in _eigh_megakernel_med, which tolerates the warp-shuffle
+    # sum reassociation (t4 measured shape2 -6%). Only the sign-DC K=300 reduced
+    # block (shape 11) needs the exact tree (fastRed=0).
     mod.mega_eigh_med_split(af, V, L, rscr, dscr, escr, dpscr, dmscr, tauscr,
-                            T, n, nt, _MEGA_BISITERS, nb)
+                            T, n, nt, _MEGA_BISITERS, nb, 1)
     # V holds Z (tridiag eigenvectors); rscr holds the Householder panel; T the
     # per-panel block-T. Back-transform Z -> Q on tensor cores.
     Q = _mega_med_backtransform(V, rscr, T, n, nb, npan)
@@ -2498,9 +2535,17 @@ def _lr_bare_scratch(B, k, dev):
     return buf
 
 
-def _lr_reduced_mega(Bk, bt_prec=None):
+def _lr_reduced_mega(Bk, bt_prec=None, fast_reduce=True):
     """RAW megakernel eigh of Bk (B x k x k) for k in the SMEM-fit range
     (32,448]. No wrapper gate, no scratch re-alloc, no sort. Returns (lam, G).
+
+    fast_reduce (brief-83): when True the medium split kernel uses the warp-shuffle
+    block SUM (2 barriers/reduction vs the tree's 10) for the two tridiag inner
+    products -- faster, but the sum reassociation drifts the reduced-block
+    eigenvalues. Safe for the low-rank inner solves (2/3/8/12; their outer A@V /
+    Rayleigh gate absorbs it, t4 measured a win). The sign-DC K=300 block (shape
+    11) passes False: its eigr gate (~3.6e-3) is razor-close and the drift trips
+    mass cuSOLVER fallback (t4 measured +38%), so it keeps the exact tree.
 
     For the medium branch (k in (200,448], i.e. the k=352/384 low-rank inner
     solves) this uses the SPLIT kernel + torch-level tensor-core WY back-
@@ -2534,13 +2579,14 @@ def _lr_reduced_mega(Bk, bt_prec=None):
     nb = _MEGA_MED_SPLIT_NB
     T, npan = _mega_med_split_T(B, kk, nb, Bk.device)
     mod.mega_eigh_med_split(Bkc, V, L, rscr, dscr, escr, dpscr, dmscr, tauscr,
-                            T, kk, _MEGA_MED_NT, _MEGA_BISITERS, nb)
+                            T, kk, _MEGA_MED_NT, _MEGA_BISITERS, nb,
+                            1 if fast_reduce else 0)
     # V holds Z; rscr the Householder panel; back-transform on tensor cores.
     G = _mega_med_backtransform(V, rscr, T, kk, nb, npan, prec=bt_prec)
     return L, G
 
 
-def _lr_reduced_eigh(Bk, bt_prec=None):
+def _lr_reduced_eigh(Bk, bt_prec=None, fast_reduce=True):
     """Eigendecomposition of the reduced symmetric block Bk (B x k x k). Returns
     (lam, G) in the torch.linalg.eigh convention (Bk @ G[:,:,i] = lam[:,i] *
     G[:,:,i]); ordering is whatever the path produced (the OUTER low-rank path
@@ -2556,7 +2602,7 @@ def _lr_reduced_eigh(Bk, bt_prec=None):
     mod = _mega_get()
     kk = Bk.shape[-1]
     if mod is not None and 32 < kk <= _MEGA_MED_NMAX:
-        return _lr_reduced_mega(Bk, bt_prec=bt_prec)
+        return _lr_reduced_mega(Bk, bt_prec=bt_prec, fast_reduce=fast_reduce)
     # k in (448, 836] (dense1024 k=608 shape-4 -> C=2; nearrank1024 k=768 shape-10
     # -> C=3): C-CTA thread-block CLUSTER solve -- the packed-FP16 k-triangle is
     # row-distributed across C CTAs' DSMEM so it fits (k=608 370KB/2=185KB/CTA;
@@ -3633,7 +3679,11 @@ def _sign_dc_solve(af, n, dev):
     Bstk = _lr_lift_gemm(Ustk.transpose(-1, -2), AU, _SIGN_DC_AV_MODE)
     Bstk = 0.5 * (Bstk + Bstk.transpose(-1, -2))
     try:
-        lstk, gstk = _lr_reduced_eigh(Bstk, bt_prec=_SIGN_DC_BT_PREC)
+        # fast_reduce=False: shape-11's eigr gate is razor-close (~3.6e-3); the
+        # warp-shuffle sum reassociation drifts the K=300 eigenvalues past it
+        # (t4: +38% via mass cuSOLVER fallback). Keep the exact tree reduction here.
+        lstk, gstk = _lr_reduced_eigh(Bstk, bt_prec=_SIGN_DC_BT_PREC,
+                                      fast_reduce=False)
     except Exception:
         lstk, gstk = torch.linalg.eigh(Bstk)
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -3720,7 +3770,9 @@ def _sign_dc_block_eigh(A_blk, dev):
     B = A_blk.shape[0]
     m = A_blk.shape[-1]
     if m <= _SIGN_DC_BASE_MAX:
-        return _lr_reduced_eigh(A_blk)
+        # exact tree reduction: sign-DC-family membership gates are tight (see the
+        # shape-11 note at the depth-0 call); keep gate-safe on shape 5's path too.
+        return _lr_reduced_eigh(A_blk, fast_reduce=False)
     # shift = mean eigenvalue (== trace/m); ~ the median for a roughly-symmetric or
     # roughly-uniform spectrum, so the +/- split is close to balanced.
     sigma = A_blk.diagonal(dim1=-2, dim2=-1).mean(dim=-1).reshape(B, 1, 1)
@@ -3980,7 +4032,8 @@ def _sign_dc_multiway(A_blk, dev, nways):
         AU = torch.cat(AUs, dim=0)
         Bstk = torch.bmm(Ustk.transpose(-1, -2), AU)
         Bstk = 0.5 * (Bstk + Bstk.transpose(-1, -2))
-    lstk, gstk = _lr_reduced_eigh(Bstk)          # (nways*B, K), (nways*B, K, K)
+    # exact tree reduction (sign-DC-family gate safety; see shape-11 note).
+    lstk, gstk = _lr_reduced_eigh(Bstk, fast_reduce=False)   # (nways*B, K), (nways*B, K, K)
     torch.backends.cuda.matmul.allow_tf32 = True
     Vstk = torch.bmm(Ustk, gstk)                 # (nways*B, m, K) candidate eigenvectors
     # membership per piece (of that piece's projector)
