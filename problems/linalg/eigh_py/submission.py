@@ -2458,13 +2458,18 @@ def _lr_reduced_mega(Bk, bt_prec=None):
     FP32 A@V gate falls that whole matrix back to cuSOLVER (unchanged).
 
     bt_prec overrides the WY back-transform GEMM precision for THIS call only
-    (None -> the shared _MEGA_MED_SPLIT_PREC=fp32). The sign-DC reduced-block
-    solve (shape 11 / shape 5) passes "tf32x3": its eigenvectors are cleaned by
-    a finishing 3xTF32 Newton-Schulz + a residual gate, so FP32-accurate 3xTF32
-    (Ozaki hi+lo, ~6e-6) is gate-safe and moves the ~5ms of back-transform
-    GEMMs off the FP32-SIMT path onto tensor cores; the low-rank inner solve
-    (shapes 2/3/8/12) leaves it None -> unchanged FP32 (that tighter Rayleigh
-    gate trips on plain TF32 and tf32x3 net-lost there per brief-22)."""
+    (None -> the shared _MEGA_MED_SPLIT_PREC=fp32). The n=512 sign-DC reduced-block
+    solve (shape 11) passes _SIGN_DC_BT_PREC="tf32": its K=300 eigenvectors are
+    re-orthonormalized by a finishing 3xTF32 Newton-Schulz + caught by the
+    per-matrix residual gate, so single-pass TF32 is gate-safe (5-seed verified,
+    0 new fallback) and moves the ~5ms of back-transform off the FP32-SIMT path
+    onto tensor cores. brief-72 measured tf32x3 (Ozaki 3-bmm) a REGRESSION here
+    (+13% shape11 -- split tax on the 1280-CTA batch where FP32-SIMT already
+    saturates), so plain "tf32" is used. The low-rank inner solve (shapes
+    2/3/8/12) leaves bt_prec None -> unchanged FP32 (its tighter Rayleigh gate
+    trips on plain TF32 and tf32x3 net-lost there, brief-22). The n=2048 sign-DC
+    base (shape 5) routes K~1072 to cluster/cuSOLVER, not this med path, so it
+    is unaffected regardless."""
     mod = _mega_get()
     kk = Bk.shape[-1]
     B = Bk.shape[0]
