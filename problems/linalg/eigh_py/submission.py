@@ -1910,7 +1910,7 @@ def _mega_med_backtransform(Z, V, T, n, nb, npan, prec=None):
     return Z
 
 
-def _mega_med_split_solve(af, dev, b, n, nt, nb, bisiters=None):
+def _mega_med_split_solve(af, dev, b, n, nt, nb, bisiters=None, bt_prec=None):
     """Run the SPLIT med kernel (stages 1-3 + block-T persist) then form the
     eigenvectors Q via the torch-level tensor-core WY back-transform. Returns
     (Q, L) UNSORTED (columns of Q pair with L entries), exactly matching what
@@ -1936,7 +1936,7 @@ def _mega_med_split_solve(af, dev, b, n, nt, nb, bisiters=None):
                             T, n, nt, bisiters, nb, 1)
     # V holds Z (tridiag eigenvectors); rscr holds the Householder panel; T the
     # per-panel block-T. Back-transform Z -> Q on tensor cores.
-    Q = _mega_med_backtransform(V, rscr, T, n, nb, npan)
+    Q = _mega_med_backtransform(V, rscr, T, n, nb, npan, prec=bt_prec)
     return Q, L
 
 
@@ -1960,7 +1960,17 @@ _MEGA_SMALL_BISITERS = 32
 # barrier stall ncu measures at 66% (10.6 of 16 warp-cycles). A smaller nt syncs fewer
 # warps (cheaper barrier) + shrinks _mega_fast_sum's cross-warp pass. MUST be a power
 # of 2 (the red[] tree reduction drops elements otherwise). Swept per shape.
-_MEGA_SMALL_NT = 256
+# MEASURED (t7): 256 was FLAT vs 512 (barrier is SM/GPC arrival cost, not idle-warp
+# participation), and t6's 512 gave the marginally best shape-1 (1882 vs 1896). Keep 512.
+_MEGA_SMALL_NT = 512
+# brief-114: back-transform GEMM precision for the small-n (n<=200) path. The default
+# ("fp32") runs the WY back-transform GEMMs on SIMT CUDA cores (no TC path for true
+# FP32 on B200 -- nsys t2 showed cutlass3x_sm100_simt_sgemm). At n=176 there are only
+# ~174 reflectors (vs ~350 at n=352 where TF32 tripped the orth gate), and the residual
+# gate tolerance scales with n, so plain TF32 (tensor cores) MAY be accurate enough here
+# -- moving the ~14%-of-shape1 back-transform onto TC. Per-matrix gate + fallback
+# backstops any matrix TF32 mis-orthogonalizes.
+_MEGA_SMALL_BT_PREC = "tf32"
 
 
 def _mega_sq_split_solve(af, dev, b, n, nt, nb):
@@ -1987,7 +1997,10 @@ def _mega_sq_split_solve(af, dev, b, n, nt, nb):
 # the small-n split uses mega_eigh_med_split2 (2 matrices/CTA, per-slot named barrier)
 # so the two matrices' per-column barrier stalls OVERLAP -- hiding the 66% barrier
 # stall ncu measured with 40 CTAs 1/SM. nt must be 512 (splits into 2x256).
-_MEGA_SMALL_2SLOT = True
+# MEASURED (t8): 2-slot REGRESSED shape 1 (1882->2492us) -- the 2 slots share the same
+# 4 schedulers so the named barrier waits on time-sliced warps (not hidden), and grid
+# halves to 20 CTAs. Software co-residency can't hide the barrier. Disabled.
+_MEGA_SMALL_2SLOT = False
 _MEGA_SMALL_2SLOT_NT = 512
 
 
@@ -2047,8 +2060,9 @@ def _eigh_megakernel_med(a: torch.Tensor) -> output_t:
     elif _MEGA_MED_SQUARE and _small:
         Qz, L = _mega_sq_split_solve(af, dev, b, n, _nt, _MEGA_MED_SPLIT_NB)
     else:
+        _btp = _MEGA_SMALL_BT_PREC if _small else None
         Qz, L = _mega_med_split_solve(af, dev, b, n, _nt, _MEGA_MED_SPLIT_NB,
-                                      bisiters=_bis)
+                                      bisiters=_bis, bt_prec=_btp)
     L, order = torch.sort(L, dim=-1)
     Q = torch.gather(Qz, 2, order.unsqueeze(1).expand(b, n, n))
     # Recon=||Q L Q^T - A||_1 is REDUNDANT given eigr + orth and is NOT recomputed
