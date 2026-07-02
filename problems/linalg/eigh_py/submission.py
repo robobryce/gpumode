@@ -3445,7 +3445,7 @@ _SIGN_DC_NS_ITERS = 18    # Newton-Schulz sign iterations (each = 2 batched GEMM
 #   "px"    = Polar-Express aggressive first-iterate coeffs (steepest slope at 0,
 #             |p|>1 mid-range overshoot that later iters contract) -- fastest but the
 #             membership tolerates it (residual gate is the safety net).
-_SIGN_DC_NS_DEGREE = "mixed"  # 3 (baseline), 5 (all degree-5), or "mixed" (deg-5 head +
+_SIGN_DC_NS_DEGREE = 3    # 3 (baseline), 5 (all degree-5), or "mixed" (deg-5 head +
                           # deg-3 tail). Diagnostic (brief-87 t1/t2): all-degree-5 in
                           # TF32 converges the EIGENVALUES fine (eigr ~3.5e-3 == deg3)
                           # but leaves the EIGENVECTORS 3-6x less orthonormal (orth
@@ -3712,6 +3712,38 @@ def _sign_dc_ns_sign(X, iters, degree=None, coef=None):
     return X
 
 
+_SIGNDC_TIMERS: dict = {}   # stage -> [total_ms, count] when SIGNDC_TIME is set
+
+
+class _sdc_timer:
+    """Env-gated CUDA-event stage timer for the sign-DC pipeline. No-op unless
+    SIGNDC_TIME is set (records nothing, no sync overhead on the hot path)."""
+    _on = None
+
+    def __init__(self, name):
+        if _sdc_timer._on is None:
+            import os as _os
+            _sdc_timer._on = bool(_os.environ.get("SIGNDC_TIME"))
+        self.name = name
+        self.active = _sdc_timer._on
+
+    def __enter__(self):
+        if self.active:
+            self.e0 = torch.cuda.Event(enable_timing=True)
+            self.e1 = torch.cuda.Event(enable_timing=True)
+            self.e0.record()
+        return self
+
+    def __exit__(self, *a):
+        if self.active:
+            self.e1.record()
+            torch.cuda.synchronize()
+            ms = self.e0.elapsed_time(self.e1)
+            d = _SIGNDC_TIMERS.setdefault(self.name, [0.0, 0])
+            d[0] += ms
+            d[1] += 1
+
+
 def _sign_dc_solve(af, n, dev):
     """Batched spectral divide-and-conquer eigh via the matrix sign function.
     Returns (Q, L) UNSORTED-then-sorted (columns of Q pair with L); the CALLER
@@ -3721,18 +3753,20 @@ def _sign_dc_solve(af, n, dev):
     _gp = torch.backends.cuda.matmul.allow_tf32
     torch.backends.cuda.matmul.allow_tf32 = True
     # spectral-norm scale via A^2 power iteration (sign-robust for indefinite A)
-    v = torch.randn(b, n, 1, device=dev, dtype=torch.float32)
-    v = v / v.norm(dim=1, keepdim=True).clamp_min(1e-30)
-    for _ in range(_SIGN_DC_POWER_ITERS):
-        v = af @ (af @ v)
+    with _sdc_timer("1_powerscale"):
+        v = torch.randn(b, n, 1, device=dev, dtype=torch.float32)
         v = v / v.norm(dim=1, keepdim=True).clamp_min(1e-30)
-    nrm2 = (v.transpose(-1, -2) @ (af @ (af @ v))).abs().reshape(b, 1, 1).clamp_min(1e-30)
-    scale = nrm2.sqrt() * 1.02
+        for _ in range(_SIGN_DC_POWER_ITERS):
+            v = af @ (af @ v)
+            v = v / v.norm(dim=1, keepdim=True).clamp_min(1e-30)
+        nrm2 = (v.transpose(-1, -2) @ (af @ (af @ v))).abs().reshape(b, 1, 1).clamp_min(1e-30)
+        scale = nrm2.sqrt() * 1.02
     # Matrix-sign iteration (degree-3 NS or degree-5 higher-order, per _SIGN_DC_NS_DEGREE).
     # Degree-3 baddbmm-fuses the 1.5X-0.5X^3; degree-5 uses the steeper-slope Horner form.
-    X = af / scale
-    _nsit = _SIGN_DC_NS5_ITERS if _SIGN_DC_NS_DEGREE == 5 else _SIGN_DC_NS_ITERS
-    X = _sign_dc_ns_sign(X, _nsit)   # HEAD/TAIL used internally for "mixed"
+    with _sdc_timer("2_ns_sign"):
+        X = af / scale
+        _nsit = _SIGN_DC_NS5_ITERS if _SIGN_DC_NS_DEGREE == 5 else _SIGN_DC_NS_ITERS
+        X = _sign_dc_ns_sign(X, _nsit)   # HEAD/TAIL used internally for "mixed"
     # Spectral projectors are NOT materialized: P+ @ M = 0.5*(M + X@M) and
     # P- @ M = 0.5*(M - X@M), so the subspace probes and the membership test apply
     # the sign directly to their (thin) operands -- no full n*n P+/P- tensors.
@@ -3745,8 +3779,9 @@ def _sign_dc_solve(af, n, dev):
     # bases are the SAME (n x K) shape, so STACK them (2b x n x K) and run one CQR +
     # one A@U GEMM instead of two -- better GPU fill, half the launch overhead.
     Om, Om2 = _sign_dc_omega(b, n, K, dev)
-    Ustk = _sign_dc_cqr(torch.cat([_pp(Om), _pm(Om2)], dim=0),
-                        passes=_SIGN_DC_CQR_PASSES)               # (2b, n, K)
+    with _sdc_timer("3_proj_cqr"):
+        Ustk = _sign_dc_cqr(torch.cat([_pp(Om), _pm(Om2)], dim=0),
+                            passes=_SIGN_DC_CQR_PASSES)               # (2b, n, K)
     torch.backends.cuda.matmul.allow_tf32 = _gp
     # reduced K x K blocks -> fused tensor-core megakernel (raw, unsorted, ungated).
     # Both blocks solved in ONE stacked (2b, K, K) megakernel launch: one-CTA-per-matrix,
@@ -3754,11 +3789,13 @@ def _sign_dc_solve(af, n, dev):
     # A@U half is done on each b-block (both share af, so no b*n*n repeat of af) then
     # concatenated for the stacked reduced Gram + eigh.
     # brief-54: A@U lift (af @ Ustk) + reduced-block build at _SIGN_DC_AV_MODE.
-    AU = _lr_lift_gemm(af, Ustk[:b], _SIGN_DC_AV_MODE)
-    AU = torch.cat([AU, _lr_lift_gemm(af, Ustk[b:], _SIGN_DC_AV_MODE)], dim=0)
-    Bstk = _lr_lift_gemm(Ustk.transpose(-1, -2), AU, _SIGN_DC_AV_MODE)
-    Bstk = 0.5 * (Bstk + Bstk.transpose(-1, -2))
-    try:
+    with _sdc_timer("4_lift_build"):
+        AU = _lr_lift_gemm(af, Ustk[:b], _SIGN_DC_AV_MODE)
+        AU = torch.cat([AU, _lr_lift_gemm(af, Ustk[b:], _SIGN_DC_AV_MODE)], dim=0)
+        Bstk = _lr_lift_gemm(Ustk.transpose(-1, -2), AU, _SIGN_DC_AV_MODE)
+        Bstk = 0.5 * (Bstk + Bstk.transpose(-1, -2))
+    with _sdc_timer("5_mega_eigh"):
+      try:
         # fast_reduce=True (brief-83 t12): the CLEAN warp-shuffle sum (_mega_fast_sum)
         # IS gate-safe for shape 11. EIGH_DIAG measurement over 2 full runs: 0/640
         # fallback every iteration, orth_max ~2.0e-3 (vs the exact tree's ~3.4-4.4e-3)
@@ -3769,49 +3806,52 @@ def _sign_dc_solve(af, n, dev):
         # 84995->83930, geomean 27862->27824, still 39/39, 0 fallback.
         lstk, gstk = _lr_reduced_eigh(Bstk, bt_prec=_SIGN_DC_BT_PREC,
                                       fast_reduce=True)
-    except Exception:
+      except Exception:
         lstk, gstk = torch.linalg.eigh(Bstk)
-    torch.backends.cuda.matmul.allow_tf32 = True
-    Up, Um = Ustk[:b], Ustk[b:]
-    Vstk = torch.bmm(Ustk, gstk)               # (2b, n, K) candidate eigenvectors
-    Vp, Vm = Vstk[:b], Vstk[b:]
-    lp, lm = lstk[:b], lstk[b:]
-    # projector membership: ~1 for a real eigenvector of that block, ~0 for padding
-    selp = _pp(Vp).norm(dim=1)                 # (b, K)
-    selm = _pm(Vm).norm(dim=1)                 # (b, K)
-    torch.backends.cuda.matmul.allow_tf32 = _gp
-    Vall = torch.cat([Vp, Vm], dim=-1)         # n x 2K
-    Lall = torch.cat([lp, lm], dim=-1)         # 2K
-    mem = torch.cat([selp, selm], dim=-1)      # 2K
-    topi = mem.topk(n, dim=-1).indices         # the n true eigenpairs
-    Q = torch.gather(Vall, 2, topi.unsqueeze(1).expand(b, n, n))
-    L = torch.gather(Lall, 1, topi)
+    with _sdc_timer("6_member_topk"):
+        torch.backends.cuda.matmul.allow_tf32 = True
+        Up, Um = Ustk[:b], Ustk[b:]
+        Vstk = torch.bmm(Ustk, gstk)               # (2b, n, K) candidate eigenvectors
+        Vp, Vm = Vstk[:b], Vstk[b:]
+        lp, lm = lstk[:b], lstk[b:]
+        # projector membership: ~1 for a real eigenvector of that block, ~0 for padding
+        selp = _pp(Vp).norm(dim=1)                 # (b, K)
+        selm = _pm(Vm).norm(dim=1)                 # (b, K)
+        torch.backends.cuda.matmul.allow_tf32 = _gp
+        Vall = torch.cat([Vp, Vm], dim=-1)         # n x 2K
+        Lall = torch.cat([lp, lm], dim=-1)         # 2K
+        mem = torch.cat([selp, selm], dim=-1)      # 2K
+        topi = mem.topk(n, dim=-1).indices         # the n true eigenpairs
+        Q = torch.gather(Vall, 2, topi.unsqueeze(1).expand(b, n, n))
+        L = torch.gather(Lall, 1, topi)
     # finishing Newton-Schulz orthonormalization (cleans the TF32-sign bases' ~1e-2
     # orth to ~1e-4). The Gram + Q@Gram GEMMs run in 3xTF32 (Ozaki hi+lo split, ~FP32
     # accuracy at ~1.6x the FP32-SIMT rate) instead of true FP32-SIMT -- the two n*n
     # simt_sgemm terms were ~10% of the shape.
-    if _SIGN_DC_FINAL_NS > 0:
-        _p2 = torch.backends.cuda.matmul.allow_tf32
-        torch.backends.cuda.matmul.allow_tf32 = True
-        for _ in range(_SIGN_DC_FINAL_NS):
-            # brief-46: the finishing-NS Gram g = Q^T Q is symmetric, so the
-            # symmetric-aware 3xTF32 form (2 bmms, identical ~6e-6 accuracy) does
-            # this n*n Gram at one fewer tensor-core bmm than the 3-bmm variant.
-            g = _gram_3xtf32_sym(Q)
-            Q = 1.5 * Q - 0.5 * _matmul_3xtf32(Q, g)
-        torch.backends.cuda.matmul.allow_tf32 = _p2
+    with _sdc_timer("7_finish_ns"):
+        if _SIGN_DC_FINAL_NS > 0:
+            _p2 = torch.backends.cuda.matmul.allow_tf32
+            torch.backends.cuda.matmul.allow_tf32 = True
+            for _ in range(_SIGN_DC_FINAL_NS):
+                # brief-46: the finishing-NS Gram g = Q^T Q is symmetric, so the
+                # symmetric-aware 3xTF32 form (2 bmms, identical ~6e-6 accuracy) does
+                # this n*n Gram at one fewer tensor-core bmm than the 3-bmm variant.
+                g = _gram_3xtf32_sym(Q)
+                Q = 1.5 * Q - 0.5 * _matmul_3xtf32(Q, g)
+            torch.backends.cuda.matmul.allow_tf32 = _p2
     # Rayleigh-quotient re-eval of L on the orthonormalized Q (eigenvalues are the
     # diagonal of Q^T A Q; feeds the gate + output). A@Q on TF32 (gate-precision).
     # AQ is gathered by the SAME sort order as Q so the caller's eigen-residual gate
     # can reuse it column-aligned (no second A@Q GEMM).
-    torch.backends.cuda.matmul.allow_tf32 = True
-    AQ = af @ Q
-    torch.backends.cuda.matmul.allow_tf32 = _gp
-    L = (Q * AQ).sum(dim=1)
-    L, order = torch.sort(L, dim=-1)
-    oexp = order.unsqueeze(1).expand(b, n, n)
-    Q = torch.gather(Q, 2, oexp)
-    AQ = torch.gather(AQ, 2, oexp)
+    with _sdc_timer("8_rayleigh_sort"):
+        torch.backends.cuda.matmul.allow_tf32 = True
+        AQ = af @ Q
+        torch.backends.cuda.matmul.allow_tf32 = _gp
+        L = (Q * AQ).sum(dim=1)
+        L, order = torch.sort(L, dim=-1)
+        oexp = order.unsqueeze(1).expand(b, n, n)
+        Q = torch.gather(Q, 2, oexp)
+        AQ = torch.gather(AQ, 2, oexp)
     return Q, L, AQ, order
 
 
@@ -4308,6 +4348,12 @@ def _eigh_sign_dc(a: torch.Tensor) -> output_t:
             f"orth_gate={75.0*n*eps:.4g} orth_max={orth.max().item():.4g} "
             f"eigr_gate={150.0*n*eps:.4g} eigr_rel_max={(eigr/a_l1).max().item():.4g} "
             f"nbad={int(bad.sum().item())}/{b}\n")
+        _sys.stderr.flush()
+    if _os.environ.get("SIGNDC_TIME") and _SIGNDC_TIMERS:
+        import sys as _sys
+        tot = sum(v[0] for v in _SIGNDC_TIMERS.values())
+        parts = " ".join(f"{k}={v[0]/max(v[1],1):.2f}ms" for k, v in sorted(_SIGNDC_TIMERS.items()))
+        _sys.stderr.write(f"[SIGNDC_TIME] per-call avg (n={n} b={b}): {parts} | sum={tot/max(list(_SIGNDC_TIMERS.values())[0][1],1):.2f}ms\n")
         _sys.stderr.flush()
     if bool(bad.any()):
         idx = torch.nonzero(bad, as_tuple=False).flatten()
