@@ -2453,6 +2453,7 @@ def _lr_cholesky_qr2(Y, passes=2, shift=1e-5, tf32_gram=False, gram_mode=None):
     c = Y.shape[-1]
     eye = torch.eye(c, device=Y.device, dtype=Y.dtype)
     prev = torch.backends.cuda.matmul.allow_tf32
+    _fmod = _fused_cqr_get() if _FUSED_CQR_SHIFT else None
     try:
         for pm in pass_modes:
             torch.backends.cuda.matmul.allow_tf32 = (pm in ("tf32", "3xtf32"))
@@ -2461,8 +2462,15 @@ def _lr_cholesky_qr2(Y, passes=2, shift=1e-5, tf32_gram=False, gram_mode=None):
                 G = _gram_3xtf32_sym(Q)
             else:
                 G = torch.bmm(Q.transpose(-1, -2), Q)
-            dm = G.diagonal(dim1=-2, dim2=-1).abs().amax(-1).clamp_min(1e-30)
-            L = torch.linalg.cholesky(G + (shift * dm).view(-1, 1, 1) * eye)
+            if _fmod is not None and G.is_contiguous():
+                # in-place diag shift only when G is already contiguous (plain-bmm
+                # Gram) -- forcing .contiguous() on the 3xTF32-sym Gram (a sum, non-
+                # contiguous) would add a copy launch that eats the fused saving.
+                _fmod.add_shifted_diag(G, float(shift))
+                L = torch.linalg.cholesky(G)
+            else:
+                dm = G.diagonal(dim1=-2, dim2=-1).abs().amax(-1).clamp_min(1e-30)
+                L = torch.linalg.cholesky(G + (shift * dm).view(-1, 1, 1) * eye)
             Q = torch.linalg.solve_triangular(L, Q.transpose(-1, -2), upper=False).transpose(-1, -2)
     finally:
         torch.backends.cuda.matmul.allow_tf32 = prev
@@ -3707,6 +3715,279 @@ def _sign_dc_omega(b, n, K, dev):
     return om
 
 
+# ---------------------------------------------------------------------------
+# FUSED BATCHED CholeskyQR kernel (brief-92).
+#
+# The sign-DC proj_cqr stage (CholeskyQR2 orthonormalization of the stacked
+# (2b, n, K=300) projected bases) is the biggest torch component of shape 11's
+# pipeline (SIGNDC_TIME: proj_cqr 20.2ms of 81ms). torch does it as separate
+# bmm(Gram) + potrf + trsm launches per pass, twice; the k*k Gram factor
+# round-trips through HBM between the potrf and the tall n*k trsm each pass, and
+# the ~14 dependent launches per proj_cqr accumulate ~10ms of inter-kernel gap on
+# top of the ~10ms of kernel work (Gram 0.58 + potrf 3.21 + trsm 5.48 + projapply
+# 1.14ms measured; the remainder is launch/dispatch gap).
+#
+# This module fuses Gram + shifted-Cholesky into ONE launch, one CTA per matrix,
+# with the k*k packed lower-triangle Gram/factor RESIDENT in shared memory (no
+# HBM round-trip of the Gram between the accumulation and the potrf). The factor
+# L is written to HBM once; torch's backward-stable solve_triangular then does
+# the tall n*k trsm (the inv-GEMM / NS substitutes both broke the orthogonality
+# gate in brief-87, so the FP32 trsm is kept). Collapsing the Gram bmm + the
+# diagonal/shift elementwise + the potrf into one kernel removes those launches
+# and their dependency gaps.
+#
+# SMEM: packed lower triangle k(k+1)/2 floats (k=300 -> 176KB) + a small row-tile
+# staging buffer. Requires the opt-in (>48KB) dynamic-SMEM carveout on sm_100.
+# ---------------------------------------------------------------------------
+_FUSED_CQR_CPP = r"""
+#include <torch/extension.h>
+torch::Tensor fused_gram_chol(torch::Tensor Q, double shift);
+void add_shifted_diag(torch::Tensor G, double shift);
+"""
+
+_FUSED_CQR_CUDA = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+// One CTA per matrix. Computes G = Q^T Q (k x k, symmetric) for a tall Q (n x k),
+// adds shift*max_diag to the diagonal, then does an in-place left-looking Cholesky
+// of the packed lower triangle in shared memory, and writes the lower factor L to
+// HBM. Q is (B, n, k) row-major; out L is (B, k, k) row-major (lower-triangular,
+// upper part zeroed).
+//
+// Shared memory layout (dynamic):
+//   float Gp[k*(k+1)/2];      // packed lower triangle, row-major-by-row: Gp[i*(i+1)/2 + j], i>=j
+//   float tile[RB*k];         // row-block staging for the Gram accumulation
+// plus a few scalars in static smem.
+
+#ifndef FUSED_CQR_RB
+#define FUSED_CQR_RB 16
+#endif
+
+__device__ __forceinline__ int pidx(int i, int j) { return (i*(i+1))/2 + j; }  // i>=j
+
+extern "C" __global__ void fused_gram_chol_kernel(
+        const float* __restrict__ Q, float* __restrict__ Lout,
+        int B, int n, int k, float shift) {
+    const int mat = blockIdx.x;
+    if (mat >= B) return;
+    const int tid = threadIdx.x;
+    const int nt  = blockDim.x;
+    const int tri = (k*(k+1))/2;
+
+    extern __shared__ float smem[];
+    float* Gp   = smem;             // tri floats
+    float* tile = smem + tri;       // RB*k floats
+
+    const float* Qm = Q + (long)mat * n * k;
+    float*       Lm = Lout + (long)mat * k * k;
+
+    // ---- zero the packed Gram ----
+    for (int e = tid; e < tri; e += nt) Gp[e] = 0.0f;
+    __syncthreads();
+
+    // ---- Gram accumulation, walked over row-blocks of RB rows ----
+    // Thread t owns the strided set of triangle ROWS {i : i % nt == t}; for each such
+    // row it accumulates the contiguous packed segment Gp[pidx(i,0)..pidx(i,i)] over
+    // the RB rows in the SMEM tile. This avoids the per-entry sqrt index recovery and
+    // gives each thread contiguous writes to its row segment. tile[t*k + i] (row-i's
+    // value, loop-invariant in j) is loaded once per row-block row t.
+    for (int r0 = 0; r0 < n; r0 += FUSED_CQR_RB) {
+        int rb = min(FUSED_CQR_RB, n - r0);
+        // coalesced load of the row-block into SMEM tile (rb x k)
+        for (int e = tid; e < rb * k; e += nt) tile[e] = Qm[(long)r0 * k + e];
+        __syncthreads();
+        for (int i = tid; i < k; i += nt) {
+            float* Gi = Gp + pidx(i, 0);       // contiguous row-i segment [0..i]
+            for (int t = 0; t < rb; t++) {
+                const float* qt = tile + t * k;
+                float qti = qt[i];
+                #pragma unroll 4
+                for (int j = 0; j <= i; j++) Gi[j] += qti * qt[j];
+            }
+        }
+        __syncthreads();
+    }
+
+    // ---- shift the diagonal: add shift * max_i |G[i,i]| ----
+    // reduce max diagonal into tile[0]
+    float local_max = 0.0f;
+    for (int i = tid; i < k; i += nt) {
+        float d = fabsf(Gp[pidx(i, i)]);
+        local_max = fmaxf(local_max, d);
+    }
+    // block reduce via SMEM (reuse tile[])
+    tile[tid] = local_max;
+    __syncthreads();
+    for (int s = nt >> 1; s > 0; s >>= 1) {
+        if (tid < s) tile[tid] = fmaxf(tile[tid], tile[tid + s]);
+        __syncthreads();
+    }
+    float dmax = tile[0];
+    float sh = shift * fmaxf(dmax, 1e-30f);
+    __syncthreads();
+    for (int i = tid; i < k; i += nt) Gp[pidx(i, i)] += sh;
+    __syncthreads();
+
+    // ---- in-place left-looking Cholesky of the packed lower triangle ----
+    // For column j: L[j,j] = sqrt(G[j,j] - sum_{p<j} L[j,p]^2);
+    //   L[i,j] = (G[i,j] - sum_{p<j} L[i,p]*L[j,p]) / L[j,j]   (i > j)
+    // BLOCKED right-looking Cholesky, block width NB. Per outer step over the NB
+    // diagonal columns [jb, jb+nb): (1) factor the NB diagonal block IN PLACE using
+    // the already-materialized left part (columns < jb), then (2) rank-NB update the
+    // trailing subdiagonal (rows > jb+nb-1, columns [jb,jb+nb)) in parallel. This
+    // cuts the __syncthreads count from k (~300) to ~k/NB (~10) and makes each
+    // trailing update a big parallel rank-NB pass -> far more work per barrier than
+    // the per-column left-looking form.
+    const int NB = 24;
+    for (int jb = 0; jb < k; jb += NB) {
+        int nb = min(NB, k - jb);
+        // (1) factor the nb x nb diagonal block, columns jb..jb+nb-1, sequentially in
+        // the local column c; the subdiagonal of each local column parallelizes. The
+        // dot uses the FULL left part p<j (already factored) so the block is finished
+        // correctly in one pass.
+        for (int c = 0; c < nb; c++) {
+            int j = jb + c;
+            if (tid == 0) {
+                float s = Gp[pidx(j, j)];
+                const float* Lj = Gp + pidx(j, 0);
+                for (int p = 0; p < j; p++) { float v = Lj[p]; s -= v * v; }
+                s = (s > 1e-30f) ? sqrtf(s) : 1e-15f;
+                Gp[pidx(j, j)] = s;
+            }
+            __syncthreads();
+            float inv = 1.0f / Gp[pidx(j, j)];
+            // finish the rest of the diagonal block's column j (rows j+1 .. jb+nb-1)
+            for (int i = j + 1 + tid; i < jb + nb; i += nt) {
+                float s = Gp[pidx(i, j)];
+                const float* Li = Gp + pidx(i, 0);
+                const float* Lj = Gp + pidx(j, 0);
+                for (int p = 0; p < j; p++) s -= Li[p] * Lj[p];
+                Gp[pidx(i, j)] = s * inv;
+            }
+            __syncthreads();
+        }
+        // (2) rank-nb update + scale of the trailing panel: for each row i >= jb+nb,
+        // compute L[i, j] for j in [jb, jb+nb) left-to-right (they depend on earlier
+        // columns of the SAME block via the p<j sum). Each thread owns a set of rows.
+        for (int i = jb + nb + tid; i < k; i += nt) {
+            const float* Li = Gp + pidx(i, 0);
+            for (int c = 0; c < nb; c++) {
+                int j = jb + c;
+                float s = Gp[pidx(i, j)];
+                const float* Lj = Gp + pidx(j, 0);
+                #pragma unroll 4
+                for (int p = 0; p < j; p++) s -= Li[p] * Lj[p];
+                Gp[pidx(i, j)] = s / Gp[pidx(j, j)];
+            }
+        }
+        __syncthreads();
+    }
+
+    // ---- write L to HBM (lower part; zero the upper) ----
+    for (int e = tid; e < k * k; e += nt) {
+        int i = e / k, j = e % k;
+        Lm[e] = (i >= j) ? Gp[pidx(i, j)] : 0.0f;
+    }
+}
+
+// One CTA per matrix. Adds shift * max_i|G[i,i]| to the diagonal of a (B,k,k)
+// batch IN PLACE, fusing the diag/abs/amax/clamp/mul/add/eye elementwise chain
+// (~6-7 tiny torch launches) into ONE launch. This does not touch the (slow to
+// beat) cuSOLVER potrf or the trsm -- it only removes the dependency-gap launches
+// between the Gram bmm and the potrf.
+extern "C" __global__ void add_shifted_diag_kernel(
+        float* __restrict__ G, int B, int k, float shift) {
+    const int mat = blockIdx.x;
+    if (mat >= B) return;
+    const int tid = threadIdx.x, nt = blockDim.x;
+    float* Gm = G + (long)mat * k * k;
+    __shared__ float red[1024];
+    float lm = 0.0f;
+    for (int i = tid; i < k; i += nt) lm = fmaxf(lm, fabsf(Gm[(long)i * k + i]));
+    red[tid] = lm;
+    __syncthreads();
+    for (int s = nt >> 1; s > 0; s >>= 1) {
+        if (tid < s) red[tid] = fmaxf(red[tid], red[tid + s]);
+        __syncthreads();
+    }
+    float sh = shift * fmaxf(red[0], 1e-30f);
+    for (int i = tid; i < k; i += nt) Gm[(long)i * k + i] += sh;
+}
+
+void add_shifted_diag(torch::Tensor G, double shift) {
+    TORCH_CHECK(G.dim() == 3 && G.size(1) == G.size(2), "G must be (B,k,k)");
+    TORCH_CHECK(G.scalar_type() == torch::kFloat32, "G must be float32");
+    int B = G.size(0), k = G.size(1);
+    int nt = 256;
+    add_shifted_diag_kernel<<<B, nt>>>(G.data_ptr<float>(), B, k, (float)shift);
+}
+
+torch::Tensor fused_gram_chol(torch::Tensor Q, double shift) {
+    TORCH_CHECK(Q.dim() == 3, "Q must be (B,n,k)");
+    TORCH_CHECK(Q.scalar_type() == torch::kFloat32, "Q must be float32");
+    auto Qc = Q.contiguous();
+    int B = Qc.size(0), n = Qc.size(1), k = Qc.size(2);
+    auto L = torch::empty({B, k, k}, Qc.options());
+    int tri = (k * (k + 1)) / 2;
+    size_t shbytes = (size_t)(tri + FUSED_CQR_RB * k) * sizeof(float);
+    int nt = 512;
+    static int configured = 0;
+    if (!configured) {
+        cudaFuncSetAttribute(fused_gram_chol_kernel,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, (int)shbytes);
+        configured = 1;
+    } else {
+        cudaFuncSetAttribute(fused_gram_chol_kernel,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, (int)shbytes);
+    }
+    fused_gram_chol_kernel<<<B, nt, shbytes>>>(
+        Qc.data_ptr<float>(), L.data_ptr<float>(), B, n, k, (float)shift);
+    return L;
+}
+"""
+
+_fused_cqr_mod = None
+_fused_cqr_failed = False
+
+
+def _fused_cqr_get():
+    """Lazily compile + cache the fused CholeskyQR extension. Returns the module,
+    or None if compilation failed (caller falls back to the torch CQR path)."""
+    global _fused_cqr_mod, _fused_cqr_failed
+    if _fused_cqr_mod is not None:
+        return _fused_cqr_mod
+    if _fused_cqr_failed:
+        return None
+    try:
+        import os
+        from torch.utils.cpp_extension import load_inline
+        os.environ["TORCH_CUDA_ARCH_LIST"] = "10.0a"
+        _fused_cqr_mod = load_inline(
+            name="fused_cqr_b92",
+            cpp_sources=_FUSED_CQR_CPP,
+            cuda_sources=_FUSED_CQR_CUDA,
+            functions=["fused_gram_chol", "add_shifted_diag"],
+            with_cuda=True,
+            verbose=False,
+            extra_cuda_cflags=["-O3", "--use_fast_math"],
+        )
+        return _fused_cqr_mod
+    except Exception:
+        _fused_cqr_failed = True
+        return None
+
+
+# Master switch for the fused whole-Gram+Cholesky path inside _sign_dc_cqr (t1-t3:
+# occupancy-bound single-CTA Cholesky, ~7x slower than cuSOLVER's batched potrf --
+# left OFF). _FUSED_CQR_SHIFT fuses ONLY the diag/abs/amax/clamp/mul/add/eye chain
+# between the Gram bmm and the potrf into one launch, keeping the fast library
+# potrf+trsm -- targets the ~10ms host-dispatch gap in proj_cqr, not the kernels.
+_FUSED_CQR_GRAMCHOL = False
+_FUSED_CQR_SHIFT = True
+
+
 def _sign_dc_cqr(Y, passes=2, shift=1e-4, ns_refine=0):
     """Shifted batched CholeskyQR orthonormalization (Gram -> Cholesky -> trsm, all
     BLAS3). The shift regularizes the rank-deficient directions of P+/P- @ Omega
@@ -3726,10 +4007,29 @@ def _sign_dc_cqr(Y, passes=2, shift=1e-4, ns_refine=0):
     c = Y.shape[-1]
     eyek = torch.eye(c, device=Y.device, dtype=Y.dtype)
     n_chol = passes - ns_refine
+    _fmod = (_fused_cqr_get() if (_FUSED_CQR_GRAMCHOL or _FUSED_CQR_SHIFT) else None)
     for _ in range(n_chol):
-        G = torch.bmm(Qc.transpose(-1, -2), Qc)
-        dm = G.diagonal(dim1=-2, dim2=-1).abs().amax(-1).clamp_min(1e-30)
-        L = torch.linalg.cholesky(G + (shift * dm).view(-1, 1, 1) * eyek)
+        if _fmod is not None and _FUSED_CQR_GRAMCHOL:
+            # brief-92: fused Gram + shifted-Cholesky in ONE launch (packed k*k
+            # factor resident in SMEM, no HBM round-trip between the Gram and the
+            # potrf). Falls back to torch on any exception (shape/compile).
+            try:
+                L = _fmod.fused_gram_chol(Qc.contiguous(), float(shift))
+            except Exception:
+                G = torch.bmm(Qc.transpose(-1, -2), Qc)
+                dm = G.diagonal(dim1=-2, dim2=-1).abs().amax(-1).clamp_min(1e-30)
+                L = torch.linalg.cholesky(G + (shift * dm).view(-1, 1, 1) * eyek)
+        elif _fmod is not None and _FUSED_CQR_SHIFT:
+            # brief-92: fuse the diag/abs/amax/clamp/mul/add/eye shift chain (~6-7 tiny
+            # launches) into ONE add_shifted_diag launch on G, keeping torch's Gram
+            # bmm + the fast cuSOLVER potrf. Targets proj_cqr's ~10ms host-dispatch gap.
+            G = torch.bmm(Qc.transpose(-1, -2), Qc)
+            _fmod.add_shifted_diag(G, float(shift))
+            L = torch.linalg.cholesky(G)
+        else:
+            G = torch.bmm(Qc.transpose(-1, -2), Qc)
+            dm = G.diagonal(dim1=-2, dim2=-1).abs().amax(-1).clamp_min(1e-30)
+            L = torch.linalg.cholesky(G + (shift * dm).view(-1, 1, 1) * eyek)
         if _SIGN_DC_CQR_INV_GEMM:
             # brief-87: Q = Qc @ L^{-T} via a SMALL K x K triangular inverse + one
             # tensor-core GEMM, instead of the wide (K x n) triangular solve. The
