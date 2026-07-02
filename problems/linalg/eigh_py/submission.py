@@ -3419,7 +3419,7 @@ _SIGN_DC_K = 300          # oversized subspace width (>= max +count/-count over 
                           # eigh is the wall; K in [288,300] all land ~110ms), so the
                           # extra margin is free. Both K-blocks fit the megakernel's
                           # n<=448 range. Matrices with +count>K fall to cuSOLVER.
-_SIGN_DC_NS_ITERS = 12    # Newton-Schulz sign iterations (each = 2 batched GEMMs).
+_SIGN_DC_NS_ITERS = 10    # Newton-Schulz sign iterations (each = 2 batched GEMMs).
                           # The near-zero eigenvalues plateau |X| below 1 (they need
                           # ~22 quadratic steps to fully resolve), but the projector
                           # MEMBERSHIP rank-select tolerates a fuzzy sign, so ~18 iters
@@ -3473,7 +3473,7 @@ _SIGN_DC_NS_SCALED = True
 # schedule should chase the BULK region whose crispness sets orthogonality, so a0 is a
 # moderate floor (sweep 1e-1 .. 1e-3), NOT the true 1e-7. Smaller a0 = steeper origin =
 # faster small-eigenvalue lift but more mid-range overshoot (which later iters contract).
-_SIGN_DC_NS_A0 = 0.3
+_SIGN_DC_NS_A0 = 0.2
 # brief-93: split the scaled iteration into a CANS head + fixed-NS (1.5,0.5) tail. The
 # CANS head lifts the near-zero eigenvalues fast (steep origin) but its aggressive overshoot
 # (~1.6-1.9) accumulates TF32 error; the fixed-NS tail is SELF-CORRECTING at the +/-1 fixed
