@@ -5616,8 +5616,19 @@ def _sign_dc_solve(af, n, dev):
         trX = X.diagonal(dim1=-2, dim2=-1).sum(dim=-1)   # ~ n+ - n-
         npos = (n + trX) / 2.0
         maxside = torch.maximum(npos, n - npos)
-        _sys.stderr.write(f"[SIGNDC_KCOUNT] n={n} K={K} n+_range=[{npos.min().item():.1f},{npos.max().item():.1f}] "
-                          f"max_side={maxside.max().item():.1f} (K margin={K - maxside.max().item():.1f})\n")
+        _ms_sorted = torch.sort(maxside).values
+        _qs = [0.0, 0.5, 0.9, 0.95, 0.99, 1.0]
+        _pct = " ".join(f"p{int(q*100)}={torch.quantile(maxside, q).item():.1f}" for q in _qs)
+        # bucket counts at ceil-to-multiple-of-8 boundaries for adaptive-K sizing
+        _ceil = torch.ceil(maxside)
+        _buck = {}
+        for _v in _ceil.tolist():
+            _bk = int(((_v + 7) // 8) * 8)
+            _buck[_bk] = _buck.get(_bk, 0) + 1
+        _bstr = " ".join(f"{k}:{v}" for k, v in sorted(_buck.items()))
+        _sys.stderr.write(f"[SIGNDC_KCOUNT] n={n} K={K} b={b} n+_range=[{npos.min().item():.1f},{npos.max().item():.1f}] "
+                          f"max_side={maxside.max().item():.1f} (K margin={K - maxside.max().item():.1f}) "
+                          f"pct[{_pct}] buckets8[{_bstr}]\n")
         _sys.stderr.flush()
     # Spectral projectors are NOT materialized: P+ @ M = 0.5*(M + X@M) and
     # P- @ M = 0.5*(M - X@M), so the subspace probes and the membership test apply
