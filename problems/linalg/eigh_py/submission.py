@@ -33,6 +33,16 @@ _MEGA_NMAX = 200          # largest n routed to the megakernel. n=200 FP32 V =
                           # (32,200] is n=176; the wider bound (covering reseeds to
                           # nearby n) is safe because the residual gate falls any
                           # matrix the FP16 reduction can't resolve back to cuSOLVER.
+# brief-114: shape 1 (n=176, b=40) on the OLD full mega_eigh_k is occupancy-bound
+# (ncu: Grid 40 CTAs = 0.27 waves/SM, Block Limit Shared Mem=1 from the 125KB FP32
+# V matrix, Achieved Occupancy 12.5%, 2 warps/scheduler, No-Eligible 79.2%, 34.7%
+# barrier stall -- 108 of 148 SMs idle and the in-kernel SIMT back-transform =
+# ~half the work has no sibling warps to hide its per-column barriers). The MEDIUM
+# split path (mega_eigh_med_split) already moves that back-transform OFF the SIMT
+# path onto batched cuBLAS TF32 tensor-core GEMMs (full-GPU) and packs A as a FP16
+# triangle for 2-CTA co-residency -- the exact occupancy fix. Route the small-n
+# class through it too when set. Same per-matrix residual gate + cuSOLVER fallback.
+_MEGA_SMALL_VIA_MED = True
 _MEGA_NT = 256            # threads per CTA
 _MEGA_BISITERS = 45       # Sturm-bisection iterations (FP32 converged)
 _mega_mod = None          # lazily-compiled extension module (None until built)
@@ -5752,6 +5762,11 @@ def custom_kernel(data: input_t) -> output_t:
     # whole eigh resident in SMEM, one launch) -- 2.0x faster than cuSOLVER on
     # the small-n batched shapes, residual-gated for safety.
     if 32 < n <= _MEGA_NMAX:
+        # brief-114: route the small-n class through the medium split path (tensor-
+        # core back-transform + 2-CTA-co-resident FP16-triangle kernel) to fix the
+        # occupancy-bound in-kernel SIMT back-transform of the old full megakernel.
+        if _MEGA_SMALL_VIA_MED:
+            return _eigh_megakernel_med(a)
         return _eigh_megakernel(a)
     # MEDIUM-n fused megakernel (brief 3): packed FP16 lower-triangle A in SMEM
     # + global eigenvector matrix breaks the 228KB SMEM cliff that capped the
