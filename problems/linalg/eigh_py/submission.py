@@ -533,32 +533,38 @@ extern "C" __global__ void mega_eigh_med_split_k(const float* __restrict__ Ain,
   int nref=n-2;
   int npan=(nref + nb - 1)/nb;
   float* Yp=(float*)shc;              // n*nb   (panel reflectors Yp[i*nb+a])
-  float* Tp=Yp + (long)n*nb;          // nb*nb  (Gram, overwritten by block-T)
-  float* colA=Tp + (long)nb*nb;       // nb     (snapshot of G[:,a] per column)
+  float* Gp=Yp + (long)n*nb;          // nb*nb  (Gram G = Y^T Y, PERSISTENT)
+  float* Tp=Gp + (long)nb*nb;         // nb*nb  (block-T, separate buffer)
+  // brief-83 LEVER B: block-T build with a SEPARATE T buffer (Tp) from the Gram
+  // (Gp). The old build stored the Gram in Tp then overwrote it column by column,
+  // which forced a per-column snapshot of G[:,a] (read-before-write) => 2
+  // __syncthreads per column a. Keeping the Gram immutable in Gp removes the
+  // hazard and the snapshot => 1 barrier per column (~320 fewer barriers over
+  // ~10 panels x 32 cols). The extra nb*nb buffer (4KB) is free: it fits inside
+  // the already-allocated packed-A SMEM region (90KB >> the 46KB block-T set).
+  // Numerically identical build; the block-T feeds the back-transform which the
+  // sign-DC NS re-orthonormalizes, so this is gate-safe.
   for(int c0=0;c0<nref;c0+=nb){
     int k=nref-c0; if(k>nb) k=nb;
     int pidx=c0/nb;
     float* Tg=Tout + ((long)m*npan + pidx)*(long)nb*nb;
     for(int idx=tid; idx<n*nb; idx+=nt){ int i=idx/nb, a=idx%nb; Yp[i*nb+a]=(a<k)?Rm[i*n+(c0+a)]:0.f; }
     __syncthreads();
-    // Gram G = Y^T Y (k x k) -> Tp (upper-tri entries used; full symmetric ok)
-    for(int idx=tid; idx<k*k; idx+=nt){ int a=idx/k, b=idx%k; float s=0.f; for(int i=0;i<n;++i) s+=Yp[i*nb+a]*Yp[i*nb+b]; Tp[a*nb+b]=s; }
-    __syncthreads();
-    // clear strict-lower triangle of T (row>col): the recurrence T[b][a] sums
-    // T[b][e] over e<a, which must be 0 when b>e; Tp still holds the symmetric
-    // Gram so its strict-lower is nonzero -> must clear. Tp is row-major
-    // Tp[row*nb+col]; strict-lower is row>col.
-    for(int idx=tid; idx<nb*nb; idx+=nt){ int row=idx/nb, col=idx%nb; if(row>col) Tp[row*nb+col]=0.f; }
+    // Gram G = Y^T Y (k x k) -> Gp (upper-tri entries used; full symmetric ok).
+    // Also zero Tp (the recurrence only writes the upper triangle+diagonal; the
+    // strict-lower must be 0 so the persisted block-T is properly upper-triangular).
+    for(int idx=tid; idx<nb*nb; idx+=nt) Tp[idx]=0.f;
+    for(int idx=tid; idx<k*k; idx+=nt){ int a=idx/k, b=idx%k; float s=0.f; for(int i=0;i<n;++i) s+=Yp[i*nb+a]*Yp[i*nb+b]; Gp[a*nb+b]=s; }
     __syncthreads();
     // build upper-triangular block-T column by column (serial in a): thread b
     // owns row b. T[a][a]=tau_a; T[b][a]=-tau_a * sum_{e<a} T[b][e]*G[e][a].
+    // G stays in Gp (never written here), T accumulates in Tp -> no snapshot,
+    // one barrier per column.
     for(int a=0;a<k;++a){
       float ta=Tau[c0+a];
-      if(tid<a) colA[tid]=Tp[tid*nb+a];   // snapshot G[e][a] (e<a) BEFORE any write
-      __syncthreads();
       if(tid<a){
         float val=0.f;
-        for(int e=0;e<a;++e) val += Tp[tid*nb+e]*colA[e];   // T[tid][e]*G[e][a]
+        for(int e=0;e<a;++e) val += Tp[tid*nb+e]*Gp[e*nb+a];   // T[tid][e]*G[e][a]
         Tp[tid*nb+a] = -ta*val;
       } else if(tid==a){
         Tp[a*nb+a] = ta;
@@ -583,7 +589,9 @@ void mega_eigh_med_split(torch::Tensor A, torch::Tensor Vout, torch::Tensor Lout
   // the block-T build reuses shc for Yp(n*nb)+Tp(nb*nb)+colA(nb); ensure the
   // dynamic SMEM is at least that large (it usually is -- packed-A dominates --
   // but a large nb at small n can exceed it).
-  size_t shmT=((size_t)n*nb + (size_t)nb*nb + (size_t)nb)*sizeof(float);
+  // brief-83: block-T build now uses Yp(n*nb) + Gp(nb*nb, persistent Gram) +
+  // Tp(nb*nb, separate block-T) so the recurrence needs no per-column snapshot.
+  size_t shmT=((size_t)n*nb + (size_t)2*nb*nb)*sizeof(float);
   if(shmT>shm) shm=shmT;
   cudaFuncSetAttribute(mega_eigh_med_split_k, cudaFuncAttributeMaxDynamicSharedMemorySize, shm);
   // brief-83: prefer the MAX SMEM carveout so the driver reserves the full opt-in
