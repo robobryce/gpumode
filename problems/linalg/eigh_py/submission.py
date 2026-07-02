@@ -3355,7 +3355,7 @@ _SIGN_DC_RITZ_PROJ = 256    # random Rayleigh-Ritz projection dim for shift esti
 # "tf32" is NOT safe (its ~3e-4 back-transform error propagates through membership
 # select). Only affects the sign-DC call site; shapes 2/3/8/12 keep FP32 (their
 # tighter low-rank Rayleigh gate trips on TF32 and tf32x3 net-lost, brief-22).
-_SIGN_DC_BT_PREC = "tf32x3"
+_SIGN_DC_BT_PREC = "tf32"
 _SIGN_DC_AV_MODE = "tf32"    # sign-DC A@U lift + reduced-block build precision
 # brief-55: eigenvalue-side membership consistency for the projector rank-select.
 # Only matters when the base solver's eigenvectors are ~1e-2 orthonormal (the C-CTA
