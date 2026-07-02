@@ -4230,12 +4230,18 @@ _SIGN_DC_K = 300          # oversized subspace width (>= max +count/-count over 
 # unchanged (runs on the reassembled full batch), so any misbucketed matrix still
 # falls back -- no correctness risk, no regression below the cuSOLVER floor.
 _SIGN_DC_BUCKETS = 2        # 1 = single global-K pipeline (parent behavior).
-                            # >=2 = adaptive: split batch into this many max_side buckets.
-_SIGN_DC_BUCKET_MARGIN = 14 # K for a bucket = ceil(bucket max_side) + this margin,
-                            # capped at _SIGN_DC_K. 14 keeps the same 0-fallback safety
-                            # the global K=300 has over p100 (287.6 + 12.4).
-_SIGN_DC_BUCKET_MIN = 32    # never route a bucket below this many matrices (a tiny
-                            # bucket underfills the megakernel -> merge it up into wide).
+                            # >=2 = adaptive: split batch into max_side buckets per the
+                            # plan below. (Kept as the enable switch; the plan sets edges.)
+_SIGN_DC_BUCKET_MARGIN = 14 # oversampling margin: a bucket covering max_side<=E uses
+                            # K=E+this (capped at _SIGN_DC_K). >=~10 needed: K near a
+                            # matrix's max_side mass-falls-back (near-median sign fuzz).
+# brief-117: FIXED bucket plan (max_side_upper, K) ascending, catch-all last. Edges are
+# absolute max_side ceilings (the distribution is stable across seeds: p0=256 p50=263.6
+# p90=273.8 p100=287.6). None -> auto-build a _SIGN_DC_BUCKETS-way even split of the
+# [n/2, n/2+_SIGN_DC_MAXSIDE_SPAN] range with K=edge+margin. Explicit plan overrides.
+_SIGN_DC_BUCKET_PLAN_OVERRIDE = [(272.0, 282), (512.0, 300)]  # narrow<=272 K=282 (margin10), wide K=300
+_SIGN_DC_MAXSIDE_SPAN = 40  # assumed max_side spread above n/2 (287.6-256 = 31.6 obs;
+                            # 40 gives reseed headroom). Auto edges span [n/2, n/2+span].
 _SIGN_DC_NS_ITERS = 10    # Newton-Schulz sign iterations (each = 2 batched GEMMs).
                           # The near-zero eigenvalues plateau |X| below 1 (they need
                           # ~22 quadratic steps to fully resolve), but the projector
@@ -5611,6 +5617,40 @@ class _sdc_timer:
             d[1] += 1
 
 
+_SIGN_DC_BUCKET_PLAN_CACHE: dict = {}
+
+
+def _sign_dc_bucket_plan(n, K):
+    """Return the fixed [(max_side_upper, K), ...] bucket plan (ascending, catch-all
+    last with K=_SIGN_DC_K). Either the explicit _SIGN_DC_BUCKET_PLAN_OVERRIDE, or an
+    auto even split of [n/2, n/2+span] into _SIGN_DC_BUCKETS buckets, each K=edge+margin
+    capped at K. Cached by (n, K, buckets, margin, span, override-id)."""
+    import math as _math
+    key = (n, K, _SIGN_DC_BUCKETS, _SIGN_DC_BUCKET_MARGIN, _SIGN_DC_MAXSIDE_SPAN,
+           repr(_SIGN_DC_BUCKET_PLAN_OVERRIDE))
+    cached = _SIGN_DC_BUCKET_PLAN_CACHE.get(key)
+    if cached is not None:
+        return cached
+    if _SIGN_DC_BUCKET_PLAN_OVERRIDE is not None:
+        plan = [(float(e), min(int(K), int(k))) for (e, k) in _SIGN_DC_BUCKET_PLAN_OVERRIDE]
+        # force the last bucket to be a catch-all at the safe wide K
+        plan[-1] = (float(n), int(K))
+    else:
+        nb = max(1, int(_SIGN_DC_BUCKETS))
+        base = n / 2.0
+        span = float(_SIGN_DC_MAXSIDE_SPAN)
+        plan = []
+        for i in range(nb):
+            edge = base + span * (i + 1) / nb
+            kb = min(int(K), int(_math.ceil(edge)) + int(_SIGN_DC_BUCKET_MARGIN))
+            if i == nb - 1:
+                edge = float(n)          # catch-all
+                kb = int(K)
+            plan.append((float(edge), int(kb)))
+    _SIGN_DC_BUCKET_PLAN_CACHE[key] = plan
+    return plan
+
+
 def _sign_dc_reduced(af, X, K, n, dev):
     """Stages 3-6 of the sign-DC pipeline on a (sub-)batch: given af (b,n,n) and its
     converged matrix-sign X (b,n,n), form the +/- invariant-subspace bases at width
@@ -5765,40 +5805,35 @@ def _sign_dc_solve(af, n, dev):
     if _SIGN_DC_BUCKETS <= 1:
         Q, L = _sign_dc_reduced(af, X, K, n, dev)
     else:
-        import math as _math
-        # per-matrix captured rank (max of the +/- side, from the sign trace)
+        # per-matrix captured rank (max of the +/- side, from the sign trace).
+        # No host sync: the bucket EDGES and per-bucket K are FIXED constants
+        # (_SIGN_DC_BUCKET_PLAN), so the only device->host transfer is the per-bucket
+        # nonzero index needed to gather that bucket's matrices.
         trX = X.diagonal(dim1=-2, dim2=-1).sum(dim=-1)
         npos = (n + trX) * 0.5
         maxside = torch.maximum(npos, n - npos)                 # (b,)
-        # bucket by evenly-spaced max_side edges between the batch min and the global
-        # ceiling; assign each matrix to the smallest bucket whose K covers it.
-        ms_max = float(maxside.max().item())
-        ms_min = float(maxside.min().item())
-        nb = int(_SIGN_DC_BUCKETS)
-        # candidate bucket UPPER edges (max_side ceilings), ascending; last == ms_max
-        edges = [ms_min + (ms_max - ms_min) * (i + 1) / nb for i in range(nb)]
-        Q = af.new_zeros((b, n, n))
-        L = af.new_zeros((b, n))
-        assigned = torch.zeros(b, dtype=torch.bool, device=dev)
-        lo = -1.0
-        for bi, hi in enumerate(edges):
-            if bi == nb - 1:
-                sel = (~assigned)
+        Q = af.new_empty((b, n, n))
+        L = af.new_empty((b, n))
+        # _SIGN_DC_BUCKET_PLAN: ascending [(max_side_upper_frac_of_n, K), ...]; the
+        # LAST entry is the catch-all (its K = _SIGN_DC_K, the safe wide width). A
+        # matrix lands in the first bucket whose upper edge covers its max_side.
+        plan = _sign_dc_bucket_plan(n, K)
+        lo_edge = 0.0
+        for hi_edge, kb in plan:
+            if hi_edge >= n:
+                sel = maxside > lo_edge      # catch-all (also grabs any > previous top)
             else:
-                sel = (~assigned) & (maxside <= hi + 1e-3)
-            cnt = int(sel.sum().item())
-            if cnt == 0:
-                continue
-            # this bucket's K: cover its widest matrix + oversampling margin, cap at K
-            kb = min(K, int(_math.ceil(min(hi, ms_max))) + int(_SIGN_DC_BUCKET_MARGIN))
-            kb = max(64, kb)
+                sel = (maxside > lo_edge) & (maxside <= hi_edge)
             idx = torch.nonzero(sel, as_tuple=False).flatten()
-            Qb, Lb = _sign_dc_reduced(af[idx].contiguous(), X[idx].contiguous(),
-                                      kb, n, dev)
-            Q[idx] = Qb
-            L[idx] = Lb
-            assigned |= sel
-            lo = hi
+            if idx.numel() == 0:
+                lo_edge = hi_edge
+                continue
+            Qb, Lb = _sign_dc_reduced(af.index_select(0, idx).contiguous(),
+                                      X.index_select(0, idx).contiguous(),
+                                      int(kb), n, dev)
+            Q.index_copy_(0, idx, Qb)
+            L.index_copy_(0, idx, Lb)
+            lo_edge = hi_edge
     # finishing Newton-Schulz orthonormalization (cleans the TF32-sign bases' ~1e-2
     # orth to ~1e-4). The Gram + Q@Gram GEMMs run in 3xTF32 (Ozaki hi+lo split, ~FP32
     # accuracy at ~1.6x the FP32-SIMT rate) instead of true FP32-SIMT -- the two n*n
