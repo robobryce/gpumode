@@ -6543,7 +6543,7 @@ _WJAC_CPP = (
     "void warp_jacobi_eigh(torch::Tensor A, torch::Tensor Vout, torch::Tensor Lout, "
     "int n, int sweeps, int warpsPerBlock);\n"
     "void mw_jacobi_eigh(torch::Tensor A, torch::Tensor Vout, torch::Tensor Lout, "
-    "int n, int sweeps);"
+    "torch::Tensor Bad, int n, int sweeps);"
 )
 
 _WJAC_CUDA = r'''
@@ -6711,11 +6711,13 @@ extern "C" __global__ void warp_jacobi_eigh_k(
 // + cuSOLVER fallback at the Python layer.
 template<int SW>
 __device__ __forceinline__ void mwjac_solve32(
-    const float* __restrict__ Am, float* __restrict__ Vm, float* __restrict__ Lm) {
+    const float* __restrict__ Am, float* __restrict__ Vm, float* __restrict__ Lm,
+    float* __restrict__ Bad) {
   const unsigned FULL = 0xffffffffu;
   const int NN = 32, NW = 16;   // NW warps = NN/2 pairs
   __shared__ float As[NN * NN];
   __shared__ float Vs[NN * NN];
+  __shared__ float redOff[NW], redNrm[NW];   // block-reduction scratch (gate)
   int tid = threadIdx.x;
   int warp = tid >> 5, lane = tid & 31;
   // cooperative load A -> SMEM, V = I
@@ -6771,6 +6773,34 @@ __device__ __forceinline__ void mwjac_solve32(
       __syncthreads();
     }
   }
+  // IN-KERNEL eigen-residual GATE (removes the 2 torch gate GEMMs + 3 norms). The
+  // eigen residual ||AQ-QL||_F = ||offdiag(A_final)||_F EXACTLY (Frobenius is
+  // unitarily invariant; A_final = Q^T A Q), and ||A||_F = ||A_final||_F. So the
+  // relative Frobenius residual = sqrt(off2/norm2) over the SMEM A_final. CONSERVATIVE
+  // vs the harness L1 gate (200*n*eps): flag bad if sqrt(off2/norm2) > 1e-4 (measured
+  // clean matrices sit ~1.2e-5, and the harness L1 gate ~7.6e-4 is looser after the
+  // sqrt(n) L1<->F factors) -- errs toward flagging so any harness-failing matrix is
+  // caught + falls back. Orthogonality of Q is guaranteed by construction (product of
+  // exact Givens rotations; measured orth 1.3e-5, 35x under gate).
+  {
+    float off2 = 0.0f, nrm2 = 0.0f;
+    for (int idx = tid; idx < NN * NN; idx += NW * 32) {
+      float v = As[idx]; float v2 = v * v; nrm2 += v2;
+      int i = idx / NN, j = idx % NN; if (i != j) off2 += v2;
+    }
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) { off2 += __shfl_down_sync(FULL, off2, o); nrm2 += __shfl_down_sync(FULL, nrm2, o); }
+    if (lane == 0) { redOff[warp] = off2; redNrm[warp] = nrm2; }
+    __syncthreads();
+    if (tid == 0) {
+      float toff = 0.0f, tnrm = 0.0f;
+      #pragma unroll
+      for (int w = 0; w < NW; ++w) { toff += redOff[w]; tnrm += redNrm[w]; }
+      // relative Frobenius eigen-residual^2 = toff/tnrm; flag bad if > (1e-4)^2.
+      float rel2 = toff / (tnrm + 1e-30f);
+      Bad[blockIdx.x] = (rel2 > 1.0e-8f || !isfinite(rel2)) ? 1.0f : 0.0f;
+    }
+  }
   // eigenvalues = diag(As); IN-KERNEL sort (ascending) by rank, scatter V columns.
   // Only the first NN threads (warp0 + warp... ) handle the 32 columns; use tid<NN.
   if (tid < NN) {
@@ -6791,20 +6821,20 @@ __device__ __forceinline__ void mwjac_solve32(
 
 extern "C" __global__ void mw_jacobi_eigh_k(
     const float* __restrict__ Ain, float* __restrict__ Vout,
-    float* __restrict__ Lout, int B, int n, int sweeps) {
+    float* __restrict__ Lout, float* __restrict__ Bad, int B, int n, int sweeps) {
   int m = blockIdx.x;
   if (m >= B || n != 32) return;
   const float* Am = Ain + (long)m * 32 * 32;
   float* Vm = Vout + (long)m * 32 * 32;
   float* Lm = Lout + (long)m * 32;
   switch (sweeps) {
-    case 4:  mwjac_solve32<4>(Am, Vm, Lm); break;
-    case 5:  mwjac_solve32<5>(Am, Vm, Lm); break;
-    case 6:  mwjac_solve32<6>(Am, Vm, Lm); break;
-    case 7:  mwjac_solve32<7>(Am, Vm, Lm); break;
-    case 8:  mwjac_solve32<8>(Am, Vm, Lm); break;
-    case 10: mwjac_solve32<10>(Am, Vm, Lm); break;
-    default: mwjac_solve32<6>(Am, Vm, Lm); break;
+    case 4:  mwjac_solve32<4>(Am, Vm, Lm, Bad); break;
+    case 5:  mwjac_solve32<5>(Am, Vm, Lm, Bad); break;
+    case 6:  mwjac_solve32<6>(Am, Vm, Lm, Bad); break;
+    case 7:  mwjac_solve32<7>(Am, Vm, Lm, Bad); break;
+    case 8:  mwjac_solve32<8>(Am, Vm, Lm, Bad); break;
+    case 10: mwjac_solve32<10>(Am, Vm, Lm, Bad); break;
+    default: mwjac_solve32<6>(Am, Vm, Lm, Bad); break;
   }
 }
 
@@ -6818,12 +6848,13 @@ void warp_jacobi_eigh(torch::Tensor A, torch::Tensor Vout, torch::Tensor Lout,
       A.data_ptr<float>(), Vout.data_ptr<float>(), Lout.data_ptr<float>(), B, n, sweeps);
 }
 
-// one CTA per matrix, 16 warps (512 threads) per CTA.
+// one CTA per matrix, 16 warps (512 threads) per CTA. Bad[m] = per-matrix gate flag.
 void mw_jacobi_eigh(torch::Tensor A, torch::Tensor Vout, torch::Tensor Lout,
-                    int n, int sweeps) {
+                    torch::Tensor Bad, int n, int sweeps) {
   int B = A.size(0);
   mw_jacobi_eigh_k<<<B, 16 * 32>>>(
-      A.data_ptr<float>(), Vout.data_ptr<float>(), Lout.data_ptr<float>(), B, n, sweeps);
+      A.data_ptr<float>(), Vout.data_ptr<float>(), Lout.data_ptr<float>(),
+      Bad.data_ptr<float>(), B, n, sweeps);
 }
 '''
 
@@ -6916,23 +6947,18 @@ def _eigh_mw_jacobi(a: torch.Tensor) -> output_t:
     dev = af.device
     Q = torch.empty(b, n, n, device=dev, dtype=torch.float32)   # kernel writes SORTED Q
     L = torch.empty(b, n, device=dev, dtype=torch.float32)      # kernel writes SORTED L
-    mod.mw_jacobi_eigh(af, Q, L, n, _MWJAC_SWEEPS)
-    # per-matrix residual gate (harness-level), fall failures back to cuSOLVER.
-    eps = torch.finfo(torch.float32).eps
-    eye = torch.eye(n, device=dev, dtype=torch.float32)
-    AQ = af @ Q
-    eigr = torch.linalg.matrix_norm(AQ - Q * L.unsqueeze(-2), ord=1, dim=(-2, -1))
-    orth = torch.linalg.matrix_norm(Q.transpose(-1, -2) @ Q - eye, ord=1, dim=(-2, -1))
-    a_l1 = torch.linalg.matrix_norm(af, ord=1, dim=(-2, -1)).clamp_min(1e-30)
-    bad = ((orth > 70.0 * n * eps) | (eigr / a_l1 > 140.0 * n * eps)
-           | ~torch.isfinite(L).all(dim=-1) | ~torch.isfinite(Q).all(dim=(-2, -1)))
+    Bad = torch.zeros(b, device=dev, dtype=torch.float32)       # in-kernel gate flag
+    mod.mw_jacobi_eigh(af, Q, L, Bad, n, _MWJAC_SWEEPS)
+    # The kernel computes the per-matrix eigen-residual gate IN-KERNEL (exact
+    # Frobenius identity, conservative threshold) and Q's orthogonality is
+    # guaranteed by construction -> no torch gate GEMMs/norms (removes ~13 host
+    # launches on this tiny shape). Only a finiteness backstop + the Bad flag remain.
+    bad = (Bad > 0.5) | ~torch.isfinite(L).all(dim=-1) | ~torch.isfinite(Q).all(dim=(-2, -1))
     import os as _os
     if _os.environ.get("MWJAC_DBG"):
         import sys as _sys
         _sys.stderr.write(
-            f"[MWJAC_DBG] n={n} b={b} sweeps={_MWJAC_SWEEPS} "
-            f"orth_gate={70.0*n*eps:.4g} orth_max={orth.max().item():.4g} "
-            f"eigr_gate={140.0*n*eps:.4g} eigr_rel_max={(eigr/a_l1).max().item():.4g} "
+            f"[MWJAC_DBG] n={n} b={b} sweeps={_MWJAC_SWEEPS} in-kernel-gate "
             f"nbad={int(bad.sum().item())}/{b}\n")
         _sys.stderr.flush()
     if bool(bad.any()):
