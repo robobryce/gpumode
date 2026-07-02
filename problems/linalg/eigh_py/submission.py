@@ -851,7 +851,22 @@ extern "C" __global__ void mega_eigh_clust_split_k(
     for(int i=c+1+tid;i<n;i+=nt) p[i]=p[i]-K*v[i];
     __syncthreads();
     int iu=(r0>c+1)?r0:(c+1);
-    if(active) for(int i=iu+tid;i<r1;i+=nt){ float vi=v[i],wi=p[i]; for(int j=c+1;j<=i;++j){ float a=AOWN(i,j); AOWNSET(i,j, a-vi*p[j]-wi*v[j]); } }
+    // brief-95 open#1: the rank-2 trailing update A[i][j]-=v[i]p[j]+w[i]v[j] over
+    // j in [c+1,i] has work (i-c) GROWING with row i -- the triangular load imbalance
+    // that leaves early-row threads idle at the cl.sync (ncu: 61-72% barrier stall,
+    // "diverging code paths before a barrier"). Plain cyclic (i=iu+tid+m*nt) makes
+    // thread nt-1 do ~2.4x thread 0. BOUSTROPHEDON striding balances it: even blocks
+    // go forward (row=iu+m*nt+tid), odd blocks reversed (row=iu+m*nt+(nt-1-tid)), so
+    // over each block-pair the tid-dependent work cancels and all threads reach the
+    // barrier together -- WITHOUT changing the sync count.
+    if(active){
+      int nrows=r1-iu;
+      for(int base=0, m=0; base<nrows; base+=nt, ++m){
+        int off = (m&1) ? (nt-1-tid) : tid;
+        int i = iu + base + off;
+        if(off<nt && i<r1){ float vi=v[i],wi=p[i]; for(int j=c+1;j<=i;++j){ float a=AOWN(i,j); AOWNSET(i,j, a-vi*p[j]-wi*v[j]); } }
+      }
+    }
     if(tid==0 && lead){ Em[c]=beta; Tau[c]=tau; }
     __syncthreads();
     cl.sync();
