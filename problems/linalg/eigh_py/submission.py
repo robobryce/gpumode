@@ -3500,7 +3500,8 @@ _SIGN_DC_CQR_NS_REFINE = 0
 # -- unlike the NS refinement (t5) which diverged on the rank-deficient bases.
 _SIGN_DC_CQR_INV_GEMM = False
 # brief-87: fuse the two projector applies P+@Om, P-@Om2 into one wide X@[Om|Om2] GEMM.
-_SIGN_DC_FUSE_PROJ = True
+# t11 measured this NEUTRAL/NEG (the 2 baddbmm already fuse the 0.5*Om add) -> off.
+_SIGN_DC_FUSE_PROJ = False
 _SIGN_DC_CQR_PASSES = 2   # subspace-basis CholeskyQR passes. REQUIRED at 2: the
                           # projected bases P+/- @ Omega are rank-deficient (the K
                           # oversample exceeds the true subspace rank), and 1 shifted
