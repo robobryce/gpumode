@@ -3433,6 +3433,21 @@ _SIGN_DC_NS_ITERS = 18    # Newton-Schulz sign iterations (each = 2 batched GEMM
                           # 990099 nbad 1-3), and 14 mass-falls-back (22/640 on the
                           # benchmark seed). So 18 is the safe floor -- 2 fewer batched
                           # GEMMs than 20, do not drop below 18.
+# brief-87: HIGHER-ORDER sign polynomial. The degree-3 NS map p3(x)=1.5x-0.5x^3 has
+# slope 1.5 at 0, so the near-zero eigenvalues (the gapless even spectrum's densest
+# region) crawl to +/-1 -- that is what forces _SIGN_DC_NS_ITERS as high as 18 (2
+# GEMMs each). A degree-5 map p5(x)=a*x+b*x^3+c*x^5 fixing +/-1 can be given a MUCH
+# steeper slope at 0, so it resolves the small eigenvalues in far fewer iterations at
+# 3 GEMMs each -- a net GEMM cut when iters drop by >1.5x. _SIGN_DC_NS_DEGREE selects
+# the map; _SIGN_DC_NS5_ITERS the degree-5 iteration count; _SIGN_DC_NS5_COEF the
+# (a,b,c) triple. The two standard safe choices:
+#   "pade"  = (15,-10,3)/8  -> slope 1.875 at 0, monotone on [-1,1], no overshoot.
+#   "px"    = Polar-Express aggressive first-iterate coeffs (steepest slope at 0,
+#             |p|>1 mid-range overshoot that later iters contract) -- fastest but the
+#             membership tolerates it (residual gate is the safety net).
+_SIGN_DC_NS_DEGREE = 5    # 3 (baseline) or 5 (higher-order)
+_SIGN_DC_NS5_ITERS = 12   # degree-5 iteration count (each = 3 batched GEMMs)
+_SIGN_DC_NS5_COEF = "pade"
 _SIGN_DC_POWER_ITERS = 4  # A^2 power iterations for the spectral-norm scale estimate.
                           # The scale only needs to be a loose UPPER bound on ||A||_2
                           # (multiplied by 1.02) so the Newton-Schulz sign iteration
@@ -3635,6 +3650,38 @@ def _sign_dc_cqr(Y, passes=2, shift=1e-4):
     return Qc
 
 
+# Polar-Express aggressive degree-5 coefficients (steepest slope at 0). These are the
+# Muon/Polar-Express first-iterate triple; safe here because the split only needs sign,
+# not a norm-preserving polar factor, and the residual gate catches any degenerate case.
+_NS5_PX = (3.4445, -4.7750, 2.0315)
+_NS5_PADE = (1.875, -1.25, 0.375)   # (15,-10,3)/8
+
+
+def _sign_dc_ns_sign(X, iters, degree=None, coef=None):
+    """Batched matrix-sign iteration on a symmetric X whose eigenvalues are pre-scaled
+    into [-1,1]. degree=3 -> Newton-Schulz p3(x)=1.5x-0.5x^3 (2 GEMMs/iter, baddbmm-
+    fused). degree=5 -> p5(x)=a*x+b*x^3+c*x^5 via Horner X <- X@(a*I + X2@(b*I + c*X2))
+    (3 GEMMs/iter) with a steeper slope at 0 for faster small-eigenvalue convergence.
+    Returns the converged sign matrix X (eigenvalues ~ +/-1)."""
+    deg = _SIGN_DC_NS_DEGREE if degree is None else degree
+    if deg == 5:
+        a, b, c = coef if coef is not None else (
+            _NS5_PX if _SIGN_DC_NS5_COEF == "px" else _NS5_PADE)
+        m = X.shape[-1]
+        eye = torch.eye(m, device=X.device, dtype=X.dtype)
+        for _ in range(iters):
+            X2 = torch.bmm(X, X)
+            # Horner: poly = a*I + X2 @ (b*I + c*X2) ; X <- X @ poly
+            inner = c * X2 + b * eye              # b*I + c*X2   (elementwise)
+            mid = torch.baddbmm(a * eye, X2, inner, beta=1.0, alpha=1.0)  # a*I + X2@inner
+            X = torch.bmm(X, mid)
+        return X
+    for _ in range(iters):
+        X2 = torch.bmm(X, X)
+        X = torch.baddbmm(X, X, X2, beta=1.5, alpha=-0.5)
+    return X
+
+
 def _sign_dc_solve(af, n, dev):
     """Batched spectral divide-and-conquer eigh via the matrix sign function.
     Returns (Q, L) UNSORTED-then-sorted (columns of Q pair with L); the CALLER
@@ -3651,13 +3698,11 @@ def _sign_dc_solve(af, n, dev):
         v = v / v.norm(dim=1, keepdim=True).clamp_min(1e-30)
     nrm2 = (v.transpose(-1, -2) @ (af @ (af @ v))).abs().reshape(b, 1, 1).clamp_min(1e-30)
     scale = nrm2.sqrt() * 1.02
-    # Newton-Schulz sign iteration X <- 1.5 X - 0.5 X^3, the scale+subtract FUSED into
-    # the second GEMM via baddbmm (beta*X + alpha*(X@X2)) -- one kernel instead of a
-    # GEMM plus two elementwise passes over the b*n*n tensor per iter.
+    # Matrix-sign iteration (degree-3 NS or degree-5 higher-order, per _SIGN_DC_NS_DEGREE).
+    # Degree-3 baddbmm-fuses the 1.5X-0.5X^3; degree-5 uses the steeper-slope Horner form.
     X = af / scale
-    for _ in range(_SIGN_DC_NS_ITERS):
-        X2 = torch.bmm(X, X)
-        X = torch.baddbmm(X, X, X2, beta=1.5, alpha=-0.5)
+    _nsit = _SIGN_DC_NS5_ITERS if _SIGN_DC_NS_DEGREE == 5 else _SIGN_DC_NS_ITERS
+    X = _sign_dc_ns_sign(X, _nsit)
     # Spectral projectors are NOT materialized: P+ @ M = 0.5*(M + X@M) and
     # P- @ M = 0.5*(M - X@M), so the subspace probes and the membership test apply
     # the sign directly to their (thin) operands -- no full n*n P+/P- tensors.
