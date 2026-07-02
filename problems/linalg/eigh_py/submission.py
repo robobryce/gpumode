@@ -3608,7 +3608,7 @@ _SIGN_DC_FINAL_NS = 2     # finishing FP32 NS orthonormalization steps on Q
 # 5 bmm) vs "tf32" (1-pass TF32, 2 bmm, ~2x cheaper) -- Q is already near-orthonormal
 # from the sign-DC so a plain-TF32 NS refinement may hold the orth gate at half the
 # cost. Gated: any matrix a cheaper finish leaves above the orth bound falls back.
-_SIGN_DC_FINISH_PREC = "tf32x3_delta"
+_SIGN_DC_FINISH_PREC = "fp16_then_x3"
 # brief-87: the sign-DC internal residual-GATE factors. The FROZEN reference.py checker
 # gates orth at _ORTH_RTOL_FACTOR=100 * n * eps and eigen at _EIGEN_RTOL_FACTOR=200 * n
 # * eps (measured from reference.py). The submission's internal gate was set at 75/150
@@ -5032,8 +5032,33 @@ def _sign_dc_solve(af, n, dev):
             _p2 = torch.backends.cuda.matmul.allow_tf32
             torch.backends.cuda.matmul.allow_tf32 = True
             eye_n = _sign_dc_eye(n, dev)
-            for _ in range(_SIGN_DC_FINAL_NS):
-                if _SIGN_DC_FINISH_PREC == "tf32":
+            # brief-103: "fp16_then_x3" -- run all but the LAST finishing pass in
+            # fp16 (cheap), then a final tf32x3_delta pass to pull orth back under
+            # the tight gate. Plain fp16/bf16 finish is precision-BOUND (orth_max
+            # 0.0064/0.053 > gate 0.0055 -> nbad 640/640): the finish is what holds
+            # shape 11's orth gate, so at least the last pass must be high precision.
+            _fin_lpdt = ({"fp16": torch.float16, "bf16": torch.bfloat16}
+                         .get(_SIGN_DC_FINISH_PREC))
+            _fin_mixed = (_SIGN_DC_FINISH_PREC == "fp16_then_x3")
+            for _pi in range(_SIGN_DC_FINAL_NS):
+                _lp_this = _fin_lpdt
+                if _fin_mixed:
+                    # low precision except the final pass
+                    _lp_this = (torch.float16 if _pi < _SIGN_DC_FINAL_NS - 1
+                                else None)
+                if _lp_this is not None:
+                    # half-precision delta-form NS pass: Gram + correction in fp16/bf16
+                    # (fp32 accumulate), linear Q term full precision.
+                    Ql = Q.to(_lp_this)
+                    g = torch.bmm(Ql.transpose(-1, -2), Ql).float()   # Q^T Q
+                    E = g - eye_n
+                    Q = Q - 0.5 * torch.bmm(Ql, E.to(_lp_this)).float()
+                elif _fin_mixed:
+                    # the final high-precision pass of the mixed schedule (3xTF32 delta)
+                    g = _gram_3xtf32_sym(Q)
+                    E = g - eye_n
+                    Q = Q - 0.5 * torch.bmm(Q, E)
+                elif _SIGN_DC_FINISH_PREC == "tf32":
                     # 1-pass TF32 finishing NS (2 n*n bmm): Q already near-orthonormal
                     # from the sign-DC, so plain-TF32's ~3e-4/op refinement stays under
                     # the 4.578e-3 orth gate at ~2x less cost than the 3xTF32 form.
