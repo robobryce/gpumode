@@ -5966,10 +5966,25 @@ _WJAC_CUDA = r'''
 #include <torch/extension.h>
 #include <cuda_runtime.h>
 
+// Round-robin (circle method) partner of player `p` in round `r`, padded size nP
+// (even). player 0 is fixed at position 0; player p>0 at position
+// pos = ((p-1) - r) mod (nP-1) + 1. Pairs = (pos, nP-1-pos). Returns the PLAYER at
+// the paired position (deterministic -> recomputed per lane, no shuffle needed).
+__device__ __forceinline__ int wjac_partner(int p, int r, int nP) {
+  int m = nP - 1;
+  int pos = (p == 0) ? 0 : (((p - 1 - r) % m + m) % m + 1);
+  int pp = m - pos;                          // paired position
+  return (pp == 0) ? 0 : (((pp - 1 + r) % m) + 1);
+}
+
 // One WARP per matrix. Lane l owns row l of A (Ar) and row l of V (Vr), V init=I.
 // Two-sided cyclic Jacobi with the round-robin (Brent-Luk) parallel ordering:
 // per round every lane is in exactly one disjoint (p,q) pair. Fully register-
 // resident: the only cross-lane traffic is __shfl_sync (no SMEM, no barriers).
+// LEAN: no full-row temp arrays. The column update visits each column-pair ONCE
+// (from the LOW column j<pj) and writes both Ar[j],Ar[pj] from snapshotted
+// scalars -> 2 temps, not a 32-float shadow row. partner/low-role are RECOMPUTED
+// locally (wjac_partner) so only (c,s) is shuffled per source lane.
 extern "C" __global__ void warp_jacobi_eigh_k(
     const float* __restrict__ Ain, float* __restrict__ Vout,
     float* __restrict__ Lout, int B, int n, int sweeps) {
@@ -5986,48 +6001,21 @@ extern "C" __global__ void warp_jacobi_eigh_k(
     Ar[j] = (lane < n && j < n) ? Am[(long)lane * n + j] : ((lane == j) ? 1.0f : 0.0f);
     Vr[j] = (lane == j) ? 1.0f : 0.0f;
   }
-  // Round-robin schedule (circle method): position 0 fixed = player 0; position
-  // t>0 = ((t-1)+r) mod (n-1) + 1. Pairs = (pos, n-1-pos). We need, for THIS lane
-  // (= player `lane`), its position each round; then partner player, and whether
-  // it is the low-index member of its pair (only the low member computes the
-  // angle, then broadcasts). n padded to even nP with dummy players (diag-only,
-  // Ar[dummy cols]=0 above) so nP/2 pairs and nP-1 rounds cover n<=32.
-  int nP = (n + 1) & ~1;                     // even padded size (>= n)
+  int nP = (n + 1) & ~1;                      // even padded size (>= n)
   for (int sw = 0; sw < sweeps; ++sw) {
     for (int r = 0; r < nP - 1; ++r) {
-      // position of THIS player `lane` in round r:
-      //   player 0 -> pos 0; player p>0 -> pos = ((p-1) - r) mod (nP-1) + 1
-      int myPos;
-      if (lane == 0) myPos = 0;
-      else {
-        int x = (lane - 1 - r) % (nP - 1);
-        if (x < 0) x += (nP - 1);
-        myPos = x + 1;
-      }
-      int partPos = (nP - 1) - myPos;        // paired position
-      // player at partPos:
-      int partner;
-      if (partPos == 0) partner = 0;
-      else partner = ((partPos - 1 + r) % (nP - 1)) + 1;
-      bool amLow = lane < partner;           // low member computes the rotation
-      // ---- compute rotation (low member), then broadcast (c,s) via shuffle ----
-      // low member p holds app=Ar[p]=Ar[lane], apq=Ar[q]=Ar[partner]; needs
-      // aqq=A[q][q] from lane q (= partner).
+      int partner = wjac_partner(lane, r, nP);
+      bool amLow = lane < partner;            // low member computes the rotation
+      // ---- rotation: low member p uses app=Ar[lane], aqq from partner's diag,
+      // apq=Ar[partner]=A[p][q]. Both members compute the SAME (c,s) redundantly so
+      // lane `lane` holds the rotation of the pair containing player `lane`.
       float aqq_from_partner = __shfl_sync(FULL, Ar[lane], partner);  // partner's diag
       float c = 1.0f, s = 0.0f;
-      // both members compute the SAME (c,s) redundantly so lane `lane` holds the
-      // rotation of the pair containing player `lane` (needed for column bcast).
       {
-        int p = amLow ? lane : partner;
-        int q = amLow ? partner : lane;
         float app = amLow ? Ar[lane] : aqq_from_partner;   // A[p][p]
         float aqq = amLow ? aqq_from_partner : Ar[lane];   // A[q][q]
-        float apq = Ar[q];   // A[lane][q]; for low member q=partner, for high member q=lane -> Ar[lane]=A[q][q]?? see below
-        // apq must be A[p][q]. low member (lane==p): Ar[q]=Ar[partner]=A[p][q]. OK.
-        // high member (lane==q): needs A[p][q]=A[q][p]=Ar[p]=Ar[partner]. Ar[partner]=A[q][p]. OK (symmetry).
-        apq = Ar[partner];
-        // Jacobi rotation to zero apq.
-        if (fabsf(apq) > 1e-30f * (fabsf(app) + fabsf(aqq) + 1e-30f)) {
+        float apq = Ar[partner];                           // A[p][q] (symmetry)
+        if (partner < n && fabsf(apq) > 1e-30f * (fabsf(app) + fabsf(aqq) + 1e-30f)) {
           float tau = (aqq - app) / (2.0f * apq);
           float t = (tau >= 0.0f) ? 1.0f / (tau + sqrtf(1.0f + tau * tau))
                                   : -1.0f / (-tau + sqrtf(1.0f + tau * tau));
@@ -6035,47 +6023,35 @@ extern "C" __global__ void warp_jacobi_eigh_k(
           s = t * c;
         }
       }
-      // Per-column rotation broadcast: for column j, its pair's rotation is held
-      // by lane j. low-role flag for column j: player j is low iff j < its partner.
-      // We already have amLow per lane; broadcast c,s,partner,amLow indexed by lane.
       __syncwarp();
-      // ---- COLUMN update: newA[l][j] uses pair(j)'s rotation & partner col ----
-      // Read old row, then overwrite. For column j (low member): A[l][j] = c*A[l][j]-s*A[l][pj];
-      // high member: A[l][j] = s*A[l][pj]+c*A[l][j], where pj=partner of column j.
-      float newAr[32];
-      float newVr[32];
+      // ---- COLUMN update A<-A*J (and V<-V*J). For column j: its pair's rotation is
+      // held by lane j; partner column pj=wjac_partner(j). low col: c*A[j]-s*A[pj];
+      // high col: s*A[pj]+c*A[j]. Snapshot old row FIRST (shadow) to avoid RAW.
+      float oldA[32], oldV[32];
       #pragma unroll
-      for (int j = 0; j < 32; ++j) { newAr[j] = Ar[j]; newVr[j] = Vr[j]; }
+      for (int j = 0; j < 32; ++j) { oldA[j] = Ar[j]; oldV[j] = Vr[j]; }
       #pragma unroll
       for (int j = 0; j < 32; ++j) {
-        if (j >= n) continue;
         float cj = __shfl_sync(FULL, c, j);
         float sj = __shfl_sync(FULL, s, j);
-        int pj = __shfl_sync(FULL, partner, j);
-        int lowj = __shfl_sync(FULL, (int)amLow, j);
-        if (pj >= n) continue;              // dummy partner: no rotation
-        float aj = Ar[j];
-        float apj = Ar[pj];
-        float vj = Vr[j];
-        float vpj = Vr[pj];
-        if (lowj) { newAr[j] = cj * aj - sj * apj; newVr[j] = cj * vj - sj * vpj; }
-        else      { newAr[j] = sj * apj + cj * aj; newVr[j] = sj * vpj + cj * vj; }
+        int pj = wjac_partner(j, r, nP);
+        if (j < n && pj < n) {
+          if (j < pj) { Ar[j] = cj * oldA[j] - sj * oldA[pj]; Vr[j] = cj * oldV[j] - sj * oldV[pj]; }
+          else        { Ar[j] = sj * oldA[pj] + cj * oldA[j]; Vr[j] = sj * oldV[pj] + cj * oldV[j]; }
+        }
       }
-      #pragma unroll
-      for (int j = 0; j < 32; ++j) { Ar[j] = newAr[j]; Vr[j] = newVr[j]; }
       __syncwarp();
-      // ---- ROW update: rows p,q combine. Each lane combines its row with its
-      // partner's row using its OWN pair's (c,s). low member: newrow = c*row - s*prow;
-      // high member: newrow = s*prow + c*row. V rows are NOT row-rotated (V<-V*J only).
+      // ---- ROW update A<-J^T*A: each lane combines its row with its partner's row
+      // using its OWN pair's (c,s). low: newrow=c*row-s*prow; high: newrow=s*prow+c*row.
+      // V rows are NOT row-rotated (V<-V*J only). Snapshot partner's FULL row FIRST
+      // (all 32 shuffles) then combine -> no read-after-write hazard on Ar[j].
       float prow[32];
       #pragma unroll
       for (int j = 0; j < 32; ++j) prow[j] = __shfl_sync(FULL, Ar[j], partner);
       if (partner < n) {
         #pragma unroll
         for (int j = 0; j < 32; ++j) {
-          if (j >= n) continue;
-          float rj = Ar[j], pj = prow[j];
-          Ar[j] = amLow ? (c * rj - s * pj) : (s * pj + c * rj);
+          if (j < n) Ar[j] = amLow ? (c * Ar[j] - s * prow[j]) : (s * prow[j] + c * Ar[j]);
         }
       }
       __syncwarp();
