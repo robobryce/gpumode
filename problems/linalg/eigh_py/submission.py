@@ -2524,6 +2524,10 @@ _LAST_CQR_TOT = -1      # batch size of the last gated CQR call
 # A matrix skips pass 2 when its predicted 1-pass orth kd^2*n*eps < margin*(80*n*eps),
 # i.e. kd^2 < margin*80. None disables the gate (parent's unconditional 2-pass).
 _LR_COMPL_COND_MARGIN = 1.0
+# brief-110: pass count for the COMPLEMENT 1st CQR call (compl_pass1). Parent used 2.
+# The 2nd call (compl_pass2) re-orthonormalizes after the reprojection, so the 1st
+# call may only need to SPAN the complement (1 pass) -- measured per shape.
+_LR_COMPL_PASS1_PASSES = 1
 
 
 def _lr_cqr_diag_emit(label, ipass, L, Q, n_matrices_hi):
@@ -2937,7 +2941,8 @@ def _lowrank_eigh(a, k, power=1, dom_gram_mode=None, vd_lift_mode=None,
             # the final one 1-pass raised live fallbacks on shapes 8/12, t5); the
             # Gram uses plain TF32 (3xTF32 there net-lost, t7).
             Vc = _lr_cholesky_qr2(R, shift=1e-4, gram_mode="tf32",
-                                  diag_label="compl_pass1")
+                                  diag_label="compl_pass1",
+                                  passes=_LR_COMPL_PASS1_PASSES)
             Vc = _lr_project_out(Qd, Vc, proj_mode)
             # brief-110: after compl_pass1 + reproject, Vc is fairly well-conditioned
             # (measured kd~1 for the majority, tail up to ~57). Conditioning-gate the
