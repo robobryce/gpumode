@@ -3778,13 +3778,20 @@ _SIGN_DC_INSOLVER_EIGR = True
 # Newton-Schulz + the per-matrix eigr/orth gate + cuSOLVER fallback backstop any
 # drift. Toggled here so it routes ONLY the sign-DC path (the low-rank inner
 # solves 2/12 keep the FP32 update via their own callers passing f16upd=False).
-_SIGN_DC_F16UPD = True
-# brief-108: fp16/half2 symv (p = tau*A@v) in the reduced-block tridiagonalization.
-# The contiguous j<=i packed row is done in half2 (fp16 A*v products, FP32
-# accumulate); the transpose tail j>i stays scalar. This is the OTHER O(n^2)/column
-# hot-loop op alongside the rank-2 update. Tested in isolation (F16UPD off) to
-# measure whether the symv ALU reduction moves the barrier-bound wall.
-_SIGN_DC_F16SYMV = True
+# brief-108 ROUTING DECISION: both fp16 half2 sites are routed OFF in the live path.
+# The mechanism (bit1 f16upd rank-2 update, bit2 f16symv, both gated + validated
+# 39/39 gate-clean) IS retained in the kernel + threaded through the callers, but
+# measurement showed fp16 on the reduced-block hot-loop matmul-shaped ops does NOT
+# shrink mega_eigh_med_split_k: it is barrier-latency-bound (ncu shape11: 56.8%
+# CTA-barrier stall, only ~43% ALU compute between barriers). With BOTH sites on
+# (flag=7) ncu confirmed the ALU pipe dropped 36.1%->29.7% (fp16 DID cut compute)
+# yet Duration held ~23.7ms and barrier stall stayed ~56% -- the freed ALU cycles
+# become barrier wait. Geomean: parent 27278, rank-2-fp16 28590 (regress), symv-fp16
+# 27396 (flat), both-fp16 27331 (flat). None beat parent, so OFF holds the parent
+# floor exactly (byte-identical FP32 path) with no shape regressed. A future brief
+# that cuts the BARRIER count (not the matmul precision) is the lever for this kernel.
+_SIGN_DC_F16UPD = False
+_SIGN_DC_F16SYMV = False
 _SIGN_DC_CQR_PASSES = 2   # subspace-basis CholeskyQR passes. REQUIRED at 2: the
                           # projected bases P+/- @ Omega are rank-deficient (the K
                           # oversample exceeds the true subspace rank), and 1 shifted
