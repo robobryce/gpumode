@@ -3445,8 +3445,20 @@ _SIGN_DC_NS_ITERS = 18    # Newton-Schulz sign iterations (each = 2 batched GEMM
 #   "px"    = Polar-Express aggressive first-iterate coeffs (steepest slope at 0,
 #             |p|>1 mid-range overshoot that later iters contract) -- fastest but the
 #             membership tolerates it (residual gate is the safety net).
-_SIGN_DC_NS_DEGREE = 5    # 3 (baseline) or 5 (higher-order)
-_SIGN_DC_NS5_ITERS = 14   # degree-5 iteration count (each = 3 batched GEMMs)
+_SIGN_DC_NS_DEGREE = "mixed"  # 3 (baseline), 5 (all degree-5), or "mixed" (deg-5 head +
+                          # deg-3 tail). Diagnostic (brief-87 t1/t2): all-degree-5 in
+                          # TF32 converges the EIGENVALUES fine (eigr ~3.5e-3 == deg3)
+                          # but leaves the EIGENVECTORS 3-6x less orthonormal (orth
+                          # ~0.010-0.020 vs deg3's ~0.003, gate 0.004578) -> ~17/640
+                          # fall back to cuSOLVER -> +45% shape11. The orth loss is
+                          # TF32 error accumulating over many degree-5 iters (the X^4
+                          # intermediate loses ~3 bits). "mixed" caps that: degree-5
+                          # for the first _SIGN_DC_NS5_HEAD iters (steep slope at 0
+                          # lifts the near-zero eigenvalues fast) then degree-3 for the
+                          # tail (cheap, low TF32 error, restores orthogonality).
+_SIGN_DC_NS5_ITERS = 14   # degree-5 iteration count when _SIGN_DC_NS_DEGREE == 5
+_SIGN_DC_NS5_HEAD = 4     # degree-5 head iters when _SIGN_DC_NS_DEGREE == "mixed"
+_SIGN_DC_NS5_TAIL = 8     # degree-3 tail iters when _SIGN_DC_NS_DEGREE == "mixed"
 _SIGN_DC_NS5_COEF = "pade"
 _SIGN_DC_POWER_ITERS = 4  # A^2 power iterations for the spectral-norm scale estimate.
                           # The scale only needs to be a loose UPPER bound on ||A||_2
@@ -3657,28 +3669,46 @@ _NS5_PX = (3.4445, -4.7750, 2.0315)
 _NS5_PADE = (1.875, -1.25, 0.375)   # (15,-10,3)/8
 
 
+def _ns5_step(X, eye, a, b, c):
+    """One degree-5 sign step X <- X@(a*I + X2@(b*I + c*X2)) (3 batched GEMMs)."""
+    X2 = torch.bmm(X, X)
+    inner = c * X2 + b * eye                               # b*I + c*X2 (elementwise)
+    mid = torch.baddbmm(a * eye, X2, inner, beta=1.0, alpha=1.0)  # a*I + X2@inner
+    return torch.bmm(X, mid)
+
+
+def _ns3_step(X):
+    """One degree-3 Newton-Schulz sign step X <- 1.5X - 0.5X^3 (2 GEMMs, baddbmm-fused)."""
+    X2 = torch.bmm(X, X)
+    return torch.baddbmm(X, X, X2, beta=1.5, alpha=-0.5)
+
+
 def _sign_dc_ns_sign(X, iters, degree=None, coef=None):
     """Batched matrix-sign iteration on a symmetric X whose eigenvalues are pre-scaled
-    into [-1,1]. degree=3 -> Newton-Schulz p3(x)=1.5x-0.5x^3 (2 GEMMs/iter, baddbmm-
-    fused). degree=5 -> p5(x)=a*x+b*x^3+c*x^5 via Horner X <- X@(a*I + X2@(b*I + c*X2))
-    (3 GEMMs/iter) with a steeper slope at 0 for faster small-eigenvalue convergence.
+    into [-1,1]. degree=3 -> Newton-Schulz p3(x)=1.5x-0.5x^3 (2 GEMMs/iter). degree=5 ->
+    p5(x)=a*x+b*x^3+c*x^5 (3 GEMMs/iter, steeper slope at 0 -> faster small-eigenvalue
+    convergence). "mixed" -> _SIGN_DC_NS5_HEAD degree-5 steps then _SIGN_DC_NS5_TAIL
+    degree-3 steps (fast early lift, clean-orthogonality low-TF32-error tail).
     Returns the converged sign matrix X (eigenvalues ~ +/-1)."""
     deg = _SIGN_DC_NS_DEGREE if degree is None else degree
+    a, b, c = coef if coef is not None else (
+        _NS5_PX if _SIGN_DC_NS5_COEF == "px" else _NS5_PADE)
+    if deg == "mixed":
+        m = X.shape[-1]
+        eye = torch.eye(m, device=X.device, dtype=X.dtype)
+        for _ in range(_SIGN_DC_NS5_HEAD):
+            X = _ns5_step(X, eye, a, b, c)
+        for _ in range(_SIGN_DC_NS5_TAIL):
+            X = _ns3_step(X)
+        return X
     if deg == 5:
-        a, b, c = coef if coef is not None else (
-            _NS5_PX if _SIGN_DC_NS5_COEF == "px" else _NS5_PADE)
         m = X.shape[-1]
         eye = torch.eye(m, device=X.device, dtype=X.dtype)
         for _ in range(iters):
-            X2 = torch.bmm(X, X)
-            # Horner: poly = a*I + X2 @ (b*I + c*X2) ; X <- X @ poly
-            inner = c * X2 + b * eye              # b*I + c*X2   (elementwise)
-            mid = torch.baddbmm(a * eye, X2, inner, beta=1.0, alpha=1.0)  # a*I + X2@inner
-            X = torch.bmm(X, mid)
+            X = _ns5_step(X, eye, a, b, c)
         return X
     for _ in range(iters):
-        X2 = torch.bmm(X, X)
-        X = torch.baddbmm(X, X, X2, beta=1.5, alpha=-0.5)
+        X = _ns3_step(X)
     return X
 
 
@@ -3702,7 +3732,7 @@ def _sign_dc_solve(af, n, dev):
     # Degree-3 baddbmm-fuses the 1.5X-0.5X^3; degree-5 uses the steeper-slope Horner form.
     X = af / scale
     _nsit = _SIGN_DC_NS5_ITERS if _SIGN_DC_NS_DEGREE == 5 else _SIGN_DC_NS_ITERS
-    X = _sign_dc_ns_sign(X, _nsit)
+    X = _sign_dc_ns_sign(X, _nsit)   # HEAD/TAIL used internally for "mixed"
     # Spectral projectors are NOT materialized: P+ @ M = 0.5*(M + X@M) and
     # P- @ M = 0.5*(M - X@M), so the subspace probes and the membership test apply
     # the sign directly to their (thin) operands -- no full n*n P+/P- tensors.
@@ -4270,6 +4300,15 @@ def _eigh_sign_dc(a: torch.Tensor) -> output_t:
     a_l1 = torch.linalg.matrix_norm(af, ord=1, dim=(-2, -1)).clamp_min(1e-30)
     bad = ((orth > 75.0 * n * eps) | (eigr / a_l1 > 150.0 * n * eps)
            | ~torch.isfinite(L).all(dim=-1) | ~torch.isfinite(Q).all(dim=(-2, -1)))
+    import os as _os
+    if _os.environ.get("SIGNDC_DBG"):
+        import sys as _sys
+        _sys.stderr.write(
+            f"[SIGNDC_DBG] n={n} b={b} deg={_SIGN_DC_NS_DEGREE} "
+            f"orth_gate={75.0*n*eps:.4g} orth_max={orth.max().item():.4g} "
+            f"eigr_gate={150.0*n*eps:.4g} eigr_rel_max={(eigr/a_l1).max().item():.4g} "
+            f"nbad={int(bad.sum().item())}/{b}\n")
+        _sys.stderr.flush()
     if bool(bad.any()):
         idx = torch.nonzero(bad, as_tuple=False).flatten()
         Lf, Qf = torch.linalg.eigh(af[idx])
