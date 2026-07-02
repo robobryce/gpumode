@@ -1708,12 +1708,14 @@ def _mega_med_backtransform(Z, V, T, n, nb, npan, prec=None):
     return Z
 
 
-def _mega_med_split_solve(af, dev, b, n, nt, nb):
+def _mega_med_split_solve(af, dev, b, n, nt, nb, bisiters=None):
     """Run the SPLIT med kernel (stages 1-3 + block-T persist) then form the
     eigenvectors Q via the torch-level tensor-core WY back-transform. Returns
     (Q, L) UNSORTED (columns of Q pair with L entries), exactly matching what
     mega_eigh_med produces before the caller's sort. cuSOLVER fallback / gate
     are the CALLER's responsibility (kept identical to the in-kernel path)."""
+    if bisiters is None:
+        bisiters = _MEGA_BISITERS
     mod = _mega_get()
     V = torch.empty(b, n, n, device=dev, dtype=torch.float32)
     L = torch.empty(b, n, device=dev, dtype=torch.float32)
@@ -1729,7 +1731,7 @@ def _mega_med_split_solve(af, dev, b, n, nt, nb):
     # sum reassociation (t4 measured shape2 -6%). Only the sign-DC K=300 reduced
     # block (shape 11) needs the exact tree (fastRed=0).
     mod.mega_eigh_med_split(af, V, L, rscr, dscr, escr, dpscr, dmscr, tauscr,
-                            T, n, nt, _MEGA_BISITERS, nb, 1)
+                            T, n, nt, bisiters, nb, 1)
     # V holds Z (tridiag eigenvectors); rscr holds the Householder panel; T the
     # per-panel block-T. Back-transform Z -> Q on tensor cores.
     Q = _mega_med_backtransform(V, rscr, T, n, nb, npan)
@@ -1739,8 +1741,17 @@ def _mega_med_split_solve(af, dev, b, n, nt, nb):
 # brief-114: at n<=200 the SQUARE-storage split kernel replaces the packed-triangle
 # med kernel to remove the per-element AGET branch + _tri recompute from the two
 # dominant O(n^3)-per-column tridiag loops (kernel = 86% of shape-1 time, ncu t2).
-_MEGA_MED_SQUARE = True    # use mega_eigh_sq_split for n<=_MEGA_MED_SQ_NMAX
+_MEGA_MED_SQUARE = False   # MEASURED (t5): square storage regressed shape 1
+                           # (1949->2191us) -- full-row trailing update is 2x the
+                           # triangle-only rank-2 work. Keep the packed-triangle med
+                           # kernel for n<=200.
 _MEGA_MED_SQ_NMAX = 200    # square FP16 A = n*n*2B <= 80KB fits SMEM up to n=200
+# brief-114: Sturm-bisection iteration count for the small-n (n<=200) split path.
+# The eigenvalues feed the twisted-factorization eigenvectors; the per-matrix orth+
+# eigen residual gate + cuSOLVER fallback backstops any matrix whose reduced-iter
+# eigenvalue is too imprecise, so this trades kernel latency for a bounded fallback
+# risk. Probe: 45->30 gave shape 1 1949->1872us with NO extra fallback (geomean down).
+_MEGA_SMALL_BISITERS = 32
 
 
 def _mega_sq_split_solve(af, dev, b, n, nt, nb):
@@ -1782,10 +1793,14 @@ def _eigh_megakernel_med(a: torch.Tensor) -> output_t:
     # brief-114: n<=200 uses the SQUARE-storage split kernel (branch-free FP16 A)
     # to shed the packed-triangle AGET/_tri overhead in the dominant tridiag loops;
     # larger n keeps the packed-triangle med kernel (square A would overflow SMEM).
+    # brief-114: n<=200 uses fewer Sturm-bisection iters (_MEGA_SMALL_BISITERS) --
+    # the twisted eigenvectors + residual gate tolerate the coarser eigenvalue.
+    _bis = _MEGA_SMALL_BISITERS if n <= _MEGA_MED_SQ_NMAX else _MEGA_BISITERS
     if _MEGA_MED_SQUARE and n <= _MEGA_MED_SQ_NMAX:
         Qz, L = _mega_sq_split_solve(af, dev, b, n, _MEGA_MED_NT, _MEGA_MED_SPLIT_NB)
     else:
-        Qz, L = _mega_med_split_solve(af, dev, b, n, _MEGA_MED_NT, _MEGA_MED_SPLIT_NB)
+        Qz, L = _mega_med_split_solve(af, dev, b, n, _MEGA_MED_NT, _MEGA_MED_SPLIT_NB,
+                                      bisiters=_bis)
     L, order = torch.sort(L, dim=-1)
     Q = torch.gather(Qz, 2, order.unsqueeze(1).expand(b, n, n))
     # Recon=||Q L Q^T - A||_1 is REDUNDANT given eigr + orth and is NOT recomputed
