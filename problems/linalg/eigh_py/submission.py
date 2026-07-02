@@ -3475,7 +3475,7 @@ _SIGN_DC_FINAL_NS = 1     # finishing FP32 NS orthonormalization steps on Q
 # 5 bmm) vs "tf32" (1-pass TF32, 2 bmm, ~2x cheaper) -- Q is already near-orthonormal
 # from the sign-DC so a plain-TF32 NS refinement may hold the orth gate at half the
 # cost. Gated: any matrix a cheaper finish leaves above the orth bound falls back.
-_SIGN_DC_FINISH_PREC = "tf32x3"
+_SIGN_DC_FINISH_PREC = "tf32x3_delta"
 # brief-87: trailing CQR passes done as cheap Newton-Schulz refinements (2 GEMMs)
 # instead of Cholesky+trsm. The stacked (2b,n,K=300) trsm is the single biggest
 # sub-cost of the pipeline (nsys batch_trsm ~9.5ms across the 2 passes). ns_refine=1
@@ -3486,7 +3486,7 @@ _SIGN_DC_CQR_NS_REFINE = 0
 # K x K triangular inverse + one tensor-core GEMM Qc @ L^{-T}. Rank-safe (still uses
 # the shifted Cholesky) and precision-safe (the GEMM keeps FP32/tensor-core accuracy)
 # -- unlike the NS refinement (t5) which diverged on the rank-deficient bases.
-_SIGN_DC_CQR_INV_GEMM = True
+_SIGN_DC_CQR_INV_GEMM = False
 _SIGN_DC_CQR_PASSES = 2   # subspace-basis CholeskyQR passes. REQUIRED at 2: the
                           # projected bases P+/- @ Omega are rank-deficient (the K
                           # oversample exceeds the true subspace rank), and 1 shifted
@@ -3885,6 +3885,7 @@ def _sign_dc_solve(af, n, dev):
         if _SIGN_DC_FINAL_NS > 0:
             _p2 = torch.backends.cuda.matmul.allow_tf32
             torch.backends.cuda.matmul.allow_tf32 = True
+            eye_n = _sign_dc_eye(n, dev)
             for _ in range(_SIGN_DC_FINAL_NS):
                 if _SIGN_DC_FINISH_PREC == "tf32":
                     # 1-pass TF32 finishing NS (2 n*n bmm): Q already near-orthonormal
@@ -3892,6 +3893,16 @@ def _sign_dc_solve(af, n, dev):
                     # the 4.578e-3 orth gate at ~2x less cost than the 3xTF32 form.
                     g = torch.bmm(Q.transpose(-1, -2), Q)
                     Q = torch.baddbmm(Q, Q, g, beta=1.5, alpha=-0.5)
+                elif _SIGN_DC_FINISH_PREC == "tf32x3_delta":
+                    # brief-87 DELTA form: Q <- 1.5Q - 0.5 Q@G = Q - 0.5 Q@(G-I).
+                    # The Gram G = Q^T Q is 3xTF32-accurate (2 bmm, captures the small
+                    # non-orthonormality E = G-I). The correction Q@E is done in PLAIN
+                    # TF32 (1 bmm): E is small (~orth ~1e-2) so TF32's ~3e-4 RELATIVE
+                    # error on Q@E is ~3e-6 ABSOLUTE -- negligible. 3 bmm vs 5 for the
+                    # full 3xTF32 NS, same effective accuracy on the orthonormalization.
+                    g = _gram_3xtf32_sym(Q)
+                    E = g - eye_n
+                    Q = Q - 0.5 * torch.bmm(Q, E)   # plain TF32 (allow_tf32 True)
                 else:
                     # brief-46: the finishing-NS Gram g = Q^T Q is symmetric, so the
                     # symmetric-aware 3xTF32 form (2 bmms, identical ~6e-6 accuracy) does
