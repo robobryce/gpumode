@@ -2518,6 +2518,12 @@ def _lr_project_out(Qd, X, mode):
 
 _LR_CQR_DIAG = bool(__import__("os").environ.get("LR_CQR_DIAG"))
 _LR_CQR_DIAG_SEEN: set = set()      # (label, ipass, B, n, k) already emitted this process
+_LAST_CQR_SKIP2 = -1    # #matrices routed single-pass (pass 2 skipped) on last gated CQR call
+_LAST_CQR_TOT = -1      # batch size of the last gated CQR call
+# brief-110: conditioning-gate margin for the COMPLEMENT 2nd CQR call (compl_pass2).
+# A matrix skips pass 2 when its predicted 1-pass orth kd^2*n*eps < margin*(80*n*eps),
+# i.e. kd^2 < margin*80. None disables the gate (parent's unconditional 2-pass).
+_LR_COMPL_COND_MARGIN = None
 
 
 def _lr_cqr_diag_emit(label, ipass, L, Q, n_matrices_hi):
@@ -2555,8 +2561,32 @@ def _lr_cqr_diag_emit(label, ipass, L, Q, n_matrices_hi):
         sys.stderr.flush()
 
 
+_LR_CQR_COND_EPS = torch.finfo(torch.float32).eps
+
+
+def _lr_cqr_one_pass(Q, pm, shift, eye, fmod):
+    """One CholeskyQR pass on batch Q at precision pm. Returns (Q_new, L, kd)
+    where L is the Cholesky factor of the (shifted) Gram and kd = max/min diag(L)
+    is the per-matrix conditioning estimate (kappa(Q) ~ kd, kappa(G) ~ kd^2)."""
+    torch.backends.cuda.matmul.allow_tf32 = (pm in ("tf32", "3xtf32"))
+    if pm == "3xtf32":
+        G = _gram_3xtf32_sym(Q)
+    else:
+        G = torch.bmm(Q.transpose(-1, -2), Q)
+    if fmod is not None and G.is_contiguous():
+        fmod.add_shifted_diag(G, float(shift))
+        L = torch.linalg.cholesky(G)
+    else:
+        dm = G.diagonal(dim1=-2, dim2=-1).abs().amax(-1).clamp_min(1e-30)
+        L = torch.linalg.cholesky(G + (shift * dm).view(-1, 1, 1) * eye)
+    Qn = torch.linalg.solve_triangular(L, Q.transpose(-1, -2), upper=False).transpose(-1, -2)
+    d = L.diagonal(dim1=-2, dim2=-1).abs().clamp_min(1e-30)
+    kd = d.amax(-1) / d.amin(-1)
+    return Qn, L, kd
+
+
 def _lr_cholesky_qr2(Y, passes=2, shift=1e-5, tf32_gram=False, gram_mode=None,
-                     diag_label=None):
+                     diag_label=None, cond_single_pass=None):
     # gram_mode selects the precision of the Gram G = Q^T Q (the dominant
     # FP32-SIMT cost of the CholeskyQR2 orthonormalization):
     #   "fp32"    - true FP32 simt_sgemm (default; the accurate, slow path).
@@ -2586,29 +2616,54 @@ def _lr_cholesky_qr2(Y, passes=2, shift=1e-5, tf32_gram=False, gram_mode=None,
         pass_modes = [gram_mode] * passes
     Q = Y
     c = Y.shape[-1]
+    n = Y.shape[-2]
     eye = torch.eye(c, device=Y.device, dtype=Y.dtype)
     prev = torch.backends.cuda.matmul.allow_tf32
     _fmod = _fused_cqr_get() if _FUSED_CQR_SHIFT else None
     try:
-        for _ip, pm in enumerate(pass_modes):
-            torch.backends.cuda.matmul.allow_tf32 = (pm in ("tf32", "3xtf32"))
-            if pm == "3xtf32":
-                # symmetric-aware 3xTF32 Gram: 2 bmms (vs 3), same ~6e-6 accuracy.
-                G = _gram_3xtf32_sym(Q)
-            else:
-                G = torch.bmm(Q.transpose(-1, -2), Q)
-            if _fmod is not None and G.is_contiguous():
-                # in-place diag shift only when G is already contiguous (plain-bmm
-                # Gram) -- forcing .contiguous() on the 3xTF32-sym Gram (a sum, non-
-                # contiguous) would add a copy launch that eats the fused saving.
-                _fmod.add_shifted_diag(G, float(shift))
-                L = torch.linalg.cholesky(G)
-            else:
-                dm = G.diagonal(dim1=-2, dim2=-1).abs().amax(-1).clamp_min(1e-30)
-                L = torch.linalg.cholesky(G + (shift * dm).view(-1, 1, 1) * eye)
-            Q = torch.linalg.solve_triangular(L, Q.transpose(-1, -2), upper=False).transpose(-1, -2)
+        # CONDITIONING-GATED SINGLE-PASS (brief-110): the standard CholeskyQR2 runs
+        # `passes` passes unconditionally. When cond_single_pass=<margin> is set (and
+        # passes==2), run pass 1 on the whole batch, then use pass 1's Cholesky-factor
+        # diagonal ratio kd (kappa(Q1_input)~kd, kappa(G)~kd^2) to decide PER MATRIX
+        # whether pass 2 is needed. The CholeskyQR 1-pass orthogonality bound is
+        # ||Q1^T Q1 - I|| ~ c*kd^2*eps, so a matrix whose predicted 1-pass orth clears
+        # the gate (kd^2*n*eps < margin * 80*n*eps  ==>  kd^2*eps < margin*80*eps) is
+        # routed SINGLE-pass (skip pass 2); the rest are gathered and get pass 2, then
+        # scattered back. The per-matrix FP32 residual+orth gate + cuSOLVER fallback in
+        # _lr_gate_and_fallback backstops any matrix this misjudges (a matrix routed
+        # 1-pass whose real orth is over gate simply falls back, never an invalid
+        # result). Falls through to the unconditional loop when cond_single_pass is None.
+        do_cond = (cond_single_pass is not None and passes == 2)
+        if do_cond:
+            gate = 80.0 * n * _LR_CQR_COND_EPS
+            # pass 1 on the full batch
+            Q, L, kd = _lr_cqr_one_pass(Q, pass_modes[0], shift, eye, _fmod)
             if _LR_CQR_DIAG and diag_label is not None:
-                _lr_cqr_diag_emit(diag_label, _ip, L, Q, None)
+                _lr_cqr_diag_emit(diag_label, 0, L, Q, None)
+            # predicted 1-pass orth ~ kd^2 * n * eps; route 1-pass where under margin*gate
+            pred1 = (kd * kd) * (n * _LR_CQR_COND_EPS)
+            need2 = pred1 >= (cond_single_pass * gate)
+            global _LAST_CQR_SKIP2, _LAST_CQR_TOT
+            _LAST_CQR_TOT = int(kd.shape[0])
+            _LAST_CQR_SKIP2 = int((~need2).sum().item())
+            if bool(need2.all().item()):
+                # every matrix needs pass 2 -> plain 2nd pass on the whole batch
+                Q, L, _ = _lr_cqr_one_pass(Q, pass_modes[1], shift, eye, _fmod)
+                if _LR_CQR_DIAG and diag_label is not None:
+                    _lr_cqr_diag_emit(diag_label, 1, L, Q, None)
+            elif bool(need2.any().item()):
+                # SOME matrices skip pass 2: gather the need-2 subset, 2nd pass, scatter
+                idx = need2.nonzero(as_tuple=False).flatten()
+                Qsub = Q.index_select(0, idx)
+                Qsub, _, _ = _lr_cqr_one_pass(Qsub, pass_modes[1], shift,
+                                              eye, _fmod)
+                Q = Q.index_copy(0, idx, Qsub)
+            # else: no matrix needs pass 2 -> Q already single-passed for all
+        else:
+            for _ip, pm in enumerate(pass_modes):
+                Q, L, _kd = _lr_cqr_one_pass(Q, pm, shift, eye, _fmod)
+                if _LR_CQR_DIAG and diag_label is not None:
+                    _lr_cqr_diag_emit(diag_label, _ip, L, Q, None)
     finally:
         torch.backends.cuda.matmul.allow_tf32 = prev
     return Q
@@ -2876,8 +2931,14 @@ def _lowrank_eigh(a, k, power=1, dom_gram_mode=None, vd_lift_mode=None,
             Vc = _lr_cholesky_qr2(R, shift=1e-4, gram_mode="tf32",
                                   diag_label="compl_pass1")
             Vc = _lr_project_out(Qd, Vc, proj_mode)
+            # brief-110: after compl_pass1 + reproject, Vc is fairly well-conditioned
+            # (measured kd~1 for the majority, tail up to ~57). Conditioning-gate the
+            # 2nd complement CQR so the well-conditioned majority skips its 2nd pass;
+            # the ill-conditioned tail keeps both passes. Per-matrix residual gate +
+            # cuSOLVER fallback backstops any misjudged matrix. Off (None) => parent.
             Vc = _lr_cholesky_qr2(Vc, shift=1e-5, gram_mode="tf32",
-                                  diag_label="compl_pass2")
+                                  diag_label="compl_pass2",
+                                  cond_single_pass=_LR_COMPL_COND_MARGIN)
             torch.backends.cuda.matmul.allow_tf32 = _prev
             # brief-54: A@Vc complement Rayleigh matvec at av_mode (3xTF32). Feeds
             # lam_c = diag(Vc^T A Vc) and the complement's eigen-gate residual.
