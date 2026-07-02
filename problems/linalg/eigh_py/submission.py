@@ -2636,6 +2636,7 @@ def _lr_cholesky_qr2(Y, passes=2, shift=1e-5, tf32_gram=False, gram_mode=None,
         do_cond = (cond_single_pass is not None and passes == 2)
         if do_cond:
             gate = 80.0 * n * _LR_CQR_COND_EPS
+            B = Q.shape[0]
             # pass 1 on the full batch
             Q, L, kd = _lr_cqr_one_pass(Q, pass_modes[0], shift, eye, _fmod)
             if _LR_CQR_DIAG and diag_label is not None:
@@ -2643,22 +2644,29 @@ def _lr_cholesky_qr2(Y, passes=2, shift=1e-5, tf32_gram=False, gram_mode=None,
             # predicted 1-pass orth ~ kd^2 * n * eps; route 1-pass where under margin*gate
             pred1 = (kd * kd) * (n * _LR_CQR_COND_EPS)
             need2 = pred1 >= (cond_single_pass * gate)
+            n_need2 = int(need2.sum().item())    # ONE device->host sync
             global _LAST_CQR_SKIP2, _LAST_CQR_TOT
-            _LAST_CQR_TOT = int(kd.shape[0])
-            _LAST_CQR_SKIP2 = int((~need2).sum().item())
-            if bool(need2.all().item()):
-                # every matrix needs pass 2 -> plain 2nd pass on the whole batch
+            _LAST_CQR_TOT = B
+            _LAST_CQR_SKIP2 = B - n_need2
+            # Gather is only worth it when enough matrices skip pass 2 to amortize the
+            # index_select/index_copy; below that the full-batch 2nd pass is cheaper than
+            # gathering ~B rows for a ~B-row 2nd pass. Route:
+            #   n_need2 == 0            -> skip pass 2 entirely (Q already single-passed)
+            #   B - n_need2 < min_skip  -> full 2nd pass (too few skip to amortize gather)
+            #   else                    -> gather the need-2 subset, 2nd pass, scatter back
+            min_skip = max(8, B // 16)
+            if n_need2 == 0:
+                pass
+            elif (B - n_need2) < min_skip:
                 Q, L, _ = _lr_cqr_one_pass(Q, pass_modes[1], shift, eye, _fmod)
                 if _LR_CQR_DIAG and diag_label is not None:
                     _lr_cqr_diag_emit(diag_label, 1, L, Q, None)
-            elif bool(need2.any().item()):
-                # SOME matrices skip pass 2: gather the need-2 subset, 2nd pass, scatter
+            else:
                 idx = need2.nonzero(as_tuple=False).flatten()
                 Qsub = Q.index_select(0, idx)
                 Qsub, _, _ = _lr_cqr_one_pass(Qsub, pass_modes[1], shift,
                                               eye, _fmod)
                 Q = Q.index_copy(0, idx, Qsub)
-            # else: no matrix needs pass 2 -> Q already single-passed for all
         else:
             for _ip, pm in enumerate(pass_modes):
                 Q, L, _kd = _lr_cqr_one_pass(Q, pm, shift, eye, _fmod)
