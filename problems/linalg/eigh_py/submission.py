@@ -3433,7 +3433,7 @@ _SIGN_DC_K = 300          # oversized subspace width (>= max +count/-count over 
                           # eigh is the wall; K in [288,300] all land ~110ms), so the
                           # extra margin is free. Both K-blocks fit the megakernel's
                           # n<=448 range. Matrices with +count>K fall to cuSOLVER.
-_SIGN_DC_NS_ITERS = 17    # Newton-Schulz sign iterations (each = 2 batched GEMMs).
+_SIGN_DC_NS_ITERS = 10    # Newton-Schulz sign iterations (each = 2 batched GEMMs).
                           # The near-zero eigenvalues plateau |X| below 1 (they need
                           # ~22 quadratic steps to fully resolve), but the projector
                           # MEMBERSHIP rank-select tolerates a fuzzy sign, so ~18 iters
@@ -3474,6 +3474,29 @@ _SIGN_DC_NS5_ITERS = 14   # degree-5 iteration count when _SIGN_DC_NS_DEGREE == 
 _SIGN_DC_NS5_HEAD = 4     # degree-5 head iters when _SIGN_DC_NS_DEGREE == "mixed"
 _SIGN_DC_NS5_TAIL = 8     # degree-3 tail iters when _SIGN_DC_NS_DEGREE == "mixed"
 _SIGN_DC_NS5_COEF = "pade"
+# brief-93: SCALED (Chebyshev-optimal / CANS) per-iteration degree-3 schedule. When True,
+# the degree-3 sign iteration uses _cans_coeffs(a0, iters) -- a per-step (c1,c3) pair that
+# is the minimax-optimal odd degree-3 map on the shrinking magnitude interval [a_k,1] --
+# instead of the fixed (1.5, 0.5). This steepens the slope at 0 in the early iters (fast
+# lift of the near-zero even-spectrum eigenvalues that drive orthogonality) so FEWER iters
+# clear the orth gate. Degree-3 throughout (a sibling found degree-5 breaks orth in TF32).
+_SIGN_DC_NS_SCALED = True
+# a0 = the smallest eigenvalue MAGNITUDE (relative to the [-1,1]-scaled spectrum) that the
+# CANS schedule targets. The gapless even spectrum's true min magnitude is ~1e-7 (below TF32
+# resolution and irrelevant -- the projector membership tolerates a fuzzy sign there); the
+# schedule should chase the BULK region whose crispness sets orthogonality, so a0 is a
+# moderate floor (sweep 1e-1 .. 1e-3), NOT the true 1e-7. Smaller a0 = steeper origin =
+# faster small-eigenvalue lift but more mid-range overshoot (which later iters contract).
+_SIGN_DC_NS_A0 = 0.2
+# brief-93: split the scaled iteration into a CANS head + fixed-NS (1.5,0.5) tail. The
+# CANS head lifts the near-zero eigenvalues fast (steep origin) but its aggressive overshoot
+# (~1.6-1.9) accumulates TF32 error; the fixed-NS tail is SELF-CORRECTING at the +/-1 fixed
+# point (slope 0 there) so it cleans the orthogonality the head roughed up -- same rationale
+# as the degree-5 "mixed" head/tail. _SIGN_DC_NS_HEAD = number of CANS-scaled steps; the
+# remaining (_nsit - HEAD) steps are fixed-NS. HEAD = _nsit means all-CANS (no tail); the
+# head's own schedule is length HEAD (the CANS interval recurrence targets [a0,1] over HEAD
+# steps). None -> all steps CANS (legacy).
+_SIGN_DC_NS_HEAD = None
 _SIGN_DC_POWER_ITERS = 4  # A^2 power iterations for the spectral-norm scale estimate.
                           # The scale only needs to be a loose UPPER bound on ||A||_2
                           # (multiplied by 1.02) so the Newton-Schulz sign iteration
@@ -3483,7 +3506,14 @@ _SIGN_DC_POWER_ITERS = 4  # A^2 power iterations for the spectral-norm scale est
                           # set) from 3 iters up -- the A^2 power estimate converges in
                           # ~3 iters on the even/gapless spectrum. 4 keeps one iter of
                           # reseed margin while dropping ~11 iters (~22 batched matvecs).
-_SIGN_DC_FINAL_NS = 1     # finishing FP32 NS orthonormalization steps on Q
+_SIGN_DC_FINAL_NS = 2     # finishing FP32 NS orthonormalization steps on Q
+# brief-93: with the sign iters cut (17->12) via the CANS-scaled schedule, ONE finishing
+# tf32x3_delta NS step no longer fully cleans orthogonality (the reduced-iter sign leaves Q
+# slightly less orthonormal), so a SECOND finishing step is load-bearing: it drives orth
+# from ~0.005 (at the gate) to ~1e-4. The 2 tf32x3_delta finishes (~3 GEMMs each = +1 step
+# ~1.4ms) cost far less than the 5 sign iters removed (~4.5ms), a net GEMM cut. eigr stays
+# ~0.004 (62% under its gate) because the CANS schedule resolves the near-zero eigenvalues'
+# sign faster than the fixed map at the same iter count (fixed-12 gives eigr right at gate).
 # brief-87: precision of the finishing-NS Gram + Q@Gram. The stage timer put this
 # finishing step at ~5.27ms/step (3xTF32 = 5 n*n bmm). "tf32x3" (default, ~6e-6,
 # 5 bmm) vs "tf32" (1-pass TF32, 2 bmm, ~2x cheaper) -- Q is already near-orthonormal
@@ -3516,6 +3546,39 @@ _SIGN_DC_CQR_INV_GEMM = False
 # brief-87: fuse the two projector applies P+@Om, P-@Om2 into one wide X@[Om|Om2] GEMM.
 # t11 measured this NEUTRAL/NEG (the 2 baddbmm already fuse the 0.5*Om add) -> off.
 _SIGN_DC_FUSE_PROJ = False
+# brief-96: fuse the two MEMBERSHIP projector applies X@Vp, X@Vm into ONE wide
+# X @ [Vp | Vm] GEMM. Both membership terms (selp = ||P+ Vp||, selm = ||P- Vm||)
+# apply the SAME sign matrix X to a (b,n,K) block; stacking the two RHS blocks into
+# one (b,n,2K) GEMM gives better tensor-core fill + one launch instead of two.
+# nsys/probe (shape 11): the two X@V GEMMs are ~1.06ms. brief-96 MEASURED the wide
+# fused form SLOWER than the two-baddbmm form (1.69ms vs 1.05ms): Vp,Vm are
+# non-contiguous BATCH slices of Vstk, so cat([Vp,Vm],dim=-1) forces a 786MB copy,
+# and splitting the 0.5*(V +/- X@V) into separate elementwise ops materializes
+# intermediates -- both cost more than the two baddbmm epilogues (which fuse the
+# 0.5*V add into the GEMM) save. So the two-baddbmm form is kept (fused already).
+_SIGN_DC_FUSE_MEMBERSHIP = False
+# brief-96: SKIP the explicit 0.5*(B+B^T) symmetrization of the reduced Rayleigh-Ritz
+# block Bstk = Ustk^T A Ustk. The reduced-block eigensolver (mega_eigh_med_split_k)
+# reads Bstk through the AGET(i,j)= (j<=i)? lower[i,j] : lower[j,i] accessor -- it only
+# ever loads the LOWER triangle and treats the upper as its mirror, i.e. it symmetrizes
+# to the lower triangle internally. The cuSOLVER-eigh fallback likewise uses UPLO='L'.
+# So the explicit symmetrization only changes the (unread) strict-upper triangle plus
+# the tiny antisymmetric TF32 error on the lower part (~1e-4 rel) -- absorbed by the
+# finishing NS + membership + per-matrix residual gate. The probe measured this
+# elementwise op at 0.76ms (37% of stage 4's 2.05ms) on a (2b,300,300) tensor, so
+# dropping it is a real HBM/launch cut. Gated: if orth degrades, the residual gate
+# falls those matrices to cuSOLVER; validated against the real eval.py checker.
+_SIGN_DC_SKIP_BSYM = True
+# brief-96: compute the eigen-residual eigr = max_j ||A@Q[:,j] - L[j] Q[:,j]||_1 INSIDE
+# the solver, on the pre-sort (but mutually consistent) Q/AQ/L, and return it -- so the
+# caller's gate uses it directly and the solver NEVER gathers AQ by the sort order. The
+# ord=1 matrix norm is the max over column abs-sums, and sorting permutes columns
+# jointly across A@Q, Q and L, so the eigr MAX is permutation-invariant -- the value is
+# identical whether taken before or after the sort. This drops the second (n x n) gather
+# (probe: AQ gather ~0.39ms of stage-8's 1.57ms) since only Q + L need sorting for the
+# output. The orth gate (Gram Q^T Q) is likewise permutation-invariant but the caller
+# needs the final sorted Q anyway, so orth stays caller-side on the sorted Q.
+_SIGN_DC_INSOLVER_EIGR = True
 _SIGN_DC_CQR_PASSES = 2   # subspace-basis CholeskyQR passes. REQUIRED at 2: the
                           # projected bases P+/- @ Omega are rank-deficient (the K
                           # oversample exceeds the true subspace rank), and 1 shifted
@@ -4047,6 +4110,58 @@ def _ns3_step(X):
     return torch.baddbmm(X, X, X2, beta=1.5, alpha=-0.5)
 
 
+# brief-93: SCALED (Chebyshev-optimal, CANS) per-iteration degree-3 sign schedule.
+# The fixed NS map p3(x)=1.5x-0.5x^3 has slope 1.5 at 0, so the near-zero eigenvalues
+# of the gapless even spectrum crawl to +/-1 -- that is what forces _SIGN_DC_NS_ITERS
+# high. The CANS schedule replaces the FIXED (1.5, 0.5) with a per-iteration coefficient
+# pair (c1_k, c3_k) that is the minimax-optimal odd degree-3 map on the CURRENT magnitude
+# interval [a_k, 1] (Chen-Chow stable scaling / arXiv:2506.10935): it maximizes the slope
+# at 0 subject to no overshoot past ~1 on that interval, so the small eigenvalues are
+# lifted as fast as a degree-3 map can, and the interval collapses toward {1} QUADRATICALLY
+# (limit ratio 3/4) rather than linearly. c1_k - c3_k need not equal 1 (the map targets
+# [1-eps, 1+eps], not exactly 1), but the schedule keeps |p|<=~1+eps on the interval so
+# the iterate cannot blow up. The recurrence a_{k+1}=1-eps_k is CLOSED-FORM SCALAR (the
+# spectrum is homogeneous across the 640 batch), so the coefficients are precomputed on the
+# host once per (a0, iters) -- zero per-iteration GPU reduction. Each step is still 2 GEMMs.
+_CANS_COEF_CACHE: dict = {}
+
+
+def _cans_coeffs(a0, iters):
+    """Chebyshev-optimal degree-3 sign-iteration coefficients for a magnitude interval
+    starting at [a0, 1]. Returns a list of (c1, c3) pairs, one per iteration, where step k
+    applies X <- c1*X - c3*X^3. a0 is the SMALLEST eigenvalue-magnitude the schedule targets
+    (the bulk that must reach +/-1 for orthogonality; magnitudes below a0 stay fuzzy and the
+    projector membership tolerates them). Cached by (round(a0,6), iters)."""
+    key = (round(float(a0), 8), int(iters))
+    cc = _CANS_COEF_CACHE.get(key)
+    if cc is not None:
+        return cc
+    a = float(a0)
+    b = 1.0
+    out = []
+    for _ in range(int(iters)):
+        a = max(a, 1e-12)
+        s = (a * a + a * b + b * b) / 3.0          # 3s = a^2+ab+b^2
+        s32 = s ** 1.5
+        denom = 2.0 * s32 + a * a * b + a * b * b
+        alpha = 6.0 / denom
+        c1 = alpha * s                              # slope at 0
+        c3 = alpha / 3.0
+        eps = (2.0 * s32 - a * a * b - a * b * b) / denom
+        out.append((c1, c3))
+        # next magnitude interval [1-eps, 1+eps]
+        a = 1.0 - eps
+        b = 1.0 + eps
+    _CANS_COEF_CACHE[key] = out
+    return out
+
+
+def _ns3_step_scaled(X, c1, c3):
+    """One SCALED degree-3 sign step X <- c1*X - c3*X^3 (2 GEMMs, baddbmm-fused)."""
+    X2 = torch.bmm(X, X)
+    return torch.baddbmm(X, X, X2, beta=c1, alpha=-c3)
+
+
 def _sign_dc_ns_sign(X, iters, degree=None, coef=None):
     """Batched matrix-sign iteration on a symmetric X whose eigenvalues are pre-scaled
     into [-1,1]. degree=3 -> Newton-Schulz p3(x)=1.5x-0.5x^3 (2 GEMMs/iter). degree=5 ->
@@ -4070,6 +4185,16 @@ def _sign_dc_ns_sign(X, iters, degree=None, coef=None):
         eye = torch.eye(m, device=X.device, dtype=X.dtype)
         for _ in range(iters):
             X = _ns5_step(X, eye, a, b, c)
+        return X
+    if _SIGN_DC_NS_SCALED:
+        # brief-93: Chebyshev-optimal scaled degree-3 schedule (fast small-eigenvalue lift),
+        # optionally with a fixed-NS self-correcting tail that cleans the TF32 error the
+        # aggressive CANS head leaves in the orthogonality.
+        head = iters if _SIGN_DC_NS_HEAD is None else min(int(_SIGN_DC_NS_HEAD), iters)
+        for (c1, c3) in _cans_coeffs(_SIGN_DC_NS_A0, head):
+            X = _ns3_step_scaled(X, c1, c3)
+        for _ in range(iters - head):
+            X = _ns3_step(X)
         return X
     for _ in range(iters):
         X = _ns3_step(X)
@@ -4178,7 +4303,8 @@ def _sign_dc_solve(af, n, dev):
         AU = _lr_lift_gemm(af, Ustk[:b], _SIGN_DC_AV_MODE)
         AU = torch.cat([AU, _lr_lift_gemm(af, Ustk[b:], _SIGN_DC_AV_MODE)], dim=0)
         Bstk = _lr_lift_gemm(Ustk.transpose(-1, -2), AU, _SIGN_DC_AV_MODE)
-        Bstk = 0.5 * (Bstk + Bstk.transpose(-1, -2))
+        if not _SIGN_DC_SKIP_BSYM:
+            Bstk = 0.5 * (Bstk + Bstk.transpose(-1, -2))
     with _sdc_timer("5_mega_eigh"):
       try:
         # fast_reduce=True (brief-83 t12): the CLEAN warp-shuffle sum (_mega_fast_sum)
@@ -4200,8 +4326,16 @@ def _sign_dc_solve(af, n, dev):
         Vp, Vm = Vstk[:b], Vstk[b:]
         lp, lm = lstk[:b], lstk[b:]
         # projector membership: ~1 for a real eigenvector of that block, ~0 for padding
-        selp = _pp(Vp).norm(dim=1)                 # (b, K)
-        selm = _pm(Vm).norm(dim=1)                 # (b, K)
+        if _SIGN_DC_FUSE_MEMBERSHIP:
+            # brief-96: X@Vp and X@Vm share the SAME X -> one wide X@[Vp|Vm] GEMM
+            # (b,n,n)@(b,n,2K) instead of two (b,n,n)@(b,n,K) baddbmms. Then
+            # P+ Vp = 0.5*(Vp + (X@Vp)), P- Vm = 0.5*(Vm - (X@Vm)).
+            XVpm = torch.bmm(X, torch.cat([Vp, Vm], dim=-1))   # (b, n, 2K)
+            selp = (0.5 * (Vp + XVpm[..., :K])).norm(dim=1)    # (b, K)
+            selm = (0.5 * (Vm - XVpm[..., K:])).norm(dim=1)    # (b, K)
+        else:
+            selp = _pp(Vp).norm(dim=1)                 # (b, K)
+            selm = _pm(Vm).norm(dim=1)                 # (b, K)
         torch.backends.cuda.matmul.allow_tf32 = _gp
         Vall = torch.cat([Vp, Vm], dim=-1)         # n x 2K
         Lall = torch.cat([lp, lm], dim=-1)         # 2K
@@ -4251,11 +4385,20 @@ def _sign_dc_solve(af, n, dev):
         AQ = af @ Q
         torch.backends.cuda.matmul.allow_tf32 = _gp
         L = (Q * AQ).sum(dim=1)
+        eigr = None
+        if _SIGN_DC_INSOLVER_EIGR:
+            # eigen residual on the PRE-SORT consistent (AQ, Q, L). max-column-abs-sum
+            # (ord=1) is permutation-invariant, so this equals the post-sort eigr and
+            # lets us skip gathering AQ (only Q + L are sorted for the output).
+            eigr = torch.linalg.matrix_norm(AQ - Q * L.unsqueeze(-2), ord=1, dim=(-2, -1))
         L, order = torch.sort(L, dim=-1)
         oexp = order.unsqueeze(1).expand(b, n, n)
         Q = torch.gather(Q, 2, oexp)
-        AQ = torch.gather(AQ, 2, oexp)
-    return Q, L, AQ, order
+        if not _SIGN_DC_INSOLVER_EIGR:
+            AQ = torch.gather(AQ, 2, oexp)
+        else:
+            AQ = None
+    return Q, L, AQ, order, eigr
 
 
 def _sign_dc_rec_omega(b, m, K, dev):
@@ -4719,7 +4862,7 @@ def _eigh_sign_dc(a: torch.Tensor) -> output_t:
     dev = a.device
     af = a.float().contiguous()
     try:
-        Q, L, AQ, _order = _sign_dc_solve(af, n, dev)
+        Q, L, AQ, _order, eigr = _sign_dc_solve(af, n, dev)
     except Exception:
         Lc, Qc = torch.linalg.eigh(af)
         return Qc.contiguous(), Lc.contiguous()
@@ -4739,7 +4882,10 @@ def _eigh_sign_dc(a: torch.Tensor) -> output_t:
     # fewer tensor-core bmm.
     orth = torch.linalg.matrix_norm(_gram_3xtf32_sym(Q) - eye, ord=1, dim=(-2, -1))
     torch.backends.cuda.matmul.allow_tf32 = _gp
-    eigr = torch.linalg.matrix_norm(AQ - Q * L.unsqueeze(-2), ord=1, dim=(-2, -1))
+    if eigr is None:
+        # brief-96: only recompute if the solver didn't (it computes the
+        # permutation-invariant eigr pre-sort and skips the AQ gather).
+        eigr = torch.linalg.matrix_norm(AQ - Q * L.unsqueeze(-2), ord=1, dim=(-2, -1))
     a_l1 = torch.linalg.matrix_norm(af, ord=1, dim=(-2, -1)).clamp_min(1e-30)
     _orth_gate = _SIGN_DC_ORTH_FAC * n * eps
     _eigr_gate = _SIGN_DC_EIGR_FAC * n * eps
