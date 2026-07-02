@@ -3470,6 +3470,12 @@ _SIGN_DC_POWER_ITERS = 4  # A^2 power iterations for the spectral-norm scale est
                           # ~3 iters on the even/gapless spectrum. 4 keeps one iter of
                           # reseed margin while dropping ~11 iters (~22 batched matvecs).
 _SIGN_DC_FINAL_NS = 1     # finishing FP32 NS orthonormalization steps on Q
+# brief-87: trailing CQR passes done as cheap Newton-Schulz refinements (2 GEMMs)
+# instead of Cholesky+trsm. The stacked (2b,n,K=300) trsm is the single biggest
+# sub-cost of the pipeline (nsys batch_trsm ~9.5ms across the 2 passes). ns_refine=1
+# keeps pass-1 as shifted Cholesky (contracts the rank-deficient bases from any
+# conditioning) and does pass-2 as an NS orthonormalization step at GEMM speed.
+_SIGN_DC_CQR_NS_REFINE = 1
 _SIGN_DC_CQR_PASSES = 2   # subspace-basis CholeskyQR passes. REQUIRED at 2: the
                           # projected bases P+/- @ Omega are rank-deficient (the K
                           # oversample exceeds the true subspace rank), and 1 shifted
@@ -3645,20 +3651,33 @@ def _sign_dc_omega(b, n, K, dev):
     return om
 
 
-def _sign_dc_cqr(Y, passes=2, shift=1e-4):
+def _sign_dc_cqr(Y, passes=2, shift=1e-4, ns_refine=0):
     """Shifted batched CholeskyQR orthonormalization (Gram -> Cholesky -> trsm, all
     BLAS3). The shift regularizes the rank-deficient directions of P+/P- @ Omega
     (the oversample width K exceeds the true subspace rank), so the near-null
     padding columns become small-norm junk columns rather than breaking the
-    Cholesky -- the membership rank-select drops them afterward."""
+    Cholesky -- the membership rank-select drops them afterward.
+
+    brief-87: `ns_refine` replaces that many TRAILING Cholesky passes with a cheaper
+    Newton-Schulz orthonormalization step Qc <- Qc @ (1.5 I - 0.5 G) (2 tensor-core
+    GEMMs, NO Cholesky + NO triangular solve). The stacked (2b, n, K) trsm is the
+    single biggest sub-cost of the sign-DC pipeline (nsys: batch_trsm ~9.5ms); after
+    the first shifted-Cholesky pass Qc is near-orthonormal (Gram ~ I, singular values
+    in the NS convergence basin), so an NS refinement pulls it the rest of the way at
+    GEMM speed. `passes` counts total passes; the first (passes - ns_refine) are
+    Cholesky, the last `ns_refine` are NS."""
     Qc = Y
     c = Y.shape[-1]
     eyek = torch.eye(c, device=Y.device, dtype=Y.dtype)
-    for _ in range(passes):
+    n_chol = passes - ns_refine
+    for _ in range(n_chol):
         G = torch.bmm(Qc.transpose(-1, -2), Qc)
         dm = G.diagonal(dim1=-2, dim2=-1).abs().amax(-1).clamp_min(1e-30)
         L = torch.linalg.cholesky(G + (shift * dm).view(-1, 1, 1) * eyek)
         Qc = torch.linalg.solve_triangular(L, Qc.transpose(-1, -2), upper=False).transpose(-1, -2)
+    for _ in range(ns_refine):
+        G = torch.bmm(Qc.transpose(-1, -2), Qc)          # K x K Gram
+        Qc = torch.baddbmm(Qc, Qc, G, beta=1.5, alpha=-0.5)  # Qc@(1.5I - 0.5G), fused
     return Qc
 
 
@@ -3781,7 +3800,8 @@ def _sign_dc_solve(af, n, dev):
     Om, Om2 = _sign_dc_omega(b, n, K, dev)
     with _sdc_timer("3_proj_cqr"):
         Ustk = _sign_dc_cqr(torch.cat([_pp(Om), _pm(Om2)], dim=0),
-                            passes=_SIGN_DC_CQR_PASSES)               # (2b, n, K)
+                            passes=_SIGN_DC_CQR_PASSES,
+                            ns_refine=_SIGN_DC_CQR_NS_REFINE)         # (2b, n, K)
     torch.backends.cuda.matmul.allow_tf32 = _gp
     # reduced K x K blocks -> fused tensor-core megakernel (raw, unsorted, ungated).
     # Both blocks solved in ONE stacked (2b, K, K) megakernel launch: one-CTA-per-matrix,
