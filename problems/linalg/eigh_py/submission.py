@@ -486,6 +486,7 @@ extern "C" __global__ void mega_eigh_med_split_k(const float* __restrict__ Ain,
   int f16upd = (fastRed >> 1) & 1;
   int f16symv = (fastRed >> 2) & 1;   // bit2: half2 symv (contiguous j<=i part)
   int slimBar = (fastRed >> 3) & 1;   // bit3: 1-barrier block reductions (barrier-count lever)
+  int fuseS2  = (fastRed >> 4) & 1;   // bit4: fold next-col s2 into the rank-2 update (needs slimBar)
   extern __shared__ char shc[];
   __half* Ah=(__half*)shc;
   size_t triN=((size_t)n*(n+1))>>1;
@@ -520,17 +521,29 @@ extern "C" __global__ void mega_eigh_med_split_k(const float* __restrict__ Ain,
     Ah[t]=__float2half(Am[(long)i*n+j]*invs);
   }
   __syncthreads();
+  // brief-108 fuseS2 (bit4, requires slimBar): carry the NEXT column's reflector-norm
+  // s2 across iterations. Column c's rank-2 update writes A[i][c+1] (i>c+1) -- exactly
+  // the entries whose squares sum to column c+1's s2 -- so each thread accumulates
+  // A[i][c+1]^2 as it writes, warp-reduces into red[], and the rank-2 TAIL __syncthreads
+  // (already present) doubles as the slimBar accumulate barrier -> next column reads
+  // its s2 with ZERO extra barriers, removing the standalone s2 reduction (1 barrier/
+  // col beyond slimBar). Column 0 is bootstrapped by the normal read+reduce below.
+  float xnorm2_carry = 0.f; int carry_valid = 0;
   for(int c=0;c<n-2;++c){
-    float s2=0.f;
-    for(int i=c+1+tid;i<n;i+=nt){ float x=AGET(i,c); s2+=x*x; }
     float xnorm2;
-    if(slimBar){ xnorm2=_mega_sum1b(s2,red,tid,nt); }
-    else if(fr){ xnorm2=_mega_fast_sum(s2,red,tid,nt); }
-    else { red[tid]=s2; __syncthreads();
-      for(int s=nt>>1;s>0;s>>=1){ if(tid<s)red[tid]+=red[tid+s]; __syncthreads(); }
-      xnorm2=red[0]; }
+    if(fuseS2 && c>0 && carry_valid){
+      xnorm2 = xnorm2_carry;   // computed inside column c-1's rank-2 update (below)
+    } else {
+      float s2=0.f;
+      for(int i=c+1+tid;i<n;i+=nt){ float x=AGET(i,c); s2+=x*x; }
+      if(slimBar){ xnorm2=_mega_sum1b(s2,red,tid,nt); }
+      else if(fr){ xnorm2=_mega_fast_sum(s2,red,tid,nt); }
+      else { red[tid]=s2; __syncthreads();
+        for(int s=nt>>1;s>0;s>>=1){ if(tid<s)red[tid]+=red[tid+s]; __syncthreads(); }
+        xnorm2=red[0]; }
+    }
     float alpha=AGET(c+1,c); float tail2=xnorm2-alpha*alpha;
-    if(tail2<=1e-20f){ if(tid==0){Em[c]=alpha;Tau[c]=0.f;} for(int i=tid;i<n;i+=nt) Rm[i*n+c]=(i==c+1)?1.f:0.f; __syncthreads(); continue; }
+    if(tail2<=1e-20f){ if(tid==0){Em[c]=alpha;Tau[c]=0.f;} for(int i=tid;i<n;i+=nt) Rm[i*n+c]=(i==c+1)?1.f:0.f; carry_valid=0; __syncthreads(); continue; }
     float xnorm=sqrtf(xnorm2); float beta=(alpha>=0.f)?-xnorm:xnorm; float tau=(beta-alpha)/beta; float denom=alpha-beta;
     // brief-83 LEVER B: fuse the zero-pass + reflector fill into ONE pass over v.
     // v[0..c]=0 (never read by symv/vp/rank-2, but Rm[:,c] must carry them),
@@ -625,7 +638,26 @@ extern "C" __global__ void mega_eigh_med_split_k(const float* __restrict__ Ain,
       for(int i=c+1+tid;i<n;i+=nt){ float vi=v[i],wi=p[i]; for(int j=c+1;j<=i;++j){ float a=AGET(i,j); ASET(i,j,a-vi*p[j]-wi*v[j]); } }
     }
     if(tid==0){Em[c]=beta;Tau[c]=tau;}
-    __syncthreads();
+    // brief-108 fuseS2: compute the NEXT column's reflector-norm s2 here, folded into
+    // the rank-2 tail barrier. Each thread re-reads its OWN just-written A[i][c+1]
+    // (i>c+1, lower-tri, no cross-thread read -> no barrier needed for the read),
+    // squares+sums, warp-reduces into red[wid]. The tail __syncthreads() below then
+    // makes red[] block-visible and doubles as the slimBar accumulate barrier; the
+    // xnorm2_carry combine (each thread sums the <=16 warp-partials) runs after it.
+    // This removes column c+1's standalone s2 reduction (1 barrier/col beyond slimBar).
+    if(fuseS2 && c<n-3){
+      float s2n=0.f;
+      for(int i=c+2+tid;i<n;i+=nt){ float x=AGET(i,c+1); s2n+=x*x; }
+      s2n=_mega_warp_sum(s2n);
+      if((tid&31)==0) red[tid>>5]=s2n;
+      __syncthreads();
+      int nw=(nt+31)>>5; float r=0.f;
+      #pragma unroll 1
+      for(int w=0;w<nw;++w) r+=red[w];
+      xnorm2_carry=r; carry_valid=1;
+    } else {
+      __syncthreads();
+    }
   }
   if(tid==0) Em[n-2]=AGET(n-1,n-2);
   for(int i=tid;i<n;i+=nt) Dm[i]=AGET(i,i);
@@ -2755,7 +2787,7 @@ def _lr_bare_scratch(B, k, dev):
     return buf
 
 
-def _lr_reduced_mega(Bk, bt_prec=None, fast_reduce=True, f16upd=False, f16symv=False, slimbar=False):
+def _lr_reduced_mega(Bk, bt_prec=None, fast_reduce=True, f16upd=False, f16symv=False, slimbar=False, fuses2=False):
     """RAW megakernel eigh of Bk (B x k x k) for k in the SMEM-fit range
     (32,448]. No wrapper gate, no scratch re-alloc, no sort. Returns (lam, G).
 
@@ -2803,7 +2835,8 @@ def _lr_reduced_mega(Bk, bt_prec=None, fast_reduce=True, f16upd=False, f16symv=F
     # sign-DC reduced block can take the FP16 panel update without changing the
     # reduction precision (its eigr gate is razor-close to the tree reduction).
     flag = ((1 if fast_reduce else 0) | (2 if f16upd else 0)
-            | (4 if f16symv else 0) | (8 if slimbar else 0))
+            | (4 if f16symv else 0) | (8 if slimbar else 0)
+            | (16 if fuses2 else 0))
     mod.mega_eigh_med_split(Bkc, V, L, rscr, dscr, escr, dpscr, dmscr, tauscr,
                             T, kk, _MEGA_MED_NT, _MEGA_BISITERS, nb, flag)
     # V holds Z; rscr the Householder panel; back-transform on tensor cores.
@@ -2811,7 +2844,7 @@ def _lr_reduced_mega(Bk, bt_prec=None, fast_reduce=True, f16upd=False, f16symv=F
     return L, G
 
 
-def _lr_reduced_eigh(Bk, bt_prec=None, fast_reduce=True, f16upd=False, f16symv=False, slimbar=False):
+def _lr_reduced_eigh(Bk, bt_prec=None, fast_reduce=True, f16upd=False, f16symv=False, slimbar=False, fuses2=False):
     """Eigendecomposition of the reduced symmetric block Bk (B x k x k). Returns
     (lam, G) in the torch.linalg.eigh convention (Bk @ G[:,:,i] = lam[:,i] *
     G[:,:,i]); ordering is whatever the path produced (the OUTER low-rank path
@@ -2828,7 +2861,8 @@ def _lr_reduced_eigh(Bk, bt_prec=None, fast_reduce=True, f16upd=False, f16symv=F
     kk = Bk.shape[-1]
     if mod is not None and 32 < kk <= _MEGA_MED_NMAX:
         return _lr_reduced_mega(Bk, bt_prec=bt_prec, fast_reduce=fast_reduce,
-                                f16upd=f16upd, f16symv=f16symv, slimbar=slimbar)
+                                f16upd=f16upd, f16symv=f16symv, slimbar=slimbar,
+                                fuses2=fuses2)
     # k in (448, 836] (dense1024 k=608 shape-4 -> C=2; nearrank1024 k=768 shape-10
     # -> C=3): C-CTA thread-block CLUSTER solve -- the packed-FP16 k-triangle is
     # row-distributed across C CTAs' DSMEM so it fits (k=608 370KB/2=185KB/CTA;
@@ -3827,6 +3861,13 @@ _SIGN_DC_F16SYMV = False
 # current FP32 precision (load-bearing for the eigr gate). Gated + guarded by the
 # per-matrix eigr/orth gate + cuSOLVER fallback; routed for the sign-DC reduced blocks.
 _SIGN_DC_SLIMBAR = True
+# brief-108 BARRIER-COUNT lever 2 (needs SLIMBAR): fuse the NEXT column's reflector-norm
+# s2 into the current column's rank-2 update -- each thread squares its own just-written
+# A[i][c+1], warp-reduces, and the rank-2 TAIL barrier doubles as the reduction's
+# accumulate barrier -> removes column c+1's standalone s2 reduction (1 more barrier/col
+# beyond slimBar). Numerically identical s2 (same entries summed), the tail2-zero
+# early-exit path invalidates the carry so those columns recompute -> gate-safe.
+_SIGN_DC_FUSES2 = True
 _SIGN_DC_CQR_PASSES = 2   # subspace-basis CholeskyQR passes. REQUIRED at 2: the
                           # projected bases P+/- @ Omega are rank-deficient (the K
                           # oversample exceeds the true subspace rank), and 1 shifted
@@ -5146,7 +5187,8 @@ def _sign_dc_solve(af, n, dev):
         # 84995->83930, geomean 27862->27824, still 39/39, 0 fallback.
         lstk, gstk = _lr_reduced_eigh(Bstk, bt_prec=_SIGN_DC_BT_PREC,
                                       fast_reduce=True, f16upd=_SIGN_DC_F16UPD,
-                                      f16symv=_SIGN_DC_F16SYMV, slimbar=_SIGN_DC_SLIMBAR)
+                                      f16symv=_SIGN_DC_F16SYMV, slimbar=_SIGN_DC_SLIMBAR,
+                                      fuses2=_SIGN_DC_FUSES2)
       except Exception:
         lstk, gstk = torch.linalg.eigh(Bstk)
     with _sdc_timer("6_member_topk"):
