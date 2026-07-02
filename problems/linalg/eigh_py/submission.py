@@ -1953,7 +1953,8 @@ _MEGA_MED_SQ_NMAX = 200    # square FP16 A = n*n*2B <= 80KB fits SMEM up to n=20
 # eigen residual gate + cuSOLVER fallback backstops any matrix whose reduced-iter
 # eigenvalue is too imprecise, so this trades kernel latency for a bounded fallback
 # risk. Probe: 45->30 gave shape 1 1949->1872us with NO extra fallback (geomean down).
-_MEGA_SMALL_BISITERS = 32
+_MEGA_SMALL_BISITERS = 28   # SWEPT: 32->28 improves shape 1 (1890->1868us) fallback-free;
+                            # 25 tips into mass cuSOLVER fallback (2640us). 28 is the floor.
 # brief-114: threads/CTA for the small-n (n<=200) split path. The med default (512)
 # wastes ~336 idle threads at n=176 (loops stride by nt but only ~176 lanes do work),
 # and those idle warps STILL participate in every __syncthreads -- inflating the
