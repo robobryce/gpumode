@@ -262,6 +262,10 @@ _MEGA_MED_CPP = (
     "void mega_eigh_sq_split(torch::Tensor A, torch::Tensor Vout, torch::Tensor Lout, "
     "torch::Tensor rscr, torch::Tensor dscr, torch::Tensor escr, "
     "torch::Tensor dpscr, torch::Tensor dmscr, torch::Tensor tauscr, "
+    "torch::Tensor Tout, int n, int nt, int bisIters, int nb, int fastRed);\n"
+    "void mega_eigh_med_split2(torch::Tensor A, torch::Tensor Vout, torch::Tensor Lout, "
+    "torch::Tensor rscr, torch::Tensor dscr, torch::Tensor escr, "
+    "torch::Tensor dpscr, torch::Tensor dmscr, torch::Tensor tauscr, "
     "torch::Tensor Tout, int n, int nt, int bisIters, int nb, int fastRed);"
 )
 
@@ -792,6 +796,203 @@ void mega_eigh_sq_split(torch::Tensor A, torch::Tensor Vout, torch::Tensor Lout,
     dpscr.data_ptr<float>(),dmscr.data_ptr<float>(),tauscr.data_ptr<float>(),
     Tout.data_ptr<float>(),B,n,bisIters,nb,fastRed);
 }
+
+// brief-114: TWO-SLOT named-barrier split kernel for the small-n class (n<=200).
+// ncu (t6) measured the med split kernel's per-column CTA barrier as 66% of the warp
+// stall (10.6 of 16 cyc): at b=40 the 40 CTAs spread 1/SM so there is NO co-resident
+// CTA whose warps hide the serial tridiag's __syncthreads. This kernel gives each CTA
+// TWO independent matrices (slots g=0,1), each owned by half the threads (a 256-thread
+// warp-group) that synchronize on their OWN NAMED barrier (barrier.sync id=1+g). When
+// slot 0 stalls at its barrier, slot 1's warps are eligible to run (different barrier)
+// -- the two matrices' barrier stalls OVERLAP, hiding the latency WITHOUT any cross-CTA
+// sync (avoids the cluster cl.sync data-movement trap measured in t3/t4). Grid = ceil
+// (B/2) CTAs; the second slot idles (early-return, never touches its barrier) when
+// 2*blockIdx.x+1 >= B. Everything else mirrors mega_eigh_med_split_k (packed FP16
+// lower-triangle A, global DP/DM twisted recurrence, per-panel block-T persist for the
+// torch tensor-core back-transform). Per-slot SMEM: packed triangle + v + p + red[nt/32].
+__device__ __forceinline__ void _gsync(int g, int lnt){
+  // named barrier for warp-group g (256 threads); id 1+g so the two groups (and the
+  // default __syncthreads barrier id 0, unused here) never collide.
+  asm volatile("barrier.sync %0, %1;" :: "r"(g+1), "r"(lnt) : "memory");
+}
+extern "C" __global__ void mega_eigh_med_split2_k(const float* __restrict__ Ain,
+    float* __restrict__ Vout, float* __restrict__ Lout,
+    float* __restrict__ rscr, float* __restrict__ dscr, float* __restrict__ escr,
+    float* __restrict__ dpscr, float* __restrict__ dmscr, float* __restrict__ tauscr,
+    float* __restrict__ Tout,
+    int B, int n, int bisIters, int nb, int fastRed){
+  int gtid = threadIdx.x, gnt = blockDim.x;
+  int lnt = gnt >> 1;                         // threads per slot (256)
+  int g = gtid / lnt;                         // slot 0 or 1
+  int tid = gtid - g*lnt;                     // local tid within the slot
+  int m = 2*blockIdx.x + g;                   // matrix this slot owns
+  if(m>=B) return;                            // idle slot: never touches its barrier
+  extern __shared__ char shc[];
+  // per-slot SMEM block: [ packed-tri halves | pad | v (n f) | p (n f) | red (nwarps f) ]
+  size_t triN=((size_t)n*(n+1))>>1;
+  int nwarps = lnt>>5;
+  size_t perHalf = triN*sizeof(__half);
+  size_t perV = ((perHalf + 15u)&~15u);       // v starts 16B-aligned after the triangle
+  size_t slotBytes = perV + (size_t)(2*n + nwarps)*sizeof(float);
+  slotBytes = (slotBytes + 15u)&~15u;
+  char* sb = shc + (size_t)g*slotBytes;
+  __half* Ah=(__half*)sb;
+  float* v=(float*)(sb + perV);
+  float* p=v+n;
+  float* red=p+n;                             // nwarps floats (warp-sum staging)
+  float* Rm=rscr+(long)m*n*n; float* Dm=dscr+(long)m*n; float* Em=escr+(long)m*(n-1);
+  float* DP=dpscr+(long)m*n*n; float* DM=dmscr+(long)m*n*n;
+  float* Tau=tauscr+(long)m*n;
+  float* Vg=Vout+(long)m*n*n;
+  const float* Am=Ain+(long)m*n*n;
+  #define AGET(i,j) __half2float( ((j)<=(i)) ? Ah[_tri(i,j)+(j)] : Ah[_tri(j,i)+(i)] )
+  #define ASET(i,j,val) Ah[_tri(i,j)+(j)] = __float2half(val)
+  // per-slot warp-shuffle block sum (like _clsum but scoped to this slot's lnt threads
+  // and its OWN red[] + named barrier).
+  #define GSUM(x, out) do { \
+      float _v=(x); for(int _o=16;_o>0;_o>>=1) _v += __shfl_down_sync(0xffffffff,_v,_o); \
+      int _w=tid>>5, _l=tid&31; if(_l==0) red[_w]=_v; _gsync(g,lnt); \
+      float _r=0.f; if(tid==0){ for(int _i=0;_i<nwarps;++_i) _r+=red[_i]; red[0]=_r; } \
+      _gsync(g,lnt); (out)=red[0]; } while(0)
+  #define GMAX(x, out) do { \
+      float _v=(x); for(int _o=16;_o>0;_o>>=1){ float _t=__shfl_down_sync(0xffffffff,_v,_o); _v=fmaxf(_v,_t);} \
+      int _w=tid>>5, _l=tid&31; if(_l==0) red[_w]=_v; _gsync(g,lnt); \
+      float _r=-1e30f; if(tid==0){ for(int _i=0;_i<nwarps;++_i) _r=fmaxf(_r,red[_i]); red[0]=_r; } \
+      _gsync(g,lnt); (out)=red[0]; } while(0)
+  #define GMIN(x, out) do { \
+      float _v=(x); for(int _o=16;_o>0;_o>>=1){ float _t=__shfl_down_sync(0xffffffff,_v,_o); _v=fminf(_v,_t);} \
+      int _w=tid>>5, _l=tid&31; if(_l==0) red[_w]=_v; _gsync(g,lnt); \
+      float _r=1e30f; if(tid==0){ for(int _i=0;_i<nwarps;++_i) _r=fminf(_r,red[_i]); red[0]=_r; } \
+      _gsync(g,lnt); (out)=red[0]; } while(0)
+  float amax=0.f;
+  for(int idx=tid; idx<n*n; idx+=lnt){ float x=fabsf(Am[idx]); amax=fmaxf(amax,x); }
+  float scale; GMAX(amax, scale); if(scale<1e-30f) scale=1.f;
+  float invs=1.f/scale;
+  for(long t=tid; t<(long)triN; t+=lnt){
+    int i=(int)((sqrtf(8.0f*(float)t+1.0f)-1.0f)*0.5f);
+    while((long)((i+1)*(i+2)/2)<=t) ++i;
+    while((long)(i*(i+1)/2)>t) --i;
+    int j=(int)(t-(long)(i*(i+1)/2));
+    Ah[t]=__float2half(Am[(long)i*n+j]*invs);
+  }
+  _gsync(g,lnt);
+  for(int c=0;c<n-2;++c){
+    float s2=0.f;
+    for(int i=c+1+tid;i<n;i+=lnt){ float x=AGET(i,c); s2+=x*x; }
+    float xnorm2; GSUM(s2, xnorm2);
+    float alpha=AGET(c+1,c); float tail2=xnorm2-alpha*alpha;
+    if(tail2<=1e-20f){ if(tid==0){Em[c]=alpha;Tau[c]=0.f;} for(int i=tid;i<n;i+=lnt) Rm[i*n+c]=(i==c+1)?1.f:0.f; _gsync(g,lnt); continue; }
+    float xnorm=sqrtf(xnorm2); float beta=(alpha>=0.f)?-xnorm:xnorm; float tau=(beta-alpha)/beta; float denom=alpha-beta;
+    for(int i=tid;i<n;i+=lnt) v[i]=(i<=c)?0.f:((i==c+1)?1.f:AGET(i,c)/denom);
+    _gsync(g,lnt);
+    for(int i=tid;i<n;i+=lnt) Rm[i*n+c]=v[i];
+    for(int i=c+1+tid;i<n;i+=lnt){ float acc=0.f; for(int j=c+1;j<n;++j) acc+=AGET(i,j)*v[j]; p[i]=tau*acc; }
+    float vp=0.f; for(int i=c+1+tid;i<n;i+=lnt) vp+=v[i]*p[i];
+    float vpr; GSUM(vp, vpr);
+    float K=0.5f*tau*vpr;
+    for(int i=c+1+tid;i<n;i+=lnt) p[i]=p[i]-K*v[i];
+    _gsync(g,lnt);
+    for(int i=c+1+tid;i<n;i+=lnt){ float vi=v[i],wi=p[i]; for(int j=c+1;j<=i;++j){ float a=AGET(i,j); ASET(i,j,a-vi*p[j]-wi*v[j]); } }
+    if(tid==0){Em[c]=beta;Tau[c]=tau;}
+    _gsync(g,lnt);
+  }
+  if(tid==0) Em[n-2]=AGET(n-1,n-2);
+  for(int i=tid;i<n;i+=lnt) Dm[i]=AGET(i,i);
+  for(int i=tid;i<n;i+=lnt){ Rm[i*n+(n-2)]=0.f; Rm[i*n+(n-1)]=0.f; }
+  _gsync(g,lnt);
+  float glo, ghi;
+  { float lglo=1e30f, lghi=-1e30f;
+    for(int i=tid;i<n;i+=lnt){ float r=(i>0?fabsf(Em[i-1]):0.f)+(i<n-1?fabsf(Em[i]):0.f); lglo=fminf(lglo,Dm[i]-r); lghi=fmaxf(lghi,Dm[i]+r); }
+    GMIN(lglo, glo); GMAX(lghi, ghi); }
+  for(int ev=tid; ev<n; ev+=lnt){
+    float lo=glo, hi=ghi;
+    for(int it=0;it<bisIters;++it){
+      float mid=0.5f*(lo+hi);
+      float q=Dm[0]-mid; int cnt=(q<0.f);
+      for(int k=1;k<n;++k){ float d2=(fabsf(q)<1e-30f)?1e-30f:q; q=(Dm[k]-mid)-Em[k-1]*Em[k-1]/d2; cnt+=(q<0.f); }
+      if(cnt<=ev) lo=mid; else hi=mid;
+    }
+    Lout[(long)m*n+ev]=0.5f*(lo+hi);
+  }
+  _gsync(g,lnt);
+  for(int i=tid;i<n*n;i+=lnt) Vg[i]=0.f;
+  _gsync(g,lnt);
+  float eps=1e-30f;
+  for(int ev=tid; ev<n; ev+=lnt){
+    float lam=Lout[(long)m*n+ev];
+    float dpk=Dm[0]-lam; DP[0*n+ev]=dpk;
+    for(int k=1;k<n;++k){ float prev=(fabsf(dpk)<eps)?eps:dpk; dpk=(Dm[k]-lam)-Em[k-1]*Em[k-1]/prev; DP[k*n+ev]=dpk; }
+    float dmk=Dm[n-1]-lam; DM[(n-1)*n+ev]=dmk;
+    for(int k=n-2;k>=0;--k){ float nx=(fabsf(dmk)<eps)?eps:dmk; dmk=(Dm[k]-lam)-Em[k]*Em[k]/nx; DM[k*n+ev]=dmk; }
+    int r=0; float best=1e38f;
+    for(int k=0;k<n;++k){ float gg=fabsf(DP[k*n+ev]+DM[k*n+ev]-(Dm[k]-lam)); if(gg<best){best=gg; r=k;} }
+    Vg[r*n+ev]=1.f;
+    for(int k=r-1;k>=0;--k){ float dpkk=DP[k*n+ev]; dpkk=(fabsf(dpkk)<eps)?eps:dpkk; Vg[k*n+ev]=-(Em[k]/dpkk)*Vg[(k+1)*n+ev]; }
+    for(int k=r+1;k<n;++k){ float dmkk=DM[k*n+ev]; dmkk=(fabsf(dmkk)<eps)?eps:dmkk; Vg[k*n+ev]=-(Em[k-1]/dmkk)*Vg[(k-1)*n+ev]; }
+    float nrm=0.f; for(int k=0;k<n;++k) nrm+=Vg[k*n+ev]*Vg[k*n+ev]; nrm=sqrtf(nrm)+1e-30f;
+    for(int k=0;k<n;++k) Vg[k*n+ev]/=nrm;
+  }
+  _gsync(g,lnt);
+  for(int ev=tid; ev<n; ev+=lnt) Lout[(long)m*n+ev]*=scale;
+  // per-panel compact-WY block-T build (reuse this slot's SMEM: Yp+Gp+Tp).
+  int nref=n-2;
+  int npan=(nref + nb - 1)/nb;
+  float* Yp=(float*)sb;
+  float* Gp=Yp + (long)n*nb;
+  float* Tp=Gp + (long)nb*nb;
+  for(int c0=0;c0<nref;c0+=nb){
+    int k=nref-c0; if(k>nb) k=nb;
+    int pidx=c0/nb;
+    float* Tg=Tout + ((long)m*npan + pidx)*(long)nb*nb;
+    for(int idx=tid; idx<n*nb; idx+=lnt){ int i=idx/nb, a=idx%nb; Yp[i*nb+a]=(a<k)?Rm[i*n+(c0+a)]:0.f; }
+    _gsync(g,lnt);
+    for(int idx=tid; idx<nb*nb; idx+=lnt) Tp[idx]=0.f;
+    for(int idx=tid; idx<k*k; idx+=lnt){ int a=idx/k, b=idx%k; float s=0.f; for(int i=0;i<n;++i) s+=Yp[i*nb+a]*Yp[i*nb+b]; Gp[a*nb+b]=s; }
+    _gsync(g,lnt);
+    for(int a=0;a<k;++a){
+      float ta=Tau[c0+a];
+      if(tid<a){
+        float val=0.f;
+        for(int e=0;e<a;++e) val += Tp[tid*nb+e]*Gp[e*nb+a];
+        Tp[tid*nb+a] = -ta*val;
+      } else if(tid==a){
+        Tp[a*nb+a] = ta;
+      }
+      _gsync(g,lnt);
+    }
+    for(int idx=tid; idx<nb*nb; idx+=lnt){ int a=idx/nb, b=idx%nb; Tg[a*nb+b]=(a<k&&b<k)?Tp[a*nb+b]:0.f; }
+    _gsync(g,lnt);
+  }
+  #undef AGET
+  #undef ASET
+  #undef GSUM
+  #undef GMAX
+  #undef GMIN
+}
+void mega_eigh_med_split2(torch::Tensor A, torch::Tensor Vout, torch::Tensor Lout,
+    torch::Tensor rscr, torch::Tensor dscr, torch::Tensor escr,
+    torch::Tensor dpscr, torch::Tensor dmscr, torch::Tensor tauscr,
+    torch::Tensor Tout, int n, int nt, int bisIters, int nb, int fastRed){
+  int B=A.size(0);
+  int lnt = nt>>1;
+  int nwarps = lnt>>5;
+  size_t triN=((size_t)n*(n+1))>>1;
+  size_t perHalf = triN*sizeof(__half);
+  size_t perV = ((perHalf + 15u)&~15u);
+  size_t slotBytes = perV + (size_t)(2*n + nwarps)*sizeof(float);
+  slotBytes = (slotBytes + 15u)&~15u;
+  size_t shm = 2*slotBytes;
+  // the block-T build reuses each slot's sb for Yp(n*nb)+Gp(nb*nb)+Tp(nb*nb)
+  size_t shmTslot = ((size_t)n*nb + (size_t)2*nb*nb)*sizeof(float);
+  if(shmTslot > slotBytes) shm = 2*shmTslot;
+  int grid = (B+1)/2;
+  cudaFuncSetAttribute(mega_eigh_med_split2_k, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)shm);
+  cudaFuncSetAttribute(mega_eigh_med_split2_k, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+  mega_eigh_med_split2_k<<<grid,nt,shm>>>(A.data_ptr<float>(),Vout.data_ptr<float>(),Lout.data_ptr<float>(),
+    rscr.data_ptr<float>(),dscr.data_ptr<float>(),escr.data_ptr<float>(),
+    dpscr.data_ptr<float>(),dmscr.data_ptr<float>(),tauscr.data_ptr<float>(),
+    Tout.data_ptr<float>(),B,n,bisIters,nb,fastRed);
+}
 void mega_eigh_med_split(torch::Tensor A, torch::Tensor Vout, torch::Tensor Lout,
     torch::Tensor rscr, torch::Tensor dscr, torch::Tensor escr,
     torch::Tensor dpscr, torch::Tensor dmscr, torch::Tensor tauscr,
@@ -1216,7 +1417,8 @@ def _mega_get():
             cpp_sources=_MEGA_CPP + "\n" + _MEGA_MED_CPP + "\n" + _MEGA_CLUST_CPP,
             cuda_sources=_MEGA_CUDA + "\n" + _MEGA_MED_CUDA + "\n" + _MEGA_CLUST_CUDA,
             functions=["mega_eigh", "mega_eigh_med", "mega_eigh_med_split",
-                       "mega_eigh_sq_split", "mega_eigh_clust_split"],
+                       "mega_eigh_sq_split", "mega_eigh_med_split2",
+                       "mega_eigh_clust_split"],
             with_cuda=True,
             verbose=False,
             # -O3/--use_fast_math is the LIVE-ACCEPTED best-lineage flag set (8b9b6f40,
@@ -1781,6 +1983,36 @@ def _mega_sq_split_solve(af, dev, b, n, nt, nb):
     return Q, L
 
 
+# brief-114: two-slot named-barrier path selector for the small-n class. When True,
+# the small-n split uses mega_eigh_med_split2 (2 matrices/CTA, per-slot named barrier)
+# so the two matrices' per-column barrier stalls OVERLAP -- hiding the 66% barrier
+# stall ncu measured with 40 CTAs 1/SM. nt must be 512 (splits into 2x256).
+_MEGA_SMALL_2SLOT = True
+_MEGA_SMALL_2SLOT_NT = 512
+
+
+def _mega_split2_solve(af, dev, b, n, nt, nb, bisiters=None):
+    """Like _mega_med_split_solve but runs the TWO-SLOT named-barrier kernel
+    (mega_eigh_med_split2): ceil(b/2) CTAs, 2 matrices/CTA on separate named
+    barriers. Same Z/panel/block-T outputs -> same torch TC WY back-transform."""
+    if bisiters is None:
+        bisiters = _MEGA_BISITERS
+    mod = _mega_get()
+    V = torch.empty(b, n, n, device=dev, dtype=torch.float32)
+    L = torch.empty(b, n, device=dev, dtype=torch.float32)
+    rscr = torch.empty(b, n, n, device=dev, dtype=torch.float32)
+    dscr = torch.empty(b, n, device=dev, dtype=torch.float32)
+    escr = torch.empty(b, n - 1, device=dev, dtype=torch.float32)
+    dpscr = torch.empty(b, n, n, device=dev, dtype=torch.float32)
+    dmscr = torch.empty(b, n, n, device=dev, dtype=torch.float32)
+    tauscr = torch.empty(b, n, device=dev, dtype=torch.float32)
+    T, npan = _mega_med_split_T(b, n, nb, dev)
+    mod.mega_eigh_med_split2(af, V, L, rscr, dscr, escr, dpscr, dmscr, tauscr,
+                             T, n, nt, bisiters, nb, 1)
+    Q = _mega_med_backtransform(V, rscr, T, n, nb, npan)
+    return Q, L
+
+
 def _eigh_megakernel_med(a: torch.Tensor) -> output_t:
     """Medium-n fused megakernel (packed FP16 lower-triangle A in SMEM, global
     eigenvector matrix). Same contract + per-matrix residual gate as
@@ -1807,7 +2039,12 @@ def _eigh_megakernel_med(a: torch.Tensor) -> output_t:
     _small = n <= _MEGA_MED_SQ_NMAX
     _bis = _MEGA_SMALL_BISITERS if _small else _MEGA_BISITERS
     _nt = _MEGA_SMALL_NT if _small else _MEGA_MED_NT
-    if _MEGA_MED_SQUARE and _small:
+    if _small and _MEGA_SMALL_2SLOT:
+        # two matrices per CTA on per-slot named barriers -> overlap the per-column
+        # barrier stalls (hide the 66% barrier ncu measured at 40 CTAs 1/SM).
+        Qz, L = _mega_split2_solve(af, dev, b, n, _MEGA_SMALL_2SLOT_NT,
+                                   _MEGA_MED_SPLIT_NB, bisiters=_bis)
+    elif _MEGA_MED_SQUARE and _small:
         Qz, L = _mega_sq_split_solve(af, dev, b, n, _nt, _MEGA_MED_SPLIT_NB)
     else:
         Qz, L = _mega_med_split_solve(af, dev, b, n, _nt, _MEGA_MED_SPLIT_NB,
