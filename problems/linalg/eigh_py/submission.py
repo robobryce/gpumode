@@ -6715,17 +6715,22 @@ __device__ __forceinline__ void mwjac_solve32(
     float* __restrict__ Bad) {
   const unsigned FULL = 0xffffffffu;
   const int NN = 32, NW = 16;   // NW warps = NN/2 pairs
-  __shared__ float As[NN * NN];
-  __shared__ float Vs[NN * NN];
+  const int LD = NN + 1;        // PADDED row stride: breaks the 32-way SMEM bank
+                                // conflict on COLUMN accesses As[i*LD+p] (stride LD=33
+                                // -> each row lands in a different bank). Column reads/
+                                // writes are the hot path (col phase touches col p over
+                                // all 32 rows) -> unpadded stride-32 = all same bank.
+  __shared__ float As[NN * LD];
+  __shared__ float Vs[NN * LD];
   __shared__ float redOff[NW], redNrm[NW];   // block-reduction scratch (gate)
   int tid = threadIdx.x;
   int warp = tid >> 5, lane = tid & 31;
-  // cooperative load A -> SMEM, V = I
+  // cooperative load A -> SMEM (padded), V = I
   #pragma unroll
   for (int idx = tid; idx < NN * NN; idx += NW * 32) {
-    As[idx] = Am[idx];
     int i = idx / NN, j = idx % NN;
-    Vs[idx] = (i == j) ? 1.0f : 0.0f;
+    As[i * LD + j] = Am[idx];
+    Vs[i * LD + j] = (i == j) ? 1.0f : 0.0f;
   }
   __syncthreads();
   #pragma unroll 1
@@ -6739,7 +6744,7 @@ __device__ __forceinline__ void mwjac_solve32(
       // rotation from A[p][p],A[q][q],A[p][q] (lane 0 computes, broadcast).
       float c = 1.0f, s = 0.0f;
       if (lane == 0) {
-        float app = As[p * NN + p], aqq = As[q * NN + q], apq = As[p * NN + q];
+        float app = As[p * LD + p], aqq = As[q * LD + q], apq = As[p * LD + q];
         if (fabsf(apq) > 1e-30f * (fabsf(app) + fabsf(aqq) + 1e-30f)) {
           float tau = (aqq - app) / (2.0f * apq);
           float t = (tau >= 0.0f) ? 1.0f / (tau + sqrtf(1.0f + tau * tau))
@@ -6754,21 +6759,21 @@ __device__ __forceinline__ void mwjac_solve32(
       // columns across warps -> no write conflict; reads only its own 2 columns.
       {
         int i = lane;   // NN==32 lanes cover all rows
-        float aip = As[i * NN + p], aiq = As[i * NN + q];
-        As[i * NN + p] = c * aip - s * aiq;
-        As[i * NN + q] = s * aip + c * aiq;
-        float vip = Vs[i * NN + p], viq = Vs[i * NN + q];
-        Vs[i * NN + p] = c * vip - s * viq;
-        Vs[i * NN + q] = s * vip + c * viq;
+        float aip = As[i * LD + p], aiq = As[i * LD + q];
+        As[i * LD + p] = c * aip - s * aiq;
+        As[i * LD + q] = s * aip + c * aiq;
+        float vip = Vs[i * LD + p], viq = Vs[i * LD + q];
+        Vs[i * LD + p] = c * vip - s * viq;
+        Vs[i * LD + q] = s * vip + c * viq;
       }
       __syncthreads();
       // ROW phase: warp w rotates rows p,q for all columns j (lane j). Disjoint
       // rows across warps. Reads post-column-update SMEM.
       {
         int j = lane;
-        float apj = As[p * NN + j], aqj = As[q * NN + j];
-        As[p * NN + j] = c * apj - s * aqj;
-        As[q * NN + j] = s * apj + c * aqj;
+        float apj = As[p * LD + j], aqj = As[q * LD + j];
+        As[p * LD + j] = c * apj - s * aqj;
+        As[q * LD + j] = s * apj + c * aqj;
       }
       __syncthreads();
     }
@@ -6785,8 +6790,9 @@ __device__ __forceinline__ void mwjac_solve32(
   {
     float off2 = 0.0f, nrm2 = 0.0f;
     for (int idx = tid; idx < NN * NN; idx += NW * 32) {
-      float v = As[idx]; float v2 = v * v; nrm2 += v2;
-      int i = idx / NN, j = idx % NN; if (i != j) off2 += v2;
+      int i = idx / NN, j = idx % NN;
+      float v = As[i * LD + j]; float v2 = v * v; nrm2 += v2;
+      if (i != j) off2 += v2;
     }
     #pragma unroll
     for (int o = 16; o > 0; o >>= 1) { off2 += __shfl_down_sync(FULL, off2, o); nrm2 += __shfl_down_sync(FULL, nrm2, o); }
@@ -6802,10 +6808,10 @@ __device__ __forceinline__ void mwjac_solve32(
     }
   }
   // eigenvalues = diag(As); IN-KERNEL sort (ascending) by rank, scatter V columns.
-  // Only the first NN threads (warp0 + warp... ) handle the 32 columns; use tid<NN.
+  // Only the first NN threads (warp0) handle the 32 columns; use tid<NN.
   if (tid < NN) {
     int l = tid;
-    float ev = As[l * NN + l];
+    float ev = As[l * LD + l];
     int rank = 0;
     #pragma unroll
     for (int k = 0; k < NN; ++k) {
@@ -6815,7 +6821,7 @@ __device__ __forceinline__ void mwjac_solve32(
     Lm[rank] = ev;
     // eigenvector column l -> sorted column rank. write column l of Vs to Vm[:,rank].
     #pragma unroll
-    for (int i = 0; i < NN; ++i) Vm[i * NN + rank] = Vs[i * NN + l];
+    for (int i = 0; i < NN; ++i) Vm[i * NN + rank] = Vs[i * LD + l];
   }
 }
 
