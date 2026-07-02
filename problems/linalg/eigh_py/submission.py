@@ -1752,6 +1752,13 @@ _MEGA_MED_SQ_NMAX = 200    # square FP16 A = n*n*2B <= 80KB fits SMEM up to n=20
 # eigenvalue is too imprecise, so this trades kernel latency for a bounded fallback
 # risk. Probe: 45->30 gave shape 1 1949->1872us with NO extra fallback (geomean down).
 _MEGA_SMALL_BISITERS = 32
+# brief-114: threads/CTA for the small-n (n<=200) split path. The med default (512)
+# wastes ~336 idle threads at n=176 (loops stride by nt but only ~176 lanes do work),
+# and those idle warps STILL participate in every __syncthreads -- inflating the
+# barrier stall ncu measures at 66% (10.6 of 16 warp-cycles). A smaller nt syncs fewer
+# warps (cheaper barrier) + shrinks _mega_fast_sum's cross-warp pass. MUST be a power
+# of 2 (the red[] tree reduction drops elements otherwise). Swept per shape.
+_MEGA_SMALL_NT = 256
 
 
 def _mega_sq_split_solve(af, dev, b, n, nt, nb):
@@ -1793,13 +1800,17 @@ def _eigh_megakernel_med(a: torch.Tensor) -> output_t:
     # brief-114: n<=200 uses the SQUARE-storage split kernel (branch-free FP16 A)
     # to shed the packed-triangle AGET/_tri overhead in the dominant tridiag loops;
     # larger n keeps the packed-triangle med kernel (square A would overflow SMEM).
-    # brief-114: n<=200 uses fewer Sturm-bisection iters (_MEGA_SMALL_BISITERS) --
-    # the twisted eigenvectors + residual gate tolerate the coarser eigenvalue.
-    _bis = _MEGA_SMALL_BISITERS if n <= _MEGA_MED_SQ_NMAX else _MEGA_BISITERS
-    if _MEGA_MED_SQUARE and n <= _MEGA_MED_SQ_NMAX:
-        Qz, L = _mega_sq_split_solve(af, dev, b, n, _MEGA_MED_NT, _MEGA_MED_SPLIT_NB)
+    # brief-114: n<=200 uses fewer Sturm-bisection iters (_MEGA_SMALL_BISITERS) and a
+    # smaller CTA (_MEGA_SMALL_NT) -- fewer idle warps at the per-column barrier that
+    # ncu measures at 66% of the stall; twisted eigenvectors + residual gate tolerate
+    # the coarser eigenvalue.
+    _small = n <= _MEGA_MED_SQ_NMAX
+    _bis = _MEGA_SMALL_BISITERS if _small else _MEGA_BISITERS
+    _nt = _MEGA_SMALL_NT if _small else _MEGA_MED_NT
+    if _MEGA_MED_SQUARE and _small:
+        Qz, L = _mega_sq_split_solve(af, dev, b, n, _nt, _MEGA_MED_SPLIT_NB)
     else:
-        Qz, L = _mega_med_split_solve(af, dev, b, n, _MEGA_MED_NT, _MEGA_MED_SPLIT_NB,
+        Qz, L = _mega_med_split_solve(af, dev, b, n, _nt, _MEGA_MED_SPLIT_NB,
                                       bisiters=_bis)
     L, order = torch.sort(L, dim=-1)
     Q = torch.gather(Qz, 2, order.unsqueeze(1).expand(b, n, n))
