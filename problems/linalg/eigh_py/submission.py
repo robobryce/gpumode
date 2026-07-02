@@ -90,6 +90,27 @@ __device__ __forceinline__ float _mega_fast_sum(float v, float* red, int tid, in
   __syncthreads();
   return red[0];
 }
+// brief-108 barrier-COUNT lever: a ONE-barrier block SUM reduction. _mega_fast_sum
+// needs 2 __syncthreads (accumulate warp-partials into red[], then broadcast the
+// combined result from red[0]). Here each warp writes its partial to red[wid], ONE
+// barrier makes all nw partials visible, then EVERY thread sums the nw partials
+// itself (nw<=16, cheap) -> no broadcast barrier. This trades a tiny redundant
+// nw-way add per thread for removing 1 block barrier PER REDUCTION -- the kernel is
+// barrier-latency-bound (56.7% CTA-barrier stall, eligible-warps 0.92), so cutting
+// the barrier count is the lever. Numerically IDENTICAL result to _mega_fast_sum
+// (same warp-shuffle tree + same nw-way combine order), so gate-safe -- it only
+// changes WHERE the combine runs (per-thread vs thread-0-then-broadcast).
+__device__ __forceinline__ float _mega_sum1b(float v, float* red, int tid, int nt){
+  int lane=tid&31, wid=tid>>5;
+  v=_mega_warp_sum(v);
+  if(lane==0) red[wid]=v;
+  __syncthreads();
+  int nw=(nt+31)>>5;
+  float r=0.f;
+  #pragma unroll 1
+  for(int w=0; w<nw; ++w) r+=red[w];
+  return r;
+}
 extern "C" __global__ void mega_eigh_k(const float* __restrict__ Ain,
     float* __restrict__ Vout, float* __restrict__ Lout,
     float* __restrict__ rscr, float* __restrict__ dscr, float* __restrict__ escr,
@@ -464,6 +485,7 @@ extern "C" __global__ void mega_eigh_med_split_k(const float* __restrict__ Ain,
   int fr = fastRed & 1;
   int f16upd = (fastRed >> 1) & 1;
   int f16symv = (fastRed >> 2) & 1;   // bit2: half2 symv (contiguous j<=i part)
+  int slimBar = (fastRed >> 3) & 1;   // bit3: 1-barrier block reductions (barrier-count lever)
   extern __shared__ char shc[];
   __half* Ah=(__half*)shc;
   size_t triN=((size_t)n*(n+1))>>1;
@@ -502,7 +524,8 @@ extern "C" __global__ void mega_eigh_med_split_k(const float* __restrict__ Ain,
     float s2=0.f;
     for(int i=c+1+tid;i<n;i+=nt){ float x=AGET(i,c); s2+=x*x; }
     float xnorm2;
-    if(fr){ xnorm2=_mega_fast_sum(s2,red,tid,nt); }
+    if(slimBar){ xnorm2=_mega_sum1b(s2,red,tid,nt); }
+    else if(fr){ xnorm2=_mega_fast_sum(s2,red,tid,nt); }
     else { red[tid]=s2; __syncthreads();
       for(int s=nt>>1;s>0;s>>=1){ if(tid<s)red[tid]+=red[tid+s]; __syncthreads(); }
       xnorm2=red[0]; }
@@ -554,7 +577,8 @@ extern "C" __global__ void mega_eigh_med_split_k(const float* __restrict__ Ain,
     // __syncthreads/column (~298). Pure ordering -- byte-identical, gate-safe.
     float vp=0.f; for(int i=c+1+tid;i<n;i+=nt) vp+=v[i]*p[i];
     float vpr;
-    if(fr){ vpr=_mega_fast_sum(vp,red,tid,nt); }
+    if(slimBar){ vpr=_mega_sum1b(vp,red,tid,nt); }
+    else if(fr){ vpr=_mega_fast_sum(vp,red,tid,nt); }
     else { red[tid]=vp; __syncthreads();
       for(int s=nt>>1;s>0;s>>=1){ if(tid<s)red[tid]+=red[tid+s]; __syncthreads(); }
       vpr=red[0]; }
@@ -2731,7 +2755,7 @@ def _lr_bare_scratch(B, k, dev):
     return buf
 
 
-def _lr_reduced_mega(Bk, bt_prec=None, fast_reduce=True, f16upd=False, f16symv=False):
+def _lr_reduced_mega(Bk, bt_prec=None, fast_reduce=True, f16upd=False, f16symv=False, slimbar=False):
     """RAW megakernel eigh of Bk (B x k x k) for k in the SMEM-fit range
     (32,448]. No wrapper gate, no scratch re-alloc, no sort. Returns (lam, G).
 
@@ -2778,7 +2802,8 @@ def _lr_reduced_mega(Bk, bt_prec=None, fast_reduce=True, f16upd=False, f16symv=F
     # bit1=f16upd (half2 trailing rank-2 update). Routed independently so the
     # sign-DC reduced block can take the FP16 panel update without changing the
     # reduction precision (its eigr gate is razor-close to the tree reduction).
-    flag = (1 if fast_reduce else 0) | (2 if f16upd else 0) | (4 if f16symv else 0)
+    flag = ((1 if fast_reduce else 0) | (2 if f16upd else 0)
+            | (4 if f16symv else 0) | (8 if slimbar else 0))
     mod.mega_eigh_med_split(Bkc, V, L, rscr, dscr, escr, dpscr, dmscr, tauscr,
                             T, kk, _MEGA_MED_NT, _MEGA_BISITERS, nb, flag)
     # V holds Z; rscr the Householder panel; back-transform on tensor cores.
@@ -2786,7 +2811,7 @@ def _lr_reduced_mega(Bk, bt_prec=None, fast_reduce=True, f16upd=False, f16symv=F
     return L, G
 
 
-def _lr_reduced_eigh(Bk, bt_prec=None, fast_reduce=True, f16upd=False, f16symv=False):
+def _lr_reduced_eigh(Bk, bt_prec=None, fast_reduce=True, f16upd=False, f16symv=False, slimbar=False):
     """Eigendecomposition of the reduced symmetric block Bk (B x k x k). Returns
     (lam, G) in the torch.linalg.eigh convention (Bk @ G[:,:,i] = lam[:,i] *
     G[:,:,i]); ordering is whatever the path produced (the OUTER low-rank path
@@ -2803,7 +2828,7 @@ def _lr_reduced_eigh(Bk, bt_prec=None, fast_reduce=True, f16upd=False, f16symv=F
     kk = Bk.shape[-1]
     if mod is not None and 32 < kk <= _MEGA_MED_NMAX:
         return _lr_reduced_mega(Bk, bt_prec=bt_prec, fast_reduce=fast_reduce,
-                                f16upd=f16upd, f16symv=f16symv)
+                                f16upd=f16upd, f16symv=f16symv, slimbar=slimbar)
     # k in (448, 836] (dense1024 k=608 shape-4 -> C=2; nearrank1024 k=768 shape-10
     # -> C=3): C-CTA thread-block CLUSTER solve -- the packed-FP16 k-triangle is
     # row-distributed across C CTAs' DSMEM so it fits (k=608 370KB/2=185KB/CTA;
@@ -3792,6 +3817,16 @@ _SIGN_DC_INSOLVER_EIGR = True
 # that cuts the BARRIER count (not the matmul precision) is the lever for this kernel.
 _SIGN_DC_F16UPD = False
 _SIGN_DC_F16SYMV = False
+# brief-108 BARRIER-COUNT lever: route the reduced-block tridiag's two per-column SUM
+# reductions (reflector norm s2, rank-2 coefficient vp) through the 1-barrier block
+# reduction _mega_sum1b (vs _mega_fast_sum's 2 barriers). mega_eigh_med_split_k is
+# barrier-latency-bound (ncu shape11: 56.7% CTA-barrier stall, eligible-warps 0.92) --
+# each reduction's SECOND (broadcast) barrier is removed by having every thread sum the
+# <=16 warp-partials itself. ~2 fewer block barriers/column x ~298 columns. Numerically
+# identical reduction (same shuffle tree + combine), so the tree reductions stay their
+# current FP32 precision (load-bearing for the eigr gate). Gated + guarded by the
+# per-matrix eigr/orth gate + cuSOLVER fallback; routed for the sign-DC reduced blocks.
+_SIGN_DC_SLIMBAR = True
 _SIGN_DC_CQR_PASSES = 2   # subspace-basis CholeskyQR passes. REQUIRED at 2: the
                           # projected bases P+/- @ Omega are rank-deficient (the K
                           # oversample exceeds the true subspace rank), and 1 shifted
@@ -5111,7 +5146,7 @@ def _sign_dc_solve(af, n, dev):
         # 84995->83930, geomean 27862->27824, still 39/39, 0 fallback.
         lstk, gstk = _lr_reduced_eigh(Bstk, bt_prec=_SIGN_DC_BT_PREC,
                                       fast_reduce=True, f16upd=_SIGN_DC_F16UPD,
-                                      f16symv=_SIGN_DC_F16SYMV)
+                                      f16symv=_SIGN_DC_F16SYMV, slimbar=_SIGN_DC_SLIMBAR)
       except Exception:
         lstk, gstk = torch.linalg.eigh(Bstk)
     with _sdc_timer("6_member_topk"):
