@@ -6050,14 +6050,30 @@ __device__ __forceinline__ void wjac_solve32(
       for (int j = 0; j < NN; ++j) Ar[j] = amLow ? (c * Ar[j] - s * prow[j]) : (s * prow[j] + c * Ar[j]);
     }
   }
-  // eigenvalue for player `lane` = A[lane][lane] (masked reduction); eigenvector =
-  // column `lane` of V -> write V row-major (lane i -> row i) so Vm[:, l] is eigvec l.
+  // eigenvalue for player `lane` = A[lane][lane] (masked reduction over Ar).
   float mydiag = 0.0f;
   #pragma unroll
   for (int k = 0; k < NN; ++k) mydiag += (k == lane) ? Ar[k] : 0.0f;
-  Lm[lane] = mydiag;
+  // ---- IN-KERNEL SORT (ascending) via rank, to skip the torch sort+gather (which
+  // add ~4 host launches + a b*n*n gather on the tiny shape where launch latency
+  // dominates). rank = #{k: eigval_k < mydiag} + stable tiebreak (k<lane). All
+  // cross-lane reads are __shfl (register-resident); the sorted WRITE address is a
+  // dynamic GLOBAL offset (fine -- not a local-array index).
+  int rank = 0;
   #pragma unroll
-  for (int j = 0; j < NN; ++j) Vm[lane * NN + j] = Vr[j];
+  for (int k = 0; k < NN; ++k) {
+    float ek = __shfl_sync(FULL, mydiag, k);
+    rank += (ek < mydiag || (ek == mydiag && k < lane)) ? 1 : 0;
+  }
+  Lm[rank] = mydiag;                       // eigenvalue -> its sorted slot
+  // eigenvector for original column l is { Vr_i[l] over lanes i }; it belongs at
+  // sorted column rank_l. For each source column l (constant index into Vr ->
+  // register), broadcast its rank and scatter this lane's entry to Vm[lane][rank_l].
+  #pragma unroll
+  for (int l = 0; l < NN; ++l) {
+    int rl = __shfl_sync(FULL, rank, l);   // sorted position of original column l
+    Vm[lane * NN + rl] = Vr[l];            // Q_sorted[lane][rl] = V[lane][l]
+  }
 }
 
 extern "C" __global__ void warp_jacobi_eigh_k(
@@ -6134,11 +6150,11 @@ def _eigh_warp_jacobi(a: torch.Tensor) -> output_t:
         return vectors, values
     af = a.float().contiguous()
     dev = af.device
-    V = torch.empty(b, n, n, device=dev, dtype=torch.float32)
-    L = torch.empty(b, n, device=dev, dtype=torch.float32)
-    mod.warp_jacobi_eigh(af, V, L, n, _WJAC_SWEEPS, _WJAC_WARPS)
-    L, order = torch.sort(L, dim=-1)
-    Q = torch.gather(V, 2, order.unsqueeze(1).expand(b, n, n))
+    Q = torch.empty(b, n, n, device=dev, dtype=torch.float32)   # kernel writes SORTED Q
+    L = torch.empty(b, n, device=dev, dtype=torch.float32)      # kernel writes SORTED L
+    mod.warp_jacobi_eigh(af, Q, L, n, _WJAC_SWEEPS, _WJAC_WARPS)
+    # kernel sorts eigenvalues ascending in-warp and scatters V columns to match,
+    # so no torch.sort/gather here (saves ~4 host launches on this tiny shape).
     # per-matrix residual gate (harness-level), fall failures back to cuSOLVER.
     eps = torch.finfo(torch.float32).eps
     eye = torch.eye(n, device=dev, dtype=torch.float32)
