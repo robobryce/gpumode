@@ -5953,7 +5953,10 @@ def _eigh_sign_dc(a: torch.Tensor) -> output_t:
 # matrix and falls any miss back to cuSOLVER (never regresses below the floor).
 _WJAC_NMAX = 32           # only n<=32 routed to the warp-Jacobi kernel
 _WJAC_SWEEPS = 6          # cyclic-Jacobi sweeps (each = n-1 rounds). Swept below.
-_WJAC_WARPS = 8           # warps (matrices) per CTA -> co-residency at high occ
+_WJAC_WARPS = 1           # matrices per CTA. Swept 1/2/4/8: all within noise (~560-
+                          # 590us) -- the kernel is per-warp dependency-chain latency-
+                          # bound at 20 warps, so warp placement barely matters. 1 warp/
+                          # CTA spreads the 20 warps across 20 SMs (1 per SM).
 _wjac_mod = None
 _wjac_failed = False
 
