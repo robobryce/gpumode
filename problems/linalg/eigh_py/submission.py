@@ -3561,6 +3561,16 @@ _SIGN_DC_FUSE_MEMBERSHIP = True
 # dropping it is a real HBM/launch cut. Gated: if orth degrades, the residual gate
 # falls those matrices to cuSOLVER; validated against the real eval.py checker.
 _SIGN_DC_SKIP_BSYM = True
+# brief-96: compute the eigen-residual eigr = max_j ||A@Q[:,j] - L[j] Q[:,j]||_1 INSIDE
+# the solver, on the pre-sort (but mutually consistent) Q/AQ/L, and return it -- so the
+# caller's gate uses it directly and the solver NEVER gathers AQ by the sort order. The
+# ord=1 matrix norm is the max over column abs-sums, and sorting permutes columns
+# jointly across A@Q, Q and L, so the eigr MAX is permutation-invariant -- the value is
+# identical whether taken before or after the sort. This drops the second (n x n) gather
+# (probe: AQ gather ~0.39ms of stage-8's 1.57ms) since only Q + L need sorting for the
+# output. The orth gate (Gram Q^T Q) is likewise permutation-invariant but the caller
+# needs the final sorted Q anyway, so orth stays caller-side on the sorted Q.
+_SIGN_DC_INSOLVER_EIGR = True
 _SIGN_DC_CQR_PASSES = 2   # subspace-basis CholeskyQR passes. REQUIRED at 2: the
                           # projected bases P+/- @ Omega are rank-deficient (the K
                           # oversample exceeds the true subspace rank), and 1 shifted
@@ -4367,11 +4377,20 @@ def _sign_dc_solve(af, n, dev):
         AQ = af @ Q
         torch.backends.cuda.matmul.allow_tf32 = _gp
         L = (Q * AQ).sum(dim=1)
+        eigr = None
+        if _SIGN_DC_INSOLVER_EIGR:
+            # eigen residual on the PRE-SORT consistent (AQ, Q, L). max-column-abs-sum
+            # (ord=1) is permutation-invariant, so this equals the post-sort eigr and
+            # lets us skip gathering AQ (only Q + L are sorted for the output).
+            eigr = torch.linalg.matrix_norm(AQ - Q * L.unsqueeze(-2), ord=1, dim=(-2, -1))
         L, order = torch.sort(L, dim=-1)
         oexp = order.unsqueeze(1).expand(b, n, n)
         Q = torch.gather(Q, 2, oexp)
-        AQ = torch.gather(AQ, 2, oexp)
-    return Q, L, AQ, order
+        if not _SIGN_DC_INSOLVER_EIGR:
+            AQ = torch.gather(AQ, 2, oexp)
+        else:
+            AQ = None
+    return Q, L, AQ, order, eigr
 
 
 def _sign_dc_rec_omega(b, m, K, dev):
@@ -4835,7 +4854,7 @@ def _eigh_sign_dc(a: torch.Tensor) -> output_t:
     dev = a.device
     af = a.float().contiguous()
     try:
-        Q, L, AQ, _order = _sign_dc_solve(af, n, dev)
+        Q, L, AQ, _order, eigr = _sign_dc_solve(af, n, dev)
     except Exception:
         Lc, Qc = torch.linalg.eigh(af)
         return Qc.contiguous(), Lc.contiguous()
@@ -4855,7 +4874,10 @@ def _eigh_sign_dc(a: torch.Tensor) -> output_t:
     # fewer tensor-core bmm.
     orth = torch.linalg.matrix_norm(_gram_3xtf32_sym(Q) - eye, ord=1, dim=(-2, -1))
     torch.backends.cuda.matmul.allow_tf32 = _gp
-    eigr = torch.linalg.matrix_norm(AQ - Q * L.unsqueeze(-2), ord=1, dim=(-2, -1))
+    if eigr is None:
+        # brief-96: only recompute if the solver didn't (it computes the
+        # permutation-invariant eigr pre-sort and skips the AQ gather).
+        eigr = torch.linalg.matrix_norm(AQ - Q * L.unsqueeze(-2), ord=1, dim=(-2, -1))
     a_l1 = torch.linalg.matrix_norm(af, ord=1, dim=(-2, -1)).clamp_min(1e-30)
     _orth_gate = _SIGN_DC_ORTH_FAC * n * eps
     _eigr_gate = _SIGN_DC_EIGR_FAC * n * eps
