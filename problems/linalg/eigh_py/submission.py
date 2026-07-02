@@ -2462,10 +2462,12 @@ def _lr_cholesky_qr2(Y, passes=2, shift=1e-5, tf32_gram=False, gram_mode=None):
                 G = _gram_3xtf32_sym(Q)
             else:
                 G = torch.bmm(Q.transpose(-1, -2), Q)
-            if _fmod is not None:
-                Gc = G.contiguous()
-                _fmod.add_shifted_diag(Gc, float(shift))
-                L = torch.linalg.cholesky(Gc)
+            if _fmod is not None and G.is_contiguous():
+                # in-place diag shift only when G is already contiguous (plain-bmm
+                # Gram) -- forcing .contiguous() on the 3xTF32-sym Gram (a sum, non-
+                # contiguous) would add a copy launch that eats the fused saving.
+                _fmod.add_shifted_diag(G, float(shift))
+                L = torch.linalg.cholesky(G)
             else:
                 dm = G.diagonal(dim1=-2, dim2=-1).abs().amax(-1).clamp_min(1e-30)
                 L = torch.linalg.cholesky(G + (shift * dm).view(-1, 1, 1) * eye)
