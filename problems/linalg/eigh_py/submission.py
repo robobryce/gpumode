@@ -3221,14 +3221,20 @@ _SIGN_DC_K = 300          # oversized subspace width (>= max +count/-count over 
                           # eigh is the wall; K in [288,300] all land ~110ms), so the
                           # extra margin is free. Both K-blocks fit the megakernel's
                           # n<=448 range. Matrices with +count>K fall to cuSOLVER.
-_SIGN_DC_NS_ITERS = 20    # Newton-Schulz sign iterations (each = 2 batched GEMMs).
+_SIGN_DC_NS_ITERS = 18    # Newton-Schulz sign iterations (each = 2 batched GEMMs).
                           # The near-zero eigenvalues plateau |X| below 1 (they need
                           # ~22 quadratic steps to fully resolve), but the projector
-                          # MEMBERSHIP rank-select tolerates a fuzzy sign, so ~20 iters
-                          # is enough for a clean split (shape-11 eig ~3.6e-3, ~3.4x
+                          # MEMBERSHIP rank-select tolerates a fuzzy sign, so ~18 iters
+                          # is enough for a clean split (shape-11 eig ~3.7e-3, ~2.5x
                           # under the gate) at far less cost than driving ||X^2-I|| to
-                          # machine precision (~60 iters). Swept 20/24/30: 20 holds the
-                          # eig margin (3.6e-3) with the fewest GEMMs.
+                          # machine precision (~60 iters). brief-72 re-swept 20/18/16/14
+                          # with a 5-seed reseed sweep: 18 holds the SAME fallback set as
+                          # 20 (benchmark seed 780001 nbad=0 + only the pre-existing
+                          # +count>K matrix at seed 222222) with eigr cushion 2.5x; 16
+                          # introduces NEW fallbacks on 3 of 5 reseeds (111111/424242/
+                          # 990099 nbad 1-3), and 14 mass-falls-back (22/640 on the
+                          # benchmark seed). So 18 is the safe floor -- 2 fewer batched
+                          # GEMMs than 20, do not drop below 18.
 _SIGN_DC_POWER_ITERS = 15 # A^2 power iterations for the spectral-norm scale estimate
 _SIGN_DC_FINAL_NS = 1     # finishing FP32 NS orthonormalization steps on Q
 _SIGN_DC_CQR_PASSES = 2   # subspace-basis CholeskyQR passes. REQUIRED at 2: the
