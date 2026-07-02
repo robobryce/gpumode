@@ -3635,6 +3635,14 @@ _SIGN_DC_CQR_INV_GEMM = False
 # brief-87: fuse the two projector applies P+@Om, P-@Om2 into one wide X@[Om|Om2] GEMM.
 # t11 measured this NEUTRAL/NEG (the 2 baddbmm already fuse the 0.5*Om add) -> off.
 _SIGN_DC_FUSE_PROJ = False
+# brief-103: precision of the projector-apply GEMMs P+@Om = 0.5*(Om + X@Om) and
+# P-@Om2 = 0.5*(Om2 - X@Om2) that build the subspace bases (a BIGGER single GEMM
+# than the NS one: (b,n,n)@(b,n,K), K=300). "tf32" (parent, baddbmm-fused) or
+# "fp16"/"bf16" (X and Om cast to half, fp32 accumulate, the 0.5*Om +/- 0.5*(X@Om)
+# combine done in fp32). These bases feed the CholeskyQR -> orthonormal Ustk, so
+# fp16 here is the most orth-sensitive of the sign-DC GEMMs; gate-guarded (the
+# per-matrix residual/orth gate + cuSOLVER fallback catch any matrix it degrades).
+_SIGN_DC_PROJ_PREC = "tf32"
 # brief-96: fuse the two MEMBERSHIP projector applies X@Vp, X@Vm into ONE wide
 # X @ [Vp | Vm] GEMM. Both membership terms (selp = ||P+ Vp||, selm = ||P- Vm||)
 # apply the SAME sign matrix X to a (b,n,K) block; stacking the two RHS blocks into
@@ -4924,10 +4932,24 @@ def _sign_dc_solve(af, n, dev):
     # Spectral projectors are NOT materialized: P+ @ M = 0.5*(M + X@M) and
     # P- @ M = 0.5*(M - X@M), so the subspace probes and the membership test apply
     # the sign directly to their (thin) operands -- no full n*n P+/P- tensors.
+    # brief-103: _SIGN_DC_PROJ_PREC="fp16"/"bf16" runs the X@M projector-apply GEMM
+    # in half precision (fp32 accumulate) and does the 0.5*M +/- 0.5*(X@M) combine
+    # in fp32; "tf32" (default) keeps the byte-identical baddbmm-fused form.
+    _proj_lpdt = ({"bf16": torch.bfloat16, "fp16": torch.float16}
+                  .get(_SIGN_DC_PROJ_PREC))
+    if _proj_lpdt is not None:
+        _Xl = X.to(_proj_lpdt)
+
     def _pp(M):
+        if _proj_lpdt is not None:
+            XM = torch.bmm(_Xl, M.to(_proj_lpdt)).float()
+            return 0.5 * M + 0.5 * XM
         return torch.baddbmm(M, X, M, beta=0.5, alpha=0.5)
 
     def _pm(M):
+        if _proj_lpdt is not None:
+            XM = torch.bmm(_Xl, M.to(_proj_lpdt)).float()
+            return 0.5 * M - 0.5 * XM
         return torch.baddbmm(M, X, M, beta=0.5, alpha=-0.5)
     # oversized invariant-subspace bases (batched CholeskyQR, NOT cuSOLVER QR). Both
     # bases are the SAME (n x K) shape, so STACK them (2b x n x K) and run one CQR +
