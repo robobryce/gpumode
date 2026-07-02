@@ -42,7 +42,12 @@ _MEGA_NMAX = 200          # largest n routed to the megakernel. n=200 FP32 V =
 # path onto batched cuBLAS TF32 tensor-core GEMMs (full-GPU) and packs A as a FP16
 # triangle for 2-CTA co-residency -- the exact occupancy fix. Route the small-n
 # class through it too when set. Same per-matrix residual gate + cuSOLVER fallback.
-_MEGA_SMALL_VIA_MED = True
+# brief-114: small-n (n<=200) path selector:
+#   "full"  - original all-FP32-resident mega_eigh_k (in-kernel SIMT back-transform)
+#   "med"   - medium split path (TC batched back-transform + FP16-triangle kernel)
+#   "clust" - C-CTA cluster path (multi-CTA-per-matrix cooperative tridiag via GPC
+#             cl.sync + TC back-transform): C*b CTAs to fill the machine at low batch
+_MEGA_SMALL_PATH = "clust"
 _MEGA_NT = 256            # threads per CTA
 _MEGA_BISITERS = 45       # Sturm-bisection iterations (FP32 converged)
 _mega_mod = None          # lazily-compiled extension module (None until built)
@@ -1360,6 +1365,84 @@ def _lr_reduced_clust(Bk, C):
     # V holds Z; rscr the Householder panel; T the per-panel block-T -> torch WY.
     G = _mega_med_backtransform(V, rscr, T, kk, nb, npan)
     return L, G
+
+
+# brief-114: FULL-matrix multi-CTA cluster solve for the small-n class (n<=200).
+# The med split path (mega_eigh_med_split) fixed the back-transform occupancy but
+# left the kernel (tridiag+bisect+twisted) at 1 CTA/matrix -> 40 CTAs on 148 SMs
+# (ncu trial 2: Grid 40, Waves 0.14, Achieved Occupancy 25%, No-Eligible 74.7%,
+# barrier-stall-dominated). The C-CTA cluster kernel (mega_eigh_clust_split) is the
+# multi-CTA-per-matrix cooperative tridiag: C CTAs share one matrix's reduction via
+# GPC-local cl.sync, so 40 matrices -> C*40 CTAs (C=2 -> 80). Same tridiag+bisect+
+# twisted + block-T-persist contract as the med kernel -> reuse _mega_med_backtransform
+# for the tensor-core WY back-transform. Returns (Q,L) UNSORTED; gate/fallback is the
+# caller's (kept identical to _eigh_megakernel_med).
+_MEGA_CLUST_FULL_C = 2       # CTAs per matrix for the full-n cluster path (peer DSMEM
+                             # exchange in the kernel is specialized to C==2)
+_MEGA_CLUST_FULL_PB = 1      # panel width for the cluster tridiag (1 = per-column)
+
+
+def _mega_clust_full_solve(af, dev, b, n, C, pb):
+    """Run the C-CTA cluster kernel on FULL n x n matrices (stages 1-3 + block-T
+    persist), then form Q via the torch tensor-core WY back-transform. Grid is C*b
+    CTAs (C CTAs cooperate on each matrix's tridiag via cl.sync). Returns (Q, L)
+    UNSORTED, matching what the med kernel produces before the caller's sort."""
+    mod = _mega_get()
+    V = torch.empty(b, n, n, device=dev, dtype=torch.float32)
+    L = torch.empty(b, n, device=dev, dtype=torch.float32)
+    rscr = torch.empty(b, n, n, device=dev, dtype=torch.float32)
+    dscr = torch.empty(b, n, device=dev, dtype=torch.float32)
+    escr = torch.empty(b, n - 1, device=dev, dtype=torch.float32)
+    dpscr = torch.empty(b, n, n, device=dev, dtype=torch.float32)
+    dmscr = torch.empty(b, n, n, device=dev, dtype=torch.float32)
+    tauscr = torch.empty(b, n, device=dev, dtype=torch.float32)
+    vscr = torch.empty(b, n, device=dev, dtype=torch.float32)
+    pscr = torch.empty(b, C, n, device=dev, dtype=torch.float32)
+    bounds = _mega_clust_bounds(n, C, dev)
+    nb = _MEGA_MED_SPLIT_NB
+    T, npan = _mega_med_split_T(b, n, nb, dev)
+    # fastRed unavailable here (cluster kernel uses its own _clsum); nb=32.
+    mod.mega_eigh_clust_split(af, V, L, rscr, dscr, escr, dpscr, dmscr, tauscr,
+                              vscr, pscr, bounds, T, n, _MEGA_CLUST_NT,
+                              _MEGA_BISITERS, nb, C, pb)
+    Q = _mega_med_backtransform(V, rscr, T, n, nb, npan)
+    return Q, L
+
+
+def _eigh_megakernel_clust(a: torch.Tensor) -> output_t:
+    """Full-n multi-CTA cluster megakernel path (n<=200). C CTAs cooperate per
+    matrix. Same per-matrix residual gate + cuSOLVER fallback as _eigh_megakernel_med
+    (falls back wholesale if the extension is unavailable)."""
+    mod = _mega_get()
+    b, n, _ = a.shape
+    if mod is None or not hasattr(mod, "mega_eigh_clust_split"):
+        values, vectors = torch.linalg.eigh(a)
+        return vectors, values
+    af = a.float().contiguous()
+    dev = af.device
+    Qz, L = _mega_clust_full_solve(af, dev, b, n, _MEGA_CLUST_FULL_C,
+                                   _MEGA_CLUST_FULL_PB)
+    L, order = torch.sort(L, dim=-1)
+    Q = torch.gather(Qz, 2, order.unsqueeze(1).expand(b, n, n))
+    eye = torch.eye(n, device=dev, dtype=torch.float32)
+    eps = torch.finfo(torch.float32).eps
+    _gp = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = False
+    orth = torch.linalg.matrix_norm(Q.transpose(-1, -2) @ Q - eye, ord=1, dim=(-2, -1))
+    torch.backends.cuda.matmul.allow_tf32 = True
+    aq = af @ Q
+    torch.backends.cuda.matmul.allow_tf32 = _gp
+    eigr = torch.linalg.matrix_norm(aq - Q * L.unsqueeze(-2), ord=1, dim=(-2, -1))
+    a_l1 = torch.linalg.matrix_norm(af, ord=1, dim=(-2, -1)).clamp_min(1e-30)
+    bad = ((orth > 75.0 * n * eps)
+           | (eigr / a_l1 > 150.0 * n * eps))
+    bad = bad | ~torch.isfinite(L).all(dim=-1) | ~torch.isfinite(Q).all(dim=(-2, -1))
+    if bool(bad.any()):
+        idx = torch.nonzero(bad, as_tuple=False).flatten()
+        Lf, Qf = torch.linalg.eigh(af[idx])
+        Q[idx] = Qf
+        L[idx] = Lf
+    return Q.contiguous(), L.contiguous()
 
 
 def _mega_med_split_T(B, n, nb, dev):
@@ -5762,10 +5845,13 @@ def custom_kernel(data: input_t) -> output_t:
     # whole eigh resident in SMEM, one launch) -- 2.0x faster than cuSOLVER on
     # the small-n batched shapes, residual-gated for safety.
     if 32 < n <= _MEGA_NMAX:
-        # brief-114: route the small-n class through the medium split path (tensor-
-        # core back-transform + 2-CTA-co-resident FP16-triangle kernel) to fix the
-        # occupancy-bound in-kernel SIMT back-transform of the old full megakernel.
-        if _MEGA_SMALL_VIA_MED:
+        # brief-114: route the small-n class per _MEGA_SMALL_PATH. The old full
+        # megakernel's in-kernel SIMT back-transform is occupancy-bound at low batch;
+        # "med" moves it to tensor-core GEMMs, "clust" additionally splits the tridiag
+        # across C CTAs per matrix (C*b CTAs) to fill the 108 idle SMs at b=40.
+        if _MEGA_SMALL_PATH == "clust":
+            return _eigh_megakernel_clust(a)
+        if _MEGA_SMALL_PATH == "med":
             return _eigh_megakernel_med(a)
         return _eigh_megakernel(a)
     # MEDIUM-n fused megakernel (brief 3): packed FP16 lower-triangle A in SMEM
