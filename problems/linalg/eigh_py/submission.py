@@ -2527,7 +2527,7 @@ _LR_COMPL_COND_MARGIN = 1.0
 # brief-110: pass count for the COMPLEMENT 1st CQR call (compl_pass1). Parent used 2.
 # The 2nd call (compl_pass2) re-orthonormalizes after the reprojection, so the 1st
 # call may only need to SPAN the complement (1 pass) -- measured per shape.
-_LR_COMPL_PASS1_PASSES = 1
+_LR_COMPL_PASS1_PASSES = 2
 
 
 def _lr_cqr_diag_emit(label, ipass, L, Q, n_matrices_hi):
