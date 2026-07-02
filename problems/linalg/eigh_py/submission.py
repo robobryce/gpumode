@@ -62,6 +62,36 @@ _MEGA_CUDA = r'''
 #include <torch/extension.h>
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+// brief-83 LEVER B: warp-shuffle block reductions. The old red[] tree reduction
+// (for s=nt>>1;s>0;s>>=1){ ...; __syncthreads(); }) costs log2(nt) barriers per
+// reduction -- 9 barriers at nt=512, and the tridiag loop runs TWO such reductions
+// per column x ~298 columns => ~5300 barriers, the bulk of the 66.7%-barrier stall.
+// A warp-shuffle reduction needs ZERO barriers within a warp (5 shfl steps), then
+// ONE __syncthreads to combine the <=32 per-warp partials -- 9 barriers -> 1 per
+// reduction. `red` is a >=32-float scratch (the caller's red[] SMEM); op selects
+// sum(0)/min(1)/max(2). All threads call; returns the reduced value to every thread.
+__device__ __forceinline__ float _mega_warp_reduce(float v, int op){
+  #pragma unroll
+  for(int o=16;o>0;o>>=1){
+    float t=__shfl_down_sync(0xffffffffu, v, o);
+    v = (op==0)?(v+t):((op==1)?fminf(v,t):fmaxf(v,t));
+  }
+  return v;
+}
+__device__ __forceinline__ float _mega_block_reduce(float v, int op, float* red, int tid, int nt){
+  int lane=tid&31, wid=tid>>5;
+  v=_mega_warp_reduce(v,op);
+  if(lane==0) red[wid]=v;
+  __syncthreads();
+  int nw=(nt+31)>>5;
+  // warp 0 reduces the nw per-warp partials (nw<=32 for nt<=1024) then broadcasts
+  // through red[0]; a second __syncthreads makes red[0] visible to all threads.
+  float r = (tid<nw)?red[tid]:((op==0)?0.f:((op==1)? 1e30f : -1e30f));
+  if(wid==0) r=_mega_warp_reduce(r,op);
+  if(tid==0) red[0]=r;
+  __syncthreads();
+  return red[0];
+}
 extern "C" __global__ void mega_eigh_k(const float* __restrict__ Ain,
     float* __restrict__ Vout, float* __restrict__ Lout,
     float* __restrict__ rscr, float* __restrict__ dscr, float* __restrict__ escr,
@@ -441,9 +471,7 @@ extern "C" __global__ void mega_eigh_med_split_k(const float* __restrict__ Ain,
   #define ASET(i,j,val) Ah[_tri(i,j)+(j)] = __float2half(val)
   float amax=0.f;
   for(int idx=tid; idx<n*n; idx+=nt){ float x=fabsf(Am[idx]); amax=fmaxf(amax,x); }
-  red[tid]=amax; __syncthreads();
-  for(int s=nt>>1;s>0;s>>=1){ if(tid<s)red[tid]=fmaxf(red[tid],red[tid+s]); __syncthreads(); }
-  float scale=red[0]; if(scale<1e-30f) scale=1.f; __syncthreads();
+  float scale=_mega_block_reduce(amax,2,red,tid,nt); if(scale<1e-30f) scale=1.f;
   float invs=1.f/scale;
   for(long t=tid; t<(long)triN; t+=nt){
     int i=(int)((sqrtf(8.0f*(float)t+1.0f)-1.0f)*0.5f);
@@ -456,9 +484,7 @@ extern "C" __global__ void mega_eigh_med_split_k(const float* __restrict__ Ain,
   for(int c=0;c<n-2;++c){
     float s2=0.f;
     for(int i=c+1+tid;i<n;i+=nt){ float x=AGET(i,c); s2+=x*x; }
-    red[tid]=s2; __syncthreads();
-    for(int s=nt>>1;s>0;s>>=1){ if(tid<s)red[tid]+=red[tid+s]; __syncthreads(); }
-    float xnorm2=red[0];
+    float xnorm2=_mega_block_reduce(s2,0,red,tid,nt);
     float alpha=AGET(c+1,c); float tail2=xnorm2-alpha*alpha;
     if(tail2<=1e-20f){ if(tid==0){Em[c]=alpha;Tau[c]=0.f;} for(int i=tid;i<n;i+=nt) Rm[i*n+c]=(i==c+1)?1.f:0.f; __syncthreads(); continue; }
     float xnorm=sqrtf(xnorm2); float beta=(alpha>=0.f)?-xnorm:xnorm; float tau=(beta-alpha)/beta; float denom=alpha-beta;
@@ -470,9 +496,7 @@ extern "C" __global__ void mega_eigh_med_split_k(const float* __restrict__ Ain,
     for(int i=c+1+tid;i<n;i+=nt){ float acc=0.f; for(int j=c+1;j<n;++j) acc+=AGET(i,j)*v[j]; p[i]=tau*acc; }
     __syncthreads();
     float vp=0.f; for(int i=c+1+tid;i<n;i+=nt) vp+=v[i]*p[i];
-    red[tid]=vp; __syncthreads();
-    for(int s=nt>>1;s>0;s>>=1){ if(tid<s)red[tid]+=red[tid+s]; __syncthreads(); }
-    float K=0.5f*tau*red[0];
+    float K=0.5f*tau*_mega_block_reduce(vp,0,red,tid,nt);
     for(int i=c+1+tid;i<n;i+=nt) p[i]=p[i]-K*v[i];
     __syncthreads();
     for(int i=c+1+tid;i<n;i+=nt){ float vi=v[i],wi=p[i]; for(int j=c+1;j<=i;++j){ float a=AGET(i,j); ASET(i,j,a-vi*p[j]-wi*v[j]); } }
@@ -488,8 +512,8 @@ extern "C" __global__ void mega_eigh_med_split_k(const float* __restrict__ Ain,
   __syncthreads();
   float glo=1e30f, ghi=-1e30f;
   for(int i=tid;i<n;i+=nt){ float r=(i>0?fabsf(Em[i-1]):0.f)+(i<n-1?fabsf(Em[i]):0.f); glo=fminf(glo,Dm[i]-r); ghi=fmaxf(ghi,Dm[i]+r); }
-  red[tid]=glo; __syncthreads(); for(int s=nt>>1;s>0;s>>=1){ if(tid<s)red[tid]=fminf(red[tid],red[tid+s]); __syncthreads(); } glo=red[0]; __syncthreads();
-  red[tid]=ghi; __syncthreads(); for(int s=nt>>1;s>0;s>>=1){ if(tid<s)red[tid]=fmaxf(red[tid],red[tid+s]); __syncthreads(); } ghi=red[0]; __syncthreads();
+  glo=_mega_block_reduce(glo,1,red,tid,nt);
+  ghi=_mega_block_reduce(ghi,2,red,tid,nt);
   for(int ev=tid; ev<n; ev+=nt){
     float lo=glo, hi=ghi;
     for(int it=0;it<bisIters;++it){
@@ -1091,7 +1115,7 @@ _MEGA_MED_NMAX = 448
 # each CTA's barrier stall behind the other's compute. The prior 256/512/1024
 # sweep picked 1024 on n=352 b40 (a 40-CTA grid where occupancy is irrelevant);
 # shape 11's 1280-CTA grid is the regime where the occupancy win appears.
-_MEGA_MED_NT = 256
+_MEGA_MED_NT = 512
 
 # Compact-WY back-transform panel width for the SPLIT med path. The split
 # kernel builds one nb x nb block-T per panel; the torch-level back-transform
