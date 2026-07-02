@@ -463,6 +463,7 @@ extern "C" __global__ void mega_eigh_med_split_k(const float* __restrict__ Ain,
   // the outer eigr margin + cuSOLVER fallback.
   int fr = fastRed & 1;
   int f16upd = (fastRed >> 1) & 1;
+  int f16symv = (fastRed >> 2) & 1;   // bit2: half2 symv (contiguous j<=i part)
   extern __shared__ char shc[];
   __half* Ah=(__half*)shc;
   size_t triN=((size_t)n*(n+1))>>1;
@@ -518,7 +519,33 @@ extern "C" __global__ void mega_eigh_med_split_k(const float* __restrict__ Ain,
     for(int i=tid;i<n;i+=nt) v[i]=(i<=c)?0.f:((i==c+1)?1.f:AGET(i,c)/denom);
     __syncthreads();
     for(int i=tid;i<n;i+=nt) Rm[i*n+c]=v[i];
-    for(int i=c+1+tid;i<n;i+=nt){ float acc=0.f; for(int j=c+1;j<n;++j) acc+=AGET(i,j)*v[j]; p[i]=tau*acc; }
+    // brief-108: for the half2 symv, snapshot v into the FP16 shadow vh here (before
+    // the symv reads it). Filled by ALL threads over [c+1,n); the __syncthreads above
+    // already made v block-visible, and vh is written+read within this loop's own
+    // stride pattern per row i (each thread reads vh[j] for all j, so needs a barrier
+    // after the fill). One barrier/column when f16symv -- amortized by the O(n^2) symv.
+    if(f16symv){ for(int i=c+1+tid;i<n;i+=nt) vh[i]=__float2half(v[i]); __syncthreads(); }
+    if(f16symv){
+      // symv p = tau * A[c+1:,c+1:] @ v. The packed store gives row i entries j<=i
+      // contiguous (half2), while j>i reads the transpose Ah[_tri(j,i)+i] (strided ->
+      // scalar). Do the contiguous j in half2 (fp16 mul, FP32 accumulate via half2->
+      // float2), the transpose tail scalar. FP32 accumulate keeps the dot-product
+      // precision; only the A*v products drop to fp16. Gate + fallback backstop.
+      for(int i=c+1+tid;i<n;i+=nt){
+        long bi=_tri(i,0); __half* row=&Ah[bi];
+        float acc=0.f; int j=c+1;
+        for(; j+1<=i; j+=2){
+          __half2 A2=__halves2half2(row[j],row[j+1]);
+          __half2 V2=__halves2half2(vh[j],vh[j+1]);
+          __half2 pr=__hmul2(A2,V2); float2 f=__half22float2(pr); acc+=f.x+f.y;
+        }
+        for(; j<=i; ++j) acc+=__half2float(row[j])*v[j];
+        for(; j<n; ++j) acc+=AGET(i,j)*v[j];   // transpose tail (j>i): strided, scalar
+        p[i]=tau*acc;
+      }
+    } else {
+      for(int i=c+1+tid;i<n;i+=nt){ float acc=0.f; for(int j=c+1;j<n;++j) acc+=AGET(i,j)*v[j]; p[i]=tau*acc; }
+    }
     // brief-83 t13: NO barrier here. The vp dot-product reads only each thread's OWN
     // p[i] (same stride it just wrote) and the shared v (already synced by the v-fill
     // barrier), so p need not be block-visible yet. The vp reduction's own leading
@@ -678,13 +705,13 @@ void mega_eigh_med_split(torch::Tensor A, torch::Tensor Vout, torch::Tensor Lout
   int B=A.size(0);
   size_t triN=((size_t)n*(n+1))>>1;
   size_t shm=triN*sizeof(__half); shm=(shm+3u)&~3u; shm+=(size_t)2*n*sizeof(float);
-  // brief-108: reserve the FP16 shadows vh,ph (2*n halves) that follow p ONLY when
-  // f16upd (bit1) is requested -- otherwise the FP32 path never touches them, and
-  // reserving the bytes unconditionally can push a large-n block (n=352) over the
-  // 228KB opt-in cap and drop it from 2->1 CTA/SM (t2 regression). The kernel only
-  // dereferences vh/ph inside the `if(f16upd)` branch, so the pointers being past
-  // the reserved region in the FP32 path is harmless.
-  if((fastRed>>1)&1) shm += (size_t)2*n*sizeof(__half);
+  // brief-108: reserve the FP16 shadows vh,ph (2*n halves) that follow p ONLY when a
+  // half2 path (bit1 f16upd rank-2 update, or bit2 f16symv) is requested -- otherwise
+  // the FP32 path never touches them, and reserving the bytes unconditionally can push
+  // a large-n block (n=352) over the 228KB opt-in cap and drop it 2->1 CTA/SM. The
+  // kernel only dereferences vh/ph inside the `if(f16upd)`/`if(f16symv)` branches, so
+  // the pointers being past the reserved region in the pure-FP32 path is harmless.
+  if((fastRed>>1)&3) shm += (size_t)2*n*sizeof(__half);
   // the block-T build reuses shc for Yp(n*nb)+Gp(nb*nb)+Tp(nb*nb); ensure the
   // dynamic SMEM is at least that large (it usually is -- packed-A dominates --
   // but a large nb at small n can exceed it).
@@ -2704,7 +2731,7 @@ def _lr_bare_scratch(B, k, dev):
     return buf
 
 
-def _lr_reduced_mega(Bk, bt_prec=None, fast_reduce=True, f16upd=False):
+def _lr_reduced_mega(Bk, bt_prec=None, fast_reduce=True, f16upd=False, f16symv=False):
     """RAW megakernel eigh of Bk (B x k x k) for k in the SMEM-fit range
     (32,448]. No wrapper gate, no scratch re-alloc, no sort. Returns (lam, G).
 
@@ -2751,7 +2778,7 @@ def _lr_reduced_mega(Bk, bt_prec=None, fast_reduce=True, f16upd=False):
     # bit1=f16upd (half2 trailing rank-2 update). Routed independently so the
     # sign-DC reduced block can take the FP16 panel update without changing the
     # reduction precision (its eigr gate is razor-close to the tree reduction).
-    flag = (1 if fast_reduce else 0) | (2 if f16upd else 0)
+    flag = (1 if fast_reduce else 0) | (2 if f16upd else 0) | (4 if f16symv else 0)
     mod.mega_eigh_med_split(Bkc, V, L, rscr, dscr, escr, dpscr, dmscr, tauscr,
                             T, kk, _MEGA_MED_NT, _MEGA_BISITERS, nb, flag)
     # V holds Z; rscr the Householder panel; back-transform on tensor cores.
@@ -2759,7 +2786,7 @@ def _lr_reduced_mega(Bk, bt_prec=None, fast_reduce=True, f16upd=False):
     return L, G
 
 
-def _lr_reduced_eigh(Bk, bt_prec=None, fast_reduce=True, f16upd=False):
+def _lr_reduced_eigh(Bk, bt_prec=None, fast_reduce=True, f16upd=False, f16symv=False):
     """Eigendecomposition of the reduced symmetric block Bk (B x k x k). Returns
     (lam, G) in the torch.linalg.eigh convention (Bk @ G[:,:,i] = lam[:,i] *
     G[:,:,i]); ordering is whatever the path produced (the OUTER low-rank path
@@ -2776,7 +2803,7 @@ def _lr_reduced_eigh(Bk, bt_prec=None, fast_reduce=True, f16upd=False):
     kk = Bk.shape[-1]
     if mod is not None and 32 < kk <= _MEGA_MED_NMAX:
         return _lr_reduced_mega(Bk, bt_prec=bt_prec, fast_reduce=fast_reduce,
-                                f16upd=f16upd)
+                                f16upd=f16upd, f16symv=f16symv)
     # k in (448, 836] (dense1024 k=608 shape-4 -> C=2; nearrank1024 k=768 shape-10
     # -> C=3): C-CTA thread-block CLUSTER solve -- the packed-FP16 k-triangle is
     # row-distributed across C CTAs' DSMEM so it fits (k=608 370KB/2=185KB/CTA;
@@ -3751,7 +3778,13 @@ _SIGN_DC_INSOLVER_EIGR = True
 # Newton-Schulz + the per-matrix eigr/orth gate + cuSOLVER fallback backstop any
 # drift. Toggled here so it routes ONLY the sign-DC path (the low-rank inner
 # solves 2/12 keep the FP32 update via their own callers passing f16upd=False).
-_SIGN_DC_F16UPD = True
+_SIGN_DC_F16UPD = False
+# brief-108: fp16/half2 symv (p = tau*A@v) in the reduced-block tridiagonalization.
+# The contiguous j<=i packed row is done in half2 (fp16 A*v products, FP32
+# accumulate); the transpose tail j>i stays scalar. This is the OTHER O(n^2)/column
+# hot-loop op alongside the rank-2 update. Tested in isolation (F16UPD off) to
+# measure whether the symv ALU reduction moves the barrier-bound wall.
+_SIGN_DC_F16SYMV = True
 _SIGN_DC_CQR_PASSES = 2   # subspace-basis CholeskyQR passes. REQUIRED at 2: the
                           # projected bases P+/- @ Omega are rank-deficient (the K
                           # oversample exceeds the true subspace rank), and 1 shifted
@@ -5070,7 +5103,8 @@ def _sign_dc_solve(af, n, dev):
         # pairing _mega_block_reduce helper, NOT fast-reduce itself.) shape11
         # 84995->83930, geomean 27862->27824, still 39/39, 0 fallback.
         lstk, gstk = _lr_reduced_eigh(Bstk, bt_prec=_SIGN_DC_BT_PREC,
-                                      fast_reduce=True, f16upd=_SIGN_DC_F16UPD)
+                                      fast_reduce=True, f16upd=_SIGN_DC_F16UPD,
+                                      f16symv=_SIGN_DC_F16SYMV)
       except Exception:
         lstk, gstk = torch.linalg.eigh(Bstk)
     with _sdc_timer("6_member_topk"):
