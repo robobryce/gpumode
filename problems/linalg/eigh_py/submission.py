@@ -3446,7 +3446,7 @@ _SIGN_DC_NS_ITERS = 18    # Newton-Schulz sign iterations (each = 2 batched GEMM
 #             |p|>1 mid-range overshoot that later iters contract) -- fastest but the
 #             membership tolerates it (residual gate is the safety net).
 _SIGN_DC_NS_DEGREE = 5    # 3 (baseline) or 5 (higher-order)
-_SIGN_DC_NS5_ITERS = 12   # degree-5 iteration count (each = 3 batched GEMMs)
+_SIGN_DC_NS5_ITERS = 14   # degree-5 iteration count (each = 3 batched GEMMs)
 _SIGN_DC_NS5_COEF = "pade"
 _SIGN_DC_POWER_ITERS = 4  # A^2 power iterations for the spectral-norm scale estimate.
                           # The scale only needs to be a loose UPPER bound on ||A||_2
