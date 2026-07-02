@@ -853,18 +853,35 @@ extern "C" __global__ void mega_eigh_clust_split_k(
     int iu=(r0>c+1)?r0:(c+1);
     // brief-95 open#1: the rank-2 trailing update A[i][j]-=v[i]p[j]+w[i]v[j] over
     // j in [c+1,i] has work (i-c) GROWING with row i -- the triangular load imbalance
-    // that leaves early-row threads idle at the cl.sync (ncu: 61-72% barrier stall,
-    // "diverging code paths before a barrier"). Plain cyclic (i=iu+tid+m*nt) makes
-    // thread nt-1 do ~2.4x thread 0. BOUSTROPHEDON striding balances it: even blocks
-    // go forward (row=iu+m*nt+tid), odd blocks reversed (row=iu+m*nt+(nt-1-tid)), so
-    // over each block-pair the tid-dependent work cancels and all threads reach the
-    // barrier together -- WITHOUT changing the sync count.
+    // that leaves early-row threads idle at the cl.sync. ENTRY-PARTITION: flatten the
+    // triangular region into T entries and give thread tid the CONTIGUOUS run
+    // [tid*T/nt, (tid+1)*T/nt) -- provably uniform per-thread work (each does T/nt
+    // entries) AND contiguous walk => better SMEM locality (cuts the 60% shared-store
+    // wavefront excess ncu flagged). Row a=i-iu has cnt=d0+a entries (d0=iu-c>=1);
+    // base(a)=a*d0+a(a-1)/2; invert via one sqrt per thread to find the start row.
     if(active){
-      int nrows=r1-iu;
-      for(int base=0, m=0; base<nrows; base+=nt, ++m){
-        int off = (m&1) ? (nt-1-tid) : tid;
-        int i = iu + base + off;
-        if(off<nt && i<r1){ float vi=v[i],wi=p[i]; for(int j=c+1;j<=i;++j){ float a=AOWN(i,j); AOWNSET(i,j, a-vi*p[j]-wi*v[j]); } }
+      int nrows=r1-iu; int d0=iu-c;
+      long T=(long)nrows*d0 + (long)nrows*(nrows-1)/2;
+      long e0=(T*tid)/nt, e1=(T*(tid+1))/nt;
+      if(e1>e0){
+        // start row a from e0: a = floor( -(d0-0.5) + sqrt((d0-0.5)^2 + 2 e0) )
+        double db=(double)d0-0.5;
+        int a=(int)(floor(-db + sqrt(db*db + 2.0*(double)e0)));
+        if(a<0) a=0; if(a>=nrows) a=nrows-1;
+        long ba=(long)a*d0 + (long)a*(a-1)/2;
+        while(ba > e0){ --a; ba=(long)a*d0 + (long)a*(a-1)/2; }
+        while(a+1<nrows){ long bn=(long)(a+1)*d0 + (long)(a+1)*a/2; if(bn<=e0){ a=a+1; ba=bn; } else break; }
+        long e=e0;
+        int jj=(int)(e - ba);                 // entry offset within row a
+        while(e<e1 && a<nrows){
+          int i=iu+a; int cnt=d0+a;
+          float vi=v[i], wi=p[i];
+          int jstart=(c+1)+jj;
+          int jend=i; long room=e1-e; if((long)(jend-jstart+1)>room) jend=jstart+(int)room-1;
+          for(int j=jstart;j<=jend;++j){ float aij=AOWN(i,j); AOWNSET(i,j, aij-vi*p[j]-wi*v[j]); }
+          e += (jend-jstart+1);
+          if(jend==i){ ++a; jj=0; } else { jj += (jend-jstart+1); }
+        }
       }
     }
     if(tid==0 && lead){ Em[c]=beta; Tau[c]=tau; }
