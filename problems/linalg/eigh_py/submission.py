@@ -3470,12 +3470,18 @@ _SIGN_DC_POWER_ITERS = 4  # A^2 power iterations for the spectral-norm scale est
                           # ~3 iters on the even/gapless spectrum. 4 keeps one iter of
                           # reseed margin while dropping ~11 iters (~22 batched matvecs).
 _SIGN_DC_FINAL_NS = 1     # finishing FP32 NS orthonormalization steps on Q
+# brief-87: precision of the finishing-NS Gram + Q@Gram. The stage timer put this
+# finishing step at ~5.27ms/step (3xTF32 = 5 n*n bmm). "tf32x3" (default, ~6e-6,
+# 5 bmm) vs "tf32" (1-pass TF32, 2 bmm, ~2x cheaper) -- Q is already near-orthonormal
+# from the sign-DC so a plain-TF32 NS refinement may hold the orth gate at half the
+# cost. Gated: any matrix a cheaper finish leaves above the orth bound falls back.
+_SIGN_DC_FINISH_PREC = "tf32"
 # brief-87: trailing CQR passes done as cheap Newton-Schulz refinements (2 GEMMs)
 # instead of Cholesky+trsm. The stacked (2b,n,K=300) trsm is the single biggest
 # sub-cost of the pipeline (nsys batch_trsm ~9.5ms across the 2 passes). ns_refine=1
 # keeps pass-1 as shifted Cholesky (contracts the rank-deficient bases from any
 # conditioning) and does pass-2 as an NS orthonormalization step at GEMM speed.
-_SIGN_DC_CQR_NS_REFINE = 1
+_SIGN_DC_CQR_NS_REFINE = 0
 _SIGN_DC_CQR_PASSES = 2   # subspace-basis CholeskyQR passes. REQUIRED at 2: the
                           # projected bases P+/- @ Omega are rank-deficient (the K
                           # oversample exceeds the true subspace rank), and 1 shifted
@@ -3853,11 +3859,18 @@ def _sign_dc_solve(af, n, dev):
             _p2 = torch.backends.cuda.matmul.allow_tf32
             torch.backends.cuda.matmul.allow_tf32 = True
             for _ in range(_SIGN_DC_FINAL_NS):
-                # brief-46: the finishing-NS Gram g = Q^T Q is symmetric, so the
-                # symmetric-aware 3xTF32 form (2 bmms, identical ~6e-6 accuracy) does
-                # this n*n Gram at one fewer tensor-core bmm than the 3-bmm variant.
-                g = _gram_3xtf32_sym(Q)
-                Q = 1.5 * Q - 0.5 * _matmul_3xtf32(Q, g)
+                if _SIGN_DC_FINISH_PREC == "tf32":
+                    # 1-pass TF32 finishing NS (2 n*n bmm): Q already near-orthonormal
+                    # from the sign-DC, so plain-TF32's ~3e-4/op refinement stays under
+                    # the 4.578e-3 orth gate at ~2x less cost than the 3xTF32 form.
+                    g = torch.bmm(Q.transpose(-1, -2), Q)
+                    Q = torch.baddbmm(Q, Q, g, beta=1.5, alpha=-0.5)
+                else:
+                    # brief-46: the finishing-NS Gram g = Q^T Q is symmetric, so the
+                    # symmetric-aware 3xTF32 form (2 bmms, identical ~6e-6 accuracy) does
+                    # this n*n Gram at one fewer tensor-core bmm than the 3-bmm variant.
+                    g = _gram_3xtf32_sym(Q)
+                    Q = 1.5 * Q - 0.5 * _matmul_3xtf32(Q, g)
             torch.backends.cuda.matmul.allow_tf32 = _p2
     # Rayleigh-quotient re-eval of L on the orthonormalized Q (eigenvalues are the
     # diagonal of Q^T A Q; feeds the gate + output). A@Q on TF32 (gate-precision).
