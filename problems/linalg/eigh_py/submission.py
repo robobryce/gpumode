@@ -453,13 +453,28 @@ extern "C" __global__ void mega_eigh_med_split_k(const float* __restrict__ Ain,
     float* __restrict__ Tout,
     int B, int n, int bisIters, int nb, int fastRed){
   int m=blockIdx.x; if(m>=B) return; int tid=threadIdx.x, nt=blockDim.x;
+  // brief-108: `fastRed` is bit-packed. bit0 = warp-shuffle fast SUM reduction
+  // (the pre-existing meaning); bit1 = do the trailing symmetric rank-2 update in
+  // FP16/half2 arithmetic (fp16 inputs, the O(n^2)/col GEMM-shaped panel update
+  // that dominates the ALU-bound reduction between the __syncthreads barriers).
+  // The per-column tree reductions (s2, vp) stay FP32 regardless -- they carry
+  // the reduced-block eigr accuracy (a sibling proved lower precision there trips
+  // the ~3.6e-3 gate). Callers OR the bits: sign-DC/shape11 route bit1 gated on
+  // the outer eigr margin + cuSOLVER fallback.
+  int fr = fastRed & 1;
+  int f16upd = (fastRed >> 1) & 1;
   extern __shared__ char shc[];
   __half* Ah=(__half*)shc;
   size_t triN=((size_t)n*(n+1))>>1;
   float* v=(float*)(Ah + triN);
   size_t voff=((size_t)(Ah+triN) - (size_t)shc); voff=(voff+3u)&~3u; v=(float*)(shc+voff);
   float* p=v+n;
-  __shared__ float red[1024];
+  // brief-108: FP16 shadows of v and p (packed __half), used ONLY when f16upd so
+  // the half2 rank-2 update reads them 2-at-a-time. Placed after p; sized 2*n
+  // halves == n floats. Free inside the reduction-phase SMEM budget (the block-T
+  // rebuild reuses shc from the base, well below the packed-A region).
+  __half* vh=(__half*)(p+n);
+  __half* ph=vh+n;
   float* Rm=rscr+(long)m*n*n; float* Dm=dscr+(long)m*n; float* Em=escr+(long)m*(n-1);
   float* DP=dpscr+(long)m*n*n; float* DM=dmscr+(long)m*n*n;
   float* Tau=tauscr+(long)m*n;
@@ -485,7 +500,7 @@ extern "C" __global__ void mega_eigh_med_split_k(const float* __restrict__ Ain,
     float s2=0.f;
     for(int i=c+1+tid;i<n;i+=nt){ float x=AGET(i,c); s2+=x*x; }
     float xnorm2;
-    if(fastRed){ xnorm2=_mega_fast_sum(s2,red,tid,nt); }
+    if(fr){ xnorm2=_mega_fast_sum(s2,red,tid,nt); }
     else { red[tid]=s2; __syncthreads();
       for(int s=nt>>1;s>0;s>>=1){ if(tid<s)red[tid]+=red[tid+s]; __syncthreads(); }
       xnorm2=red[0]; }
@@ -511,14 +526,48 @@ extern "C" __global__ void mega_eigh_med_split_k(const float* __restrict__ Ain,
     // __syncthreads/column (~298). Pure ordering -- byte-identical, gate-safe.
     float vp=0.f; for(int i=c+1+tid;i<n;i+=nt) vp+=v[i]*p[i];
     float vpr;
-    if(fastRed){ vpr=_mega_fast_sum(vp,red,tid,nt); }
+    if(fr){ vpr=_mega_fast_sum(vp,red,tid,nt); }
     else { red[tid]=vp; __syncthreads();
       for(int s=nt>>1;s>0;s>>=1){ if(tid<s)red[tid]+=red[tid+s]; __syncthreads(); }
       vpr=red[0]; }
     float K=0.5f*tau*vpr;
     for(int i=c+1+tid;i<n;i+=nt) p[i]=p[i]-K*v[i];
-    __syncthreads();
-    for(int i=c+1+tid;i<n;i+=nt){ float vi=v[i],wi=p[i]; for(int j=c+1;j<=i;++j){ float a=AGET(i,j); ASET(i,j,a-vi*p[j]-wi*v[j]); } }
+    // brief-108: trailing symmetric rank-2 update A[i][j] -= v[i]p[j]+p[i]v[j]
+    // (j<=i, contiguous row-i packed storage). This is the O(n^2)/column
+    // GEMM-shaped panel update that dominates the ALU-bound reduction (ncu: 56.8%
+    // barrier stall but ALU the top pipe at 46.8% SM). f16upd does it in half2:
+    // read 2 packed A halves + broadcast v[i]/p[i] as half2, form
+    // A2 - vi2*P2 - wi2*V2 in FP16 arithmetic (2 FMAs/instr, half the ALU ops and
+    // no per-element half<->float conversion). vh/ph are the FP16 shadows of the
+    // FINAL v,p (p already has -K*v applied). Tail j (odd count / j==i) done
+    // scalar. FP32 accumulate is not needed here (each output is a - two products,
+    // not a long dot-product) so pure FP16 is the max ALU cut; the sign-DC eigr
+    // gate + cuSOLVER fallback backstops any drift. The FP32 path is byte-identical
+    // to the parent.
+    if(f16upd){
+      __syncthreads();
+      for(int i=tid;i<n;i+=nt){ vh[i]=__float2half(v[i]); ph[i]=__float2half(p[i]); }
+      __syncthreads();
+      for(int i=c+1+tid;i<n;i+=nt){
+        __half vi=vh[i], wi=ph[i];
+        __half2 vi2=__half2half2(vi), wi2=__half2half2(wi);
+        __half* row=&Ah[_tri(i,0)];           // row i base; entry j at row[j]
+        int j=c+1;
+        // align the vectorized run to an even j so half2 loads are 2-aligned
+        if(j & 1){ float a=__half2float(row[j]); row[j]=__float2half(a - v[i]*p[j] - p[i]*v[j]); ++j; }
+        for(; j+1<=i; j+=2){
+          __half2 A2 = *(__half2*)&row[j];
+          __half2 P2 = __halves2half2(ph[j], ph[j+1]);
+          __half2 V2 = __halves2half2(vh[j], vh[j+1]);
+          A2 = __hsub2(__hsub2(A2, __hmul2(vi2, P2)), __hmul2(wi2, V2));
+          *(__half2*)&row[j] = A2;
+        }
+        for(; j<=i; ++j){ float a=__half2float(row[j]); row[j]=__float2half(a - v[i]*p[j] - p[i]*v[j]); }
+      }
+    } else {
+      __syncthreads();
+      for(int i=c+1+tid;i<n;i+=nt){ float vi=v[i],wi=p[i]; for(int j=c+1;j<=i;++j){ float a=AGET(i,j); ASET(i,j,a-vi*p[j]-wi*v[j]); } }
+    }
     if(tid==0){Em[c]=beta;Tau[c]=tau;}
     __syncthreads();
   }
@@ -624,6 +673,10 @@ void mega_eigh_med_split(torch::Tensor A, torch::Tensor Vout, torch::Tensor Lout
   int B=A.size(0);
   size_t triN=((size_t)n*(n+1))>>1;
   size_t shm=triN*sizeof(__half); shm=(shm+3u)&~3u; shm+=(size_t)2*n*sizeof(float);
+  // brief-108: reserve the FP16 shadows vh,ph (2*n halves) that follow p, used by
+  // the half2 rank-2 update (f16upd). Always reserved so the pointer arithmetic is
+  // valid; the block-T rebuild region (Yp+Gp+Tp) sits below this and is unaffected.
+  shm += (size_t)2*n*sizeof(__half);
   // the block-T build reuses shc for Yp(n*nb)+Gp(nb*nb)+Tp(nb*nb); ensure the
   // dynamic SMEM is at least that large (it usually is -- packed-A dominates --
   // but a large nb at small n can exceed it).
@@ -2643,7 +2696,7 @@ def _lr_bare_scratch(B, k, dev):
     return buf
 
 
-def _lr_reduced_mega(Bk, bt_prec=None, fast_reduce=True):
+def _lr_reduced_mega(Bk, bt_prec=None, fast_reduce=True, f16upd=False):
     """RAW megakernel eigh of Bk (B x k x k) for k in the SMEM-fit range
     (32,448]. No wrapper gate, no scratch re-alloc, no sort. Returns (lam, G).
 
@@ -2686,15 +2739,19 @@ def _lr_reduced_mega(Bk, bt_prec=None, fast_reduce=True):
         return L, V
     nb = _MEGA_MED_SPLIT_NB
     T, npan = _mega_med_split_T(B, kk, nb, Bk.device)
+    # brief-108: bit-pack the kernel flag. bit0=fast_reduce (warp-shuffle SUM),
+    # bit1=f16upd (half2 trailing rank-2 update). Routed independently so the
+    # sign-DC reduced block can take the FP16 panel update without changing the
+    # reduction precision (its eigr gate is razor-close to the tree reduction).
+    flag = (1 if fast_reduce else 0) | (2 if f16upd else 0)
     mod.mega_eigh_med_split(Bkc, V, L, rscr, dscr, escr, dpscr, dmscr, tauscr,
-                            T, kk, _MEGA_MED_NT, _MEGA_BISITERS, nb,
-                            1 if fast_reduce else 0)
+                            T, kk, _MEGA_MED_NT, _MEGA_BISITERS, nb, flag)
     # V holds Z; rscr the Householder panel; back-transform on tensor cores.
     G = _mega_med_backtransform(V, rscr, T, kk, nb, npan, prec=bt_prec)
     return L, G
 
 
-def _lr_reduced_eigh(Bk, bt_prec=None, fast_reduce=True):
+def _lr_reduced_eigh(Bk, bt_prec=None, fast_reduce=True, f16upd=False):
     """Eigendecomposition of the reduced symmetric block Bk (B x k x k). Returns
     (lam, G) in the torch.linalg.eigh convention (Bk @ G[:,:,i] = lam[:,i] *
     G[:,:,i]); ordering is whatever the path produced (the OUTER low-rank path
@@ -2710,7 +2767,8 @@ def _lr_reduced_eigh(Bk, bt_prec=None, fast_reduce=True):
     mod = _mega_get()
     kk = Bk.shape[-1]
     if mod is not None and 32 < kk <= _MEGA_MED_NMAX:
-        return _lr_reduced_mega(Bk, bt_prec=bt_prec, fast_reduce=fast_reduce)
+        return _lr_reduced_mega(Bk, bt_prec=bt_prec, fast_reduce=fast_reduce,
+                                f16upd=f16upd)
     # k in (448, 836] (dense1024 k=608 shape-4 -> C=2; nearrank1024 k=768 shape-10
     # -> C=3): C-CTA thread-block CLUSTER solve -- the packed-FP16 k-triangle is
     # row-distributed across C CTAs' DSMEM so it fits (k=608 370KB/2=185KB/CTA;
@@ -3676,6 +3734,16 @@ _SIGN_DC_SKIP_BSYM = True
 # output. The orth gate (Gram Q^T Q) is likewise permutation-invariant but the caller
 # needs the final sorted Q anyway, so orth stays caller-side on the sorted Q.
 _SIGN_DC_INSOLVER_EIGR = True
+# brief-108: route the trailing symmetric rank-2 update of the reduced-block
+# tridiagonalization (mega_eigh_med_split_k) through FP16/half2 arithmetic for the
+# sign-DC reduced blocks (shape 11 & the n=512 sign-DC family). This is the
+# O(n^2)/column GEMM-shaped panel update that dominates the ALU-bound reduction
+# (ncu: 56.8% barrier stall, ALU top pipe 46.8% SM). The reflector-norm / rank-2
+# tree reductions stay FP32 (they carry the eigr accuracy). The finishing 3xTF32
+# Newton-Schulz + the per-matrix eigr/orth gate + cuSOLVER fallback backstop any
+# drift. Toggled here so it routes ONLY the sign-DC path (the low-rank inner
+# solves 2/12 keep the FP32 update via their own callers passing f16upd=False).
+_SIGN_DC_F16UPD = True
 _SIGN_DC_CQR_PASSES = 2   # subspace-basis CholeskyQR passes. REQUIRED at 2: the
                           # projected bases P+/- @ Omega are rank-deficient (the K
                           # oversample exceeds the true subspace rank), and 1 shifted
@@ -4994,7 +5062,7 @@ def _sign_dc_solve(af, n, dev):
         # pairing _mega_block_reduce helper, NOT fast-reduce itself.) shape11
         # 84995->83930, geomean 27862->27824, still 39/39, 0 fallback.
         lstk, gstk = _lr_reduced_eigh(Bstk, bt_prec=_SIGN_DC_BT_PREC,
-                                      fast_reduce=True)
+                                      fast_reduce=True, f16upd=_SIGN_DC_F16UPD)
       except Exception:
         lstk, gstk = torch.linalg.eigh(Bstk)
     with _sdc_timer("6_member_topk"):
