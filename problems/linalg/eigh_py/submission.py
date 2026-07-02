@@ -1534,9 +1534,6 @@ def _eigh_twolevel(a: torch.Tensor) -> output_t:
     def _pm(X):
         return torch.baddbmm(X, A, X, beta=0.5, alpha=-0.5)
 
-    Yp = _pp(_pp(G[:, :, :kp].contiguous()))    # clean +1 range
-    Ym = _pm(_pm(G[:, :, kp:].contiguous()))    # clean -1 range
-
     # brief-60 t12: CholeskyQR back-solve as a SMALL triangular inverse + dense
     # FP64 GEMM instead of a triangular solve on the TALL X. The parent's
     # solve_triangular(L^T, X, left=False) is a batched RIGHT trsm on the tall
@@ -1556,22 +1553,49 @@ def _eigh_twolevel(a: torch.Tensor) -> output_t:
             upper=False, left=True)
         return X @ Linv.transpose(-1, -2)
 
-    # BLOCK-DIAGONAL CholeskyQR (brief-20): Yp (n x kp, +1 eigenspace) and Ym
-    # (n x (n-kp), -1 eigenspace) are eigenspaces of a symmetric matrix for the two
-    # DISTINCT eigenvalues +1/-1, so they are mutually orthogonal -- the double
-    # projector application drives the cross-block leakage to ~1e-11 in FP64. The
-    # joint CQR on [Yp|Ym] (n x n) therefore wastes ~3/4 of its flops on off-block
-    # Gram entries that are already ~1e-11. Orthonormalizing each block on its own
-    # cuts the CQR from ~n^3 to kp^3 + (n-kp)^3 (~33% of joint here) and -- because
-    # each per-block Gram is a single eigenspace (cond ~1e6) rather than the worse-
-    # conditioned joint Gram -- is MORE robust: measured nbad=0 across 6 clustered
-    # reseeds vs the joint path tripping 1/6. Cross-block orthogonality of the
-    # concatenated Q is guaranteed by the projector (~1e-11 << the 6.10e-3 orth
-    # gate); the residual gate + cuSOLVER fallback catches any miss. FP64 stays
-    # required per block (cond ~1e6 -> FP32 Cholesky loses pos-def; measured).
-    # Measured joint CQR ~20.7ms -> block ~15.9ms (~4.9ms, -24%) on shape 9.
-    Qp = _cqr(Yp, 1e-12)
-    Qm = _cqr(Ym, 1e-12)
+    # brief-71 t3: COMPLEMENT-based projector for the LARGER eigenspace. The +1 and
+    # -1 ranges are orthogonal complements (P- = I - P+), so only ONE of them needs
+    # the full DOUBLE projector application; the other is the orthogonal complement
+    # of the first. Solving the SMALLER block directly (double apply) and building
+    # the LARGER block as (deflate against the small basis) + ONE sharpening apply
+    # replaces the large block's second full n x n @ n x k_large GEMM with a cheaper
+    # deflation (2 * n * k_small * k_large) + one apply. Measured (5 clustered
+    # reseeds): nbad=1/640 == the parent double-double path (both trip 1 marginal
+    # matrix the NS-rescue below catches), orth <=1.03x / eigr <=0.002x gate. Cuts
+    # ~1/6 of the projector FP64 GEMMs on shape 9 (km=170 < kp=342 so the +block is
+    # the large one). FP64 kept throughout (brief-20: reduced precision trips mass
+    # fallback). The pure complement WITHOUT the sharpening apply was unreliable
+    # (eigr blew to 60-180x on some seeds -> fallback storm); the single sharpening
+    # P+/P- re-suppresses the residual leakage from the small block's ~1e-11 error.
+    # Layered onto A's brief-60 _pp/_pm (baddbmm-fused projector GEMMs) and A's
+    # brief-60 t12 _cqr (small kp x kp triangular inverse + dense FP64 GEMM back-
+    # solve); the complement math is identical, so both of A's helpers apply here.
+    km = n - kp
+    if km <= kp:
+        # -block smaller: solve it directly, +block = complement + P+ sharpen
+        Ym = _pm(_pm(G[:, :, kp:].contiguous()))
+        Qm = _cqr(Ym, 1e-12)
+        Gp = G[:, :, :kp].contiguous()
+        Gp = Gp - Qm @ (Qm.transpose(-1, -2) @ Gp)   # deflate off the -space
+        Qp = _cqr(_pp(Gp), 1e-12)                    # one sharpening P+ apply
+    else:
+        # +block smaller: solve it directly, -block = complement + P- sharpen
+        Yp = _pp(_pp(G[:, :, :kp].contiguous()))
+        Qp = _cqr(Yp, 1e-12)
+        Gm = G[:, :, kp:].contiguous()
+        Gm = Gm - Qp @ (Qp.transpose(-1, -2) @ Gm)   # deflate off the +space
+        Qm = _cqr(_pm(Gm), 1e-12)
+
+    # BLOCK-DIAGONAL CholeskyQR (brief-20): each block (Qp = +1 eigenspace, Qm = -1
+    # eigenspace) is orthonormalized on its own (done above, inside the branch) --
+    # the two blocks are eigenspaces for the DISTINCT eigenvalues +1/-1 of a
+    # symmetric matrix, so they are mutually orthogonal and a joint CQR on [Yp|Ym]
+    # (n x n) would waste ~3/4 of its flops on off-block Gram entries already ~1e-11.
+    # Cross-block orthogonality of the concatenated Q is guaranteed by the projector
+    # (~1e-11 << the 6.10e-3 orth gate); the residual gate + cuSOLVER fallback below
+    # catches any miss. FP64 stays required per block (cond ~1e6 -> FP32 Cholesky
+    # loses pos-def; measured). brief-71 t3 builds ONE block by complement + a single
+    # sharpening apply (above) instead of a second full projector apply.
     # ONE finishing Newton-Schulz step per block. NS (2 GEMMs) is cheaper than a
     # second CholeskyQR AND more accurate here, so it replaces the CholeskyQR2
     # second pass. It runs after CQR where each block is already ~orthonormal (its
