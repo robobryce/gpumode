@@ -2679,20 +2679,19 @@ def _lowrank_eigh(a, k, power=1, dom_gram_mode=None, vd_lift_mode=None,
     return V, lam, Res
 
 
-def _eigh_lowrank_safe(a, k, power=1, dom_gram_mode=None, vd_lift_mode=None,
-                       av_mode=None, proj_mode=None):
+def _lr_gate_and_fallback(a, V, lam, Res, k):
+    """CHEAP FP32 per-matrix residual+orth gate + NS-rescue + cuSOLVER fallback,
+    shared between the single-subset _eigh_lowrank_safe path and the FUSED
+    multi-bucket _eigh_lowrank_safe_multi path (brief-77). `a`, `V`, `lam`, `Res`
+    are the (already-computed) low-rank factors for a batch whose matrices are in
+    ONE-TO-ONE row order with `a` -- for the fused path these are the CONCATENATION
+    of two differently-k'd subset solves (each factor is width n regardless of the
+    bucket's k, so the concatenation is well-formed). The gate math (V^TV orth,
+    ||Res||/||a|| eig, the single bad.any() sync, the NS rescue, the cuSOLVER
+    fallback) is IDENTICAL to what the parent ran per subset; folding both subsets
+    into one call collapses 2 gate GEMM sets + 2 device->host syncs into 1. `k` is
+    used only in the debug print. Returns the finalized (V, lam)."""
     B, n, _ = a.shape
-    try:
-        with _LR_TF32():
-            # brief-62: _lowrank_eigh returns the (unordered) eigen-RESIDUAL matrix
-            # Res = AV - V*lam directly (its ord=1 norm is column-permutation-
-            # invariant, and it is never returned to the user), so the outer gate
-            # needs no AV column-gather.
-            V, lam, Res = _lowrank_eigh(a, k, power, dom_gram_mode, vd_lift_mode,
-                                        av_mode, proj_mode)
-    except Exception:
-        w, q = torch.linalg.eigh(a)
-        return q.contiguous(), w.contiguous()
     with torch.no_grad():
         # CHEAP FP32 per-matrix residual gate (brief-7 t4): the eigen residual
         # reuses the A@V already computed inside _lowrank_eigh (== (A@Qd)@G for
@@ -2800,6 +2799,70 @@ def _eigh_lowrank_safe(a, k, power=1, dom_gram_mode=None, vd_lift_mode=None,
                 f"rescued={_LAST_LR_RESCUED}\n")
             __import__("sys").stderr.flush()
     return V.contiguous(), lam.contiguous()
+
+
+def _eigh_lowrank_safe(a, k, power=1, dom_gram_mode=None, vd_lift_mode=None,
+                       av_mode=None, proj_mode=None):
+    try:
+        with _LR_TF32():
+            # brief-62: _lowrank_eigh returns the (unordered) eigen-RESIDUAL matrix
+            # Res = AV - V*lam directly (its ord=1 norm is column-permutation-
+            # invariant, and it is never returned to the user), so the outer gate
+            # needs no AV column-gather.
+            V, lam, Res = _lowrank_eigh(a, k, power, dom_gram_mode, vd_lift_mode,
+                                        av_mode, proj_mode)
+    except Exception:
+        w, q = torch.linalg.eigh(a)
+        return q.contiguous(), w.contiguous()
+    return _lr_gate_and_fallback(a, V, lam, Res, k)
+
+
+def _eigh_lowrank_safe_multi(a, buckets, power=1, dom_gram_mode=None,
+                             vd_lift_mode=None, av_mode=None, proj_mode=None):
+    """FUSED multi-bucket low-rank solve (brief-77). `buckets` is a list of
+    (idx, k) where idx are row indices into `a` and k is that subset's dominant
+    rank. Each subset is solved by its OWN _lowrank_eigh at its OWN k (the k-
+    dependent CQR2 on the width-k dominant block + width-(n-k) complement stays
+    bucketed -- padding a small-k subset up to max-k is UNSAFE here: the psd
+    subset at k=352 blows past its inner-solve orth ceiling ~300 -> 100% fallback,
+    per the PSD probe table), but everything k-INDEPENDENT is FUSED across buckets:
+      * ONE combined gate (the V^TV orth GEMM + ||Res||/||a|| eig are width-n
+        regardless of k, so both subsets' factors concatenate into one batch and
+        one gate runs over the union -- 2 gate GEMM sets -> 1);
+      * ONE bad.any() device->host sync over the union (brief-67: no extra sync);
+      * ONE NS rescue + ONE cuSOLVER fallback over the union;
+      * ONE .contiguous() finalize.
+    Returns (V, lam, order_idx) where V/lam are the concatenated results and
+    order_idx is the concatenation of the buckets' idx (row j of V/lam is matrix
+    order_idx[j] of `a`), so the caller scatters once. On ANY _lowrank_eigh
+    exception the whole union falls back to a single batched cuSOLVER over the
+    gathered rows -- identical safety to the per-subset path."""
+    B, n, _ = a.shape
+    dev = a.device
+    idx_all = torch.cat([bi for bi, _ in buckets], dim=0)
+    a_all = a.index_select(0, idx_all).contiguous()
+    Vs, lams, Ress = [], [], []
+    try:
+        with _LR_TF32():
+            off = 0
+            for bi, bk in buckets:
+                cnt = bi.numel()
+                a_b = a_all[off:off + cnt]
+                off += cnt
+                Vb, lamb, Resb = _lowrank_eigh(a_b, bk, power, dom_gram_mode,
+                                               vd_lift_mode, av_mode, proj_mode)
+                Vs.append(Vb)
+                lams.append(lamb)
+                Ress.append(Resb)
+    except Exception:
+        w, q = torch.linalg.eigh(a_all)
+        return q.contiguous(), w.contiguous(), idx_all
+    V = torch.cat(Vs, dim=0) if len(Vs) > 1 else Vs[0]
+    lam = torch.cat(lams, dim=0) if len(lams) > 1 else lams[0]
+    Res = torch.cat(Ress, dim=0) if len(Ress) > 1 else Ress[0]
+    kmax = max(bk for _, bk in buckets)
+    V, lam = _lr_gate_and_fallback(a_all, V, lam, Res, kmax)
+    return V, lam, idx_all
 
 
 # RANDOMIZED DOMINANT-SUBSPACE LOW-RANK PATH -- per-(n, spectrum-concentration)
@@ -3131,34 +3194,34 @@ def _eigh_mixed_peel(a: torch.Tensor, pr: torch.Tensor) -> output_t:
     # dominant Gram at _MIXED_PEEL_DOM_GRAM_MODE (3xTF32 on tensor cores; the mixed
     # dense subset carried gate margin under 3xTF32 in t5, unlike the zero-margin
     # dense512 whole-batch route).
+    # brief-77: the dense (k352) and psd (k256) subsets differ only in their
+    # k-dependent inner CQR2 (dense's dominant block is width 352, psd's 256 --
+    # psd CANNOT be padded to 352, it blows past its ~300 orth ceiling), so they
+    # stay separate buckets INSIDE _eigh_lowrank_safe_multi; but that one call
+    # FUSES everything k-independent across them -- ONE combined residual+orth
+    # gate (the V^TV orth GEMM + ||Res||/||a|| eig are width-n regardless of k),
+    # ONE bad.any() device->host sync, ONE NS rescue + ONE cuSOLVER fallback --
+    # collapsing 2 gate GEMM sets + 2 syncs into 1. The dense window [48,62) and
+    # psd window [37,48) are still disjoint (psd never catches dense/rowscale),
+    # so each matrix is solved at its OWN k with math identical to the separate
+    # calls; only the shared per-call overhead is removed.
     dense_mask = (pr >= _MIXED_PEEL_PR_LO) & (pr < _MIXED_PEEL_PR_HI)
-    gidx = torch.nonzero(dense_mask, as_tuple=False).flatten()
-    a_sub = af.index_select(0, gidx).contiguous()
-    Qs, Ls = _eigh_lowrank_safe(a_sub, _MIXED_PEEL_K, power=1,
-                                dom_gram_mode=_MIXED_PEEL_DOM_GRAM_MODE,
-                                av_mode=_MIXED_PEEL_AV_MODE,
-                                proj_mode=_MIXED_PEEL_PROJ_MODE)
-    Q.index_copy_(0, gidx, Qs)
-    L.index_copy_(0, gidx, Ls)
-    taken |= dense_mask
-    # 1b) PSD subset -> split-mega low-rank at its OWN smaller k (brief 33). psd
-    # sits in a distinct lower PR window [37,48) than the dense [48,62); its
-    # spectrum is concentrated (cond=2 (g@g^T)/n) so a rank-k=256 block + cheap
-    # tail clears the gate ~2.8x faster than cuSOLVER on this subset. The window
-    # is disjoint from the dense window (already removed) and from rowscale below
-    # 37, so it never re-routes a dense/rowscale matrix; residual-gated internally.
+    _buckets = [(torch.nonzero(dense_mask, as_tuple=False).flatten(), _MIXED_PEEL_K)]
+    psd_mask = None
     if _MIXED_PEEL_PSD:
-        psd_mask = (pr >= _MIXED_PEEL_PSD_PR_LO) & (pr < _MIXED_PEEL_PSD_PR_HI) & (~taken)
+        psd_mask = (pr >= _MIXED_PEEL_PSD_PR_LO) & (pr < _MIXED_PEEL_PSD_PR_HI) & (~dense_mask)
         pidx = torch.nonzero(psd_mask, as_tuple=False).flatten()
         if pidx.numel() > 0:
-            a_psd = af.index_select(0, pidx).contiguous()
-            Qp, Lp = _eigh_lowrank_safe(a_psd, _MIXED_PEEL_PSD_K, power=1,
-                                        dom_gram_mode=_MIXED_PEEL_DOM_GRAM_MODE,
-                                        av_mode=_MIXED_PEEL_AV_MODE,
-                                        proj_mode=_MIXED_PEEL_PROJ_MODE)
-            Q.index_copy_(0, pidx, Qp)
-            L.index_copy_(0, pidx, Lp)
-            taken |= psd_mask
+            _buckets.append((pidx, _MIXED_PEEL_PSD_K))
+    Qm, Lm, midx = _eigh_lowrank_safe_multi(af, _buckets, power=1,
+                                            dom_gram_mode=_MIXED_PEEL_DOM_GRAM_MODE,
+                                            av_mode=_MIXED_PEEL_AV_MODE,
+                                            proj_mode=_MIXED_PEEL_PROJ_MODE)
+    Q.index_copy_(0, midx, Qm)
+    L.index_copy_(0, midx, Lm)
+    taken |= dense_mask
+    if psd_mask is not None:
+        taken |= psd_mask
     # 2) clustered (2-level, A^2~I) subset -> two-level projector path (~2x
     # cuSOLVER). Detected on the NON-dense remainder only. Self residual-gated.
     if _MIXED_PEEL_CLUSTERED:
