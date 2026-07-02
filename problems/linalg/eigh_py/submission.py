@@ -689,6 +689,7 @@ _MEGA_CLUST_CUDA = r'''
 #include <torch/extension.h>
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
 #include <cooperative_groups.h>
 namespace cg = cooperative_groups;
 
@@ -734,7 +735,15 @@ extern "C" __global__ void mega_eigh_clust_split_k(
   int r0 = bnd[R];
   int r1 = bnd[R+1];
   extern __shared__ char shc[];
-  __half* Ah=(__half*)shc;                     // packed owned-rows lower tri
+  // brief-95: the packed owned-rows lower-triangle is stored in FP8 e4m3 (1 byte/
+  // entry) instead of FP16 (2 bytes) so the per-CTA SMEM footprint HALVES -- the
+  // 185KB FP16 triangle (k=608, C=2 rank0) drops to ~90KB, letting Block Limit
+  // Shared Mem rise 1->2 (a second resident CTA gives the scheduler warps to run
+  // during the cluster-wide cl.sync, the eligible-warps=0.27 ceiling). The bulk
+  // O(k^3) tridiag math tolerates reduced-precision storage; any block that
+  // mis-reduces past the per-matrix FP64 residual gate falls back to cuSOLVER.
+  typedef __nv_fp8_e4m3 Aq_t;
+  Aq_t* Ah=(Aq_t*)shc;                          // packed owned-rows lower tri (FP8)
   size_t triLo = ((size_t)r0*(r0+1))>>1;
   size_t triHi = ((size_t)r1*(r1+1))>>1;
   size_t myTri = triHi - triLo;
@@ -759,8 +768,8 @@ extern "C" __global__ void mega_eigh_clust_split_k(
   float* vgm = vscr + (long)m*n;               // global v staging (n floats, all CTAs write owned rows)
   float* pgm = pscr + (long)m*(long)C*n;       // global per-CTA p staging (C*n)
   #define LBASE(i) ( (size_t)(((size_t)(i)*((i)+1))>>1) - triLo )
-  #define AOWN(i,j) __half2float( Ah[ LBASE(i) + (j) ] )
-  #define AOWNSET(i,j,val) Ah[ LBASE(i) + (j) ] = __float2half(val)
+  #define AOWN(i,j) ( (float)( Ah[ LBASE(i) + (j) ] ) )
+  #define AOWNSET(i,j,val) Ah[ LBASE(i) + (j) ] = (Aq_t)(float)(val)
 
   // ---- scale into FP16 range: cluster-max of max|A| over owned rows ----
   float amax=0.f;
@@ -825,15 +834,15 @@ extern "C" __global__ void mega_eigh_clust_split_k(
     // lower + local-upper from this CTA's Ah, then each PEER rank rr>R contributes
     // its rows [bnd[rr],bnd[rr+1]) from its Ah via map_shared_rank. AhPeer[rr] is
     // resolved once outside the row loop (peer map is per-rank, not per-row).
-    volatile __half* AhP[8]; long triLoP[8];
-    for(int rr=(int)R+1; rr<C; ++rr){ AhP[rr]=(volatile __half*)cl.map_shared_rank(Ah, rr); triLoP[rr]=((long)bnd[rr]*(bnd[rr]+1))/2; }
+    volatile Aq_t* AhP[8]; long triLoP[8];
+    for(int rr=(int)R+1; rr<C; ++rr){ AhP[rr]=(volatile Aq_t*)cl.map_shared_rank(Ah, rr); triLoP[rr]=((long)bnd[rr]*(bnd[rr]+1))/2; }
     if(active) for(int i=is+tid; i<r1; i+=nt){
       float acc=0.f;
       for(int j=c;j<=i;++j) acc += AOWN(i,j)*v[j];        // lower (local)
       for(int j=i+1;j<r1;++j) acc += AOWN(j,i)*v[j];       // upper, local rows
       for(int rr=(int)R+1; rr<C; ++rr){                    // upper, peer rows
-        volatile __half* AhPeer=AhP[rr]; long tlp=triLoP[rr];
-        for(int j=bnd[rr];j<bnd[rr+1];++j){ __half hh=AhPeer[((long)j*(j+1))/2 - tlp + i]; acc += __half2float(hh)*v[j]; }
+        volatile Aq_t* AhPeer=AhP[rr]; long tlp=triLoP[rr];
+        for(int j=bnd[rr];j<bnd[rr+1];++j){ Aq_t hh=AhPeer[((long)j*(j+1))/2 - tlp + i]; acc += ((float)hh)*v[j]; }
       }
       p[i]=tau*acc; pgm[i]=p[i];                           // stage owned p into GLOBAL pfull (disjoint)
     }
@@ -990,7 +999,7 @@ void mega_eigh_clust_split(torch::Tensor A, torch::Tensor Vout, torch::Tensor Lo
       prev=bR;
     }
   }
-  size_t voff = myTriMax*sizeof(__half); voff=(voff+15u)&~15u;
+  size_t voff = myTriMax*sizeof(__nv_fp8_e4m3); voff=(voff+15u)&~15u;   // FP8 triangle (brief-95)
   size_t shm = voff + (size_t)2*n*sizeof(float);
   size_t shmT = ((size_t)n*nb + (size_t)nb*nb + (size_t)nb)*sizeof(float);
   if(shmT>shm) shm=shmT;
