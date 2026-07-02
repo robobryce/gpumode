@@ -3549,6 +3549,18 @@ _SIGN_DC_FUSE_PROJ = False
 # there. Numerically identical (same products, just wider); the norm(dim=1) still
 # runs per half. Off falls back to the two-baddbmm form.
 _SIGN_DC_FUSE_MEMBERSHIP = True
+# brief-96: SKIP the explicit 0.5*(B+B^T) symmetrization of the reduced Rayleigh-Ritz
+# block Bstk = Ustk^T A Ustk. The reduced-block eigensolver (mega_eigh_med_split_k)
+# reads Bstk through the AGET(i,j)= (j<=i)? lower[i,j] : lower[j,i] accessor -- it only
+# ever loads the LOWER triangle and treats the upper as its mirror, i.e. it symmetrizes
+# to the lower triangle internally. The cuSOLVER-eigh fallback likewise uses UPLO='L'.
+# So the explicit symmetrization only changes the (unread) strict-upper triangle plus
+# the tiny antisymmetric TF32 error on the lower part (~1e-4 rel) -- absorbed by the
+# finishing NS + membership + per-matrix residual gate. The probe measured this
+# elementwise op at 0.76ms (37% of stage 4's 2.05ms) on a (2b,300,300) tensor, so
+# dropping it is a real HBM/launch cut. Gated: if orth degrades, the residual gate
+# falls those matrices to cuSOLVER; validated against the real eval.py checker.
+_SIGN_DC_SKIP_BSYM = True
 _SIGN_DC_CQR_PASSES = 2   # subspace-basis CholeskyQR passes. REQUIRED at 2: the
                           # projected bases P+/- @ Omega are rank-deficient (the K
                           # oversample exceeds the true subspace rank), and 1 shifted
@@ -4273,7 +4285,8 @@ def _sign_dc_solve(af, n, dev):
         AU = _lr_lift_gemm(af, Ustk[:b], _SIGN_DC_AV_MODE)
         AU = torch.cat([AU, _lr_lift_gemm(af, Ustk[b:], _SIGN_DC_AV_MODE)], dim=0)
         Bstk = _lr_lift_gemm(Ustk.transpose(-1, -2), AU, _SIGN_DC_AV_MODE)
-        Bstk = 0.5 * (Bstk + Bstk.transpose(-1, -2))
+        if not _SIGN_DC_SKIP_BSYM:
+            Bstk = 0.5 * (Bstk + Bstk.transpose(-1, -2))
     with _sdc_timer("5_mega_eigh"):
       try:
         # fast_reduce=True (brief-83 t12): the CLEAN warp-shuffle sum (_mega_fast_sum)
