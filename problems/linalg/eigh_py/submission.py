@@ -1215,7 +1215,7 @@ _MEGA_CLUST_NT = 512
 # reduce PB columns between the per-panel cross-cluster trailing-update cl.sync.
 # PB=1 recovers the per-column algorithm; wider PB = fewer trailing-update syncs
 # but more intra-panel correction work + more W/Y global traffic. Swept per brief.
-_MEGA_CLUST_PB = 16
+_MEGA_CLUST_PB = 4
 # Cluster size C (CTAs per matrix) is chosen at RUNTIME per k so ONE compiled
 # kernel serves both shapes: the packed-FP16 k-triangle (tri(k)=k(k+1)/2 halves)
 # is row-distributed across C CTAs, so per-CTA SMEM ~ tri(k)*2B / C must be <= the
