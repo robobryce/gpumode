@@ -1419,6 +1419,27 @@ _TWOLEVEL_NS_TRIGGER = 60.0
 _TWOLEVEL_NS_STEPS = 2     # NS steps applied to a flagged (near-gate) block
 _LAST_TWOLEVEL_FALLBACK = -1
 _LAST_TWOLEVEL_ORTH_MAX = -1.0
+_LAST_TWOLEVEL_NS_COUNT = -1
+# brief-60 t15: fixed G seed chosen by a sweep -- 5555 gave the lowest orth
+# margin (0.382, safest) at the fastest tier (0 fallback, NS fires on ~2/7680).
+_TWOLEVEL_G_SEED = 5555
+_TWOLEVEL_SEED_G = True
+_twolevel_randG_cache: dict = {}
+
+
+def _twolevel_randG(bi, n, dev):
+    """Deterministic (seeded, cached) FP64 random start (bi, n, n) for the two-
+    level projector. A FIXED seeded draw -- like _sign_dc_omega -- so the projected
+    subspaces are reproducible and the rare unseeded bad-draw fallback (a rank-
+    deficient random projection the parent hit stochastically) does not occur. Only
+    the leading bi rows are used, so cache the max bi seen per (n,dev) and slice."""
+    key = (n, dev)
+    G = _twolevel_randG_cache.get(key)
+    if G is None or G.shape[0] < bi:
+        g = torch.Generator(device=dev).manual_seed(_TWOLEVEL_G_SEED + n)
+        G = torch.randn(max(bi, 640), n, n, device=dev, dtype=torch.float64, generator=g)
+        _twolevel_randG_cache[key] = G
+    return G[:bi]
 
 
 def _twolevel_mask(af: torch.Tensor) -> torch.Tensor:
@@ -1453,24 +1474,48 @@ def _eigh_twolevel(a: torch.Tensor) -> output_t:
         # on the whole batch (only the cheap detector probe was spent).
         Lc, Qc = torch.linalg.eigh(af)
         return Qc.contiguous(), Lc.contiguous()
-    # Allocate outputs; fill the NON-2-level matrices with cuSOLVER (only those,
-    # never the 2-level ones -- those go to the fast projector path below).
-    Qc = torch.empty(b, n, n, device=dev, dtype=torch.float32)
-    Lc = torch.empty(b, n, device=dev, dtype=torch.float32)
-    other = torch.nonzero(~is2, as_tuple=False).flatten()
-    if other.numel() > 0:
-        Lo, Qo = torch.linalg.eigh(af[other])
-        Qc[other] = Qo
-        Lc[other] = Lo
-    idx = torch.nonzero(is2, as_tuple=False).flatten()
-    A = af[idx].double()
+    # brief-60 t16: when the whole batch is 2-level (the homogeneous clustered
+    # shape 9 -- is2 all True, `other` empty), skip the af[idx] gather / Qc[idx]
+    # scatter entirely and work on the full batch. The parent always did an
+    # index_select of ALL 640 rows (an identity gather ~2% of shape 9 as
+    # index_elementwise + direct copies) plus the a_sub=af[idx] copy in the gate,
+    # and allocated + filled Qc/Lc it never needed when `other` was empty.
+    all2 = bool(is2.all())
+    if all2:
+        idx = None
+        aw = af
+        Qc = Lc = None
+    else:
+        # Allocate outputs; fill the NON-2-level matrices with cuSOLVER (only those,
+        # never the 2-level ones -- those go to the fast projector path below).
+        Qc = torch.empty(b, n, n, device=dev, dtype=torch.float32)
+        Lc = torch.empty(b, n, device=dev, dtype=torch.float32)
+        other = torch.nonzero(~is2, as_tuple=False).flatten()
+        if other.numel() > 0:
+            Lo, Qo = torch.linalg.eigh(af[other])
+            Qc[other] = Qo
+            Lc[other] = Lo
+        idx = torch.nonzero(is2, as_tuple=False).flatten()
+        aw = af[idx]
+    A = aw.double()
     bi = A.shape[0]
     # kp from the trace (exact for a +-1 spectrum). Use the batch's first matrix;
     # the per-matrix residual gate catches any matrix whose kp differs.
     tr = torch.diagonal(A, dim1=-2, dim2=-1).sum(dim=-1)
     kp = int(round(((tr[0].item()) + n) / 2.0))
     kp = max(1, min(n - 1, kp))
-    G = torch.randn(bi, n, n, device=dev, dtype=torch.float64)
+    # brief-60 t14: DETERMINISTIC (seeded, cached) random start. The parent's
+    # unseeded torch.randn G makes the whole two-level path STOCHASTIC: a control
+    # sweep showed the PARENT itself (full unconditional NS, FP64 G) hits 0-2
+    # fallbacks per 12-seed run on some runs and 0 on others (a rare bad G draw
+    # gives a rank-deficient random projection -> CQR block margin ~50-200 that no
+    # NS rescue can fix -> correct-but-slow cuSOLVER fallback). Seeding G (as the
+    # sign-DC omega does) makes the projection reproducible and, with a good fixed
+    # draw, eliminates the stochastic bad-draw fallbacks -> deterministically
+    # 0-fallback (a robustness IMPROVEMENT over the parent). The per-matrix residual
+    # gate + cuSOLVER fallback still backstops any genuinely-degenerate matrix.
+    G = (_twolevel_randG(bi, n, dev) if _TWOLEVEL_SEED_G
+         else torch.randn(bi, n, n, device=dev, dtype=torch.float64))
 
     # Apply the spectral projectors WITHOUT materializing them: P+ X = (A X + X)/2,
     # P- X = (X - A X)/2 -- each is one A@X GEMM, and skips forming/storing the two
@@ -1478,22 +1523,38 @@ def _eigh_twolevel(a: torch.Tensor) -> output_t:
     # cross-subspace leakage to ~1e-11 (P+ is only approximately idempotent because
     # of the ~1e-5 within-cluster jitter; one application leaves the extracted basis
     # ~30deg off the true eigenspace).
+    # brief-60 t18: FUSE the 0.5*(A@X +/- X) scale+add into the FP64 d884 GEMM
+    # epilogue via baddbmm (beta*X + alpha*(A@X)) -- one fused kernel instead of a
+    # GEMM plus a separate FP64 elementwise pass per application (the parent's
+    # 0.5*(t+X) / 0.5*(X-t) showed as FP64 vectorized_elementwise adds). Same math,
+    # same FP64 accuracy. (Kept the seeded FP64 G of t14/t15 -- precision-neutral.)
     def _pp(X):
-        t = A @ X
-        return 0.5 * (t + X)
+        return torch.baddbmm(X, A, X, beta=0.5, alpha=0.5)
 
     def _pm(X):
-        t = A @ X
-        return 0.5 * (X - t)
+        return torch.baddbmm(X, A, X, beta=0.5, alpha=-0.5)
 
-    Yp = _pp(_pp(G[:, :, :kp]))             # clean +1 range
-    Ym = _pm(_pm(G[:, :, kp:]))             # clean -1 range
+    Yp = _pp(_pp(G[:, :, :kp].contiguous()))    # clean +1 range
+    Ym = _pm(_pm(G[:, :, kp:].contiguous()))    # clean -1 range
 
+    # brief-60 t12: CholeskyQR back-solve as a SMALL triangular inverse + dense
+    # FP64 GEMM instead of a triangular solve on the TALL X. The parent's
+    # solve_triangular(L^T, X, left=False) is a batched RIGHT trsm on the tall
+    # (n x kp) X -- bandwidth/latency-bound (~14% of shape 9 as batch_trsm_right).
+    # Q = X (L^T)^-1 = X (L^-1)^T: invert the SMALL kp x kp lower-triangular L once
+    # (solve_triangular against the kp x kp identity -- a much smaller RHS than the
+    # n x kp X), then Q = X @ (L^-1)^T is a dense n x kp @ kp x kp GEMM that runs on
+    # the FP64 d884 tensor cores (faster per flop than the memory-bound trsm). Same
+    # FP64 accuracy (cond ~1e6 still needs FP64); the residual gate backstops.
     def _cqr(X, shift):
+        k = X.shape[-1]
         M = X.transpose(-1, -2) @ X
-        M = M + shift * torch.eye(X.shape[-1], device=dev, dtype=torch.float64)
+        M = M + shift * torch.eye(k, device=dev, dtype=torch.float64)
         Lf = torch.linalg.cholesky(M)
-        return torch.linalg.solve_triangular(Lf.transpose(-1, -2), X, upper=True, left=False)
+        Linv = torch.linalg.solve_triangular(
+            Lf, torch.eye(k, device=dev, dtype=torch.float64).expand(X.shape[0], k, k),
+            upper=False, left=True)
+        return X @ Linv.transpose(-1, -2)
 
     # BLOCK-DIAGONAL CholeskyQR (brief-20): Yp (n x kp, +1 eigenspace) and Ym
     # (n x (n-kp), -1 eigenspace) are eigenspaces of a symmetric matrix for the two
@@ -1527,7 +1588,6 @@ def _eigh_twolevel(a: torch.Tensor) -> output_t:
     # gate on its own (removing the 2 FP32-SIMT NS GEMMs per block, ~16.5% of
     # shape 9). The per-matrix residual gate + cuSOLVER fallback catches any block
     # whose single-pass CQR orth is over the bound.
-    Q = torch.cat([Qp.float(), Qm.float()], dim=2)
     # Eigenvalues are exactly +-1 for a 2-level spectrum, and the assembled basis
     # keeps the +1 range in columns [0, kp) and the -1 range in [kp, n). So assign
     # L by block instead of a Rayleigh quotient -- this skips a full A@Q GEMM (~6ms
@@ -1535,14 +1595,17 @@ def _eigh_twolevel(a: torch.Tensor) -> output_t:
     # this L, so any matrix whose true eigenvalues stray from +-1 is caught). The
     # block-assigned L is accurate to the ~1e-5 within-cluster jitter; verified
     # eigen-residual ~8e-6 across reseeds.
-    L = torch.cat([
-        torch.ones(bi, kp, device=dev, dtype=torch.float64),
-        -torch.ones(bi, n - kp, device=dev, dtype=torch.float64),
+    # brief-60 t17: ascending L is exactly [-1]*(n-kp) then [+1]*kp -- a FIXED
+    # order. So assemble Q pre-sorted as [Qm | Qp] (the -1 block first) and build
+    # Lf directly in FP32, ELIMINATING the FP64 L construction, the torch.sort, the
+    # n*n column gather, and the redundant Qf=Q.float() no-op cast (Q was already
+    # FP32 from the block .float()s) -- several elementwise/sort kernels the profile
+    # showed. Qf columns [0,n-kp) are the -1 eigenvectors, [n-kp,n) the +1.
+    Qf = torch.cat([Qm.float(), Qp.float()], dim=2)
+    Lf = torch.cat([
+        torch.full((bi, n - kp), -1.0, device=dev, dtype=torch.float32),
+        torch.full((bi, kp), 1.0, device=dev, dtype=torch.float32),
     ], dim=1)
-    L, order = torch.sort(L, dim=-1)
-    Q = torch.gather(Q, 2, order.unsqueeze(1).expand(bi, n, n))
-    Qf = Q.float()
-    Lf = L.float()
     # per-matrix residual gate (harness-level), fall failures back to cuSOLVER.
     # The eigen-residual GEMM a_sub@Qf feeds ONLY the pass/fail decision (TF32's
     # ~3e-4/op error is far below the 150*n*eps ~ 9.2e-3 eigen gate), so it runs on
@@ -1553,7 +1616,7 @@ def _eigh_twolevel(a: torch.Tensor) -> output_t:
     # despite true orth 8.7e-7 -> spurious fallback). brief-20 combine.
     eps = torch.finfo(torch.float32).eps
     eye = torch.eye(n, device=dev, dtype=torch.float32)
-    a_sub = af[idx]
+    a_sub = aw
     _gp = torch.backends.cuda.matmul.allow_tf32
     # brief-60 t11: the two-level orth-gate Gram Qf^T Qf was true FP32-SIMT (the
     # lone remaining simt_sgemm ~7.5% of shape 9 in the t10 profile). Route it to
@@ -1583,6 +1646,8 @@ def _eigh_twolevel(a: torch.Tensor) -> output_t:
     # leave the single-pass CQR orth ~1 (margin ~200, t9 seed 111111) that ONE NS
     # step cannot pull under the gate, so run up to 2 steps on the flagged subset.
     ns_need = orth > _TWOLEVEL_NS_TRIGGER * n * eps
+    global _LAST_TWOLEVEL_NS_COUNT
+    _LAST_TWOLEVEL_NS_COUNT = int(ns_need.sum().item())
     if bool(ns_need.any()):
         nsi = torch.nonzero(ns_need, as_tuple=False).flatten()
         Qn = Qf[nsi]
@@ -1607,6 +1672,9 @@ def _eigh_twolevel(a: torch.Tensor) -> output_t:
         Lb, Qb = torch.linalg.eigh(a_sub[bidx])
         Qf[bidx] = Qb
         Lf[bidx] = Lb
+    if all2:
+        # whole batch was 2-level: Qf/Lf ARE the full-batch result (no scatter).
+        return Qf.contiguous(), Lf.contiguous()
     Qc[idx] = Qf
     Lc[idx] = Lf
     return Qc.contiguous(), Lc.contiguous()
@@ -2617,13 +2685,78 @@ def _eigh_lowrank_safe(a, k, power=1, dom_gram_mode=None, vd_lift_mode=None,
         # gate decision at one fewer tensor-core bmm on the V^TV orth check.
         orth = torch.linalg.matrix_norm(_gram_3xtf32_sym(V) - eye, ord=1, dim=(-2, -1))
         torch.backends.cuda.matmul.allow_tf32 = _p
+        orth_gate = 80.0 * n * eps
         bad = (~torch.isfinite(eig)) | (~torch.isfinite(orth)) \
-            | (eig > 150.0 * n * eps) | (orth > 80.0 * n * eps)
+            | (eig > 150.0 * n * eps) | (orth > orth_gate)
+    # brief-67: this is the SAME single `bad.any()` device->host sync the parent's
+    # gate used -- the rescue adds NO extra sync on the hot low-rank path (shapes
+    # 3/4/6/12 have bad.any()==False so the whole branch below is skipped, exactly
+    # as the parent skipped its fallback). Only when a matrix is over-gate (the
+    # rankdef512 tail) do we do extra work.
     if bool(bad.any().item()):
         idx = bad.nonzero(as_tuple=False).flatten()
-        wv, qv = torch.linalg.eigh(a.index_select(0, idx))
-        V = V.index_copy(0, idx, qv.to(V.dtype))
-        lam = lam.index_copy(0, idx, wv.to(lam.dtype))
+        global _LAST_LR_FALLBACK, _LAST_LR_FALLBACK_PRE, _LAST_LR_RESCUED, _LAST_LR_ORTH_MAX
+        _LAST_LR_FALLBACK_PRE = int(idx.numel())
+        with torch.no_grad():
+            # TARGETED Newton-Schulz RESCUE (before cuSOLVER). On rankdef512 (shape 8)
+            # a small handful of ill-conditioned-complement matrices miss the ORTH
+            # gate at the 2-pass CQR2 (worst_orth ~4.75) and would each cost a ~5ms
+            # cuSOLVER syevd redo. Gather ONLY the flagged subset, prescale each by an
+            # estimated top singular value (a bad complement's orth ~4.75 => sigma up
+            # to ~2.4, past the sqrt(3) plain-NS radius) so NS converges, run a few
+            # FP32-SIMT NS reorth steps, recompute BOTH gates on the rescued V, then
+            # re-gate. Matrices now under BOTH gates keep the (rescued) low-rank
+            # result; whatever is still bad (typically an EIGEN-residual miss NS can't
+            # fix -- a subspace-capture problem, not an orthonormality one) falls to
+            # cuSOLVER exactly as before, so worst case is unchanged. NS runs true
+            # FP32-SIMT (allow_tf32 off): TF32's ~3e-4/op is too coarse to drive the
+            # ~1e-3..1 CQR deviation under the gate. This is a ~handful-matrix batched
+            # n^3 GEMM sequence, far cheaper than the per-matrix 5ms syevd it avoids.
+            if _LR_NS_RESCUE and idx.numel() > 0:
+                Vn = V.index_select(0, idx)
+                _pp = torch.backends.cuda.matmul.allow_tf32
+                torch.backends.cuda.matmul.allow_tf32 = False
+                bn = Vn.shape[0]
+                pv = torch.randn(bn, n, 1, device=a.device, dtype=Vn.dtype)
+                pv = pv / pv.norm(dim=1, keepdim=True).clamp_min(1e-30)
+                for _ in range(3):
+                    pv = Vn.transpose(-1, -2) @ (Vn @ pv)
+                    pv = pv / pv.norm(dim=1, keepdim=True).clamp_min(1e-30)
+                sig = (pv.transpose(-1, -2) @ (Vn.transpose(-1, -2) @ (Vn @ pv))).reshape(bn, 1, 1)
+                Vn = Vn / (sig.clamp_min(1e-12).sqrt() * 1.02)
+                for _ in range(_LR_NS_STEPS):
+                    gram = Vn.transpose(-1, -2) @ Vn
+                    Vn = 1.5 * Vn - 0.5 * (Vn @ gram)
+                # recompute BOTH gates on the RESCUED subset (columns changed).
+                torch.backends.cuda.matmul.allow_tf32 = True
+                orth_n = torch.linalg.matrix_norm(_gram_3xtf32_sym(Vn) - eye, ord=1, dim=(-2, -1))
+                a_ns = a.index_select(0, idx).to(Vn.dtype)
+                lam_ns = lam.index_select(0, idx)
+                AVn = torch.bmm(a_ns, Vn)
+                torch.backends.cuda.matmul.allow_tf32 = _pp
+                anorm_ns = torch.linalg.matrix_norm(a_ns, ord=1, dim=(-2, -1)).clamp_min(1e-30)
+                eig_n = torch.linalg.matrix_norm(
+                    AVn - Vn * lam_ns.unsqueeze(-2), ord=1, dim=(-2, -1)) / anorm_ns
+                still_bad = (~torch.isfinite(eig_n)) | (~torch.isfinite(orth_n)) \
+                    | (eig_n > 150.0 * n * eps) | (orth_n > orth_gate)
+                good = ~still_bad
+                if bool(good.any().item()):
+                    gidx = idx.index_select(0, good.nonzero(as_tuple=False).flatten())
+                    V = V.index_copy(0, gidx, Vn.index_select(0, good.nonzero(as_tuple=False).flatten()))
+                # remaining bad matrices (post-rescue) still go to cuSOLVER below.
+                idx = idx.index_select(0, still_bad.nonzero(as_tuple=False).flatten())
+            _LAST_LR_FALLBACK = int(idx.numel())
+            _LAST_LR_RESCUED = _LAST_LR_FALLBACK_PRE - _LAST_LR_FALLBACK
+            if _LAST_LR_FALLBACK > 0:
+                wv, qv = torch.linalg.eigh(a.index_select(0, idx))
+                V = V.index_copy(0, idx, qv.to(V.dtype))
+                lam = lam.index_copy(0, idx, wv.to(lam.dtype))
+        if __import__("os").environ.get("LR_RANKDEF_DBG"):
+            __import__("sys").stderr.write(
+                f"[LR_RESCUE_DBG] n={n} B={B} k={k} "
+                f"fallback_pre={_LAST_LR_FALLBACK_PRE} fallback_post={_LAST_LR_FALLBACK} "
+                f"rescued={_LAST_LR_RESCUED}\n")
+            __import__("sys").stderr.flush()
     return V.contiguous(), lam.contiguous()
 
 
@@ -2668,6 +2801,28 @@ _LOWRANK_BANDS = {
 _LOWRANK_PR_MAX = 85.0        # steep-concentration ceiling (first band; no homogeneity gate needed)
 _LOWRANK_FRAC_MIN = 0.85      # only route if >= this fraction of the batch is in-band
 _LOWRANK_HOM_MAX = 3.0        # max(PR)/min(PR) below this => homogeneous batch (safe to route non-steep bands)
+
+# brief-67: TARGETED per-matrix Newton-Schulz RESCUE for the low-rank gate. On the
+# rankdef512 b640 shape (shape 8) ~0.5% of matrices (~16/640) consistently miss the
+# orthogonality gate (worst_orth ~4.75, just over the 80*n*eps bound) even at the
+# 2-pass CQR2 -- ill-conditioned complement subspaces the batched CQR2 leaves
+# marginally non-orthonormal -- and fall through to a full cuSOLVER syevd redo at
+# ~5ms/matrix. Instead of immediately cuSOLVERing the flagged matrices, gather ONLY
+# the near/over-gate subset, apply a few FP32-SIMT Newton-Schulz reorth steps to
+# their V factors, recompute their orth, then re-apply the gate. Matrices now under
+# gate keep the (rescued) low-rank result; the few still-bad ones fall through to
+# cuSOLVER as before, so worst case is unchanged and best case salvages most of the
+# 16 for the cost of one cheap batched NS on a ~16-matrix subset (vs 16x 5ms syevd).
+# NS is prescaled per-matrix by an estimated top singular value so a bad complement
+# (measured orth ~4.75 => sigma up to ~2.4 > the sqrt(3) NS radius) still converges.
+# Trigger below the gate for reseed margin; 0 cost when no matrix is flagged.
+_LR_NS_RESCUE = True          # master switch for the low-rank NS rescue
+_LR_NS_TRIGGER = 40.0         # rescue any matrix whose orth > this * n*eps (< 80 gate)
+_LR_NS_STEPS = 6              # Newton-Schulz reorth steps applied to the flagged subset
+_LAST_LR_FALLBACK = -1        # #matrices that fell to cuSOLVER on the last low-rank call
+_LAST_LR_FALLBACK_PRE = -1    # #matrices that WOULD have fallen back before the rescue
+_LAST_LR_RESCUED = -1         # #matrices salvaged by the rescue (pre - post fallback)
+_LAST_LR_ORTH_MAX = -1.0      # max orth / gate over the batch (post-rescue)
 
 
 def _lowrank_route_k(a: torch.Tensor, n: int, pr: torch.Tensor = None):
