@@ -1412,6 +1412,15 @@ _TWOLEVEL_MINFRAC = 0.5    # only take the 2-level path if >= this fraction of t
                            # too few to amortize the split + FP64 overhead).
 
 
+# brief-60: per-matrix NS-rescue trigger (multiple of n*eps on the FP32 orth
+# norm). Matrices whose single-pass-CQR orth exceeds this get ONE FP32-SIMT NS
+# step before the gate; below the 75 gate for reseed margin. Plus diagnostics.
+_TWOLEVEL_NS_TRIGGER = 60.0
+_TWOLEVEL_NS_STEPS = 2     # NS steps applied to a flagged (near-gate) block
+_LAST_TWOLEVEL_FALLBACK = -1
+_LAST_TWOLEVEL_ORTH_MAX = -1.0
+
+
 def _twolevel_mask(af: torch.Tensor) -> torch.Tensor:
     """Per-matrix structural test: is A ~ a 2-level (+-1) spectrum (A^2 ~ I)?
     Pure function of the matrix -- legitimate algorithm selection. Uses a cheap
@@ -1513,16 +1522,12 @@ def _eigh_twolevel(a: torch.Tensor) -> output_t:
     # ~7.8ms -> block NS ~5.3ms (concat included), AND better orth margin (max
     # 0.037*gate over 6 clustered reseeds vs the joint NS's 0.12, nbad=0 for both).
     # The per-matrix residual gate + cuSOLVER fallback below catches any miss.
-    def _ns_block(Qb):
-        Qf = Qb.float()
-        eyek = torch.eye(Qf.shape[-1], device=dev, dtype=torch.float32)
-        gram = Qf.transpose(-1, -2) @ Qf
-        return Qf @ (1.5 * eyek - 0.5 * gram)
-
-    _nsp = torch.backends.cuda.matmul.allow_tf32
-    torch.backends.cuda.matmul.allow_tf32 = False   # true FP32 (no TF32) NS GEMMs
-    Q = torch.cat([_ns_block(Qp), _ns_block(Qm)], dim=2)
-    torch.backends.cuda.matmul.allow_tf32 = _nsp
+    # brief-60 t6: DROP the finishing NS step -- use the FP64 CQR output directly.
+    # Measures whether a single CQR pass is orthonormal enough to clear the orth
+    # gate on its own (removing the 2 FP32-SIMT NS GEMMs per block, ~16.5% of
+    # shape 9). The per-matrix residual gate + cuSOLVER fallback catches any block
+    # whose single-pass CQR orth is over the bound.
+    Q = torch.cat([Qp.float(), Qm.float()], dim=2)
     # Eigenvalues are exactly +-1 for a 2-level spectrum, and the assembled basis
     # keeps the +1 range in columns [0, kp) and the -1 range in [kp, n). So assign
     # L by block instead of a Rayleigh quotient -- this skips a full A@Q GEMM (~6ms
@@ -1550,8 +1555,43 @@ def _eigh_twolevel(a: torch.Tensor) -> output_t:
     eye = torch.eye(n, device=dev, dtype=torch.float32)
     a_sub = af[idx]
     _gp = torch.backends.cuda.matmul.allow_tf32
+    # brief-60 t11: the two-level orth-gate Gram Qf^T Qf was true FP32-SIMT (the
+    # lone remaining simt_sgemm ~7.5% of shape 9 in the t10 profile). Route it to
+    # the SYMMETRIC-aware 3xTF32 form (_gram_3xtf32_sym: 2 tensor-core bmms +
+    # transpose-add, ~6e-6) -- the SAME orth-gate GEMM the sign-DC path (shape 11)
+    # already runs in 3xTF32. Plain 1-pass TF32 is unsafe here (brief-18: its
+    # ~3e-4 accumulation over n dot-products pushes a clean Q's measured orth over
+    # the 6.10e-3 gate -> spurious fallback), but 3xTF32's ~6e-6 is ~10x tighter
+    # and gate-clean. Gate-only (pass/fail), and the eigen-residual gate backstops.
+    torch.backends.cuda.matmul.allow_tf32 = True
+    orth = torch.linalg.matrix_norm(_gram_3xtf32_sym(Qf) - eye, ord=1, dim=(-2, -1))
     torch.backends.cuda.matmul.allow_tf32 = False
-    orth = torch.linalg.matrix_norm(Qf.transpose(-1, -2) @ Qf - eye, ord=1, dim=(-2, -1))
+    # brief-60 t9: PER-MATRIX NS RESCUE. Dropping the unconditional NS (t6) won -4%
+    # on shape 9 but a reseed sweep left 1/640 matrices with orth JUST over the
+    # gate (margin 1.0017 at seed 555555) -> that one matrix fell back to the slow
+    # cuSOLVER syevd AND broke the brief's 0-fallback requirement. Instead of NS on
+    # ALL 640 matrices (the parent's ~16.5% FP32-SIMT cost), apply ONE FP32-SIMT NS
+    # step to ONLY the handful whose single-pass-CQR orth is near/over the gate
+    # (usually 0, at worst a few), recompute their orth, then gate. This keeps
+    # t6's win for the ~99.7% that already clear the gate while rescuing the rare
+    # marginal matrix with cheap NS (a few-matrix n^3, not a per-matrix syevd) so
+    # it clears the gate -> 0 fallback. NS runs in true FP32-SIMT (TF32 is too
+    # coarse to drive the ~1e-3 CQR deviation under the gate; t8 measured 2-seed
+    # fallback). Trigger below the gate (60 vs 75*n*eps) for reseed margin.
+    # brief-60 t10: TWO NS steps in the rescue. NS converges quadratically for a
+    # block whose singular values lie in (0, sqrt(3)); a bad random-G draw can
+    # leave the single-pass CQR orth ~1 (margin ~200, t9 seed 111111) that ONE NS
+    # step cannot pull under the gate, so run up to 2 steps on the flagged subset.
+    ns_need = orth > _TWOLEVEL_NS_TRIGGER * n * eps
+    if bool(ns_need.any()):
+        nsi = torch.nonzero(ns_need, as_tuple=False).flatten()
+        Qn = Qf[nsi]
+        for _ in range(_TWOLEVEL_NS_STEPS):
+            gram = Qn.transpose(-1, -2) @ Qn
+            Qn = Qn @ (1.5 * eye - 0.5 * gram)
+        Qf[nsi] = Qn
+        orth[nsi] = torch.linalg.matrix_norm(
+            Qn.transpose(-1, -2) @ Qn - eye, ord=1, dim=(-2, -1))
     torch.backends.cuda.matmul.allow_tf32 = True    # eigen-gate A@Q -> TF32 (gate-only)
     aQ = a_sub @ Qf
     torch.backends.cuda.matmul.allow_tf32 = _gp
@@ -1559,6 +1599,9 @@ def _eigh_twolevel(a: torch.Tensor) -> output_t:
     a_l1 = torch.linalg.matrix_norm(a_sub, ord=1, dim=(-2, -1)).clamp_min(1e-30)
     bad = ((orth > 75.0 * n * eps) | (eigr / a_l1 > 150.0 * n * eps)
            | ~torch.isfinite(Lf).all(dim=-1) | ~torch.isfinite(Qf).all(dim=(-2, -1)))
+    global _LAST_TWOLEVEL_FALLBACK, _LAST_TWOLEVEL_ORTH_MAX
+    _LAST_TWOLEVEL_FALLBACK = int(bad.sum().item())
+    _LAST_TWOLEVEL_ORTH_MAX = float((orth / (75.0 * n * eps)).max().item())
     if bool(bad.any()):
         bidx = torch.nonzero(bad, as_tuple=False).flatten()
         Lb, Qb = torch.linalg.eigh(a_sub[bidx])
@@ -2172,9 +2215,48 @@ def _lr_proj_mode_for(n: int, k: int):
 
 def _lr_project_out(Qd, X, mode):
     """X - Qd @ (Qd^T @ X), the projection onto the orthogonal complement of the
-    dominant subspace span(Qd), with both GEMMs at `mode` precision."""
-    QtX = _lr_lift_gemm(Qd.transpose(-1, -2), X, mode)
-    return X - _lr_lift_gemm(Qd, QtX, mode)
+    dominant subspace span(Qd), with both GEMMs at `mode` precision.
+
+    brief-62 (redundant-work): the second GEMM's epilogue subtract (X - Qd@QtX)
+    was a SEPARATE vectorized_elementwise_kernel + intermediate materialization
+    (the CUDAFunctor_add term, ~5% of shape8 with 28 instances). torch.baddbmm
+    fuses beta*X + alpha*(Qd@QtX) into the GEMM's own epilogue: ONE kernel, no
+    intermediate. Bit-identical to bmm-then-subtract (same accumulator, then a
+    fused add of beta*X == a separate X-minus). For 3xTF32 the subtract is folded
+    into the FIRST of the three Ozaki bmms (the other two are plain +/-)."""
+    Qt = Qd.transpose(-1, -2)
+    prev = torch.backends.cuda.matmul.allow_tf32
+    try:
+        if mode == "3xtf32":
+            torch.backends.cuda.matmul.allow_tf32 = True
+            QtX = _matmul_3xtf32(Qt, X)
+            # Ozaki hi+lo split of the second product Qd @ QtX, with the epilogue
+            # subtract fused into the FIRST bmm via baddbmm (beta*X - Qd_h@QtX_h).
+            mask = ~0x1FFF
+            Qh = (Qd.view(torch.int32) & mask).view(torch.float32)
+            Ql = Qd - Qh
+            Bh = (QtX.view(torch.int32) & mask).view(torch.float32)
+            Bl = QtX - Bh
+            out = torch.baddbmm(X, Qh, Bh, beta=1.0, alpha=-1.0)
+            out -= torch.bmm(Qh, Bl)
+            out -= torch.bmm(Ql, Bh)
+            return out
+        if mode == "2xtf32":
+            torch.backends.cuda.matmul.allow_tf32 = True
+            QtX = _matmul_2xtf32(Qt, X)
+            mask = ~0x1FFF
+            Qh = (Qd.view(torch.int32) & mask).view(torch.float32)
+            Bh = (QtX.view(torch.int32) & mask).view(torch.float32)
+            Bl = QtX - Bh
+            out = torch.baddbmm(X, Qh, Bh, beta=1.0, alpha=-1.0)
+            out -= torch.bmm(Qh, Bl)
+            return out
+        # fp32 / tf32: single-pass GEMM, subtract fused into its baddbmm epilogue.
+        torch.backends.cuda.matmul.allow_tf32 = (mode == "tf32")
+        QtX = torch.bmm(Qt, X)
+        return torch.baddbmm(X, Qd, QtX, beta=1.0, alpha=-1.0)
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = prev
 
 
 def _lr_cholesky_qr2(Y, passes=2, shift=1e-5, tf32_gram=False, gram_mode=None):
@@ -2464,16 +2546,27 @@ def _lowrank_eigh(a, k, power=1, dom_gram_mode=None, vd_lift_mode=None,
             AVc = _lr_lift_gemm(a, Vc, av_mode)
             lam_c = (AVc * Vc).sum(dim=-2)
             V = torch.cat([Vd, Vc], dim=-1)
-            AV = torch.cat([AVd, AVc], dim=-1)
             lam = torch.cat([lam_d, lam_c], dim=-1)
+            # brief-62 (redundant-work): the eigen-residual matrix Res = AV - V*lam
+            # feeds ONLY the outer gate's ord=1 matrix norm, which is INVARIANT to a
+            # column permutation (permuting columns preserves the multiset of column
+            # sums, so the max column-sum norm is unchanged). Res is never returned to
+            # the caller, so its column order is irrelevant -- form it on the UNORDERED
+            # blocks. Building it BLOCK-WISE (per dominant/complement block) also
+            # removes the AV = cat([AVd, AVc]) materialization (a CatArrayBatchedCopy
+            # kernel): the two residual blocks are cat'd directly instead. Then only
+            # V and lam need the sort gather for the ascending-eigenvalue output
+            # contract; the n*n AV column-gather is removed too (t2).
+            Res = torch.cat([AVd - Vd * lam_d.unsqueeze(-2),
+                             AVc - Vc * lam_c.unsqueeze(-2)], dim=-1)
         else:
-            V, lam, AV = Vd, lam_d, AVd
+            V, lam = Vd, lam_d
+            Res = AVd - Vd * lam_d.unsqueeze(-2)
         order = torch.argsort(lam, dim=-1)
         lam = torch.gather(lam, -1, order)
         oexp = order.unsqueeze(1).expand(B, n, n)
         V = torch.gather(V, -1, oexp)
-        AV = torch.gather(AV, -1, oexp)
-    return V, lam, AV
+    return V, lam, Res
 
 
 def _eigh_lowrank_safe(a, k, power=1, dom_gram_mode=None, vd_lift_mode=None,
@@ -2481,8 +2574,12 @@ def _eigh_lowrank_safe(a, k, power=1, dom_gram_mode=None, vd_lift_mode=None,
     B, n, _ = a.shape
     try:
         with _LR_TF32():
-            V, lam, AV = _lowrank_eigh(a, k, power, dom_gram_mode, vd_lift_mode,
-                                       av_mode, proj_mode)
+            # brief-62: _lowrank_eigh returns the (unordered) eigen-RESIDUAL matrix
+            # Res = AV - V*lam directly (its ord=1 norm is column-permutation-
+            # invariant, and it is never returned to the user), so the outer gate
+            # needs no AV column-gather.
+            V, lam, Res = _lowrank_eigh(a, k, power, dom_gram_mode, vd_lift_mode,
+                                        av_mode, proj_mode)
     except Exception:
         w, q = torch.linalg.eigh(a)
         return q.contiguous(), w.contiguous()
@@ -2500,7 +2597,9 @@ def _eigh_lowrank_safe(a, k, power=1, dom_gram_mode=None, vd_lift_mode=None,
         eps = torch.finfo(torch.float32).eps
         eye = torch.eye(n, device=a.device, dtype=torch.float32)
         anorm = torch.linalg.matrix_norm(a, ord=1, dim=(-2, -1)).clamp_min(1e-30)
-        eig = torch.linalg.matrix_norm(AV - V * lam.unsqueeze(-2), ord=1, dim=(-2, -1)) / anorm
+        # brief-62: Res == AV - V*lam is precomputed inside _lowrank_eigh (unordered,
+        # but ord=1 matrix norm is column-permutation-invariant) so no AV gather.
+        eig = torch.linalg.matrix_norm(Res, ord=1, dim=(-2, -1)) / anorm
         # Orthogonality gate GEMM V^T V is a full n*n*n batched GEMM (one of the
         # largest FP32-SIMT simt_sgemm terms in the profile: ~4ms on shape3 b640).
         # Compute it in 3xTF32 (Ozaki hi+lo split): ~FP32 accuracy (probed orth
