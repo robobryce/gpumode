@@ -3540,6 +3540,15 @@ _SIGN_DC_CQR_INV_GEMM = False
 # brief-87: fuse the two projector applies P+@Om, P-@Om2 into one wide X@[Om|Om2] GEMM.
 # t11 measured this NEUTRAL/NEG (the 2 baddbmm already fuse the 0.5*Om add) -> off.
 _SIGN_DC_FUSE_PROJ = False
+# brief-96: fuse the two MEMBERSHIP projector applies X@Vp, X@Vm into ONE wide
+# X @ [Vp | Vm] GEMM. Both membership terms (selp = ||P+ Vp||, selm = ||P- Vm||)
+# apply the SAME sign matrix X to a (b,n,K) block; stacking the two RHS blocks into
+# one (b,n,2K) GEMM gives better tensor-core fill + one launch instead of two.
+# nsys/probe (shape 11): the two X@V GEMMs are ~1.06ms -- the single biggest GEMM in
+# the back-transform/Rayleigh/membership region -- so fusing them is the top lever
+# there. Numerically identical (same products, just wider); the norm(dim=1) still
+# runs per half. Off falls back to the two-baddbmm form.
+_SIGN_DC_FUSE_MEMBERSHIP = True
 _SIGN_DC_CQR_PASSES = 2   # subspace-basis CholeskyQR passes. REQUIRED at 2: the
                           # projected bases P+/- @ Omega are rank-deficient (the K
                           # oversample exceeds the true subspace rank), and 1 shifted
@@ -4286,8 +4295,16 @@ def _sign_dc_solve(af, n, dev):
         Vp, Vm = Vstk[:b], Vstk[b:]
         lp, lm = lstk[:b], lstk[b:]
         # projector membership: ~1 for a real eigenvector of that block, ~0 for padding
-        selp = _pp(Vp).norm(dim=1)                 # (b, K)
-        selm = _pm(Vm).norm(dim=1)                 # (b, K)
+        if _SIGN_DC_FUSE_MEMBERSHIP:
+            # brief-96: X@Vp and X@Vm share the SAME X -> one wide X@[Vp|Vm] GEMM
+            # (b,n,n)@(b,n,2K) instead of two (b,n,n)@(b,n,K) baddbmms. Then
+            # P+ Vp = 0.5*(Vp + (X@Vp)), P- Vm = 0.5*(Vm - (X@Vm)).
+            XVpm = torch.bmm(X, torch.cat([Vp, Vm], dim=-1))   # (b, n, 2K)
+            selp = (0.5 * (Vp + XVpm[..., :K])).norm(dim=1)    # (b, K)
+            selm = (0.5 * (Vm - XVpm[..., K:])).norm(dim=1)    # (b, K)
+        else:
+            selp = _pp(Vp).norm(dim=1)                 # (b, K)
+            selm = _pm(Vm).norm(dim=1)                 # (b, K)
         torch.backends.cuda.matmul.allow_tf32 = _gp
         Vall = torch.cat([Vp, Vm], dim=-1)         # n x 2K
         Lall = torch.cat([lp, lm], dim=-1)         # 2K
