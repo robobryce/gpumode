@@ -1379,7 +1379,10 @@ def _lr_reduced_clust(Bk, C):
 # caller's (kept identical to _eigh_megakernel_med).
 _MEGA_CLUST_FULL_C = 2       # CTAs per matrix for the full-n cluster path (peer DSMEM
                              # exchange in the kernel is specialized to C==2)
-_MEGA_CLUST_FULL_PB = 1      # panel width for the cluster tridiag (1 = per-column)
+_MEGA_CLUST_FULL_PB = 4      # panel width for the cluster tridiag (LATRD-blocked:
+                             # reduce PB columns between cross-cluster cl.sync, so the
+                             # ~174 per-column syncs drop to ~n/PB -- amortizing the
+                             # cl.sync latency that made PB=1 net-negative at n=176)
 
 
 def _mega_clust_full_solve(af, dev, b, n, C, pb):
