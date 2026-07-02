@@ -3778,7 +3778,7 @@ _SIGN_DC_INSOLVER_EIGR = True
 # Newton-Schulz + the per-matrix eigr/orth gate + cuSOLVER fallback backstop any
 # drift. Toggled here so it routes ONLY the sign-DC path (the low-rank inner
 # solves 2/12 keep the FP32 update via their own callers passing f16upd=False).
-_SIGN_DC_F16UPD = False
+_SIGN_DC_F16UPD = True
 # brief-108: fp16/half2 symv (p = tau*A@v) in the reduced-block tridiagonalization.
 # The contiguous j<=i packed row is done in half2 (fp16 A*v products, FP32
 # accumulate); the transpose tail j>i stays scalar. This is the OTHER O(n^2)/column
