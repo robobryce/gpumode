@@ -1144,7 +1144,7 @@ _MEGA_MED_NT = 512
 # then does 3 batched tensor-core (TF32) GEMMs per panel. nb trades panel COUNT
 # (=> #GEMM launches, ~ceil((n-2)/nb)) against block-T build cost + GEMM shape.
 # nb<=32 keeps the in-kernel single-warp block-T build (one lane per column).
-_MEGA_MED_SPLIT_NB = 64
+_MEGA_MED_SPLIT_NB = 32
 _lr_split_T_cache: dict = {}   # (B,n,nb,dev) -> persistent block-T scratch
 
 # ---- C-CTA thread-block-cluster reduced-block solver constants (brief 35) ----
