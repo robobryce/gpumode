@@ -3460,7 +3460,7 @@ _SIGN_DC_NS5_ITERS = 14   # degree-5 iteration count when _SIGN_DC_NS_DEGREE == 
 _SIGN_DC_NS5_HEAD = 4     # degree-5 head iters when _SIGN_DC_NS_DEGREE == "mixed"
 _SIGN_DC_NS5_TAIL = 8     # degree-3 tail iters when _SIGN_DC_NS_DEGREE == "mixed"
 _SIGN_DC_NS5_COEF = "pade"
-_SIGN_DC_POWER_ITERS = 4  # A^2 power iterations for the spectral-norm scale estimate.
+_SIGN_DC_POWER_ITERS = 3  # A^2 power iterations for the spectral-norm scale estimate.
                           # The scale only needs to be a loose UPPER bound on ||A||_2
                           # (multiplied by 1.02) so the Newton-Schulz sign iteration
                           # starts inside its convergence region -- NS is robust to
@@ -3469,7 +3469,7 @@ _SIGN_DC_POWER_ITERS = 4  # A^2 power iterations for the spectral-norm scale est
                           # set) from 3 iters up -- the A^2 power estimate converges in
                           # ~3 iters on the even/gapless spectrum. 4 keeps one iter of
                           # reseed margin while dropping ~11 iters (~22 batched matvecs).
-_SIGN_DC_FINAL_NS = 2     # finishing FP32 NS orthonormalization steps on Q
+_SIGN_DC_FINAL_NS = 1     # finishing FP32 NS orthonormalization steps on Q
 # brief-87: precision of the finishing-NS Gram + Q@Gram. The stage timer put this
 # finishing step at ~5.27ms/step (3xTF32 = 5 n*n bmm). "tf32x3" (default, ~6e-6,
 # 5 bmm) vs "tf32" (1-pass TF32, 2 bmm, ~2x cheaper) -- Q is already near-orthonormal
@@ -3502,7 +3502,7 @@ _SIGN_DC_CQR_INV_GEMM = False
 # brief-87: fuse the two projector applies P+@Om, P-@Om2 into one wide X@[Om|Om2] GEMM.
 # t11 measured this NEUTRAL/NEG (the 2 baddbmm already fuse the 0.5*Om add) -> off.
 _SIGN_DC_FUSE_PROJ = False
-_SIGN_DC_CQR_PASSES = 1   # subspace-basis CholeskyQR passes. REQUIRED at 2: the
+_SIGN_DC_CQR_PASSES = 2   # subspace-basis CholeskyQR passes. REQUIRED at 2: the
                           # projected bases P+/- @ Omega are rank-deficient (the K
                           # oversample exceeds the true subspace rank), and 1 shifted
                           # CQR pass leaves U too far from orthonormal -> the membership
