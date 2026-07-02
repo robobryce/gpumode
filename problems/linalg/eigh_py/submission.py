@@ -62,43 +62,6 @@ _MEGA_CUDA = r'''
 #include <torch/extension.h>
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
-// brief-83 LEVER B: BIT-IDENTICAL barrier-lean block reduction. The old red[] tree
-// (red[tid]=v; __syncthreads(); for(s=nt>>1;s>0;s>>=1){ if(tid<s)red[tid]OPred[tid+s];
-// __syncthreads(); }) costs 1 + log2(nt) barriers per reduction -- 10 at nt=512, and
-// the tridiag loop runs TWO sum-reductions per column x ~298 columns => ~5900
-// barriers, the bulk of the 66.7%-barrier stall (t1 ncu).
-//
-// A plain warp-shuffle tree (reduce each warp, then combine partials) uses a
-// DIFFERENT summation pairing than the shared-mem tree, and brief-83 t4 MEASURED
-// that reassociation shifting the tridiag inner products enough to drift the Sturm
-// eigenvalues past shape-11's eigr gate (~3.6e-3, near the bound) -> mass cuSOLVER
-// fallback (+38%). So this variant preserves the EXACT (i, i+s) pairing of the old
-// tree: the cross-warp steps (s>=32) still run red[tid]OP=red[tid+s] in shared mem
-// (bit-identical), but the intra-warp tail (s=16..1, all lanes 0..31 of warp 0)
-// runs as __shfl_down_sync with offset s -- pairing lane i with lane i+s, the SAME
-// arithmetic as red[i]OP=red[i+s] with ZERO barriers. So 5 of the intra-warp
-// barriers vanish while every partial sum is computed in the identical order ->
-// gate-safe. Net: 10 barriers -> 6 (1 store-sync + 4 cross-warp for nt=512 + 1
-// broadcast). `red` is the caller's >=nt-float SMEM; op = sum(0)/min(1)/max(2).
-// All threads must call; returns the reduced value to every thread.
-__device__ __forceinline__ float _mega_reduce_op(float a, float b, int op){
-  return (op==0)?(a+b):((op==1)?fminf(a,b):fmaxf(a,b));
-}
-__device__ __forceinline__ float _mega_block_reduce(float v, int op, float* red, int tid, int nt){
-  red[tid]=v; __syncthreads();
-  // cross-warp tree steps (s >= 32): identical pairing to the old loop.
-  for(int s=nt>>1; s>=32; s>>=1){ if(tid<s) red[tid]=_mega_reduce_op(red[tid],red[tid+s],op); __syncthreads(); }
-  // intra-warp tail (s = 16..1) via shuffle over lanes 0..31 -- same (i,i+s) pairing,
-  // no barriers. Only warp 0 (tid<32) participates; it writes red[0] at the end.
-  if(tid<32){
-    float r=red[tid];
-    #pragma unroll
-    for(int s=16;s>0;s>>=1){ float t=__shfl_down_sync(0xffffffffu,r,s); r=_mega_reduce_op(r,t,op); }
-    if(tid==0) red[0]=r;
-  }
-  __syncthreads();
-  return red[0];
-}
 extern "C" __global__ void mega_eigh_k(const float* __restrict__ Ain,
     float* __restrict__ Vout, float* __restrict__ Lout,
     float* __restrict__ rscr, float* __restrict__ dscr, float* __restrict__ escr,
@@ -478,7 +441,9 @@ extern "C" __global__ void mega_eigh_med_split_k(const float* __restrict__ Ain,
   #define ASET(i,j,val) Ah[_tri(i,j)+(j)] = __float2half(val)
   float amax=0.f;
   for(int idx=tid; idx<n*n; idx+=nt){ float x=fabsf(Am[idx]); amax=fmaxf(amax,x); }
-  float scale=_mega_block_reduce(amax,2,red,tid,nt); if(scale<1e-30f) scale=1.f;
+  red[tid]=amax; __syncthreads();
+  for(int s=nt>>1;s>0;s>>=1){ if(tid<s)red[tid]=fmaxf(red[tid],red[tid+s]); __syncthreads(); }
+  float scale=red[0]; if(scale<1e-30f) scale=1.f; __syncthreads();
   float invs=1.f/scale;
   for(long t=tid; t<(long)triN; t+=nt){
     int i=(int)((sqrtf(8.0f*(float)t+1.0f)-1.0f)*0.5f);
@@ -491,19 +456,28 @@ extern "C" __global__ void mega_eigh_med_split_k(const float* __restrict__ Ain,
   for(int c=0;c<n-2;++c){
     float s2=0.f;
     for(int i=c+1+tid;i<n;i+=nt){ float x=AGET(i,c); s2+=x*x; }
-    float xnorm2=_mega_block_reduce(s2,0,red,tid,nt);
+    red[tid]=s2; __syncthreads();
+    for(int s=nt>>1;s>0;s>>=1){ if(tid<s)red[tid]+=red[tid+s]; __syncthreads(); }
+    float xnorm2=red[0];
     float alpha=AGET(c+1,c); float tail2=xnorm2-alpha*alpha;
     if(tail2<=1e-20f){ if(tid==0){Em[c]=alpha;Tau[c]=0.f;} for(int i=tid;i<n;i+=nt) Rm[i*n+c]=(i==c+1)?1.f:0.f; __syncthreads(); continue; }
     float xnorm=sqrtf(xnorm2); float beta=(alpha>=0.f)?-xnorm:xnorm; float tau=(beta-alpha)/beta; float denom=alpha-beta;
-    for(int i=tid;i<n;i+=nt) v[i]=0.f; __syncthreads();
-    if(tid==0) v[c+1]=1.f;
-    for(int i=c+2+tid;i<n;i+=nt) v[i]=AGET(i,c)/denom;
+    // brief-83 LEVER B: fuse the zero-pass + reflector fill into ONE pass over v.
+    // v[0..c]=0 (never read by symv/vp/rank-2, but Rm[:,c] must carry them),
+    // v[c+1]=1, v[c+2:]=A[i,c]/denom. Removes a __syncthreads vs the old
+    // (zero-all; sync; set v[c+1]; fill v[c+2:]; sync) -- one barrier per column
+    // x ~298 columns. Pure data movement, no reduction arithmetic touched => the
+    // Householder reflector is byte-identical -> gate-safe (unlike the reduction
+    // rewrites in t4/t5 which drifted the eigr gate).
+    for(int i=tid;i<n;i+=nt) v[i]=(i<=c)?0.f:((i==c+1)?1.f:AGET(i,c)/denom);
     __syncthreads();
     for(int i=tid;i<n;i+=nt) Rm[i*n+c]=v[i];
     for(int i=c+1+tid;i<n;i+=nt){ float acc=0.f; for(int j=c+1;j<n;++j) acc+=AGET(i,j)*v[j]; p[i]=tau*acc; }
     __syncthreads();
     float vp=0.f; for(int i=c+1+tid;i<n;i+=nt) vp+=v[i]*p[i];
-    float K=0.5f*tau*_mega_block_reduce(vp,0,red,tid,nt);
+    red[tid]=vp; __syncthreads();
+    for(int s=nt>>1;s>0;s>>=1){ if(tid<s)red[tid]+=red[tid+s]; __syncthreads(); }
+    float K=0.5f*tau*red[0];
     for(int i=c+1+tid;i<n;i+=nt) p[i]=p[i]-K*v[i];
     __syncthreads();
     for(int i=c+1+tid;i<n;i+=nt){ float vi=v[i],wi=p[i]; for(int j=c+1;j<=i;++j){ float a=AGET(i,j); ASET(i,j,a-vi*p[j]-wi*v[j]); } }
@@ -519,8 +493,8 @@ extern "C" __global__ void mega_eigh_med_split_k(const float* __restrict__ Ain,
   __syncthreads();
   float glo=1e30f, ghi=-1e30f;
   for(int i=tid;i<n;i+=nt){ float r=(i>0?fabsf(Em[i-1]):0.f)+(i<n-1?fabsf(Em[i]):0.f); glo=fminf(glo,Dm[i]-r); ghi=fmaxf(ghi,Dm[i]+r); }
-  glo=_mega_block_reduce(glo,1,red,tid,nt);
-  ghi=_mega_block_reduce(ghi,2,red,tid,nt);
+  red[tid]=glo; __syncthreads(); for(int s=nt>>1;s>0;s>>=1){ if(tid<s)red[tid]=fminf(red[tid],red[tid+s]); __syncthreads(); } glo=red[0]; __syncthreads();
+  red[tid]=ghi; __syncthreads(); for(int s=nt>>1;s>0;s>>=1){ if(tid<s)red[tid]=fmaxf(red[tid],red[tid+s]); __syncthreads(); } ghi=red[0]; __syncthreads();
   for(int ev=tid; ev<n; ev+=nt){
     float lo=glo, hi=ghi;
     for(int it=0;it<bisIters;++it){
