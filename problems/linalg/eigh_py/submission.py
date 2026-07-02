@@ -6030,6 +6030,10 @@ __device__ __forceinline__ void wjac_solve32(
       // ---- COLUMN update A<-A*J and V<-V*J. Column j pairs with the COMPILE-TIME
       // constant pj=wjac_partner(j,r,32); rotation held by lane j (shfl c,s from j).
       // Snapshot old row (register copy) to avoid RAW; all indices constant.
+      // (Shuffling only s + reconstructing cj=sqrt(1-sj^2) halves per-col shuffles
+      // but MEASURED as noise: the kernel is dependency-chain LATENCY-bound at 20
+      // warps, not shuffle-throughput-bound, and the sqrt cost offsets it + drifts
+      // orth -> nbad 0->1. Keep both-shuffle: nbad=0.)
       float oldA[NN], oldV[NN];
       #pragma unroll
       for (int j = 0; j < NN; ++j) { oldA[j] = Ar[j]; oldV[j] = Vr[j]; }
@@ -6042,7 +6046,10 @@ __device__ __forceinline__ void wjac_solve32(
         else        { Ar[j] = sj * oldA[pj] + cj * oldA[j]; Vr[j] = sj * oldV[pj] + cj * oldV[j]; }
       }
       // ---- ROW update A<-J^T*A: combine my row with partner's row using MY (c,s).
-      // Snapshot partner's full row (32 shfls, constant indices) then combine.
+      // Snapshot partner's full row (32 shfls, constant indices) then combine. The
+      // interleaved (no-snapshot) form measured marginally faster but drifted orth
+      // (7e-5 -> 4e-4, nbad 0 -> 1) -- the compiler reorders the read/write under
+      // unroll -- so keep the snapshot: nbad=0 is more robust and perf delta is noise.
       float prow[NN];
       #pragma unroll
       for (int j = 0; j < NN; ++j) prow[j] = __shfl_sync(FULL, Ar[j], partner);
