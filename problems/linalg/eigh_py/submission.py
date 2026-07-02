@@ -6960,7 +6960,8 @@ def _eigh_mw_jacobi(a: torch.Tensor) -> output_t:
     dev = af.device
     Q = torch.empty(b, n, n, device=dev, dtype=torch.float32)   # kernel writes SORTED Q
     L = torch.empty(b, n, device=dev, dtype=torch.float32)      # kernel writes SORTED L
-    Bad = torch.zeros(b, device=dev, dtype=torch.float32)       # in-kernel gate flag
+    Bad = torch.empty(b, device=dev, dtype=torch.float32)       # in-kernel gate flag
+    #    (kernel writes every entry via tid==0 per CTA -> no pre-zero needed)
     mod.mw_jacobi_eigh(af, Q, L, Bad, n, _MWJAC_SWEEPS)
     # The kernel computes the per-matrix eigen-residual gate IN-KERNEL (exact
     # Frobenius identity, conservative threshold) AND the A/V non-finite check, and
