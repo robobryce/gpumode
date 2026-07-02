@@ -3475,13 +3475,18 @@ _SIGN_DC_FINAL_NS = 1     # finishing FP32 NS orthonormalization steps on Q
 # 5 bmm) vs "tf32" (1-pass TF32, 2 bmm, ~2x cheaper) -- Q is already near-orthonormal
 # from the sign-DC so a plain-TF32 NS refinement may hold the orth gate at half the
 # cost. Gated: any matrix a cheaper finish leaves above the orth bound falls back.
-_SIGN_DC_FINISH_PREC = "tf32"
+_SIGN_DC_FINISH_PREC = "tf32x3"
 # brief-87: trailing CQR passes done as cheap Newton-Schulz refinements (2 GEMMs)
 # instead of Cholesky+trsm. The stacked (2b,n,K=300) trsm is the single biggest
 # sub-cost of the pipeline (nsys batch_trsm ~9.5ms across the 2 passes). ns_refine=1
 # keeps pass-1 as shifted Cholesky (contracts the rank-deficient bases from any
 # conditioning) and does pass-2 as an NS orthonormalization step at GEMM speed.
 _SIGN_DC_CQR_NS_REFINE = 0
+# brief-87: replace the wide (K x n) triangular solve inside CholeskyQR with a small
+# K x K triangular inverse + one tensor-core GEMM Qc @ L^{-T}. Rank-safe (still uses
+# the shifted Cholesky) and precision-safe (the GEMM keeps FP32/tensor-core accuracy)
+# -- unlike the NS refinement (t5) which diverged on the rank-deficient bases.
+_SIGN_DC_CQR_INV_GEMM = True
 _SIGN_DC_CQR_PASSES = 2   # subspace-basis CholeskyQR passes. REQUIRED at 2: the
                           # projected bases P+/- @ Omega are rank-deficient (the K
                           # oversample exceeds the true subspace rank), and 1 shifted
@@ -3680,7 +3685,20 @@ def _sign_dc_cqr(Y, passes=2, shift=1e-4, ns_refine=0):
         G = torch.bmm(Qc.transpose(-1, -2), Qc)
         dm = G.diagonal(dim1=-2, dim2=-1).abs().amax(-1).clamp_min(1e-30)
         L = torch.linalg.cholesky(G + (shift * dm).view(-1, 1, 1) * eyek)
-        Qc = torch.linalg.solve_triangular(L, Qc.transpose(-1, -2), upper=False).transpose(-1, -2)
+        if _SIGN_DC_CQR_INV_GEMM:
+            # brief-87: Q = Qc @ L^{-T} via a SMALL K x K triangular inverse + one
+            # tensor-core GEMM, instead of the wide (K x n) triangular solve. The
+            # stacked (2b,n,K) trsm is the pipeline's biggest sub-cost (nsys ~9.5ms);
+            # trsm cost scales with the K x n RHS, but a K x K inverse (n-independent)
+            # + a n*K @ K*K GEMM moves the n-dependent work onto the fast tensor cores.
+            Linv = torch.linalg.solve_triangular(
+                L, eyek.expand(L.shape[0], c, c), upper=False)   # K x K, small RHS
+            # FP32-accurate GEMM (3xTF32 Ozaki) -- plain TF32 here breaks orthogonality
+            # (t7: orth 0.031); the direct trsm is FP32 so the inverse-GEMM path must
+            # match that accuracy to hold the orth gate.
+            Qc = _matmul_3xtf32(Qc, Linv.transpose(-1, -2))      # Qc @ L^{-T}
+        else:
+            Qc = torch.linalg.solve_triangular(L, Qc.transpose(-1, -2), upper=False).transpose(-1, -2)
     for _ in range(ns_refine):
         G = torch.bmm(Qc.transpose(-1, -2), Qc)          # K x K Gram
         Qc = torch.baddbmm(Qc, Qc, G, beta=1.5, alpha=-0.5)  # Qc@(1.5I - 0.5G), fused
@@ -3792,6 +3810,15 @@ def _sign_dc_solve(af, n, dev):
         X = af / scale
         _nsit = _SIGN_DC_NS5_ITERS if _SIGN_DC_NS_DEGREE == 5 else _SIGN_DC_NS_ITERS
         X = _sign_dc_ns_sign(X, _nsit)   # HEAD/TAIL used internally for "mixed"
+    import os as _os_c
+    if _os_c.environ.get("SIGNDC_KCOUNT"):
+        import sys as _sys
+        trX = X.diagonal(dim1=-2, dim2=-1).sum(dim=-1)   # ~ n+ - n-
+        npos = (n + trX) / 2.0
+        maxside = torch.maximum(npos, n - npos)
+        _sys.stderr.write(f"[SIGNDC_KCOUNT] n={n} K={K} n+_range=[{npos.min().item():.1f},{npos.max().item():.1f}] "
+                          f"max_side={maxside.max().item():.1f} (K margin={K - maxside.max().item():.1f})\n")
+        _sys.stderr.flush()
     # Spectral projectors are NOT materialized: P+ @ M = 0.5*(M + X@M) and
     # P- @ M = 0.5*(M - X@M), so the subspace probes and the membership test apply
     # the sign directly to their (thin) operands -- no full n*n P+/P- tensors.
