@@ -5952,7 +5952,7 @@ def _eigh_sign_dc(a: torch.Tensor) -> output_t:
 # n<=32 residual gate (eigen ~7.6e-4); the Python wrapper residual-gates per
 # matrix and falls any miss back to cuSOLVER (never regresses below the floor).
 _WJAC_NMAX = 32           # only n<=32 routed to the warp-Jacobi kernel
-_WJAC_SWEEPS = 12         # cyclic-Jacobi sweeps (each = n-1 rounds). Swept below.
+_WJAC_SWEEPS = 6          # cyclic-Jacobi sweeps (each = n-1 rounds). Swept below.
 _WJAC_WARPS = 8           # warps (matrices) per CTA -> co-residency at high occ
 _wjac_mod = None
 _wjac_failed = False
