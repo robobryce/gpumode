@@ -3460,7 +3460,7 @@ _SIGN_DC_NS5_ITERS = 14   # degree-5 iteration count when _SIGN_DC_NS_DEGREE == 
 _SIGN_DC_NS5_HEAD = 4     # degree-5 head iters when _SIGN_DC_NS_DEGREE == "mixed"
 _SIGN_DC_NS5_TAIL = 8     # degree-3 tail iters when _SIGN_DC_NS_DEGREE == "mixed"
 _SIGN_DC_NS5_COEF = "pade"
-_SIGN_DC_POWER_ITERS = 3  # A^2 power iterations for the spectral-norm scale estimate.
+_SIGN_DC_POWER_ITERS = 4  # A^2 power iterations for the spectral-norm scale estimate.
                           # The scale only needs to be a loose UPPER bound on ||A||_2
                           # (multiplied by 1.02) so the Newton-Schulz sign iteration
                           # starts inside its convergence region -- NS is robust to
