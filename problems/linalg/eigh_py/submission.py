@@ -4628,7 +4628,12 @@ def _ns_graph_get():
 
 # Master switch: run the NS sign loop through the explicit-node CUDA graph
 # (our own batched tf32 WMMA GEMM nodes) instead of the torch bmm/baddbmm path.
-_SIGN_DC_NS_GRAPH = True
+# MEASURED OFF (brief-103 t1/t2): the graph replays our own WMMA GEMM, which is
+# 6-12x slower than cuBLAS, and the ~213us inter-iteration gaps are a GPU-side
+# tail-wave drain (host enqueues in 0.45ms vs 9.25ms GPU-time) that a graph
+# cannot remove -> route (a) regressed ns_sign 9.23->~80ms. Kept OFF; the drain
+# is instead attacked below by the cuBLAS-tile-occupancy lever (no graph).
+_SIGN_DC_NS_GRAPH = False
 
 
 def _sign_dc_ns_sign_graph(X0, iters, c1s, c3s):
@@ -4736,6 +4741,40 @@ def _ns3_step_scaled(X, c1, c3):
     return torch.baddbmm(X, X, X2, beta=c1, alpha=-c3)
 
 
+# brief-103: LOW-PRECISION matrix-sign GEMMs. MEASURED (shape 11, n=512 b=640):
+# the ns_sign stage runs the two batched (640,512,512) GEMMs per iteration on the
+# cutlass s256x256-2sm tf32 kernel at 230KB SMEM -> Block Limit Shared Mem=1 CTA/SM
+# -> 12.5% theoretical / 9.8% achieved occupancy (ncu), ~35 waves, so consecutive
+# GEMMs leave a ~213us tail-drain (10 x 213us = 2.15ms = 24.5% of the 8.79ms
+# region). Casting the iterate to BF16/FP16 drops ns_sign from 9.2ms to ~4.6ms
+# (~2x): BF16 tensor cores are ~2x the tf32 rate on B200 (2250 vs 1100 TFLOPS)
+# AND the smaller tile raises occupancy. The sign function is bounded (|X|~1) so
+# there is no overflow, the near-zero eigenvalues the schedule lifts are the
+# fuzzy region the projector membership tolerates anyway, and the final Q still
+# passes through the 3xTF32 finishing NS -- so reduced-precision INTERIOR sign
+# math is admissible. The per-iteration axpy (c1*X - c3*X^3) is done in FP32 to
+# keep the linear-combination accuracy; only the two GEMMs are low-precision.
+# _SIGN_DC_NS_PREC: None/"tf32" (fp32 iterate, tf32 GEMM -- baseline),
+# "bf16" or "fp16" (low-precision GEMM inputs, fp32 accumulate + fp32 axpy).
+# fp16 is preferred over bf16 here: the iterate is bounded ~[-1,1] so fp16's
+# narrower exponent is safe, and its 10 mantissa bits (vs bf16's 7) match tf32's
+# accuracy (measured rel-vs-tf32: fp16 1.1e-3, bf16 7.3e-3; both give an
+# IDENTICAL ||X^2-I|| = 3.2e-2 -- the sign quality is iteration-count-limited,
+# not precision-limited).
+_SIGN_DC_NS_PREC = "fp16"
+
+
+def _ns3_step_scaled_lp(X, c1, c3, lpdt):
+    """SCALED degree-3 sign step with a LOW-PRECISION (bf16/fp16) iterate, fully
+    baddbmm-fused (fp32 accumulate). X is low-precision (b,n,n); returns
+    low-precision. The two O(n^3) GEMMs run at the low-precision tensor-core rate
+    (~2x tf32) at 1 CTA/SM lower SMEM (higher occupancy). The linear c1*X term is
+    the beta operand of baddbmm so it fuses into the same launch (no separate
+    axpy kernel / HBM round-trip), matching the fast in-loop microbench."""
+    X2 = torch.bmm(X, X)                                  # X^2 (fp32 accum -> lpdt)
+    return torch.baddbmm(X, X, X2, beta=c1, alpha=-c3)    # c1*X - c3*(X@X^2)
+
+
 def _sign_dc_ns_sign(X, iters, degree=None, coef=None):
     """Batched matrix-sign iteration on a symmetric X whose eigenvalues are pre-scaled
     into [-1,1]. degree=3 -> Newton-Schulz p3(x)=1.5x-0.5x^3 (2 GEMMs/iter). degree=5 ->
@@ -4767,10 +4806,11 @@ def _sign_dc_ns_sign(X, iters, degree=None, coef=None):
         head = iters if _SIGN_DC_NS_HEAD is None else min(int(_SIGN_DC_NS_HEAD), iters)
         # brief-103: the full per-iteration (c1,c3) schedule is a FIXED host list
         # (CANS head + fixed-NS tail (1.5,0.5)), so the whole degree-3 loop is a
-        # fixed-topology sequence of 2*iters batched GEMMs -> capturable as an
-        # explicit-node CUDA graph (our own tf32 WMMA GEMM kernel nodes). The graph
-        # replays the real arithmetic; the outer residual gate + cuSOLVER fallback
-        # still catch any matrix it misses, so it stays 39/39-valid.
+        # fixed-topology sequence of 2*iters batched GEMMs. An explicit-node CUDA
+        # graph of this loop was measured out (route a: own WMMA GEMM 6-12x slower
+        # than cuBLAS, and the ~213us gaps are a GPU-side tail-drain the graph
+        # can't remove). Instead: low-precision (bf16/fp16) GEMMs cut the O(n^3)
+        # sign cost ~2x (higher TC rate + higher occupancy from the smaller tile).
         if _SIGN_DC_NS_GRAPH:
             c1s = [c1 for (c1, c3) in _cans_coeffs(_SIGN_DC_NS_A0, head)]
             c3s = [c3 for (c1, c3) in _cans_coeffs(_SIGN_DC_NS_A0, head)]
@@ -4779,6 +4819,18 @@ def _sign_dc_ns_sign(X, iters, degree=None, coef=None):
             Xg = _sign_dc_ns_sign_graph(X, iters, c1s, c3s)
             if Xg is not None:
                 return Xg
+        _lpdt = ({"bf16": torch.bfloat16, "fp16": torch.float16}
+                 .get(_SIGN_DC_NS_PREC))
+        if _lpdt is not None:
+            # cast the iterate to low precision ONCE; the fused baddbmm keeps it
+            # low-precision across iters (fp32 accumulate inside each GEMM), then
+            # cast back to fp32 for the later fp32 projectors/CQR.
+            Xl = X.to(_lpdt)
+            for (c1, c3) in _cans_coeffs(_SIGN_DC_NS_A0, head):
+                Xl = _ns3_step_scaled_lp(Xl, c1, c3, _lpdt)
+            for _ in range(iters - head):
+                Xl = _ns3_step_scaled_lp(Xl, 1.5, 0.5, _lpdt)
+            return Xl.float()
         for (c1, c3) in _cans_coeffs(_SIGN_DC_NS_A0, head):
             X = _ns3_step_scaled(X, c1, c3)
         for _ in range(iters - head):
