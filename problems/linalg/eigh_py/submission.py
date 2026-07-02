@@ -741,12 +741,6 @@ extern "C" __global__ void mega_eigh_clust_split_k(
   size_t voff = ((size_t)(Ah + myTri) - (size_t)shc); voff=(voff+15u)&~15u;
   float* v = (float*)(shc + voff);             // n floats: this CTA's copy of v
   float* p = v + n;                            // n floats: this CTA's partial p
-  // brief-95: SMEM-cache the OWNED rows of the compact-WY panel Y (=reflectors)
-  // and W (=A*v corrections) so the per-column bring-up-to-date + trailing-update
-  // reads hit SMEM instead of global. Sized (maxOwnedRows * PB) each, packed by
-  // LOCAL row lr=i-r0: Ysh[lr*PB+e], Wsh[lr*PB+e] for panel column e in [0,pw).
-  float* Ysh = p + n;                          // (r1-r0)*PB owned reflector rows
-  float* Wsh = Ysh + (long)(r1-r0)*PB;         // (r1-r0)*PB owned W rows
   __shared__ float red[1024];
   // peer-visible SMEM staging for the cross-CTA SCALAR reductions (amax/s2/alpha):
   // clx[0]=amax/s2 partial, clx[1]=alpha (owner CTA only), read from the peer via
@@ -783,148 +777,116 @@ extern "C" __global__ void mega_eigh_clust_split_k(
   for(int i=r0;i<r1;++i){ for(int j=tid;j<=i;j+=nt){ AOWNSET(i,j, Am[(long)i*n+j]*invs); } }
   __syncthreads();
 
-  // ============ Stage 1: BLOCKED (panel/latrd) Householder tridiagonalization ====
-  // LAPACK sytrd/latrd: reduce a PANEL of PB columns accumulating the compact-WY
-  // pair (Y=reflectors in Rm, W=A*v corrections in DP), then apply the trailing
-  // symmetric rank-2b update  Ah := Ah - W Y^T - Y W^T  ONCE PER PANEL. The
-  // packed FP16 triangle Ah is FROZEN within a panel (the per-column symv reads
-  // the panel-start matrix; the accumulated W,Y bring each column up to date), so
-  // the end-of-column trailing-update cross-cluster cl.sync collapses from one per
-  // column to one per panel. Per column there remain 3 cross-cluster syncs (norm
-  // reduction, v broadcast, p+z-vector exchange); the 4th (Ah update ordering) is
-  // now amortized over PB columns. W lives in DP (dpscr, n*n, free until Stage 3);
-  // the small correction b-vectors z1=Y(:,:j)^T v, z2=W(:,:j)^T v are exchanged
-  // through DM (dmscr) staging folded into the p-exchange sync.
-  // W[i,c] := DP[i*n + c] (absolute column index c). z-staging: DM[rr*(2*PB)+..].
-  #define WOWN(i,c) DP[(long)(i)*n + (c)]
-  #define YS(lr,e) Ysh[(long)(lr)*PB + (e)]
-  #define WS(lr,e) Wsh[(long)(lr)*PB + (e)]
-  int nrOwn = r1 - r0;                        // owned row count (>=0)
-  for(int c0=0;c0<n-2;c0+=PB){
-    int pw = (n-2) - c0; if(pw>PB) pw=PB;     // panel width
-    // Row c0..c0+pw-1's Y,W scalars (row-c broadcast for bring-up-to-date). Only the
-    // few panel scalars of a row are needed; read from global Rm/DP (peer-safe after
-    // the prior panel's cl.sync). Cache the CURRENT-panel owned Y,W in SMEM as built.
-    // ---- per-column reduction within the frozen panel ----
-    for(int jj=0;jj<pw;++jj){
-      int c = c0 + jj;
-      bool active = (r1 > c+1);
-      int is=(r0>c+1)?r0:(c+1);
-      int ownerC1=0; { for(int rr=0;rr<C;++rr){ if(c+1>=bnd[rr] && c+1<bnd[rr+1]){ ownerC1=rr; break; } } }
-      bool lead = ((int)R==ownerC1);
-      // (1) Bring column c up to date w.r.t. this panel's earlier reflectors e in
-      //     [c0,c): Acol_i = AOWN(i,c) - sum_e ( W[i,e]*Y[c,e] + Y[i,e]*W[c,e] ).
-      //     Owned rows read owned Y,W from SMEM (YS/WS); row c's Y[c,e],W[c,e] from
-      //     global (few scalars). Updated column staged in v[] (owned) + norm s2.
-      float s2=0.f;
-      if(active) for(int i=is+tid;i<r1;i+=nt){
-        int lr=i-r0; float x=AOWN(i,c);
-        for(int e=0;e<jj;++e){ int ce=c0+e; x -= WS(lr,e)*Rm[(long)c*n+ce] + YS(lr,e)*WOWN(c,ce); }
-        v[i]=x;
-        s2 += x*x;
-      }
-      s2 = _clsum(s2, red, tid, nt);
-      if(tid==0){ clx[0]=s2; if(lead) clx[1]=v[c+1]; }
-      __syncthreads();
-      cl.sync();                             // sync #1: norm reduction + alpha
-      float xnorm2=0.f, alpha=0.f;
-      for(int rr=0;rr<C;++rr){
-        volatile float* peerx = (volatile float*)cl.map_shared_rank(clx, rr);
-        xnorm2 += peerx[0];
-        if(rr==ownerC1) alpha = peerx[1];
-      }
-      float tail2 = xnorm2 - alpha*alpha;
-      if(tail2<=1e-20f){
-        if(tid==0 && lead){ Em[c]=alpha; Tau[c]=0.f; }
-        if(active) for(int i=r0+tid;i<r1;i+=nt){ int lr=i-r0; float vi=(i==c+1)?1.f:0.f; Rm[(long)i*n+c]=vi; WOWN(i,c)=0.f; YS(lr,jj)=vi; WS(lr,jj)=0.f; vgm[i]=vi; }
-        __threadfence(); __syncthreads();
-        cl.sync();                           // sync #2 (degenerate col): publish v/W=0
-        for(int i=tid;i<n;i+=nt) if(i<r0||i>=r1) v[i]=vgm[i];
-        __syncthreads();
-        continue;
-      }
-      float xnorm=sqrtf(xnorm2); float beta=(alpha>=0.f)?-xnorm:xnorm; float tau=(beta-alpha)/beta; float denom=alpha-beta;
-      // (2) Householder vector v_c (owned rows) -> v[], Rm (col c), YS SMEM, global vgm.
-      for(int i=r0+tid;i<r1;i+=nt){
-        int lr=i-r0;
-        float xi = (i>c && active) ? v[i] : 0.f;
-        float vi = (i<=c)?0.f : ((i==c+1)?1.f : xi/denom);
-        v[i]=vi; Rm[(long)i*n+c]=vi; YS(lr,jj)=vi; vgm[i]=vi;
-      }
-      __threadfence(); __syncthreads();
-      cl.sync();                             // sync #2: v broadcast
-      for(int i=tid;i<n;i+=nt) if(i<r0||i>=r1) v[i]=vgm[i];
-      __syncthreads();
-      // (3) symv p = A_frozen @ v (owned rows, RAW) + owned partials of
-      //     z1[e]=sum_i Y[i,e]v[i], z2[e]=sum_i W[i,e]v[i] (e in [0,jj)) via SMEM
-      //     Y,W -> DM per-rank staging, folded into sync #3.
-      volatile __half* AhP[8]; long triLoP[8];
-      for(int rr=(int)R+1; rr<C; ++rr){ AhP[rr]=(volatile __half*)cl.map_shared_rank(Ah, rr); triLoP[rr]=((long)bnd[rr]*(bnd[rr]+1))/2; }
-      if(active) for(int i=is+tid; i<r1; i+=nt){
-        float acc=0.f;
-        for(int j=c;j<=i;++j) acc += AOWN(i,j)*v[j];        // lower (local, frozen)
-        for(int j=i+1;j<r1;++j) acc += AOWN(j,i)*v[j];       // upper, local rows
-        for(int rr=(int)R+1; rr<C; ++rr){                    // upper, peer rows
-          volatile __half* AhPeer=AhP[rr]; long tlp=triLoP[rr];
-          for(int j=bnd[rr];j<bnd[rr+1];++j){ __half hh=AhPeer[((long)j*(j+1))/2 - tlp + i]; acc += __half2float(hh)*v[j]; }
-        }
-        p[i]=acc; pgm[i]=acc;
-      }
-      float* zst = DM + (long)R*(2*(long)PB);
-      for(int e=tid; e<jj; e+=nt){
-        float a1=0.f, a2=0.f;
-        for(int i=r0;i<r1;++i){ int lr=i-r0; float vi=v[i]; a1+=YS(lr,e)*vi; a2+=WS(lr,e)*vi; }
-        zst[e]=a1; zst[PB+e]=a2;
-      }
-      __threadfence(); __syncthreads();
-      cl.sync();                             // sync #3: p exchange + z1/z2 exchange
-      for(int i=(c+1)+tid;i<n;i+=nt) if(i<r0||i>=r1) p[i]=pgm[i];
-      __syncthreads();
-      if(tid<2*jj){ float acc=0.f; for(int rr=0;rr<C;++rr){ acc += (DM + (long)rr*(2*(long)PB))[tid]; } red[512+tid]=acc; }
-      __syncthreads();
-      // z1 = red[512+e], z2 = red[512+PB+e]. Fold the scaling K = 0.5 tau (w^T v):
-      //   w^T v = tau ( (A@v)^T v - 2 * sum_e z1[e] z2[e] )   (no full-w needed)
-      float pv=0.f;
-      for(int i=c+1+tid;i<n;i+=nt) pv+=v[i]*p[i];       // (A@v)^T v (raw p, full local)
-      pv = _clsum(pv, red, tid, nt);
-      float zz=0.f; for(int e=0;e<jj;++e) zz += red[512+e]*red[512+PB+e];
-      float vp = pv - 2.f*zz;
-      float K = 0.5f*tau*vp;
-      // (4) OWNED rows only: w[i] = tau*(A@v_i - corr_i) - K v[i], corr_i from SMEM
-      //     Y,W and broadcast z1,z2. Store w into W col c (WOWN global + WS SMEM).
-      if(active) for(int i=(c+1)+tid;i<r1;i+=nt){
-        int lr=i-r0; float corr=0.f;
-        for(int e=0;e<jj;++e) corr += YS(lr,e)*red[512+PB+e] + WS(lr,e)*red[512+e];
-        float wi = tau*(p[i]-corr) - K*v[i];
-        WOWN(i,c)=wi; WS(lr,jj)=wi;
-      }
-      // zero W below the diagonal for owned rows i<=c (kept out of trailing update)
-      for(int i=r0+tid;i<r1 && i<=c;i+=nt){ int lr=i-r0; WOWN(i,c)=0.f; WS(lr,jj)=0.f; }
-      if(tid==0 && lead){ Em[c]=beta; Tau[c]=tau; }
-      __threadfence(); __syncthreads();
-      // NOTE: no per-column trailing-update cl.sync; Ah stays frozen this panel.
-    }
-    // ---- (5) trailing symmetric rank-2b update, ONCE per panel ----
-    //   Ah[i,j] := Ah[i,j] - sum_{e in panel} ( Y[i,e] W[j,e] + W[i,e] Y[j,e] )
-    //   over owned rows i (j in [c0+1,i]). All Y,W from SMEM (owned rows) + the
-    //   row-j Y,W from global (peer-safe; j<=i covers owned + earlier peer rows).
-    cl.sync();                               // sync #P: order panel W/Y global writes before trailing update
-    int jlo = c0+1;
-    for(int i=r0+tid;i<r1;i+=nt){
-      if(i<jlo) continue;
-      int lr=i-r0;
-      for(int j=jlo;j<=i;++j){
-        float s=0.f;
-        for(int e=0;e<pw;++e){ int ce=c0+e; s += YS(lr,e)*WOWN(j,ce) + WS(lr,e)*Rm[(long)j*n+ce]; }
-        AOWNSET(i,j, AOWN(i,j) - s);
-      }
-    }
+  // ============ Stage 1: Householder tridiagonalization (SYNC-FUSED) =============
+  // brief-95: the parent per-column loop needs 4 cross-cluster cl.sync per column
+  // (norm reduction, v broadcast, p exchange, end-of-column trailing-update order).
+  // The norm-reduction of column c reads ONLY this CTA's OWNED rows of the (already
+  // updated) Ah column c -- so its partial is purely local. We therefore FUSE the
+  // norm exchange into the PREVIOUS column's end-of-column cl.sync: after the rank-2
+  // trailing update (local Ah writes), each CTA computes the NEXT column's owned s2
+  // partial from the just-updated Ah and stages it, and the SAME cl.sync that orders
+  // the trailing update also exchanges the next norm. That collapses 4 -> 3 syncs
+  // per column with NO added per-column work (pure reordering; the symv v/p exchanges
+  // are untouched). PB is ignored on this path (kept for ABI compatibility).
+  (void)PB;
+  // ---- prime column 0's norm exchange (staged into clx, exchanged by cl.sync) ----
+  {
+    int c=0; bool active=(r1>c+1); int is=(r0>c+1)?r0:(c+1);
+    int ownerC1=0; { for(int rr=0;rr<C;++rr){ if(c+1>=bnd[rr] && c+1<bnd[rr+1]){ ownerC1=rr; break; } } }
+    bool lead=((int)R==ownerC1);
+    float s2=0.f;
+    if(active) for(int i=is+tid;i<r1;i+=nt){ float x=AOWN(i,c); s2+=x*x; }
+    s2=_clsum(s2, red, tid, nt);
+    if(tid==0){ clx[0]=s2; if(lead) clx[1]=AOWN(c+1,c); }
     __syncthreads();
-    cl.sync();                               // publish Ah updates before next panel's frozen reads
+    cl.sync();                                // initial norm/alpha exchange for c=0
   }
-  #undef WOWN
-  #undef YS
-  #undef WS
+  for(int c=0;c<n-2;++c){
+    bool active = (r1 > c+1);
+    int is=(r0>c+1)?r0:(c+1);
+    int ownerC1=0; { for(int rr=0;rr<C;++rr){ if(c+1>=bnd[rr] && c+1<bnd[rr+1]){ ownerC1=rr; break; } } }
+    bool lead = ((int)R==ownerC1);
+    // norm + alpha for column c were exchanged by the PREVIOUS iteration's fused sync
+    // (or the prime block for c=0); read the C peer partials from clx.
+    float xnorm2=0.f, alpha=0.f;
+    for(int rr=0;rr<C;++rr){
+      volatile float* peerx = (volatile float*)cl.map_shared_rank(clx, rr);
+      xnorm2 += peerx[0];
+      if(rr==ownerC1) alpha = peerx[1];
+    }
+    float tail2 = xnorm2 - alpha*alpha;
+    if(tail2<=1e-20f){
+      if(tid==0 && lead){ Em[c]=alpha; Tau[c]=0.f; }
+      if(active) for(int i=r0+tid;i<r1;i+=nt) Rm[i*n+c]=(i==c+1)?1.f:0.f;
+      __syncthreads();
+      // FUSED: no trailing update this column, but still stage NEXT column's norm.
+      if(c+1<n-2){
+        int cn=c+1; bool an=(r1>cn+1); int isn=(r0>cn+1)?r0:(cn+1);
+        int on=0; { for(int rr=0;rr<C;++rr){ if(cn+1>=bnd[rr] && cn+1<bnd[rr+1]){ on=rr; break; } } }
+        bool ln=((int)R==on);
+        float s2n=0.f;
+        if(an) for(int i=isn+tid;i<r1;i+=nt){ float x=AOWN(i,cn); s2n+=x*x; }
+        s2n=_clsum(s2n, red, tid, nt);
+        if(tid==0){ clx[0]=s2n; if(ln) clx[1]=AOWN(cn+1,cn); }
+        __syncthreads();
+      }
+      cl.sync();                              // sync: (degenerate) + next-col norm exchange
+      continue;
+    }
+    float xnorm=sqrtf(xnorm2); float beta=(alpha>=0.f)?-xnorm:xnorm; float tau=(beta-alpha)/beta; float denom=alpha-beta;
+    for(int i=r0+tid;i<r1;i+=nt){
+      float vi = (i<=c)?0.f : ((i==c+1)?1.f : AOWN(i,c)/denom);
+      v[i]=vi; Rm[i*n+c]=vi; vgm[i]=vi;      // stage owned v into GLOBAL
+    }
+    __threadfence();                          // publish owned-v global writes to peers
+    __syncthreads();
+    cl.sync();                                // sync A: v broadcast
+    for(int i=tid;i<n;i+=nt) if(i<r0||i>=r1) v[i]=vgm[i];
+    __syncthreads();
+    // symv p = tau*A@v, no-atomic symmetric dot product (identical to parent).
+    volatile __half* AhP[8]; long triLoP[8];
+    for(int rr=(int)R+1; rr<C; ++rr){ AhP[rr]=(volatile __half*)cl.map_shared_rank(Ah, rr); triLoP[rr]=((long)bnd[rr]*(bnd[rr]+1))/2; }
+    if(active) for(int i=is+tid; i<r1; i+=nt){
+      float acc=0.f;
+      for(int j=c;j<=i;++j) acc += AOWN(i,j)*v[j];        // lower (local)
+      for(int j=i+1;j<r1;++j) acc += AOWN(j,i)*v[j];       // upper, local rows
+      for(int rr=(int)R+1; rr<C; ++rr){                    // upper, peer rows
+        volatile __half* AhPeer=AhP[rr]; long tlp=triLoP[rr];
+        for(int j=bnd[rr];j<bnd[rr+1];++j){ __half hh=AhPeer[((long)j*(j+1))/2 - tlp + i]; acc += __half2float(hh)*v[j]; }
+      }
+      p[i]=tau*acc; pgm[i]=p[i];                           // stage owned p into GLOBAL pfull (disjoint)
+    }
+    __threadfence();                          // publish owned-p global writes to peers
+    __syncthreads();
+    cl.sync();                                // sync B: p exchange
+    for(int i=(c+1)+tid;i<n;i+=nt) if(i<r0||i>=r1) p[i]=pgm[i];
+    __syncthreads();
+    float vp=0.f;
+    for(int i=c+1+tid;i<n;i+=nt) vp+=v[i]*p[i];
+    vp = _clsum(vp, red, tid, nt);
+    float K=0.5f*tau*vp;
+    for(int i=c+1+tid;i<n;i+=nt) p[i]=p[i]-K*v[i];
+    __syncthreads();
+    int iu=(r0>c+1)?r0:(c+1);
+    if(active) for(int i=iu+tid;i<r1;i+=nt){ float vi=v[i],wi=p[i]; for(int j=c+1;j<=i;++j){ float a=AOWN(i,j); AOWNSET(i,j, a-vi*p[j]-wi*v[j]); } }
+    if(tid==0 && lead){ Em[c]=beta; Tau[c]=tau; }
+    __syncthreads();
+    // FUSED: after the local trailing update, compute NEXT column's owned norm
+    // partial from the just-updated Ah and stage it; the cl.sync below both orders
+    // the trailing-update writes (for peer symv/norm reads next column) AND
+    // exchanges the next column's norm -- one sync doing the work of two.
+    if(c+1<n-2){
+      int cn=c+1; bool an=(r1>cn+1); int isn=(r0>cn+1)?r0:(cn+1);
+      int on=0; { for(int rr=0;rr<C;++rr){ if(cn+1>=bnd[rr] && cn+1<bnd[rr+1]){ on=rr; break; } } }
+      bool ln=((int)R==on);
+      float s2n=0.f;
+      if(an) for(int i=isn+tid;i<r1;i+=nt){ float x=AOWN(i,cn); s2n+=x*x; }
+      s2n=_clsum(s2n, red, tid, nt);
+      if(tid==0){ clx[0]=s2n; if(ln) clx[1]=AOWN(cn+1,cn); }
+      __syncthreads();
+    }
+    cl.sync();                                // sync C: trailing-update order + next-col norm exchange
+  }
   { int ownerLast=C-1; if(tid==0 && (int)R==ownerLast){ Em[n-2]=AOWN(n-1,n-2); } }
   for(int i=r0+tid;i<r1;i+=nt) Dm[i]=AOWN(i,i);
   // zero the two non-reflector V columns (as mega_eigh_med_split_k does) so the
@@ -1028,7 +990,7 @@ void mega_eigh_clust_split(torch::Tensor A, torch::Tensor Vout, torch::Tensor Lo
   int B=A.size(0);
   // Size dynamic SMEM from the LARGEST balanced CTA row-block (must match the
   // Python bounds). Also ensure the block-T build region (rank 0) fits.
-  size_t myTriMax=0; int maxOwnRows=0;
+  size_t myTriMax=0;
   {
     long triAll=((long)n*(n+1))/2;
     int prev=0;
@@ -1039,13 +1001,11 @@ void mega_eigh_clust_split(torch::Tensor A, torch::Tensor Vout, torch::Tensor Lo
       int bR=(r==C)?n:x;
       size_t tri = ((size_t)((long)bR*(bR+1)/2)) - ((size_t)((long)prev*(prev+1)/2));
       if(tri>myTriMax) myTriMax=tri;
-      if(bR-prev>maxOwnRows) maxOwnRows=bR-prev;
       prev=bR;
     }
   }
   size_t voff = myTriMax*sizeof(__half); voff=(voff+15u)&~15u;
-  // v,p (2n floats) + the SMEM-cached owned WY panel Ysh,Wsh (2 * maxOwnRows * PB).
-  size_t shm = voff + (size_t)2*n*sizeof(float) + (size_t)2*(size_t)maxOwnRows*(size_t)PB*sizeof(float);
+  size_t shm = voff + (size_t)2*n*sizeof(float);
   size_t shmT = ((size_t)n*nb + (size_t)nb*nb + (size_t)nb)*sizeof(float);
   if(shmT>shm) shm=shmT;
   cudaFuncSetAttribute(mega_eigh_clust_split_k, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)shm);
