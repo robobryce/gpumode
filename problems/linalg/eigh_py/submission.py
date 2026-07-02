@@ -1970,9 +1970,10 @@ _MEGA_SMALL_NT = 512
 # gate tolerance scales with n, so plain TF32 (tensor cores) MAY be accurate enough here
 # -- moving the ~14%-of-shape1 back-transform onto TC. Per-matrix gate + fallback
 # backstops any matrix TF32 mis-orthogonalizes.
-# MEASURED (t9): plain "tf32" -> mass fallback (shape1 7877us). Try "tf32x3" (Ozaki
-# 3-pass, ~FP32 accuracy on TC) -- preserves accuracy but triples the ~18 panel GEMMs.
-_MEGA_SMALL_BT_PREC = "tf32x3"
+# MEASURED: "tf32" -> mass fallback (t9, shape1 7877us; TF32 too coarse over the WY
+# product); "tf32x3" -> +36% (t10, triples the ~18 panel GEMMs -> launch overhead at b40).
+# fp32-SIMT is the accurate + fastest back-transform for the small-n path at b40.
+_MEGA_SMALL_BT_PREC = "fp32"
 
 
 def _mega_sq_split_solve(af, dev, b, n, nt, nb):
