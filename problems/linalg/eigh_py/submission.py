@@ -2346,7 +2346,11 @@ def _matmul_2xtf32(A, B):
 def _lr_lift_gemm(A, B, mode):
     """One low-rank lift/product GEMM A @ B at the requested precision:
     "fp32" (true FP32-SIMT), "tf32" (single-pass TF32 tensor core), "2xtf32"
-    (2-term hi+lo split), or "3xtf32" (3-term Ozaki hi+lo split, ~FP32 accuracy).
+    (2-term hi+lo split), "3xtf32" (3-term Ozaki hi+lo split, ~FP32 accuracy),
+    or "fp16"/"bf16" (half-precision inputs, fp32 accumulate -- ~2x the tf32
+    tensor-core rate + a smaller cutlass tile / higher occupancy; brief-103, for
+    the sign-DC lift + back-transform where the operands are already O(1) and the
+    outer residual gate catches any matrix a reduced factor can't resolve).
     allow_tf32 is scoped tightly so no other path's GEMM precision is perturbed."""
     prev = torch.backends.cuda.matmul.allow_tf32
     try:
@@ -2356,6 +2360,10 @@ def _lr_lift_gemm(A, B, mode):
         if mode == "2xtf32":
             torch.backends.cuda.matmul.allow_tf32 = True
             return _matmul_2xtf32(A, B)
+        if mode == "fp16":
+            return torch.bmm(A.half(), B.half()).float()
+        if mode == "bf16":
+            return torch.bmm(A.bfloat16(), B.bfloat16()).float()
         torch.backends.cuda.matmul.allow_tf32 = (mode == "tf32")
         return torch.bmm(A, B)
     finally:
@@ -3786,6 +3794,14 @@ _SIGN_DC_RITZ_PROJ = 256    # random Rayleigh-Ritz projection dim for shift esti
 # tighter low-rank Rayleigh gate trips on TF32 and tf32x3 net-lost, brief-22).
 _SIGN_DC_BT_PREC = "tf32"
 _SIGN_DC_AV_MODE = "tf32"    # sign-DC A@U lift + reduced-block build precision
+# brief-103: precision of the sign-DC back-transform Vstk = Ustk @ gstk (the
+# (2b,n,K)@(2b,K,K) candidate-eigenvector GEMM in member_topk) -- one of the
+# larger non-cuSOLVER GEMMs. "tf32" (parent) or "fp16"/"bf16" (2x TC rate +
+# higher occupancy). The candidates then go through membership rank-select and
+# the finishing 3xTF32 NS, and the per-matrix residual gate + cuSOLVER fallback
+# catch any matrix a reduced factor can't resolve, so reduced precision here is
+# gate-guarded. Swept per-precision below.
+_SIGN_DC_BT_LIFT = "tf32"
 # brief-55: eigenvalue-side membership consistency for the projector rank-select.
 # Only matters when the base solver's eigenvectors are ~1e-2 orthonormal (the C-CTA
 # cluster at K~1117), where a near-sigma eigenvector leaks into both halves and the
@@ -4962,7 +4978,9 @@ def _sign_dc_solve(af, n, dev):
     with _sdc_timer("6_member_topk"):
         torch.backends.cuda.matmul.allow_tf32 = True
         Up, Um = Ustk[:b], Ustk[b:]
-        Vstk = torch.bmm(Ustk, gstk)               # (2b, n, K) candidate eigenvectors
+        # brief-103: back-transform to candidate eigenvectors, optionally in fp16
+        # (2x tf32 rate). gate-guarded; parent "tf32" is byte-identical to the bmm.
+        Vstk = _lr_lift_gemm(Ustk, gstk, _SIGN_DC_BT_LIFT)  # (2b, n, K)
         Vp, Vm = Vstk[:b], Vstk[b:]
         lp, lm = lstk[:b], lstk[b:]
         # projector membership: ~1 for a real eigenvector of that block, ~0 for padding
