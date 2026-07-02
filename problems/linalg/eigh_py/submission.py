@@ -2453,6 +2453,7 @@ def _lr_cholesky_qr2(Y, passes=2, shift=1e-5, tf32_gram=False, gram_mode=None):
     c = Y.shape[-1]
     eye = torch.eye(c, device=Y.device, dtype=Y.dtype)
     prev = torch.backends.cuda.matmul.allow_tf32
+    _fmod = _fused_cqr_get() if _FUSED_CQR_SHIFT else None
     try:
         for pm in pass_modes:
             torch.backends.cuda.matmul.allow_tf32 = (pm in ("tf32", "3xtf32"))
@@ -2461,8 +2462,13 @@ def _lr_cholesky_qr2(Y, passes=2, shift=1e-5, tf32_gram=False, gram_mode=None):
                 G = _gram_3xtf32_sym(Q)
             else:
                 G = torch.bmm(Q.transpose(-1, -2), Q)
-            dm = G.diagonal(dim1=-2, dim2=-1).abs().amax(-1).clamp_min(1e-30)
-            L = torch.linalg.cholesky(G + (shift * dm).view(-1, 1, 1) * eye)
+            if _fmod is not None:
+                Gc = G.contiguous()
+                _fmod.add_shifted_diag(Gc, float(shift))
+                L = torch.linalg.cholesky(Gc)
+            else:
+                dm = G.diagonal(dim1=-2, dim2=-1).abs().amax(-1).clamp_min(1e-30)
+                L = torch.linalg.cholesky(G + (shift * dm).view(-1, 1, 1) * eye)
             Q = torch.linalg.solve_triangular(L, Q.transpose(-1, -2), upper=False).transpose(-1, -2)
     finally:
         torch.backends.cuda.matmul.allow_tf32 = prev
