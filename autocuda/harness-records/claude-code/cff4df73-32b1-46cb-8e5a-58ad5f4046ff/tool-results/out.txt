@@ -1,0 +1,2805 @@
+CholeskyQR with Randomization and Pivoting for Tall
+Matrices (CQRRPT)
+
+arXiv:2311.08316v3 [math.NA] 16 Mar 2025
+
+Maksim Melnichenko∗
+James Demmel†
+
+Oleg Balabanov†‡
+
+Riley Murray§
+
+Michael W. Mahoney‡¶ †
+
+Piotr Luszczek‖∗
+
+March 18, 2025
+
+Abstract
+This paper develops and analyzes a new algorithm for QR decomposition with
+column pivoting (QRCP) of rectangular matrices with many more rows than columns.
+The algorithm carefully combines methods from randomized numerical linear algebra
+to accelerate pivot decisions for the input matrix and the process of decomposing the
+pivoted matrix into the QR form. The source of the latter improvement is CholeskyQR
+with randomized preconditioning. Comprehensive analysis is provided in both exact
+and finite-precision arithmetic to characterize the algorithm’s rank-revealing properties
+and its numerical stability granted probabilistic assumptions of the sketching operator.
+An implementation of the proposed algorithm is described and made available inside
+the open-source RandLAPACK library, which itself relies on RandBLAS. Experiments
+with this implementation on an Intel Xeon Gold 6248R CPU demonstrate order-ofmagnitude speedups over LAPACK’s standard function for QRCP, and comparable
+performance to a specialized algorithm for unpivoted QR of tall matrices, which lacks
+the strong rank-revealing properties of the proposed method.
+
+1
+
+Introduction
+
+The QR factorization, considered one of “The Big Six Matrix Factorizations” [Hig22], is
+fundamental to the field of numerical linear algebra. Its applications range from linear least
+squares problems [Bjö96] and block orthogonalization [SW02] to contemporary randomized
+low-rank approximation algorithms [TW23]. Beyond the basic QR decomposition, QR with
+column pivoting (QRCP) has additional benefits for numerically challenging problems, as it
+can help with rank-revealing tasks. To describe this problem concretely, let M be a matrix
+of size m × n with m ≥ n. QRCP is concerned with finding a column permutation matrix
+Π and a QR decomposition of the product MΠ, i.e.,
+MΠ = QR
+such that the information on the leading and trailing singular values of M can be inferred
+from the spectra of leading and trailing blocks in 2 × 2 partitions of R.
+∗ Innovative Computing Laboratory, University of Tennessee, Knoxville
+† University of California, Berkeley
+‡ International Computer Science Institute (ICSI)
+§ Sandia National Laboratories
+¶ Lawrence Berkeley National Laboratory
+‖ MIT Lincoln Laboratory
+
+Funding acknowledgments and additional affiliations appear at the end of the paper.
+Send correspondence to mmelnic1@vols.utk.edu.
+
+1
+
+Remark 1. We use the term spectrum in reference to singular values, not eigenvalues. Eigenvalues are of interest to us only insofar as they coincide with singular values for positive
+semidefinite matrices.
+QRCP is considerably more expensive than unpivoted QR from a communication standpoint, even with straightforward pivoting strategies. For example, Householder QR with
+Businger and Golub’s max-norm pivoting requires updating column norms of every partial
+decomposition of M as the algorithm progresses from left to right across the columns [BG65].
+These column-norm updates entail matrix-vector (BLAS 2) operations, which are far less
+suitable for modern hardware than the matrix-matrix (BLAS 3) operations abundant in
+classic algorithms for unpivoted QR. The significance of this problem has been known for
+decades [QOSB98], and has compounded over time.
+We use methods common in Randomized Numerical Linear Algebra (RandNLA) to develop a fast and reliable QRCP algorithm we call CQRRPT,1 which stands for “CholeskyQR
+with Randomization and Pivoting for Tall matrices.” As we show below, CQRRPT can outperform not only other QRCP algorithms but also specialized communication-avoiding algorithms for unpivoted QR, such as shifted CholeskyQR3 [FKN+ 20] and TSQR [DGHL12].
+The dominant cost of our algorithm is attributed exclusively to BLAS 3 operations and
+a random projection, rendering it highly efficient from a communication standpoint. On
+distributed memory systems, it can be implemented with just two sum-reduce exchanges.
+Compared to shifted CholeskyQR3, CQRRPT requires 34 × fewer data passes and 32 × fewer
+inter-processor messages. Furthermore, compared to TSQR, CQRRPT lends itself more
+easily to performance optimization on massively parallel architectures, thanks to its simple
+reduction operator. The highly efficient computational profile, together with its numerical stability, suggests that CQRRPT essentially “solves” the algorithm design problem of
+QRCP for tall matrices.
+
+1.1
+
+Where is the randomness?
+
+CQRRPT uses randomness only once: as its very first step, it samples a linear dimension
+reduction map from a prescribed distribution. The dimension reduction map is called a
+sketching operator and is said to be sampled from a sketching distribution. Its next step
+is to apply the sketching operator to the input matrix to produce a sketch. Computing a
+sketch can be as simple as selecting rows from a matrix and as complicated as fast Fourier
+transforms. Our implementation of CQRRPT uses structured sparse sketching operators,
+since these can provide exceptional speed without sacrificing reliability of the algorithm.
+Analysis of sketching-based algorithms often comes in two parts. In the first part, the
+algorithm is analyzed as a purely deterministic method, conditional on an event that the
+sketch retains suitable geometric information from the input matrix. The second part uses
+tools from random matrix theory to bound the probability with which the desirable event
+happens, where the bound is unconditional on numerical properties of the input matrix. Our
+analysis of CQRRPT follows this tradition. Our presentation strongly emphasizes the first
+phase of analysis, since the probabilistic event that the first phase conditions on is extremely
+well understood.
+We refer the reader to the recent monograph [MDM+ 23] for a broad overview of how
+randomness can be leveraged in numerical linear algebra.
+1 pronounced “see-crypt”
+
+2
+
+1.2
+
+The CholeskyQR method and its variants
+
+The idea behind CholeskyQR is simple. Given the m × n matrix M with m ≥ n, compute
+the Gram matrix G = M∗ M. If we can factor G = R∗ R where R is an invertible uppertriangular matrix, then we can obtain the QR decomposition’s orthogonal factor – hereafter,
+the “Q-factor” – as Q = MR−1 . Note that this procedure only works if M has rank n.
+Computational profile. Computing G and R in CholeskyQR can be carried out by the
+BLAS function SYRK and the LAPACK function POTRF, respectively. The Q-factor can be
+formed explicitly with the Level 3 BLAS function TRSM. The flop count for CholeskyQR
+using these three functions is roughly 2mn2 + n3 /3 [ADO94, Page 120], which is close to
+the 2mn2 − (2/3)n3 flop count of Householder QR computed by LAPACK’s GEQRF function
+[ADO94, Page 122] when m ≥ n.
+Notably, CholeskyQR returns an explicit Q-factor, while GEQRF outputs an implicit
+representation of its Q-factor. The implicit representation is preferable for manipulating
+the full m × m orthogonal operator in a “non-economic” QR decomposition. Nevertheless, many common numerical methods, such as subspace projection methods or singular
+value decomposition of tall matrices, require computing the Q-factor explicitly. Translating
+GEQRF’s implicit factor into an explicit form (using LAPACK’s ORGQR) takes an additional
+2mn2 − (2/3)n3 flops [ADO94, Page 122]. Consequently, when r := m/n > 1, CholeskyQR
+requires a fraction (6r + 1)/(12r + 4) of the flops of the traditional method of obtaining a
+fully explicit QR factorization.
+Limitations. Despite its simplicity and speed, CholeskyQR is rarely used in practice. One
+clear shortcoming is that it fails if the computed Gram matrix is numerically rank-deficient,
+which can happen even if the input matrix is numerically full-rank. More generally, if κ(M)
+denotes the condition number of M in the spectral norm and u denotes the unit roundoff
+in working precision, then rounding errors can lead to significant orthogonality loss, in the
+sense that ∥Q∗ Q − I∥2 can be as large as O(u κ(M)2 ).
+The orthogonality loss of CholeskyQR can be mitigated by a variety of methods.2 For
+example, Jacobi preconditioning normalizes all columns
+of M to have unit norm and brings
+√
+the condition number of M to within a factor n of the best-possible diagonal preconditioner [Slu69, Theorem 3.5]; similar results are available for normalizing column blocks
+via a block-diagonal preconditioner [Dem23]. Recently, it has been suggested to obtain a
+preconditioner from an LU decomposition of M [TOO20] or from CholeskyQR on a regularized version of M [FKN+ 20]. Another approach to mitigating orthogonality loss involves
+reorthogonalization (essentially running CholeskyQR twice) resulting in “CholeskyQR2”
+[FNYY14, YNYF15]. However, this method can still fail when κ(M) > u−1/2 . Finally,
+a mixed precision approach computes the Gram matrix in higher precision whereby the
+problematic conditioning can be better controlled [YTD15].
+
+1.3
+
+Randomized preconditioning for CholeskyQR
+
+The following algorithm serves as the starting point of our work. Given the matrix M,
+it sketches M and then uses the triangular factor of the sketch’s QR decomposition as a
+preconditioner in CholeskyQR. Like standard (unpreconditioned) CholeskyQR, it has a hard
+requirement that M is full rank in exact arithmetic.
+2 Indeed, this paper adds CQRRPT to the list of orthogonality-loss mitigation methods, even though
+CQRRPT is concerned with pivoted rather than unpivoted QR.
+
+3
+
+1. Compute Msk = SM using a sketching operator S ∈ Rd×m with n ≤ d ≤ m.
+2. Compute [Qsk , Rsk ] = qr(Msk ) and discard Qsk .
+3. Form Mpre = M(Rsk )−1 explicitly, using back substitution.
+4. Compute G = (Msk )∗ (Msk ) and Rpre = chol(G, “upper”).
+5. Set Q = Mpre (Rpre )−1 and R = Rpre Rsk , then return Q and R.
+This method was first introduced [FGL21] without the context of the broader RandNLA
+literature; it was first studied in detail with the RandNLA literature in mind in [Bal22] and
+subsequently in [HSBY23]. Notably, the possibility of first computing a sketch-orthonormal
+Q-factor Mpre , and subsequently retrieving the ℓ2 -orthonormal Q-factor via a CholeskyQR
+on Mpre was originally proposed elsewhere [BG22, BG21]. Furthermore, the idea of using
+Rsk as the preconditioner traces back to the sketch-and-precondition paradigm for overdetermined least squares [RT08, AMT10, MSM14].3 If a well-studied condition called a subspace
+embedding property holds between S and range(M), then Mpre will be nearly-orthonormal
+[DMM06, Sar06, DMMS11, Mah11].
+For any reasonable sketching operator, S, the flop count of the algorithm outlined above
+will be O(mn2 ). Whether or not practical speedup is observed depends greatly on the
+sketching distribution and on the method used to compute the product SM. If a fast
+sketching operator is used with n ≤ d ≤ m, then the leading term in the resulting algorithm’s
+flop count will be 3mn2 , which is only mn2 more than the standard CholeskyQR.
+
+1.4
+
+Randomization in QR with column pivoting
+
+Substantial efforts have been devoted to the design of randomized algorithms for QRCP
+of general matrices, i.e., rectangular matrices of any aspect ratio of numbers of rows and
+columns. These efforts originate with independent contributions by Martinsson [Mar15] as
+well as Duersch and Gu [DG17], with subsequent extensions by Martinsson et al. [MQOHvdG17] and also by Xiao, Gu, and Langou [XGL17]. While there are many variations on
+these methods, they share a common structure that we outline here.
+These methods take in integers (b, s) where b > 0, s ≥ 0, and n ≥ b + s. They form a
+sketch Y = SM with b + s rows, and then proceed with a three-step iterative loop.
+1. Use any QRCP method to find Pblock , a length-b vector containing column indices for
+the first b pivots for the wide matrix Y.
+2. Process the tall matrix M[ :, Pblock ] by QRCP or unpivoted QR.
+3. Suitably update M and Y, then return to Step 1.
+The update to M at Step 3 can be handled by standard methods, such as those in blocked
+unpivoted Householder QR. The update to Y is more subtle. If done appropriately, then
+the leading term in the algorithm’s flop count can match that of Householder QR [DG17].
+A core limitation of these methods is that their best performance is attained with small
+block sizes. For example, b = 64 and s = 10 is used in both shared- and distributed-memory
+settings [MQOHvdG17, XGL17]. Much larger block sizes would be needed for the updating
+operations to be performed near the limit of machines’ peak performance rates. One of
+our motivations for developing CQRRPT has been to provide an avenue to extend earlier
+randomized QRCP algorithms to block sizes on the order of thousands.
+3 In this context, Mpre was only formed implicitly and was accessed as a linear operator.
+
+4
+
+1.5
+
+Our contributions and outline
+
+CQRRPT takes the method from Section 1.3 and replaces the call to a QR function on
+Msk with a call to a QRCP function on Msk . It uses the results from this call to QRCP to
+provide: the pivot indices, an estimate of M’s numerical rank, and the information for our
+preconditioner in the form of an upper-triangular matrix Rsk . The numerical rank estimate
+is needed to deal with the possibility that M might be rank-deficient.
+CQRRPT’s discovery was reported in two independent works [Bal22] and [MDM+ 23].
+This paper is a joint effort by the authors of these works to (1) conduct thorough theoretical
+analysis of this algorithm, and (2) demonstrate experimental results of a high-performance
+implementation of the algorithm using RandBLAS and RandLAPACK.
+Section 2 formally introduces CQRRPT as Algorithm 1. Our formalism emphasizes
+how the effect of randomness on CQRRPT’s behavior can be isolated in the choice of
+distribution used for the sketching operator. The core operations of CQRRPT are presented
+in Algorithm 2, which can be analyzed as a purely deterministic algorithm. Theorem 2
+establishes the correctness of CQRRPT’s output, and Theorem 3 characterizes the spectrum
+of the preconditioned input matrix. The remaining results in the section, Theorems 4 and 5,
+concern the quality of the pivots obtained for the input matrix.
+Section 3 concerns CQRRPT’s numerical stability. Its main result, Theorem 10, says
+that CQRRPT can be implemented to provide numerical stability that is unconditional on
+numerical properties of the input matrix. Specifically, with an appropriate criterion for
+determining numerical rank, CQRRPT can produce a decomposition with relative error
+and orthogonality loss on the order of machine precision, as long as the unit roundoff and
+problem dimensions satisfy u ≤ m−1 F (n)−1 for some low-degree polynomial F (n). After
+outlining the proof of this result we explain how numerical rank selection can be performed
+in practice. Appendix B states and proves a more technical version of Theorem 10 in the
+form of Theorem 16.
+Section 4 empirically investigates pivot quality. It shows how easy-to-compute metrics
+of pivot quality compare when running the LAPACK default function (GEQP3) versus when
+running CQRRPT (based on applying GEQP3 to Msk ). The results show the interaction
+between coherence – which essentially represents a condition number for the act of sampling
+– and parameter choices for sparse sketching operators.
+Section 5 provides performance experiments with a RandLAPACK implementation of
+CQRRPT. The experiments use a machine with dual 24-core Xeon Gold 6248R CPUs, where
+Intel MKL and RandBLAS are the underlying linear algebra libraries. We first compare
+CQRRPT with alternative methods for both unpivoted and pivoted QR factorizations. Our
+algorithm handily beats competing methods for large matrices, and it has the advantage of
+a simpler representation of Q. We then investigate how CQRRPT’s performance might be
+improved. Runtime profiling results which show that computing QRCP of the sketch via
+GEQP3 can exceed the cost of CholeskyQR several times over. This motivates an experiment
+where QRCP on the sketch is handled by HQRRP [MQOHvdG17] (one of the randomized
+algorithms for QRCP of general matrices described in Section 1.4) instead of GEQP3.
+Concluding remarks are given in Section 6.
+
+1.6
+
+Definitions and notation
+
+1.6.1
+
+The mundane
+
+Matrices appear in boldface sans-serif capital letters. The transpose of a matrix X is given
+by X∗ , its ℓ2 condition number is κ(X), and its elementwise absolute value is |X|. Numerical
+
+5
+
+vectors appear as boldface lowercase letters, while index vectors appear as uppercase letters.
+The k×k identity matrix is denoted by Ik . We enumerate components of matrices and vectors
+with indices starting from one, rather than starting from zero. We extract the leading k
+columns of X by writing X[ :, 1:k], while its trailing n − k columns are extracted by writing
+X[ :, k + 1:n]. The (i, j)th entry of X is X[i, j]. Similar conventions apply to extracting the
+rows of a matrix or components of a vector.
+The matrix we ultimately aim to decompose is denoted by M and has dimensions m × n.
+We use the letters k and ℓ as integer indices between 1 and n. Their precise meaning is
+determined by context; we are free to redefine them at any time.
+1.6.2
+
+Some necessary evils
+
+Virtuous notation is readable and intuitive. Despite our best efforts, we have been unable
+to devise wholly virtuous notation for this manuscript. We have settled instead for notation
+that is readable and internally consistent for matrices with similar structures.
+Leading columns of matrices subject to pivoting and QR. Suppose X is a matrix
+with n columns that we aim to decompose via QR after column pivoting by J (a permutation
+vector of {1, . . . , n}). For each k ∈ {1, . . . , n}, we define the truncated, pivoted matrix
+Xk := X[ :, J[1:k]].
+Taking k = n lets us refer to a pivoted matrix without any truncation.
+We use this notation from the outset with the m × n matrix X = M and the d × n
+matrix X = Msk . Section 3 extends this convention to a matrix denoted by “Mpre ,” which
+is decomposed via unpivoted QR.
+Column-pivoted QR decompositions, and their factors. A QR decomposition consists of two conformable matrices: an orthonormal matrix called the Q-factor and an uppertrapezoidal matrix called the R-factor. We equip these factors with special indexing rules.
+Specifically, the first k columns of a Q-factor “Q” are denoted by Qk , and the first k rows
+of an R-factor “R” are denoted by Rk .
+This manuscript features three matrices with important QR factors: a d × n pivoted
+pre
+of dimensions m × k (k ≤ n), and an m × n pivoted matrix Mn .
+matrix Msk
+n , a matrix M
+The QR factors of these matrices are distinguished from one another with superscripts, or
+the absence thereof (e.g., Rsk , Rpre , and R).
+Definition 1. Let X denote a rank-k matrix with n columns. A column-pivoted QR
+decomposition of X consists of QR factors (Q, R) and a length-n permutation vector J such
+that the pivoted matrix Xn = X[ :, J] satisfies Xn = Qk Rk .
+Partitions of R-factors. We partition R-factors with notation that is similar to the
+celebrated paper of Gu and Eisenstat [GE96]. Specifically, to any k × n upper-trapezoidal
+matrix R and any ℓ ≤ k, we associate the distinguished submatrices
+Aℓ = R[1:ℓ, 1:ℓ],
+
+Bℓ = R[1:ℓ, ℓ + 1:n],
+
+and Cℓ = R[ℓ + 1:k, ℓ + 1:n].
+
+For fixed ℓ, these matrices let us cleanly express R as a 2 × 2 block matrix
+
+
+Aℓ Bℓ
+R=
+.
+Cℓ
+This notation helps in analyzing our algorithm’s rank-revealing properties and numerical
+pre
+stability. We use it with R-factors from the QR decompositions of Msk
+, and Mn .
+n , M
+6
+
+2
+
+Getting to know our algorithm
+
+Section 1.1 mentioned a two-phase approach to analysis of randomized algorithms. Here
+we describe CQRRPT in a way that puts this approach front and center. We do this by
+delineating between the full algorithm (which includes a random sampling step) and the
+algorithm’s core (which is purely deterministic).
+The full algorithm appears below. Its speed and reliability are affected decisively by
+the sketching distribution, and it has two parameters that control this distribution. The
+higher-level parameter is a distribution family; this is an association of matrix dimensions to
+probability distributions over matrices with those dimensions. The lower-level parameter,
+called the sampling factor, sets the size of the sketch in proportion to n.
+Algorithm 1 CholeskyQR with randomization and pivoting for tall matrices
+Required inputs. An m × n matrix M.
+Optional inputs. A distribution family F and a sampling factor γ ≥ 1.
+Outputs. QR factors of dimensions m × k and k × n, and a length-n permutation vector.
+These comprise a column-pivoted QR decomposition of M in the sense of Definition 1 if and
+only if rank(SM) = rank(M); see Theorem 2.
+1: function [Q, R, J] = cqrrpt(M, γ, F )
+2:
+If F is not provided, set it to a default family of sparse sketching distributions.
+3:
+
+If γ is not provided, set γ = 1.25.
+
+4:
+
+Set d = ⌈γn⌉, and randomly sample a d × m matrix S from Fd,m .
+
+5:
+
+Compute [Q, R, J] = cqrrpt core(M, S)
+
+6:
+
+return
+
+CQRRPT’s core appears in Algorithm 2. We characterize its behavior in Sections 2.1
+and 2.2 using the concept of restricted singular values. The restricted singular values of
+a d × m matrix S on a subspace L ⊂ Rm are the singular values of SU where U is any
+orthonormal matrix with range L.4 The restricted condition number of S on L, denoted
+κ(S|L), is the ratio of its largest to smallest restricted singular values.
+Section 2.3 explains how the distribution family and sampling factor affect the probabilistic behavior of Algorithm 1. By the end of this section, it will be clear that standard
+results from random matrix theory can be used to probabilistically yet rigorously bound the
+restricted singular values of S on range(M). This will show that there are many ways of
+using CQRRPT to achieve different trade-offs between speed and reliability.
+Remark 2. The analysis in this section is conducted in exact arithmetic. Such analysis
+may seem strange in the context of a CholeskyQR algorithm, but it plays a valuable role in
+plotting the course for our finite-precision analysis.
+
+2.1
+
+CQRRPT’s deterministic core
+
+The algorithm below relies on functions called “qrcp” and “rank.” For now, we only assume
+that qrcp always returns column-pivoted QR decompositions in the sense of Definition 1.
+The details of rank become important when we consider finite-precision computations in
+Section 3. For now, it is just a black-box that computes the exact rank of its input.
+
+4 Note that these singular values do not depend on the choice of orthonormal basis.
+
+7
+
+Algorithm 2 : cqrrpt core
+Input: A matrix M ∈ Rm×n , and a sketching operator S ∈ Rd×m where n ≤ d ≤ m.
+1: function cqrrpt core(M, S)
+2:
+
+Sketch Msk = SM
+
+3:
+
+Decompose [Qsk , Rsk , J] = qrcp(Msk )
+// ˆ we return this n-vector J in full, regardless of subsequent steps.
+
+4:
+
+Determine k = rank(Rsk )
+
+5:
+
+−1
+Precondition Mpre = Mk (Ask
+k )
+sk
+// ˆ recall our notation that Mk := M[ :, J[1:k]] and Ask
+k := R [1:k, 1:k]
+
+6:
+
+Compute G = (Mpre )∗ (Mpre )
+
+7:
+
+Decompose Rpre = chol(G)
+
+8:
+
+Set Qk = (Mpre )(Rpre )−1
+
+9:
+
+Undo preconditioning Rk = Rpre Rsk
+k
+sk
+// ˆ recall our notation that Rsk
+k := R [1:k, :].
+
+10:
+
+return Qk , Rk , J
+
+There are two pressing questions for Algorithm 2.
+1. Under what conditions does it actually obtain a decomposition of M?
+2. Just how “safe” is its use of CholeskyQR on Lines 6 through 8?
+Section 3 answers these questions in finite-precision arithmetic. Here are simpler answers
+under the assumption of computation in exact arithmetic. When interpreting them, it can be
+informative to use the fact that κ(S| range(M)) is finite if and only if rank(SM) = rank(M).
+Theorem 2. If κ(S| range(M)) is finite, then [Qk , Rk , J] = cqrrpt core(M, S) define a
+column-pivoted QR decomposition of M in the sense of Definition 1.
+Proof. It is clear that Qk is orthonormal and Rk is upper-trapezoidal. We need to show
+that if rank(SM) = rank(M) then ∆ = Mn − Qk Rk is zero. As a step towards this, note the
+identity Qk Rk = Mpre Rsk
+k , which implies range(∆) ⊂ range(M). Next, use the assumption
+that qrcp produces column-pivoted QR decompositions in sense of Definition 1 to find
+S∆ = SMn − SMpre Rsk
+k
+sk sk
+= Msk
+n − Qk Rk = 0.
+
+Since rank(SM) = rank(M) implies ker(S) ∩ range(M) is trivial, we have ∆ = 0.
+Theorem 3. Let Mpre be as on Line 5 of Algorithm 2 for inputs M and S. If κ(S| range(M))
+is finite, then the singular values of Mpre are the inverses of the restricted singular values
+of S on range(M).
+Proof. Let U be an m × k orthonormal matrix with the same range as M. Define the set
+Ui = {L ⊂ Rk : L is a linear subspace and dim(L) = i}.
+Since the singular values of a matrix are the square roots of the eigenvalues of its Gram
+matrix, and since the square root is monotonic, the classic min-max principle for eigenvalues of Hermitian matrices directly translates to singular values of general matrices. This
+8
+
+formulation of the min-max principle tells us that
+∥Mpre x∥2
+X∈Ui x∈X
+∥x∥2
+
+σi (Mpre ) = min max
+
+and σk−i+1 (SU) = max min
+Y ∈Ui y∈Y
+
+∥SUy∥2
+.
+∥y∥2
+
+−1
+
+Our goal is to show that σi (Mpre ) = (σk−i+1 (SU)) . To do this, we assume the restricted
+singular values of S on range(M) are all nonzero. This ensures that range(Mpre ) = range(M)
+and subsequently that there is an invertible matrix T where Mpre = UT. We also rely on
+the fact that the d × k matrix SMpre is orthonormal. Combining these observations gives a
+chain of identities
+∥Mpre x∥2
+∥UTx∥2
+∥Mpre x∥2
+= min max
+= min max
+.
+pre
+X∈Ui x∈X ∥SM
+X∈Ui x∈X ∥SUTx∥2
+X∈Ui x∈X
+∥x∥2
+x∥2
+
+σi (Mpre ) = min max
+
+Then we apply a change of variables y = Tx to get
+∥Tx∥2
+∥y∥2
+= min max
+=
+X∈Ui x∈X ∥SUTx∥2
+Y ∈Ui y∈Y ∥SUy∥2
+
+σi (Mpre ) = min max
+
+
+
+∥SUy∥2
+Y ∈Ui y∈Y
+∥y∥2
+max min
+
+−1
+
+which completes the proof.
+Arithmetic complexity. The arithmetic complexity of Algorithm 2 depends on how we
+compute and then decompose Msk . Since there are many practical ways to handle the first
+of these operations, we shall simply say its cost in flops is Csk . There are also many ways one
+might perform the second operation, but the most practical is to use the LAPACK function
+GEQP3. With this choice, the algorithm’s flop count is
+2mk 2 + mk(k + 1) + 4dnk − 2k 2 (d + n) + 5k 3 /3 + Csk
+
+(1)
+
+plus lower-order terms; see Appendix A.1 for a derivation of this fact.
+If we plug k = n into (1) and assume d, n ∈ o(m), we see that the leading-order term in
+CQRRPT’s flop count is 3mn2 + Csk . This compares favorably to the 4mn2 flops required
+to compute a Householder QR decomposition and then explicitly restore the Q-factor with
+LAPACK’s ORGQR. What’s more, in certain applications it can suffice to represent Q as a
+composition of two elementary operators, Mpre and (Rpre )−1 . This comes with no sacrifices
+to the numerical stability (as will be clear from our stability analysis) yet it decreases the
+leading term in CQRRPT’s arithmetic complexity to 2mn2 + Csk .
+Communication cost. CQRRPT lends itself well to distributed computation. Here it is
+prudent to choose the sketching distribution that allows for evaluation of Line 2 with the
+smallest possible value of d while retaining good statistical properties. This can be achieved
+in theory and practice with Gaussian sketching (see Section 2.3.2) and γ = d/n ∈ [1.25, 5];
+see [MDM+ 23, §A.1.1].
+Consider a popular setting where M is distributed block row-wise across p ≤ m/d processors, each of which has at least 2dn + n2 words of memory. Here we implement Line 2 with
+local multiplications of blocks of M with the corresponding blocks of columns of S (using
+dn words of memory) and summing the contributions with an all-reduce operation (using
+another dn words of memory). From there, each processor performs QRCP on Msk , recovers
+sk
+Ask
+k from R , and applies its inverse to the corresponding local block of M. When using the
+classical binomial tree version of all-reduce, the overall computation of Mpre requires one
+global synchronization, 2 log2 p messages, 2dn log2 p communication volume, and two data
+9
+
+passes. Adding the cost of the CholeskyQR step [ND15], we get the total cost of CQRRPT:
+two global synchronizations, 4 log2 p messages, (2dn+n2 ) log2 p communication volume, and
+three data passes. Notably, if we used the recursive-halving version of all-reduce [TRG05],
+the communication volume can be improved to a mere 2dn + n2 .
+
+2.2
+
+How cqrrpt core inherits rank-revealing properties
+
+Here we explain how CQRRPT inherits pivot quality properties from its underlying qrcp
+function. To describe these properties, we speak in terms of a matrix X consisting of n
+columns and at least as many rows,5 along with its decomposition [Q, R, J] = qrcp(X). We
+set k := rank(X), and for any ℓ ≤ k we use (Aℓ , Bℓ , Cℓ ) to denote submatrices of R using
+the conventions established in Section 1.6.
+We first consider the rank revealing QR (RRQR) property. This concerns how well the
+spectrum of Aℓ approximates the leading singular values of X, and how well the spectrum
+of Cℓ approximates the trailing singular values of X. When X is fixed, we can describe the
+approximation quality by a sequence of coefficients f1 , . . . , fk , all at least unity. Formally,
+qrcp has the RRQR property for X with coefficients (fℓ )kℓ=1 if, for all ℓ ≤ k, we have
+σj (X)
+fℓ
+
+for all
+
+j ≤ ℓ,
+
+(2a)
+
+σj (Cℓ ) ≤ fℓ σℓ+j (X)
+
+for all
+
+j ≤ k − ℓ.
+
+(2b)
+
+σj (Aℓ ) ≥
+and
+
+Theorem 4. Let c = κ(S| range(M)). If qrcp satisfies the RRQR property for SM with
+coefficients (fℓ )kℓ=1 , then cqrrpt core(·, S) satisfies the RRQR property for M with coefficients (cfℓ )kℓ=1 .
+It is common to ask that a QRCP algorithm admit a function f where it ensures the
+RRQR property with coefficients (f (ℓ, n))kℓ=1 for any rank-k matrix with n columns. This
+is a significant request. Indeed, QRCP with the max-norm pivot rule does not satisfy
+the resulting requirements for any function f , as can be seen by taking a limit of Kahan
+matrices of fixed dimension [GE96, Example 1]. Still, there are several QRCP algorithms
+that can ensure the RRQR property, particularly where f (ℓ, n) is bounded by a low-degree
+polynomial in ℓ and n. Theorem 4 shows that if CQRRPT uses such an algorithm, then it
+will satisfy a nearly identical RRQR property.
+Next, we consider a strong RRQR property. This concerns our ability to use R to find
+a well-conditioned basis for an approximate null space of Xn . The particular basis is the
+columns of the block matrix Y = [A−1
+ℓ Bℓ ; −I], which satisfies ∥Xn Y∥ = ∥Cℓ ∥ in every
+unitarily invariant norm. For our purposes, we say that qrcp satisfies the strong RRQR
+property for X with coefficients (fℓ )kℓ=1 and (gℓ )kℓ=1 when the former coefficients satisfy
+(2a)-(2b) and the latter coefficients satisfy
+∥A−1
+ℓ Bℓ ∥2 ≤ gℓ
+
+(3)
+
+for all ℓ ≤ k.
+Theorem 5. Let c = κ(S| range(M)). If qrcp satisfies the strong RRQR property for
+SM with coefficients (fℓ )kℓ=1 and (gℓ )kℓ=1 , then cqrrpt core(·, S) satisfies the strong RRQR
+property for M with coefficients (cfℓ )kℓ=1 and (gℓ + cfℓ2 )kℓ=1 .
+5 Which we might take as X = M or X = Msk , depending on context.
+
+10
+
+As with RRQR, we can ask that a QRCP algorithm be associated with functions f and
+g for which (f (ℓ, n))kℓ=1 and (g(ℓ, n))kℓ=1 provide strong RRQR coefficients for any rank-k
+matrix with n columns. The first algorithm that could ensure this was introduced by Gu
+and Eisenstat [GE96].6 Setting the tuning parameter of their algorithm to two leads to
+strong RRQR coefficients
+p
+p
+f (ℓ, n) = 1 + 4ℓ(n − ℓ) and g(ℓ, n) = 2 ℓ(n − ℓ),
+with a runtime of O(dn2 log n) for a d × n matrix with d ≥ n. Theorem 5 shows that if
+CQRRPT uses this algorithm for QRCP on SM, then it will enjoy an analogous strong
+RRQR property with some increase to g.
+
+2.3
+
+Probabilistic aspects of CQRRPT
+
+From the perspective of Algorithm 1, the sketching operator S is sampled at random from
+a probability distribution, and so anything that S affects in Algorithm 2 becomes a random variable with some induced distribution. In particular, the probabilistic behavior of
+Algorithm 1 is determined by the induced distribution for the condition number of Mpre .
+Therefore to understand CQRRPT’s behavior, we must explore the following question.
+How can we bound the probability that κ(Mpre ) stays within a prescribed limit,
+no matter the matrix M?
+The answer to this question depends greatly on the distribution family F and the sampling
+factor γ used in Algorithm 1. Here we give a range of answers based on different choices for
+these values.
+2.3.1
+
+Sketching distribution families: examples and intuition
+
+For a fixed distribution family F , we use “Fd,m ” for the distribution in F over d × m
+matrices. Here are the structures of samples from Fd,m for three prominent distribution
+families.
+• Gaussian matrices. The entries of S are iid Gaussian random variables with mean
+zero and variance 1/d.
+• SASOs (short-axis-sparse operators). The columns of S are independent. Each column
+has exactly s nonzeros (for a tuning parameter s) whose
+√ locations are chosen uniformly
+at random and whose values are chosen to be ±1/ s with equal probability.7 In
+practice, it is common to keep ℓ between one and eight, even when d is on the order
+of tens of thousands.
+• SRHTs (subsampled randomized Hadamard transforms). These are ordinarily only
+defined when w = log2 m is an integer and are extended to general m by zero-padding
+the input. To absorb the zero-padding into the SRHT, define a 2⌈w⌉ × m matrix D
+whose upper m × m block is a diagonal matrix populated by independent Rademacher
+random variables and whose
+p lower block is all zeros. An SRHT is then a composition
+of three operators: S = m/d · Π[1:d, :]HD, where H is a Hadamard transform of
+order 2⌈w⌉ and Π is a random permutation matrix.
+6 The Gu-Eisenstat algorithm actually bounds (A )−1 B elementwise. The elementwise bounds readily
+ℓ
+ℓ
+imply the spectral-norm bounds that we require.
+7 For the etymology of these sketching operators, see [MDM+ 23].
+
+11
+
+These families share key properties. First, if S is a random matrix sampled from Fd,m , then
+its expected covariance matrix satisfies E[S∗ S] = Im . Second, if U is an m × k orthonormal
+matrix and d/k is sufficiently large, then the sketched Gram matrix U∗ S∗ SU concentrates
+strongly around E[U∗ S∗ SU] = Ik . To rephrase this second property: SU should concentrate
+strongly around the real Stiefel manifold Md,k of d × k orthonormal matrices.
+To see the usefulness of these properties, consider Theorem 3. If range(U) = range(M)
+and SU has rank-k, then the singular values of Mpre will equal those of the Moore-Penrose
+pseudo-inverse of SU. Therefore the desirable property of Mpre concentrating around Mm,k
+is equivalent to SU concentrating around Md,k .
+2.3.2
+
+Oblivious subspace embeddings
+
+Let U be a matrix whose columns are an orthonormal basis for a linear subspace L ⊂ Rm ,
+and let S be a d × m matrix.
+Definition 6. We call S a subspace embedding for L with distortion δ ∈ [0, 1] if
+2
+
+1 − δ ≤ σmin (SU)
+
+and
+
+2
+
+σmax (SU) ≤ 1 + δ.
+
+(4)
+
+Such a matrix is also called a δ-embedding for L.
+p
+Note that we always have κ(S|L) ≤ (1 + δ)/(1 − δ) when S is a δ-embedding for L. There
+is a long history of using subspace embeddings in randomized algorithms for least squares
+problems [Sar06, DMM06, DMMS11], including as a tool for finding preconditioners to solve
+least squares problems to higher accuracy [RT08, AMT10, MSM14].
+Theory is available on how to choose d so that a sample from Fd,m will be a δ-embedding
+for any fixed linear subspace of a given dimension with high probability. We can use this
+theory to select d in practice for very well-behaved distribution families. For example, here
+is a representative result for Gaussians.
+Remark 3. We state the following results with linear subspaces of dimension “n,” since the
+dimension of range(M) is never larger than n.
+Theorem 7. Fix an n-dimensional linear subspace L ⊂ Rm , along with some δ ∈ (0, 1) and
+τ > 0. If S is a d × m Gaussian operator with
+d
+≥
+n
+
+
+
+1+τ
+(1 + δ)1/2 − 1
+
+2
+,
+
+then it will be a δ-embedding for L with probability at least 1 − 2 exp(−nτ 2 /2).
+Proof. By rotational invariance of the Gaussian distribution, we can take L = range(U)
+for U = Im [ :, 1:n]. The claim then follows from [MT20, Theorem 8.4]. To see how, set
+θ = (1 + δ)1/2 − 1. If d is chosen in the way indicated above, then setting t := τ θ/(1 + τ ) in
+the statement of [MT20, Theorem 8.4] ensures that 1 − θ ≤ σmin (SU) and σmax (SU) ≤ 1 + θ
+hold with probability at least 1−2 exp(−nτ 2 /2). From there, simply note that 1−δ ≤ (1−θ)2
+and (1 + θ)2 = 1 + δ to find that 1 − δ ≤ σi (SU)2 ≤ 1 + δ for all i.
+We give results for SASOs and SRHTs below. These are often of interest since they are
+algorithmically more attractive than Gaussian matrices. However, the available bounds are
+quite pessimistic (they suggest that one take γ proportional to log n, but taking γ = 1.25
+suffices for practical purposes when n is large).
+
+12
+
+Theorem 8. [Coh16, Theorem 4.2] Fix an n-dimensional linear subspace L ⊂ Rm , and
+any B > 2, t ≥ 1, and δ < 1/2. There are absolute constants c1 , c2 where, upon taking
+log n
+d
+≥ c1 t(B log B) 2
+n
+δ
+
+and
+
+s ≥ c2 t(log B)
+
+log n
+,
+δ
+
+sampling a d × m SASO with s nonzeros per column provides a δ-embedding for L with
+probability at least 1 − B −t .
+Theorem 9. [BN19, Proposition 3.9] Let L ⊂ Rm be a linear subspace of dimension n. Let
+δ, p ∈ (0, 1). If S is a d × m SRHT with d ≤ m and
+d
+≥ 2(δ 2 − δ 3 /3)−1
+n
+
+r
+1+
+
+8 log(6m/p)
+n
+
+!2
+log(3n/p),
+
+then it is a δ-embedding for L with probability at least 1 − p.
+We note that the analysis in [BN19, Proposition 3.9], cited above, builds on more fundamental results from [Tro11, BG13].
+
+3
+
+Numerical stability
+
+This section analyzes cqrrpt core (Algorithm 2) under the assumption that all algebraic
+operations in it and in its subroutines are performed in finite precision arithmetic. Suppose
+for concreteness that we have
+[Qk , Rk , J] = cqrrpt core(M, S),
+
+(5)
+
+where Qk is m × k and Rk is k × n and upper-triangular. In these terms, our analysis is concerned with bounding the reconstruction error ∥Mn − Qk Rk ∥F /∥M∥F and the orthogonality
+loss ∥Q∗k Qk − Ik ∥2 .
+Proving bounds on these quantities requires assumptions on the qrcp and rank subroutines in Algorithm 2. So far we have said very little about these points because they
+are ultimately design questions that have no single answer. In this section, our goal is to
+show that qrcp and rank can be implemented so that upon conditioning on S being a δembedding for range(M) (for some δ ≤ 1/2), the reconstruction error and orthogonality loss
+are bounded above by low-degree polynomials in (m, n). Such a result will directly imply
+that CQRRPT’s properties introduced in Section 2 and proven in Appendix A are preserved
+under finite precision arithmetic.
+New notation. For purposes of exposition in this section only, we adopt notation where
+scalars x and y are said to satisfy x ≲ y if x ≤ cy + G(n)u, where c is a constant close to 1,
+G(n) is a low-degree in the small matrix dimension n, and u is a unit roundoff.8
+Up until now the m × k and k × k matrices Mpre and Rpre have been referred to without
+pre
+notational dependence on k. Moving forward, we use Mpre
+k and Rk for these matrices. We
+can select submatrices from them using notation consistent with Section 1.6. For example,
+we can speak of a parameter ℓ < k and use Mpre
+in reference to the first ℓ columns of Mpre
+ℓ
+k .
+pre
+Similarly, we can use Aℓ to denote the leading ℓ × ℓ submatrix of Rpre
+.
+k
+8 The polynomials we use will never exceed degree four, and are typically degree one or two.
+
+13
+
+3.1
+
+Summary
+
+3.1.1
+
+The challenge
+
+We begin by emphasizing that since we want to decide how rank should be implemented,
+the value k = rank(Msk ) on Line 4 of cqrrpt core is really something we choose.
+That established, let us see how k affects reconstruction error and orthogonality loss.
+In the tradition of adding zero and applying the triangle inequality, one can obtain the
+following bound on reconstruction error committed in the preconditioning step:
+sk −1 sk
+sk −1 sk
+Rk F + (Mk − Mpre Ask
+Rk F .
+Mn − Mpre Rsk
+k )(Ak )
+k F ≤ Mn − Mk (Ak )
+
+|
+
+{z
+
+(6)
+
+}
+
+truncation error
+
+Of the two terms in this upper bound, the truncation error is more opaque. To better
+understand it, suppose δ is the distortion of S for the range of M. We claim that under
+mild assumptions for the accuracy of operations on Lines 2 and 3, and an assumption that
+Ask
+k is not too ill-conditioned, one can bound
+−1 sk
+Mn − Mk (Ask
+Rk F /∥M∥F ≲
+k )
+
+√
+sk
+.
+1 + δ Csk
+k F/ M
+F
+
+(7)
+
+Since ∥Csk
+k ∥F is decreasing with k, this bound suggests that k should be large to keep
+reconstruction error under control.
+Unfortunately, if M is ill-conditioned, then choosing k too large can pose severe problems.
+sk
+The basic reason for this stems
+q from the fact that κ(An ) can be as large as κ(SM), which
+in turn can be as large as
+
+sk
+1+δ
+1−δ κ(M). This suggests that Ak can be ill-conditioned when
+k is large, even when δ is small. This matters since larger condition numbers for Ask
+k risk
+pre
+
+larger rounding errors at the step when we form the m × k matrix M . If this step is
+performed inaccurately, then κ(Mpre ) might be far from one even if δ is small, which risks
+orthogonality loss in Qk that cannot be controlled by our choice of sketching distribution
+for Algorithm 1.
+3.1.2
+
+A high-level result
+
+The tension described above raises an important question. Can we be certain that there
+exists a truncation index k so that both reconstruction error and orthogonality loss are kept
+near machine precision? The following result says the answer is yes, provided the QRCP of
+Msk is (sufficiently) strongly rank-revealing.
+Theorem 10 (Simplified version of Theorem 16 from Appendix B). Consider Algorithm 2
+where Line 5 is executed with unit roundoff u, and other lines are executed with unit roundoff
+ũ. Assume that the qrcp subroutine at Line 3 produces Qsk and Rsk by a pivoted Householder
+QR process or pivoted Givens QR process. Additionally, assume its pivots
+√ satisfy the strong
+rank-revealing properties (2a), (2b), and (3) with coefficients fℓ , gℓ ≤ 2 nℓ when X = Msk .
+Finally, suppose S is a δ-embedding for range(M) with δ ≤ 1/2.
+There exist low-degree polynomials G1 , . . . , G5 (that have no dependence on M or S) and
+a truncation index k such that if ũ ≤ m−1 G1 (n, d)−1 u and u ≤ G2 (n)−1 , then
+Mn − Mpre Rsk
+k F ≤ G3 (n)u ∥M∥F
+
+κ (Mpre ) ≤ 1.8.
+
+(8)
+
+∥Q∗k Qk − I∥2 ≤ G5 (n)u.
+
+(9)
+
+and
+
+Furthermore, as a direct consequence of Eq. (8), we have
+∥Mn − Qk Rk ∥F ≤ G4 (n)u ∥M∥F
+
+14
+
+and
+
+We have chosen a computational model with two unit roundoffs to highlight an important property of the preconditioner – that the dominant Line 5 can be performed with a
+unit roundoff not constrained by m. This property may have significant implications for
+multi- and low-precision arithmetic architectures. Clearly, the result can also be used in the
+computational model with a single roundoff.
+We note that Theorem 10 is an existential result for a suitable truncation rank k. Our
+proof of this result includes a method for how such k can be identified efficiently, under the
+stated assumptions on the unit roundoffs. However, in practice, the unit roundoff is usually
+a constant that does not change with the matrix dimensions. This creates a need for a
+separate and more practical way to choose the truncation rank, which is a topic we address
+in Section 3.3.
+
+3.2
+
+Proof sketch for Theorem 10
+
+The following lemma, which we prove in Appendix B.1 by straightforward methods, shows
+that Eq. (9) in Theorem 10 directly follows from Eq. (8).
+Lemma 11. Consider Lines 5 to 7 of Algorithm 2 where the computations are performed
+with unit roundoff ũ ≤ 0.00022m−1 n−1 . If Mpre
+and Rsk
+k satisfy
+k
+sk
+pre
+Mn − Mpre
+k Rk 2 ≤ 0.01 ∥M∥2 and κ(Mk ) ≤ 6,
+
+(10)
+
+then the output factors Qk and Rk satisfy
+sk
+2
+∥Mn − Qk Rk ∥F ≤ Mn − Mpre
+k Rk F + 60n ũ ∥M∥2 ,
+
+(11)
+
+∥Q∗k Qk − I∥2 ≤ 180mnũ.
+
+(12)
+
+Taking Lemma 11 as given, the question becomes how to choose k so that Eq. (8) holds.
+We call this the preconditioner stability question. In brief, the main idea is to choose k so
+that
+sk
+sk
+sk
+∥Csk
+k ∥F /∥R ∥2 ≤ G0 (n)u ≤ ∥Ck−1 ∥F /∥R ∥2 ,
+
+(13)
+
+for a low-degree polynomial G0 (n) that does not depend on M or S. The specific polynomial
+G0 (n) sufficient to ensure Eq. (8) is given in Theorem 16, which is stated and proven in
+Appendix B.2.2. In what follows, we outline the key steps in the argument for proving that
+theorem, using the same notation as in our formal proofs.
+Truncation ensures full numerical rank. Choosing k to satisfy (13) ensures that Ask
+k
+is numerically full-rank. Assuming Rsk comes from a column-pivoted QR decomposition of
+Msk with the theorem’s stated strong RRQR properties, such k provides for the existence
+of low-degree polynomials G6 and G7 where
+κ(Ask
+k ) =
+
+∥Rsk ∥2
+∥Ask
+k ∥2
+
+≤
+G6 (n) ≤ G7 (n)u−1 .
+∥Csk
+σmin Ask
+k−1 ∥F
+k
+
+This bound can be used to show that Mk is also numerically full-rank, in that
+r
+κ(Mk ) ≤
+
+1+δ
+−1
+κ(SMk ) ≲ κ(Ask
+.
+k ) ≤ G7 (n)u
+1−δ
+
+(14)
+
+The first inequality in (14) holds due to the δ-embedding property of S. The second inequalsk sk
+sk
+ity can be shown through three steps: κ(Ask
+k ) ≳ κ(Qk Ak ) ≳ κ(Mk ) ≳ κ(SMk ), employing
+standard rounding bounds for matrix operations, with the fact that the left-hand-side matrix
+is numerically full rank (in steps two and three).
+15
+
+Preconditioning and reconstruction error for leading columns. The next step in
+sk
+the proof is to look at Mpre
+k Ak as an unpivoted “sketched CholeskyQR” decomposition of
+Mk , in the sense of [Bal22]. According to [Bal22, Theorem 5.2], if κ(Mk ) ≲ G7 (n)u−1 , then
+there is a low-degree polynomial G8 for which
+r
+sk
+∥Mk − Mpre
+k Ak ∥F ≤ G8 (n)u∥Mk ∥F
+
+and
+
+κ(Mpre
+k ) ≲
+
+1+δ
+.
+1−δ
+
+(15)
+
+This establishes the condition number bound needed in (8). It also controls reconstruction
+error for the first k columns of Mn .
+Reconstruction error for trailing columns. To establish (8), it remains to bound the
+reconstruction error of the trailing n − k columns of M. Toward this end, we adopt the
+notation that
+Mk := M[ :, J[k + 1:n]]
+
+and
+
+sk
+
+Mk := Msk [ :, J[k + 1:n]].
+
+By using the reconstruction error bound for Mk from Eq. (15), the δ-embedding property,
+standard bounds for matrix operations, and the reconstruction error bound for Msk
+k , one
+finds that
+r
+−1 sk
+−1 sk
+sk
+∥Mk − Mk (Ask
+Bk ∥F
+1 + δ ∥SMk − SMk (Ask
+Bk ∥F
+∥Mk − Mpre
+k )
+k )
+k Bk ∥F
+≲
+≤
+∥M∥F
+∥M∥F
+1−δ
+∥SM∥F
+(16)
+r
+r
+sk
+sk
+sk −1 sk
+sk
+Bk ∥F
+1 + δ ∥Mk − Msk
+1 + δ ∥Mk − Qsk
+k (Ak )
+k Bk ∥F
+≲
+.
+≲
+1−δ
+1−δ
+∥Msk ∥F
+∥Msk ∥F
+Notably, the strong RRQR property of Rk plays a key role in Eq. (16). It ensures that the
+sk
+−1 sk
+terms of the form ∥E(Ask
+Bk ∥F√
+, for some error matrices such as E = Mk − Mpre
+k )
+k Ak , are
+bounded by gk ∥E∥F , where gk ≤ 2 kn.
+We combine Eq. (16) with the stability of the qrcp routine and the criterion Eq. (13)
+used for selecting the truncation index k to get
+r
+r
+sk
+pre sk
+∥Mk − Mk Bk ∥F
+≲
+∥M∥F
+
+sk
+1 + δ ∥Mk − Qsk
+k Bk ∥F
+≲
+sk
+1−δ
+∥M ∥F
+
+1 + δ ∥Csk
+k ∥F
+≤ G9 (n)u.
+1 − δ ∥Rsk ∥F
+
+(17)
+
+This fulfills our need for a reconstruction error bound for the trailing columns of M.
+
+3.3
+
+Determining numerical rank in practice
+
+We suggest a flexible two-stage approach to numerical rank estimation. The idea is that
+since orthogonality loss increases with truncation rank and reconstruction error (typically)
+decreases with truncation rank, it is reasonable to choose the largest rank where some
+estimate for the orthogonality loss is below a specified tolerance (say, ϵtol = 100u).
+Our first stage begins by finding a crude upper bound on the numerical rank of Rsk . For
+example, one can set
+ko = min{ℓ : ∥Csk
+(18a)
+ℓ ∥F ≤ us},
+where s is the maximum entry of |Rsk |. This bound is cheap to compute and ensures
+sk
+∥Csk
+ko ∥2 ≤ u∥R ∥2 . The rest of the first stage consists of forming the preconditioned matrix
+pre
+sk −1
+∗
+Mpre
+and computing the Cholesky decomposition of (Mpre
+ko = (Mko )(Ako )
+ko ) (Mko ).
+Our second stage uses a function for estimating condition numbers of triangular matrices.
+Given such a function, cond, we estimate the orthogonality loss of choosing truncation rank
+2
+ℓ by u · (cond(Apre
+ℓ )) . The motivation for this is that if cond bounds condition numbers
+16
+
+p
+from above, then choosing ℓ to satisfy cond(Apre
+ϵtol /u bounds orthogonality loss by
+ℓ ) ≤
+O(ϵtol ). Therefore the formal goal of the second stage is to find
+p
+ϵtol /u }.
+(18b)
+k = max{ℓ : cond(Apre
+ℓ )≤
+pre
+When computing (18b) we can assume that cond(Apre
+ℓ+1 ) ≥ cond(Aℓ ). This assumption
+holds for the true condition number, as can be seen by applying the eigenvalue interlacing
+pre
+theorem to the Gram matrices of Apre
+(the latter being a submatrix of the former).
+ℓ+1 and Aℓ
+This assumption is useful because it lets us compute (18b) by binary search over ℓ in
+{1, . . . , ko }. Even if this assumption does not hold, the only risk in deciding k by binary
+search is underestimating numerical rank.
+One can bound the condition number of a triangular matrix X in O(n2 log n) time by
+applying Krylov subspace methods to ∥X∥2 and ∥X−1 ∥2 . A similar approach with half the
+complexity could be used to estimate τ ≥ ∥I − X∥2 , which could be turned around to bound
+κ(X) ≤ (1 + τ )/(1 − τ ) if τ < 1. If we relax the requirement that cond always upper-bounds
+condition numbers, then we can take cond(X) = κ(diag(X)) to estimate κ(X) from below.
+The last of these three is actually our preferred method, since it works well in practice and
+is extremely simple to implement.
+pre
+∗
+Remark 4 (What if Cholesky fails in stage one?). Set G = (Mpre
+n ) (Mn ). Consider an
+index ko where G[1:ko , 1:ko ] is positive definite, but G[1:(ko + 1), 1:(ko + 1)] is not. Running
+LAPACK’s POTRF function on G will produce an error. However, the leading ko -by-ko submatrix of the output R factor will be well-formed and satisfy (R[1:ko , 1:ko ])∗ R[1:ko , 1:ko ] =
+G[1:ko , 1:ko ]. Therefore if POTRF fails at Line 7 and returns an error code k, then we can
+take ko = k − 1 as an initial estimate for numerical rank.
+
+4
+
+Pivot quality experiments
+
+This section gives experimental comparisons of pivot quality using the LAPACK default
+(GEQP3) versus those produced by CQRRPT based on on that default. Of course, the
+results of such a comparison depend heavily on the distribution family F and the sampling
+factor γ that determines the distribution of our sketching operator. Therefore we take this
+as an opportunity to show how one might set F and γ in practice.
+Background on leverage scores and coherence Section 2.3 presented results on how
+γ can be chosen to achieve oblivious subspace embedding properties for various sketching
+families. The relevant result for SASOs, Theorem 8, provides worst-case bounds that are
+valuable in theoretical analysis. However, some subspaces are “easier to sketch” with SASOs
+than this result would suggest, in the sense that the subspace embedding property can
+reliably be obtained with a far smaller sampling factor or sparsity parameter.
+Leverage scores are a useful concept for understanding when a subspace might be easy
+or hard to accurately sketch with a given distribution. They quantify the extent to which a
+low-dimensional subspace aligns with coordinate subspaces [Mah11, DM16, DM21].
+Definition 12. Let U be an m × n orthonormal matrix. The ith leverage score of range(U)
+is the squared row-norm ∥U[i, :]∥22 .
+When using sketching operators such as SASOs or SRHTs, it is standard to summarize
+leverage scores with a concept called coherence. This is essentially a condition number for
+random sampling algorithms [Mah11, DM16, DM21]. Formally, the coherence of an m × n
+matrix M is m times the largest leverage score of range(M). It is well-documented in the
+literature that matrices with higher coherence are harder to sketch.
+17
+
+Pivot quality metrics We use two pivot quality metrics. The first is the Frobenius
+norms of the matrices Cℓ in block 2-by-2 partitions of R. This has the natural interpretation as the norm of a rank-ℓ approximation of Mn − Qℓ Rℓ ; we plot this metric as ratios
+ours
+∥Cqp3
+∥F . Our second pivot quality metric is the ratios of rii := |R[i, i]| to the
+ℓ ∥F /∥Cℓ
+singular values of M. If R comes from GEQP3 then this ratio can be quite bad in the worst
+case. Letting σi denote the ith singular value of M, this only guarantees that ϕi := rii /σi is
+between (n(n + 1)/2)−1/2 and 2n−1 [Hig21]. Since there is a chance for large deviations, we
+qp3 ours
+plot rii /σi for our algorithm and GEQP3 separately (rather than plotting the ratio rii
+/rii ).
+
+4.1
+
+Example low-coherence matrices
+
+Here we consider tall m × n matrices with m = 217 = 131072 and n = 2000 whose spectrum
+falls into one of the two following categories.
+• Matrices for which the first ten percent of their singular values are all equal to one
+and the rest are decaying polynomially down to 1/ κ(M) = 10−10 .
+• Matrices with a four-step “staircase-shaped” spectrum. The first quarter of the singular values are 1, the next quarter are 8 · 10−10 , the quarter after that are 4 · 10−10 ,
+and the final quarter are all 10−10 .
+The singular vectors were generated by orthogonalizing the columns of matrices with iid
+Gaussian entries. Generating the left singular vectors in this way is a standard method for
+generating low-coherence matrices.
+polynomial-decay
+staircase-shaped
+1.25
+1.2
+1.15
+
+∥Cqp3
+ℓ ∥F
+ours
+∥Cℓ ∥F
+
+1.1
+1.05
+1
+0.95
+0.9
+10 1
+
+CQRRPT
+GEQP3
+
+10 0
+
+|R[ℓ, ℓ]|
+σℓ
+
+10 -1
+
+10 -2
+
+0
+
+500
+
+1000
+
+1500
+
+20000
+
+ℓ
+
+500
+
+1000
+
+1500
+
+2000
+
+ℓ
+
+Figure 1: Pivot quality results for low-coherence matrices with two types of spectral decay.
+
+Figure 1 visualizes metrics of CQRRPT’s pivot quality for these matrices, when it is
+configured to use maximally aggressive dimension reduction via SASOs (γ = 1 and one
+nonzero per column). For both matrices the ratio of GEQP3’s residual-norm metric to that
+of CQRRPT is close to 1. Although, it is noteworthy that the deviations of this ratio from
+18
+
+1 are more pronounced at ranks which coincide with rapid drops in the singular values.
+For the second pivot quality metric, observe that the curves for CQRRPT and GEQP3 are
+extremely similar (in fact, visually coincident) for the two types of matrices.
+
+4.2
+
+An example high-coherence matrix
+
+Here we consider a matrix M of the same dimensions as before, (m, n) = (131072, 2000),
+constructed in three steps. The first step is to vertically stack c = ⌊m/n⌋ copies of the n × n
+identity matrix and one copy of the first m − cn rows of the n × n identity. The second step
+is to select n rows of M at random and multiply them by 1010 . Finally, the third step is to
+multiply M on the right by a random n × n orthogonal matrix. The left singular vectors are
+not explicitly generated in this matrix to ensure its high coherence.
+Column one of Figure 2 shows pivot quality results when applying CQRRPT to M with
+overly-aggressive dimension reduction; column two of Figure 2 shows the analogous data
+for only modestly more expensive dimension reduction. The figures’ combined message is
+two-fold: that there is good reason to use γ > 1 and more than one nonzero per column
+in S, and that extensive parameter tuning is not needed to achieve reliable results from
+CQRRPT at low computational cost.
+γ = 1.0, nnz/col ≡ 1
+γ = 1.25, nnz/col ≡ 4
+10 10
+
+1.02
+
+∥Cqp3
+ℓ ∥F
+ours
+∥Cℓ ∥F
+
+10 5
+
+1
+0.98
+0.96
+
+10
+
+0
+
+10
+
+0
+
+10
+
+10 1
+
+10 -10
+
+10 0
+
+|R[ℓ, ℓ]|
+σℓ
+
+-5
+
+GEQP3
+CQRRPT
+
+10 -1
+500
+
+ℓ
+
+1500
+
+500
+
+ℓ
+
+1500
+
+Figure 2: Pivot quality results for a high-coherence matrix under two choices of sketching distribution parameters.
+
+5
+
+Algorithm benchmarking
+
+CQRRPT, together with its testing and benchmarking frameworks, have been implemented
+in the open-source C++ library called RandLAPACK. Together with its counterpart, RandBLAS, RandLAPACK provides a platform for developing, testing, and benchmarking of highperformance RandNLA algorithms. This software was developed as part of the BALLISTIC
+[DDL+ 20] project and is actively contributed to by the authors of this paper. All experiments in this section were run using the following version of our software:
+19
+
+https://github.com/BallisticLA/RandLAPACK/releases/tag/CQRRPT-benchmark-update.
+The code for CQRRPT can be found in /RandLAPACK/drivers/. The code for constructing and
+dispatching the experiments can be found in /benchmark/*.
+Experiments in this section are only concerned with algorithm speed. We measure speed in
+terms of either an algorithm’s canonical flop rate or wall clock time. The former metric is obtained
+by dividing the GEQRF flop count for a given matrix size (see [ADO94]) by the wall clock time
+required by a particular run of the algorithm. This metric helps in understanding how well different
+algorithms utilize the capabilities of a given machine.
+The test matrices were generated with RandBLAS, by sampling each entry iid from the standard
+normal distribution. While these test matrices would not be suitable for assessing pivot quality,
+they are perfectly appropriate for speed benchmarks. All of our tests used double-precision arithmetic, all code was compiled with the -O3 flag, and we use OMP NUM THREADS = 48 unless otherwise
+stated; MKL uses the same number of threads. We ran the experiments on a single node in UT
+Knoxville’s ISAAC-NG cluster, equipped with two Intel Xeon Gold 6248R processors. Detailed
+machine specifications appear in Table 1.
+Intel Xeon Gold 6248R (2x)
+24
+
+Cores per socket
+Clock Speed
+
+Base
+
+3.00 GHz
+
+Boost
+
+4.00 GHz
+
+L1
+
+1536 KB
+
+L2
+
+24 MB
+
+L3
+
+35.75 MB
+
+Type
+
+DDR4-2933
+
+Size
+
+192 GB
+
+Cache sizes per socket
+
+RAM
+BLAS & LAPACK
+
+MKL 2023.2
+
+GFLOPS in GEMM
+
+1570
+
+Table 1: Key configurations on hardware where testing was performed.
+
+5.1
+
+CQRRPT versus other algorithms
+
+Our first round of experiments compares CQRRPT to other algorithms for QR and QRCP. Specifically, we compare our algorithm to the following.
+• GEQRF - standard unpivoted Householder QR.
+• GEQR - unpivoted QR, which dispatches either a specialized algorithm for QR of tall and
+skinny matrices or a general-purpose algorithm according to implementation-specific logic.
+The selected algorithm is nominally based on a prediction of which algorithm will be more
+efficient for the given matrix. Intel MKL documentation does not promise that GEQR makes
+the optimal decision in this regard.
+• GEQP3 - standard pivoted QR.
+• GEQPT - composed of performing GEQR on an input matrix to get the factors Q1 and R1 and
+then getting data (Q2 , R, J) by running GEQP3 on R1 ; the final matrix Q is defined implicitly
+as the product of Q1 and Q2 .
+• sCholQR3 - shifted CholeskyQR3, our implementation of [FKN+ 20, Algorithm 4.2], using the
+Frobenius norm on Line 3 of said algorithm.
+The performance data for each algorithm is taken as the best of its execution times over twenty
+consecutive runs.
+
+20
+
+Varying matrix sizes. Our first set of experiments was run on m×n matrices with m = 65536
+
+GFLOP/s
+
+(Figure 3, left) and m = 131072 (Figure 3, right), with n varying as the powers of two from 512 to
+8192. The sampling factor, γ, is set to the default value of 1.25; the number of nonzeros per column
+in the sketching operator is set to the default value of 4. Note that all matrices in this experiment
+are out of cache.
+
+columns
+
+columns
+
+Figure 3: QR schemes performance comparisons for matrices with fixed numbers of rows (216 =
+65536, and 217 = 131072 respectively) and varying numbers of columns (512, . . . , 8192). In the
+case with 131072 rows, CQRRPT remains the fastest algorithm up until n = 8192; at that point,
+operations on submatrices in underlying LAPACK routines no longer fit in the cache.
+The results show that with an increase in input matrix size, CQRRPT outperforms alternative
+pivoted schemes and has either comparable or superior performance to unpivoted schemes. We
+are seeing an order of magnitude acceleration over GEQP3, and accelerations of up to 2x over GEQR
+and GEQPT, and 1.6x over GEQRF, for matrices with 131072 rows. On a plot with 65536 rows, the
+performance of CQRRPT declines after 2048 columns due to the fact that the matrix is not tall
+enough.
+Note that GEQR fails to match the performance of GEQRF and consequently causes poor performance in GEQPT. This is likely due to the fact that the matrix sizes that we use in our experiments
+are not considered “tall enough” by the internal metric of the MKL implementation of GEQR. For experiments with matrices where m is several orders of magnitude larger than n, we refer the readers
+to Appendix C.
+
+Varying number of threads. Table 2 depicts the performance scaling of various algorithms
+with the change in number of threads used. For the dimensions of the test matrix used here,
+CQRRPT remains the fastest algorithm for any number of threads.
+Threads
+8
+16
+24
+36
+48
+
+CQRRPT
+250
+490
+577
+677
+704
+
+GEQPT
+159
+286
+351
+372
+351
+
+sCholQR3
+147
+276
+316
+388
+379
+
+GEQRF
+121
+274
+343
+411
+448
+
+GEQR
+166
+300
+369
+393
+370
+
+GEQP3
+21
+25
+29
+50
+39
+
+Table 2: Canonical GFLOP/s scaling with the number of threads used, given M ∈ R131072×2048 .
+At this particular input matrix size, CQRRPT outperforms all other listed algorithms.
+
+21
+
+It is worth noting that CQRRPT has another possible performance advantage over the alternative algorithms that come from the output format that CQRRPT uses. Namely, having an explicit
+representation of a Q-factor ensures that the factor can be applied via a fast GEMM function as
+opposed to a slower ORMQR, which is used to apply an implicitly-stored Q-factor. We acknowledge
+the existence of applications where having an implicitly stored Q-factor is a necessity (for example,
+when the full square Q is required). In the context of such applications, the output format of
+CQRRPT would be disadvantageous.
+
+5.2
+
+Profiling and optimizing CQRRPT
+
+As seen from Algorithm 2, CQRRPT consists of a handful of subcomponents. Understanding
+how each such subcomponent affects overall runtime for varying input parameters is important for
+potential future optimizations of CQRRPT. To give perspective on this, we present some timing
+data in Figure 4. As before, we use an m × n Gaussian test matrix with m = 131072 and n as
+powers of two from 32 to 16384. We also set the sampling factor, γ, to the default value of 1.25.
+
+runtime (%)
+
+Figure 4: Percentages of CQRRPT’s
+runtime, occupied by its respective subroutines. Note that the cost of sketching becomes negligible for larger matrices. Note also that when d ≥ n, the cost
+of applying QRCP to the d × n sketch
+grows as Ω(n3 ). By contrast, the cost of
+applying CholeskyQR to the m × n preconditioned matrix grows as O(mn2 ).
+Therefore, it is reasonable that QRCP
+consumes a larger fraction of runtime as
+n increases.
+
+columns
+An immediate observation to be made here is that QRCP and CholeskyQR become the most
+time-consuming subroutines as the matrix size increases. Additionally, QRCP clearly becomes the
+main computational bottleneck. As the embedding dimension parameter greatly affects the timing
+of QRCP, it is important to understand how the choice of this parameter affects CQRRPT’s overall
+wall clock time.
+
+5.2.1
+
+Effect of varying the embedding dimension parameter
+
+Let’s take a look at the effect of varying the embedding dimension in practice. We use Gaussian
+random input matrices of sizes 131072×n for n ∈ {1024, 2048, 4096} with the ratio γ = d/n varying
+from 1 to 4 in steps of 0.5. Results are presented in Figure 5.
+
+22
+
+runtime (s)
+
+Figure 5: Effect of varying the sampling
+factor γ ∈ {1, 1.5, 2, ..., 4} for matrices of sizes 131072 × {1024, 2048, 4096}.
+Runtime represents the wall clock time
+for the full execution of CQRRPT. An
+increase of the embedding dimension
+has a larger effect on wider matrices,
+as QRCP becomes more expensive with
+the increased number of columns, as
+shown in Figure 4. Note that our default value of γ = 1.25 is marked with
+X; performance in this case can be inferred by interpolating between the first
+two data points of each series.
+
+X
+d/n
+
+Note that for a smaller column size n, increasing the parameter γ has little to no effect on
+CQRRPT’s overall runtime, as the portion of runtime dedicated to performing the QRCP on a
+sketch is smaller. However, as the figure suggests, for a larger n = 4096, the effect of increasing
+γ is rather noticeable. Recalling our results from Section 4.1, using small values of γ can reliably
+produce accurate results for matrices of low coherence. Therefore, a good starting point for the
+value of this parameter would be somewhere between one and two in such cases.
+
+5.2.2
+
+Performing HQRRP on the sketch
+
+By now we have repeatedly seen that CQRRPT’s method for QRCP of Msk can decisively impact
+its runtime when n is large. Here we explore the possibility of accelerating this operation by
+replacing CQRRPT’s call to GEQP3 with a call to HQRRP (Householder QR Factorization With
+Randomization for Pivoting, see [MQOHvdG17]). As outlined in Section 1.4, HQRRP uses lowdimensional random projections to make pivot decisions in small blocks.
+We incorporated an HQRRP implementation into RandLAPACK and ran experiments comparing
+HQRRP to GEQP3 directly. In these experiments, we used square matrices of sizes n × n for
+n ∈ {1000, 2000, . . . , 10000} with varying number of OpenMP threads used (which also sets the
+number of threads used by Intel MKL). Another important tuning parameter to consider in HQRRP
+benchmarking is the block size. Upon experimenting with different HQRRP block sizes, we have
+concluded that on our particular system, using the block size of 32 results in the best performance
+for HQRRP. Using other block sizes in {8, 16, 64, 128, 256} resulted in worse performance than what
+we report in this paper. Results are presented in Figure 6.
+As seen in Figure 6, HQRRP achieves its peak performance with 24 threads for large matrix
+sizes, undoubtedly beating the performance of GEQP3. However, for small input matrices, using
+a large number of threads results in HQRRP failing to outperform GEQP3. When 48 threads are
+used, the performance of HQRRP stagnates, similar to other QR factorization algorithms; see
+Appendix C for an explanation of why this happens.
+Figure 6 allows us to conclude that it is preferred to use 8 threads when running HQRRP
+on the matrices with n ≤ 6000; using 24 threads would be optimal for matrices of larger sizes.
+Additionally, using 24 threads should result in the best performance of GEQP3. Assuming CQRRPT
+used ideal parameter choices for HQRRP and GEQP3 on our machine, we would expect the HQRRP
+version to outperform the GEQP3 version when n ≥ 3000.
+
+23
+
+GFLOP/s
+
+HQRRP
+
+140
+120
+100
+80
+60
+40
+20
+0
+
+GEQP3
+
+140
+120
+100
+80
+60
+40
+20
+0
+
+1
+8
+24
+48
+
+2000
+
+4000 6000 8000
+columns
+
+10000
+
+1
+8
+24
+48
+
+2000
+
+4000 6000 8000
+columns
+
+10000
+
+Figure 6: Canonical flop rates for HQRRP vs GEQP3 with OMP THREADS in {1, 8, 24, 48}. The experimental speedup of HQRRP over GEQP3 for the larger matrix sizes is significant, but it does not
+match the speedup reported in [MQOHvdG17]; this may be due to a variety of factors (primarily,
+the machine used for benchmarking).
+
+6
+
+Conclusion
+
+This paper introduces CQRRPT, a randomized algorithm for computing a QRCP factorization of
+a tall matrix. The algorithm consists of two ingredients: obtaining the pivot order and an approximate R-factor from a small random sketch; and retrieving the complete QRCP factorization by a
+preconditioned CholeskyQR. In comparison to standard QR algorithms, such as Householder QR,
+TSQR, and their pivoted (possibly randomized) derivatives, our CQRRPT requires 34 x less flops9
+and is better suited to modern computational architectures due to fewer global synchronization
+points, fewer data passes, and/or more straightforward reduction operator. Notably, CQRRPT
+provides numerical stability even for rank-deficient matrices, in contrast to existing sketched QR,
+and CholeskyQR methods. This makes the algorithm an appealing tool for orthogonalization.
+We established rigorous conditions for the random sketch required by CQRRPT to attain the
+rank-revealing property and numerical stability. These conditions can be met by employing a
+sketching distribution that possesses oblivious subspace embedding property. The robustness and
+performance advantages of CQRRPT were confirmed through extensive numerical experiments of
+a RandLAPACK implementation based on RandBLAS. In particular, we observed flop rates improvements of up to 10x compared to the standard pivoted QR routine GEQP3 and 1.4x compared to the
+unpivoted QR routine GEQRF from LAPACK.
+This paper also highlights several promising research directions. First, the stability requirements
+and the efficiency of CQRRPT in certain scenarios can be improved by using more sophisticated
+sketching operators and schemes for computing the sketch-orthonormal preconditioned matrix. The
+performance of CQRRPT in modern computing environments such as GPUs, distributed systems,
+and multi-(or low-)precision arithmetic systems also remains to be explored. Second, combining
+our theoretical results from Appendix A with the analysis from [XGL17] may lead to a deeper
+understanding of the properties of HQRRP and other RandNLA methods existing or yet to emerge.
+Third, CQRRPT can be extended to be applicable to matrices with any aspect ratio by integrating
+ideas from this paper with ideas from [XGL17, DG17, Mar15, MQOHvdG17] for HQRRP and the
+related randomized and communication-avoiding QR techniques.
+
+Acknowledgements
+The authors would like to thank three anonymous referees for valuable feedback, which greatly
+improved the clarity of our results and the paper’s presentation.
+9 to compute QRCP factorization in explicit form
+
+24
+
+This work was partially funded by an NSF Collaborative Research Framework: Basic ALgebra
+LIbraries for Sustainable Technology with Interdisciplinary Collaboration (BALLISTIC), a project
+of the International Computer Science Institute, the University of Tennessee’s ICL, the University
+of California at Berkeley, and the University of Colorado at Denver (NSF Grant Nos. 2004235,
+2004541, 2004763, 2004850, respectively). MWM would also like to acknowledge the NSF, DOE,
+and ONR Basic Research Challenge on RLA for providing partial support for this work.
+RM was partially supported by Laboratory Directed Research and Development (LDRD) funding from Sandia National Laboratories; Sandia is a multimission laboratory managed and operated
+by National Technology & Engineering Solutions of Sandia, LLC, a wholly-owned subsidiary of
+Honeywell International Inc., for the U.S. Department of Energy’s National Nuclear Security Administration under contract DENA0003525.
+This research was sponsored by the Department of the Air Force Artificial Intelligence Accelerator and was accomplished under Cooperative Agreement Number FA8750-19-2-1000.
+The views and conclusions contained in this document are those of the authors and should not
+be interpreted as presenting the official policies, either expressed or implied, of the Department
+of the Air Force, the Department of Energy, or the U.S. Government. The U.S. Government
+is authorized to reproduce and distribute reprints for Government purposes notwithstanding any
+copyright notation herein.
+
+References
+[ADO94] E. Anderson, J. Dongarra, and S. Ostrouchov, LAPACK working note 41 installation guide
+for LAPACK, Technical Report 37996-1301, 1994.
+[AMT10] H. Avron, P. Maymounkov, and S. Toledo, Blendenpik: Supercharging LAPACK’s LeastSquares Solver, SIAM Journal on Scientific Computing 32 (January 2010), no. 3, 1217–
+1236.
+[Bal22] O. Balabanov, Randomized Cholesky QR factorizations, arXiv, 2022.
+[BG13] Christos Boutsidis and Alex Gittens, Improved matrix algorithms via the subsampled randomized Hadamard transform, SIAM Journal on Matrix Analysis and Applications 34 (January 2013), no. 3, 1301–1340.
+[BG21] O. Balabanov and L. Grigori, Randomized block gram-schmidt process for solution of linear
+systems and eigenvalue problems, arXiv, 2021.
+[BG22]
+
+, Randomized Gram–Schmidt process with application to GMRES, SIAM Journal on
+Scientific Computing 44 (2022), no. 3, A1450–A1474.
+
+[BG65] Peter Businger and Gene H. Golub, Linear least squares solutions by householder transformations, Numerische Mathematik 7 (June 1965), no. 3, 269–276.
+[Bjö96] Åke Björk, Numerical methods for least squares problems, SIAM, 1996. ISBN 0-89871-360-9.
+[BN19] Oleg Balabanov and Anthony Nouy, Randomized linear algebra for model reduction. part
+i: Galerkin methods and error estimation, Advances in Computational Mathematics 45
+(2019), no. 5, 2969–3019.
+[Coh16] M.B. Cohen, Nearly tight oblivious subspace embeddings by trace inequalities, Proceedings
+of the 27th annual ACM-SIAM Symposium on Discrete Algorithms, December 2016.
+[DDL+ 20] J. Demmel, J. Dongarra, J. Langou, J. Langou, P. Luszczek, and M.W. Mahoney, Prospectus
+for the next LAPACK and ScaLAPACK libraries: Basic ALgebra LIbraries for Sustainable
+Technology with Interdisciplinary Collaboration (BALLISTIC), 2020.
+[Dem23] J. Demmel, Nearly optimal block-Jacobi preconditioning, SIAM Journal on Matrix Analysis
+and Applications 44 (March 2023), no. 1, 408–413.
+[DG17] J.A. Duersch and M. Gu, Randomized QR with column pivoting, SIAM Journal on Scientific
+Computing 39 (January 2017), no. 4, C263–C291.
+[DGHL12] J. Demmel, L. Grigori, M. Hoemmen, and J. Langou, Communication-optimal parallel and
+sequential QR and LU factorizations, SIAM Journal on Scientific Computing 34 (2012),
+no. 1, A206–A239.
+
+25
+
+[DM16] P. Drineas and M. W. Mahoney, RandNLA: Randomized numerical linear algebra, Communications of the ACM 59 (2016), 80–90.
+[DM21] M. Derezinski and M. W. Mahoney, Determinantal point processes in randomized numerical
+linear algebra, Notices of the AMS 68 (2021), no. 1, 34–45.
+[DMM06] P. Drineas, M. W. Mahoney, and S. Muthukrishnan, Sampling algorithms for ℓ2 regression and applications, Proceedings of the 17th annual ACM-SIAM Symposium on Discrete
+Algorithms (SODA), 2006, pp. 1127–1136.
+[DMMS11] P. Drineas, M. W. Mahoney, S. Muthukrishnan, and T. Sarlós, Faster least squares approximation, Numerische Mathematik 117 (2011), no. 2, 219–249.
+[FGL21] Y. Fan, Y. Guo, and T. Lin, A novel randomized XR-based preconditioned CholeskyQR
+algorithm, arXiv, 2021.
+[FKN+ 20] T. Fukaya, R. Kannan, Y. Nakatsukasa, Y. Yamamoto, and Y. Yanagisawa, Shifted Cholesky
+QR for computing the QR factorization of ill-conditioned matrices, SIAM Journal on Scientific Computing 42 (2020), no. 1, A477–A503 (cit. on pp. 2, 19, 20).
+[FNYY14] T. Fukaya, Y. Nakatsukasa, Y. Yanagisawa, and Y. Yamamoto, Choleskyqr2: A simple
+and communication-avoiding algorithm for computing a tall-skinny QR factorization on a
+large-scale parallel system, 2014 5th workshop on latest advances in scalable algorithms for
+large-scale systems, 2014, pp. 31–38.
+[GE96] M. Gu and S.C. Eisenstat, Efficient algorithms for computing a strong rank-revealing QR
+factorization, SIAM Journal on Scientific Computing 17 (July 1996), no. 4, 848–869.
+[GVL13] G.H. Golub and C.F. Van Loan, Matrix computations, 4th ed., Johns Hopkins Studies in
+the Mathematical Sciences, Johns Hopkins University Press, Baltimore, MD, 2013 (en).
+[Hig02] N.J. Higham, Accuracy and stability of numerical algorithms, Second, Society for Industrial
+and Applied Mathematics, Philadelphia, PA, USA, 2002.
+[Hig21]
+
+, What is a rank-revealing factorization?, 2021. [Accessed 03-Apr-2023].
+
+[Hig22]
+
+, The big six matrix factorizations— nhigham.com, 2022. [Accessed 15-Mar-2023].
+
+[HSBY23] Andrew J. Higgins, Daniel B. Szyld, Erik G. Boman, and Ichitaro Yamazaki, Analysis of randomized Householder-Cholesky QR factorization with multisketching, 2023.
+arXiv:2309.05868.
+[Mah11] M. W. Mahoney, Randomized algorithms for matrices and data, Foundations and Trends
+in Machine Learning, NOW Publishers, Boston, 2011.
+[Mar15] P.-G. Martinsson, Blocked rank-revealing QR factorizations: How randomized sampling can
+be used to avoid single-vector pivoting, arXiv preprint arXiv:1505.08115 (2015).
+[MDM+ 23] R. Murray, J. Demmel, M.W. Mahoney, N.B. Erichson, M. Melnichenko, O.A. Malik, L.
+Grigori, P. Luszczek, M. Derezinski, M.E. Lopes, T. Liang, H. Luo, and J. Dongarra, Randomized numerical linear algebra: A perspective on the field with an eye to software, 2023.
+arXiv:2302.11474:v2.
+[MQOHvdG17] P.-G. Martinsson, G. Quintana-Ortı́, N. Heavner, and R. van de Geijn, Householder QR
+factorization with randomization for column pivoting (HQRRP), SIAM Journal on Scientific
+Computing 39 (January 2017), no. 2, C96–C115.
+[MSM14] X. Meng, M.A. Saunders, and M.W. Mahoney, LSRN: A parallel iterative solver for strongly
+over- or underdetermined systems, SIAM Journal on Scientific Computing 36 (January
+2014), no. 2, C95–C118.
+[MT20] P.-G. Martinsson and J. A. Tropp, Randomized numerical linear algebra: Foundations and
+algorithms, Acta Numerica 29 (2020), 403–572.
+[ND15] Hong Diep Nguyen and James Demmel, Reproducible tall-skinny QR, 2015 IEEE 22nd
+symposium on computer arithmetic, 2015, pp. 152–159.
+[QOSB98] G. Quintana-Ortı́, X. Sun, and C.H. Bischof, A BLAS-3 version of the QR factorization
+with column pivoting, SIAM Journal on Scientific Computing 19 (1998), no. 5, 1486–1494.
+[RT08] V. Rokhlin and M. Tygert, A fast randomized algorithm for overdetermined linear leastsquares regression, Proceedings of the National Academy of Sciences 105 (September 2008),
+no. 36, 13212–13217.
+[Sar06] T. Sarlos, Improved approximation algorithms for large matrices via random projections,
+Proceedings of the 47th annual IEEE Symposium on Foundations of Computer Science
+(FOCS), 2006, pp. 143–152.
+
+26
+
+[Slu69] A. Van Der Sluis., Condition numbers and equilibration of matrices., Numerische Mathematik 14 (1969), 14–23.
+[SW02] A. Stathopoulos and K. Wu, A block orthogonalization procedure with constant synchronization requirements, SIAM J. Sci. Comput. 23 (2002), 2165–2182.
+[TOO20] T. Terao, K. Ozaki, and T. Ogita, LU-Cholesky QR algorithms for thin QR decomposition,
+Parallel Computing 92 (2020), 102571.
+[TRG05] Rajeev Thakur, Rolf Rabenseifner, and William Gropp, Optimization of collective communication operations in MPICH, The International Journal of High Performance Computing
+Applications 19 (2005), no. 1, 49–66.
+[Tro11] J.A. Tropp, Improved analysis of the subsampled randomized Hadamard transform, Advances in Adaptive Data Analysis 03 (April 2011), no. 01n02, 115–126.
+[TW23] Joel A. Tropp and Robert J. Webber, Randomized algorithms for low-rank matrix approximation: Design, analysis, and applications, 2023.
+[XGL17] J. Xiao, M. Gu, and J. Langou, Fast parallel randomized QR with column pivoting algorithms for reliable low-rank matrix approximations, 2017 IEEE 24th international conference on high performance computing (HiPC), 2017, pp. 233–242.
+[YNYF15] Y. Yamamoto, Y. Nakatsukasa, Y. Yanagisawa, and T. Fukaya, Roundoff error analysis of
+the CholeskyQR2 algorithm, Electron. Trans. Numer. Anal 44 (2015), no. 01, 306–326.
+[YTD15] I. Yamazaki, S. Tomov, and J. Dongarra, Mixed-precision Cholesky QR factorization and
+its case studies on multicore CPUs with multiple GPUs, SIAM J. Scientific Computing 37
+(2015), C307–C330.
+
+A
+
+Analysis in exact arithmetic
+
+A.1
+
+Detailed arithmetic complexity analysis
+
+In an effort to give the reader a perspective on an approximate flop count of Algorithm 2,
+let us take a closer look at what happens inside this algorithm after computing the sketch.
+1. Factor Msk by QRCP. The cost of this step depends on the algorithm used for QRCP.
+By default, we use the method from LAPACK’s GEQP3. With LAPACK’s GEQP3, this
+operation would cost 4dnk − 2k 2 (d + n) + 4k 3 /3 flops [GVL13, Algorithm 5.4.1], where
+k = rank(Msk ) and d is the user-defined embedding dimension of a sketch.
+2. Apply the preconditioner to M, to get Mpre . This step is done via TRSM, so the cost
+is mk 2 [ADO94, Page 120].
+3. Run CholeskyQR on Mpre . This operation is composed of SYRK, POTRF, and TRSM
+functions. This operation would cost mk(k + 1) + k 3 /3 + k 2 /2 + k/6 + mk 2 flops
+[ADO94, Page 120].
+4. Combine the triangular factors from QRCP on Msk and CholeskyQR on Mpre . This
+cost is negligible; an O(n3 ) TRMM.
+This results in a cumulative flop count of 2mk 2 +mk(k +1)+4dnk −2k 2 (d+n)+5k 3 /3+
+k /2 + k/6. Put simply, we have an algorithm with an asymptotic flop count with a leading
+term 3mn2 when d ∈ o(n) and k = n.
+2
+
+A.2
+
+Rank-revealing properties
+
+Here we prove pivot quality results claimed in Theorems 4 and 5. Our arguments use the
+following concept to relate subspace embedding results (common in RandNLA theory) and
+restricted condition numbers.
+27
+
+Definition 13. The effective distortion of a d × m matrix S for a linear subspace L ⊂ Rm
+is the smallest real number δ where there exists a t ≥ 0 for which tS is a δ-embedding for L.
+The specific relationship is as follows [MDM+ 23, Proposition A.1.1].
+Proposition 14. Suppose the columns of U are an orthonormal basis for L = range(M),
+and let δ denote the effective distortion of S for L. If δ < 1, then we have
+r
+1+δ
+κ(SU) =
+.
+1−δ
+Furthermore, we have δ = 1 if and only if rank(SM) < rank(M).
+Now we fix an arbitrary permutation vector J of {1, . . . , n} and analyze the R-factors
+sk
+from QR decompositions of the pivoted matrices Mn = M[ :, J] and Msk
+n = M [ :, J]. Set
+sk
+k = rank(M). We assume rank(M ) = k, since otherwise there is nothing to prove.
+Proposition 15. If S has effective distortion δ < 1 for the range of M, then we have
+
+
+
+1/2 σ Ask
+j
+ℓ
+1−δ
+σj (Aℓ )
+
+ for j ≤ ℓ
+(19a)
+≥
+σj (M)
+1+δ
+σj Msk
+ 
+
+1/2 σ Csk
+j
+ℓ
+σj (Cℓ )
+1+δ
+
+
+for j ≤ k − ℓ,
+(19b)
+≤
+σℓ+j (M)
+1−δ
+σ
+Msk
+ℓ+j
+
+and
+
+−1 sk
+∥(Aℓ )−1 Bℓ ∥2 ≤ ∥(Ask
+Bℓ ∥2 +
+ℓ )
+
+
+
+1+δ
+1−δ
+
+1/2
+
+
+−1
+σmin Ask
+∥Csk
+ℓ
+ℓ ∥2 .
+
+(19c)
+
+Proof. First, note that all of our claimed bounds are invariant under scaling of S by positive
+constants. This means that we can assume S is scaled (S ← tS for some t ̸= 0) so that
+its distortion and its effective distortion coincide. From here, it follows directly from the
+min-max principle and the subspace embedding property of S that
+(1 − δ)1/2 σj (M) ≤ σj (SM) ≤ (1 + δ)1/2 σj (M) for 1 ≤ j ≤ n.
+
+(20)
+
+Consider the matrix Mpre computed in Algorithm 2. We can interpret Theorem 3 with the
+definition of a subspace embedding to find that
+(1 + δ)−1/2 ≤ σj (Mpre ) ≤ (1 − δ)−1/2 for 1 ≤ j ≤ k.
+
+(21)
+
+Next, partition the matrix Rpre from Algorithm 2 into a 2 × 2 block matrix in the way
+analogous to the partitioning of R and Rsk , and recall the definition R = Rpre Rsk .
+pre
+The bounds in Eq. (21) ensure that σmin (Apre
+) = σmin (Mpre ) ≥ (1+δ)−1/2
+ℓ ) ≥ σmin (R
+pre
+pre
+pre
+−1/2
+and ∥Cℓ ∥ ≤ ∥R ∥ = ∥M ∥ ≤ (1 − δ)
+. Meanwhile, rote calculations let us express
+pre sk
+pre sk
+pre sk
+sk
+the blocks of R as Aℓ = Apre
+A
+,
+C
+=
+C
+C
+ℓ
+ℓ
+ℓ and Bℓ = Aℓ Bℓ + Bℓ Cℓ . Consequently,
+ℓ
+ℓ
+−1
+−1
+sk
+σj Ask
+≤ σmin (Apre
+σj Apre
+= σmin (Apre
+σj (Aℓ ) ≤ (1 + δ)1/2 σj (Aℓ ) ,
+ℓ
+ℓ )
+ℓ Aℓ
+ℓ )
+
+
+
+
+
+−1
+pre sk
+−1
+−1/2
+σj Csk
+≥ ∥Cpre
+= ∥Cpre
+σj (Cℓ ) .
+ℓ
+ℓ ∥2 σj Cℓ Cℓ
+ℓ ∥2 σj (Cℓ ) ≥ (1 − δ)
+
+
+
+
+
+We can combine these inequalities with Eq. (20) to easily get Eqs. (19a) and (19b).
+28
+
+To show Eq. (19c), we first notice that
+sk −1
+sk
+pre sk
+∥(Aℓ )−1 Bℓ ∥2 = ∥(Apre
+(Apre
+ℓ Aℓ )
+ℓ Bℓ + Bℓ Cℓ )∥2
+−1 sk
+−1
+−1 pre sk
+≤ ∥(Ask
+Bℓ ∥2 + ∥(Ask
+(Apre
+Bℓ Cℓ ∥2 .
+ℓ )
+ℓ )
+ℓ )
+
+In turn, we have
+−1
+−1 pre sk
+∥(Ask
+(Apre
+Bℓ Cℓ ∥2 ≤ σmin Ask
+ℓ )
+ℓ
+ℓ )
+
+≤
+
+
+
+1+δ
+1−δ
+
+−1
+
+1/2
+
+σmin (Rpre )−1 ∥Rpre ∥2 ∥Csk
+ℓ ∥2
+
+σmin Ask
+ℓ
+
+−1
+
+∥Csk
+ℓ ∥2 ,
+
+which finishes the proof.
+It is easy to prove Theorems 4 and 5 from here. Start by using Proposition 14 to
+express the bounds from Proposition 15 in terms of the restricted condition number for S
+on range(M). Straightforward algebra shows that if (2a) and (2b) hold for X = SM, then
+(19a) and (19b) imply the claim of Theorem 4. Proving Theorem 5 requires a slight detour
+
+−1
+2
+to show that σmin Ask
+∥Csk
+ℓ
+ℓ ∥2 ≤ fℓ follows from (19a) and (19b). Combine this new
+bound with (19c) to see that if (3) holds for X = SM then the claim of Theorem 5 follows.
+
+B
+
+Technical numerical stability results
+
+Here we prove results from Section 3, using notation first defined on page 13.
+
+B.1
+
+Proof of Lemma 11
+
+The relation Eq. (12) follows directly from [YNYF15]. To show Eq. (11), notice that
+sk
+sk
+∥Mn − Qk Rk ∥F = ∥Mn − Mpre
+k Rk + E1 Rk + Qk E2 ∥F ,
+
+(23)
+
+pre
+sk
+where E1 = Mpre
+and E2 = Rk − Rpre
+k − Qk Rk
+k Rk . According to [YNYF15], it holds
+pre
+2
+that ∥E1 ∥F ≤ 8.4∥Mk ∥2 n u. By combining this relation with Eq. (12) we deduce that
+pre
+∥Rpre
+k ∥F ≤ 1.01∥Mk ∥F . Furthermore, by standard rounding bounds for matrix multiplicask
+nu
+∥Rpre
+tion [Hig02], we have ∥E2 ∥F ≤ 1−nu
+k ∥F ∥Rk ∥F . Next, from Eq. (10) it can be deduced
+pre sk
+that ∥Mk Rk ∥2 ≤ 1.01∥M∥2 , and therefore
+pre −1
+pre
+sk
+sk
+sk
+∥Mpre
+∥Mpre
+k ∥2 ∥Rk ∥2 ≤ 6 κ(Mk )
+k ∥2 ∥Rk ∥2 ≤ 6σmin (Mk ) ∥Rk ∥2 ≤ 6.06∥M∥2 .
+pre
+sk
+By plugging the obtained bounds for ∥E1 ∥F , ∥Rpre
+k ∥F , ∥E2 ∥F and ∥Mk ∥2 ∥Rk ∥2 to Eq. (23),
+we obtain
+sk
+sk
+∥Mn − Qk Rk ∥F − ∥Mn − Mpre
+k Rk ∥F ≤ ∥E1 ∥F ∥Rk ∥2 + ∥Qk ∥2 ∥E2 ∥F
+pre
+sk
+sk
+2
+≤ 8.4∥Mpre
+k ∥2 n u∥Rk ∥2 + 1.01nu∥Rk ∥F ∥Rk ∥F
+sk
+≤ 51n2 u∥M∥2 + 1.03nu∥Mpre
+k ∥F ∥Rk ∥F
+
+≤ (50.5n2 u + 6.3n2 u)∥M∥2 ,
+which completes the proof.
+
+29
+
+B.2
+
+Preconditioner stability
+
+B.2.1
+
+Assumptions
+
+To characterize the numerical stability of CQRRPT’s preconditioner, we need assumptions
+on the accuracy of the operations at Lines 2 to 5 of Algorithm 2 under finite precision
+arithmetic. We consider a scenario where Line 5, which dominates the preconditioner’s
+computational cost, is computed using unit roundoff u, whereas cheaper Lines 2 to 4 are
+computed at a higher precision, using a roundoff ũ = m−1 F (n)−1 u, where F (n) is a lowdegree polynomial. We use this computational model to illustrate a crucial property of the
+preconditioner: the ability to ensure numerical stability with a roundoff u for dominant
+operations not constrained by m. This property is of interest for integrating CQRRPT
+into multi- or low-precision arithmetic architectures. Clearly, the numerical stability of
+CQRRPT computed with two unit roundoffs also implies its stability when computed with
+a single roundoff. Define,
+E1 := SMk − Msk
+k ,
+sk
+E2 := Msk − Qsk
+k Rk
+
+(24)
+
+sk
+E3 := Mk − Mpre
+k Ak
+sk
+
+E4 := SMk − Mk ,
+sk
+
+where Mk := M[ :, J[k + 1:n]] and Mk := Msk [ :, J[k + 1:n]].
+We require that several bounds hold on these matrices. The choice for these bounds
+begins with a base assumption that the unit roundoff u and the dimensions n and k satisfy
+3
+
+5
+
+u ≤ 0.001n− 2 k − 2 .
+
+(25a)
+
+With that, the first round of bounds that we discuss are
+1
+
+∥E1 [ :, j]∥2 ≤ 0.01k − 2 u∥Mk [ :, j]∥2 for 1 ≤ j ≤ k,
+∥E2 [ :, j]∥2 ≤ 0.01k
+
+− 12
+
+u∥M [ :, j]∥2 for 1 ≤ j ≤ n,
+sk
+
+(25b)
+and
+
+∗ sk
+∥Qsk
+k Qk − I∥F ≤ 0.1u.
+
+(25c)
+
+It is easy to ensure that these conditions hold. To begin, we note that the classical worstmũ
+|S||Mk |. This tells us that Eq. (25b) can be
+case rounding analysis ensures |E1 | ≤ 1−mũ
+√
+−1 −1
+achieved if ũ = O(m n u) and ∥S∥F = O( m). Meanwhile, the condition Eq. (25c) can
+be achieved by using any stable QRCP factorization executed in sufficient precision. This
+3
+for instance includes the Householder QR with unit roundoff ũ = O(n−1 d− 2 u) or Givens
+−1 − 12
+QR with unit roundoff ũ = O(n d u) [Hig02].
+Our next round of assumptions is more substantial. In particular, assume that the
+output of the black-box qrcp function satisfies the rank-revealing properties
+
+
+
+
+
+
+1
+1
+1
+1
+sk
+2
+2
+σmin Ask
+≥ 0.5n− 2 k − 2 σk Msk ,
+∥Csk
+,
+(25d)
+k
+k−1 ∥2 ≤ 2n k σk M
+1
+
+1
+
+−1 sk
+∥(Ask
+Bk ∥F ≤ 2n 2 k 2 .
+k )
+
+(25e)
+
+These conditions can be achieved with the strong rank-revealing QR method from [GE96]
+1
+with unit roundoff ũ = O(n−1 d− 2 u). The method from [GE96] contains an extra parameter
+f that in our case should be taken as, say, 1.5. Then the qrcp subroutine on Line 3 will take
+a negligible amount O(dn2 log n) of flops and satisfy Eqs. (25d) and (25e). It is important
+to note that in practical applications, the condition Eqs. (25d) and (25e) is expected to
+30
+
+hold also for traditional QRCP with max-norm column pivoting. However, there are a few
+exceptional cases in which the traditional QRCP would not satisfy Eq. (25e).
+sk
+(j)
+Next, according to [Hig02, Theorem 8.5], we have Mpre
+k [j, :](Ak +∆A ) = Mk [j, :] with
+pre
+(j)
+sk
+|∆A | ≤ 1.1uk|Ak |, which implies that |E3 | is bounded by 1.1uk|Mk ||Ask
+k | and leads to
+the following condition
+sk
+|E3 [:, j]| ≤ 1.1ku|Mpre
+k ||A [ :, j]| for 1 ≤ j ≤ k.
+
+(25f)
+
+mũ
+|S||Mk |, which implies
+Furthermore, by the standard rounding analysis we have |E4 | ≤ 1−mũ
+1
+
+∥E4 [:, j]∥2 ≤ 0.1n− 2 u∥Mk [ :, j]∥2 for 1 ≤ j ≤ n − k,
+(25g)
+√
+if ũ = O(m−1 n−1 u) and ∥S∥F = O( m).
+With the computational model based on the assumptions Eq. (25), we can now establish
+a numerical characterization of the CQRRPT preconditioner.
+B.2.2
+
+Main result
+
+Theorem 16 is our main numerical stability result. It guarantees stability of CQRRPT’s
+preconditioner under the condition that the truncation error associated with the preceding
+index k − 1 is greater than the threshold value G(n, k)u, where G(n, k) is a low-degree
+polynomial. Consequently, by using the largest k that satisfies this condition, we will have
+pre
+sk
+a factorization Mpre
+k Rk , which is within a distance of G(n, k)u from Mn and for which Mk
+is well-conditioned.
+Theorem 16. Consider Algorithm 2 where Line 5 is executed with unit roundoff u ≤
+3
+5
+−1
+−1
+0.001n− 2 k − 2 . Assume that the other lines are executed with
+√ unit roundoff ũ = m F (n) u,
+where F (n) is some low-degree polynomial, and ∥S∥F = O( m), so that the conditions Eq. (25)
+hold. Assume that k satisfies
+3
+
+5
+
+1000n 2 k 2 u ≤
+
+∥Csk
+k−1 ∥F
+.
+∥Rsk ∥2
+
+If S is an δ-embedding for range(M) with δ ≤ 1/2, then
+sk
+∥Mn − Mpre
+∥Csk ∥F
+k Rk ∥F
+≤ 2 ksk + 10nku
+∥M∥F
+∥R ∥2
+
+(26a)
+
+pre
+0.8 ≤ σmin (Mpre
+k ) ≤ σmax (Mk ) ≤ 1.44.
+
+(26b)
+
+Our proof of Theorem 16 uses two intermediate propositions that provide further insights
+into the stability of the CQRRPT preconditioner. First, Proposition 17 concerns how the
+permutation obtained on Line 3 of CQRRPT effectively bounds the condition number of
+the submatrix Mk . Second, Proposition 18 involves examining the factors Mpre
+and Ask
+k as
+k
+an unpivoted “sketched CholeskyQR” factorization of Mk , which enables us to leverage a
+result from [Bal22].
+Proposition 17. Consider Algorithm 2 where Line 5 is executed with unit roundoff u ≤
+3
+5
+−1
+−1
+0.001n− 2 k − 2 and other lines are executed with unit
+√ roundoff ũ = m F (n) u, where F (n)
+is some low-degree polynomial, and ∥S∥F = O( m), so that the conditions Eq. (25) hold.
+Assume that k is such that
+3
+sk −1
+n 2 ku ≤ ∥Csk
+k−1 ∥F ∥R ∥2 .
+If S is an δ-embedding for Mk with δ ≤ 1/2, then we have
+3
+
+sk
+−1
+−1
+κ(Mk ) ≤ 10n 2 k∥Csk
+.
+k−1 ∥F ∥R ∥2 ≤ 2.5u
+
+31
+
+sk −1
+Proof. Denote ∥Csk
+by τk−1 . Frame the assumptions Eq. (25). Notice that
+k−1 ∥F ∥Rk ∥2
+by Eq. (25d),
+
+
+−1 − 32 −1
+(27)
+≥ 4−1 n−1 k −1 ∥Csk
+n k τk−1 ∥Ask
+σmin Ask
+k ∥2 .
+k−1 ∥2 ≥ 4
+k
+
+Thus, it is deduced that
+
+3
+
+(28)
+
+sk
+sk
+sk
+∥Msk
+k ∥2 ≤ ∥Qk ∥2 ∥Ak ∥2 + ∥E2 [:, 1 :k]∥2 ≤ 1.01∥Ak ∥2 ,
+
+(29)
+
+−1
+−1
+2
+κ(Ask
+.
+k ) ≤ 4n kτk−1 ≤ u
+
+Furthermore, by Eq. (25c) we have
+
+and
+
+
+
+
+
+
+
+
+− ∥E2 [:, 1 :k]∥2
+σmin Ask
+σmin Msk
+≥ σmin Qsk
+k
+k
+k
+
+
+
+
+
+
+sk
+≥ 0.99σmin Ask
+− 0.01u∥Msk
+− 0.011u∥Ask
+k
+k ∥2 ≥ 0.99σmin Ak
+k ∥2
+
+
+
+
+
+sk
+≥ σmin Ask
+0.99 − 0.011u κ(Ask
+.
+k
+k ) ≥ 0.97σmin Ak
+Consequently,
+
+3
+
+(30)
+
+−1
+−1
+2
+κ(Msk
+.
+k ) ≤ 4.2n kτk−1 ≤ 1.05u
+
+(31)
+
+sk
+∥SMk ∥2 ≤ ∥Msk
+k ∥2 + ∥E1 ∥2 ≤ 1.01∥Mk ∥2 ,
+
+(32)
+
+Next, by Eq. (25b) we get
+
+which due to the δ-embedding property of S implies that
+∥Mk ∥2 ≤ 1.5∥Msk
+k ∥2 .
+
+(33)
+
+We also have by Eqs. (25b) and (31),
+
+
+
+
+σmin (SMk ) ≥ σmin Msk
+− ∥E1 ∥2 ≥ σmin Msk
+− 0.01u∥Mk ∥2
+k
+k
+
+
+
+
+sk
+sk
+≥ σmin Msk
+−
+0.015u∥M
+∥
+≥
+0.92σ
+M
+.
+2
+min
+k
+k
+k
+
+(34)
+
+Consequently, by the δ-embedding property of S and Eqs. (33) and (34),
+r
+3
+1+δ
+−1
+−1
+2
+κ(Mk ) ≤
+κ(SMk ) ≤ 1.91 κ(Msk
+,
+k ) ≤ 10n kτk−1 ≤ 2.5u
+1−δ
+which finishes the proof.
+Proposition 18 (Corollary of Theorem 5.2 from [Bal22]). Consider Algorithm 2 where Line
+3
+5 is executed with unit roundoff u ≤ 0.01n− 2 κ(Mk )−1 and other lines are executed with√unit
+roundoff ũ = m−1 F (k)−1 u, where F (k) is some low-degree polynomial, and ∥S∥F = O( m),
+so that the assumptions Eq. (25) hold. If S is an δ-embedding for Mk with δ ≤ 1/2 then
+sk
+Mk + ∆M = Mpre
+k Ak
+
+(35)
+
+with ∥∆Mk [ :, j]∥2 ≤ 2.1ku∥M[ :, j]∥2 for 1 ≤ j ≤ k. Furthermore, we have
+3
+
+3
+
+pre
+−1/2
+(1 + δ)−1/2 − 4k 2 u κ(Mk ) ≤ σmin (Mpre
++ 4k 2 u κ(Mk ).
+k ) ≤ σmax (Mk ) ≤ (1 − δ)
+(36)
+
+32
+
+We are now ready to present the proof of Theorem 16.
+sk −1
+Proof of Theorem 16. Denote ∥Csk
+k ∥F ∥Rk ∥2 by τk . By Eqs. (25b), (25c), (25e) and (25g)
+we have
+sk
+sk −1 sk
+−1 sk
+∥Mk − Mpre
+Bk ∥F + ∥E3 (Ask
+Bk ∥F
+k )
+k Bk ∥F ≤ ∥Mk − Mk (Ak )
+−1 sk
+−1 sk
+≤ (1 − δ)−1/2 ∥S(Mk − Mk (Ask
+Bk )∥F + ∥E3 ∥F ∥(Ask
+Bk ∥2
+k )
+k )
+−1/2
+
+≤ (1 − δ)
+
+1
+2
+
+(37)
+
+1
+2
+
+(∥E4 + E5 + E6 + E7 ∥F ) + 2n k ∥E3 ∥F ,
+
+sk
+
+sk
+
+sk
+sk sk
+sk
+sk −1 sk
+where E4 := SMk − Mk , E5 := Mk − Qsk
+Bk , and
+k Bk , E6 := (Qk Ak − Mk )(Ak )
+sk
+sk −1 sk
+E7 := (Mk − SMk )(Ak ) Bk satisfy the following bounds
+sk
+
+∥E4 ∥F = ∥SMk − Mk ∥F ≤ 0.1u∥Mk ∥2
+sk
+
+sk
+sk
+sk
+∥E5 ∥F = ∥Mk − Qsk
+k Bk ∥F ≤ ∥Qk ∥2 ∥Ck ∥F + ∥E2 ∥F
+
+√
+1/2
+≤ 1.01τk ∥Rsk
+(1.02τk + 0.01 nu)∥M∥F
+k ∥2 + ∥E2 ∥F ≤ (1 + δ)
+
+sk
+sk
+sk −1 sk
+∥E6 ∥F = ∥(Qsk
+Bk ∥F
+k Ak − Mk )(Ak )
+sk
+sk
+sk −1 sk
+≤ ∥Qsk
+Bk ∥2
+k Ak − Mk ∥F ∥(Ak )
+1
+
+1
+
+1
+
+1
+
+≤ 2n 2 k 2 ∥E2 [:, 1 :k]∥F ≤ 0.02n 2 k 2 u∥Msk
+k ∥2 ≤ 0.03nu∥Mk ∥2
+sk −1 sk
+sk −1 sk
+∥E7 ∥F = ∥(Msk
+Bk ∥2 ≤ ∥Msk
+B ∥2
+k − SMk )(Ak )
+k − SMk ∥F ∥(Ak )
+1
+
+1
+
+≤ 2n 2 k 2 ∥E1 ∥F ≤ 0.02nu∥Mk ∥2 .
+
+By using the triangle inequality and the fact that δ ≤ 1/2, we obtain
+1
+1
+4
+(0.2nu + 1.02 45 τk )∥M∥F + 2n 2 k 2 ∥E3 ∥F .
+3
+Furthermore, from Proposition 17 it follows that
+
+sk
+∥Mk − Mpre
+k Bk ∥F ≤
+
+(38)
+
+3
+
+κ(Mk ) ≤ 10n 2 kτk −1 .
+
+(39)
+
+By looking at Mpre
+and Ask
+k as a sketched CholeskyQR factorization of Mk , according
+k
+to Proposition 18, we have
+sk
+∥E3 ∥F = ∥Mk − Mpre
+k Ak ∥F ≤ 2.1ku∥Mk ∥F
+3
+2
+
+(40a)
+3
+2
+
+pre
+−1/2
+(1 + δ)−1/2 − 4k u κ(Mk ) ≤ σmin (Mpre
++ 4k u κ(Mk )
+k ) ≤ σmax (Mk ) ≤ (1 − δ)
+(40b)
+
+By combing Eq. (40a) with Eq. (38) and using the triangle inequality we obtain Eq. (26a).
+By combining Eq. (40b) with Eq. (39) we obtain Eq. (26b) and finish the proof.
+
+C
+
+More on numerical experiments
+
+Extremely tall matrices. The matrices used in Section 5’s experiments were tall, but
+not as tall as some readers might anticipate. Therefore here we consider matrices with one
+million rows and 32 . . . 16384 columns. Figure 7 presents performance results (in canonical
+GFLOPs/second) for the algorithms considered before. It shows that for very thin matrices
+(n ≤ 256), CQRRPT may be inefficient compared to alternative algorithms. This can be
+understood with performance profiling data in Figure 8. Specifically, for these extremely tall
+and thin matrices, the runtime is dominated by sketching, and the time to pivot M before
+preconditioning takes nearly as long as CholeskyQR. As before, our experiments were run
+on the machine described in Table 1 using 48 threads.
+33
+
+runtime(%)
+
+GFLOP/s
+
+columns (n)
+Figure 7: QR schemes performance comparisons for matrices with one million
+rows and varying numbers of columns
+(32, . . . , 16384). The plot does not depict
+GEQR and GEQPT results for the number of
+columns larger than 2048, because of an
+internal overflow of parameters related to
+the input matrix size and a consequent
+early termination.
+
+columns (n)
+Figure 8: Percentages of runtime used by CQRRPT’s subroutines, for matrices with one million rows and the indicated number of columns.
+Note that although CholQR occupies the dominant portion of runtime across the larger (n ≥
+512) matrix sizes, its runtime is primarily
+comprised of vector-vector operations for the
+smaller matrix sizes. As the matrix size increases, TRSM routine gradually achieves a GEMMlike performance level.
+
+HQRRP performance details. Figure 6 is our attempt to give a contemporary refresh
+of Figures 4 and 5 from the original HQRRP publication [MQOHvdG17]. It is important
+to note that the initial HQRRP thread scalability study was performed on Intel Xeon E52695v3 (the Haswell platform) processor with clocked capped at 2.3 GHz featuring “only” 14
+cores in a single socket with 22nm node size. Our experiments used dual-socket Intel Xeon
+Gold 6248R (Cascade Lake platform) with 24 cores per socket and 48 cores total with 14nm
+feature size - a NUMA design. In essence, the new processor engages a much larger number
+of cores in the computation and they have to be coordinated by on-node interconnect, that
+is, the design keeps the content of Level 1 caches coherent through a memory controller
+state tracking each L1 cache line. For smaller matrix sizes, lower-level caches, especially
+Level 3, are very effective in alleviating the demand for cache lines from the main memory
+and HQRRP behaves as it did on the old Haswell system. For larger matrix sizes, HQRRP
+performance drops as its internal pivoted QR function, that is implemented using level 2
+BLAS routines, becomes too costly.
+
+34
+
+
