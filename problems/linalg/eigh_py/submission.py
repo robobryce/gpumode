@@ -2446,7 +2446,7 @@ def _lr_bare_scratch(B, k, dev):
     return buf
 
 
-def _lr_reduced_mega(Bk):
+def _lr_reduced_mega(Bk, bt_prec=None):
     """RAW megakernel eigh of Bk (B x k x k) for k in the SMEM-fit range
     (32,448]. No wrapper gate, no scratch re-alloc, no sort. Returns (lam, G).
 
@@ -2455,7 +2455,16 @@ def _lr_reduced_mega(Bk):
     transform: the fused kernel returns tridiag eigenvectors Z + Householder
     panel + block-T, and G = (I - V T V^T) Z is formed by batched TF32 GEMMs.
     Any Bk the reduced solve can't resolve makes G non-orthonormal -> the OUTER
-    FP32 A@V gate falls that whole matrix back to cuSOLVER (unchanged)."""
+    FP32 A@V gate falls that whole matrix back to cuSOLVER (unchanged).
+
+    bt_prec overrides the WY back-transform GEMM precision for THIS call only
+    (None -> the shared _MEGA_MED_SPLIT_PREC=fp32). The sign-DC reduced-block
+    solve (shape 11 / shape 5) passes "tf32x3": its eigenvectors are cleaned by
+    a finishing 3xTF32 Newton-Schulz + a residual gate, so FP32-accurate 3xTF32
+    (Ozaki hi+lo, ~6e-6) is gate-safe and moves the ~5ms of back-transform
+    GEMMs off the FP32-SIMT path onto tensor cores; the low-rank inner solve
+    (shapes 2/3/8/12) leaves it None -> unchanged FP32 (that tighter Rayleigh
+    gate trips on plain TF32 and tf32x3 net-lost there per brief-22)."""
     mod = _mega_get()
     kk = Bk.shape[-1]
     B = Bk.shape[0]
@@ -2470,11 +2479,11 @@ def _lr_reduced_mega(Bk):
     mod.mega_eigh_med_split(Bkc, V, L, rscr, dscr, escr, dpscr, dmscr, tauscr,
                             T, kk, _MEGA_MED_NT, _MEGA_BISITERS, nb)
     # V holds Z; rscr the Householder panel; back-transform on tensor cores.
-    G = _mega_med_backtransform(V, rscr, T, kk, nb, npan)
+    G = _mega_med_backtransform(V, rscr, T, kk, nb, npan, prec=bt_prec)
     return L, G
 
 
-def _lr_reduced_eigh(Bk):
+def _lr_reduced_eigh(Bk, bt_prec=None):
     """Eigendecomposition of the reduced symmetric block Bk (B x k x k). Returns
     (lam, G) in the torch.linalg.eigh convention (Bk @ G[:,:,i] = lam[:,i] *
     G[:,:,i]); ordering is whatever the path produced (the OUTER low-rank path
@@ -2482,11 +2491,15 @@ def _lr_reduced_eigh(Bk):
     inner gate is run (the outer FP32 A@V-reusing gate catches any matrix the
     reduced solve can't resolve). Two regimes:
       * 32 < k <= 448: RAW megakernel (fits one CTA's SMEM) -- the win.
-      * k > 448 / k <= 32 / extension unavailable: cuSOLVER."""
+      * k > 448 / k <= 32 / extension unavailable: cuSOLVER.
+
+    bt_prec overrides the megakernel WY back-transform GEMM precision (see
+    _lr_reduced_mega); None keeps the shared FP32. The sign-DC caller passes
+    "tf32x3" (gate-safe there); the low-rank caller leaves it None."""
     mod = _mega_get()
     kk = Bk.shape[-1]
     if mod is not None and 32 < kk <= _MEGA_MED_NMAX:
-        return _lr_reduced_mega(Bk)
+        return _lr_reduced_mega(Bk, bt_prec=bt_prec)
     # k in (448, 836] (dense1024 k=608 shape-4 -> C=2; nearrank1024 k=768 shape-10
     # -> C=3): C-CTA thread-block CLUSTER solve -- the packed-FP16 k-triangle is
     # row-distributed across C CTAs' DSMEM so it fits (k=608 370KB/2=185KB/CTA;
@@ -3332,6 +3345,17 @@ _SIGN_DC_RITZ_PROJ = 256    # random Rayleigh-Ritz projection dim for shift esti
 # the sign-DC A@U lift already picks the efficient s256x256 TF32 tile (nsys), unlike
 # shape10's k=768 GEMM which hit a slow 1-pass tiling. So keep plain TF32 (parent's
 # _LR_TF32 mode; _lr_lift_gemm(...,"tf32") is byte-identical to the old _LR_TF32 bmm).
+# brief-72: precision of the reduced-block megakernel WY back-transform for the
+# sign-DC path (shape 11 / shape 5). The shared _mega_med_backtransform defaults
+# to FP32-SIMT (_MEGA_MED_SPLIT_PREC), which the shape-11 profile showed as ~5ms
+# of cutlass_80_simt_sgemm running OFF the tensor cores. The sign-DC reduced-block
+# eigenvectors are re-orthonormalized by a finishing 3xTF32 Newton-Schulz + caught
+# by the per-matrix residual gate, so FP32-accurate 3xTF32 (Ozaki hi+lo, ~6e-6) is
+# gate-safe here and runs those GEMMs on tensor cores (~1.6x the SIMT rate). Plain
+# "tf32" is NOT safe (its ~3e-4 back-transform error propagates through membership
+# select). Only affects the sign-DC call site; shapes 2/3/8/12 keep FP32 (their
+# tighter low-rank Rayleigh gate trips on TF32 and tf32x3 net-lost, brief-22).
+_SIGN_DC_BT_PREC = "tf32x3"
 _SIGN_DC_AV_MODE = "tf32"    # sign-DC A@U lift + reduced-block build precision
 # brief-55: eigenvalue-side membership consistency for the projector rank-select.
 # Only matters when the base solver's eigenvectors are ~1e-2 orthonormal (the C-CTA
@@ -3448,7 +3472,7 @@ def _sign_dc_solve(af, n, dev):
     Bstk = _lr_lift_gemm(Ustk.transpose(-1, -2), AU, _SIGN_DC_AV_MODE)
     Bstk = 0.5 * (Bstk + Bstk.transpose(-1, -2))
     try:
-        lstk, gstk = _lr_reduced_eigh(Bstk)
+        lstk, gstk = _lr_reduced_eigh(Bstk, bt_prec=_SIGN_DC_BT_PREC)
     except Exception:
         lstk, gstk = torch.linalg.eigh(Bstk)
     torch.backends.cuda.matmul.allow_tf32 = True
