@@ -3793,27 +3793,54 @@ extern "C" __global__ void fused_gram_chol_kernel(
     // ---- in-place left-looking Cholesky of the packed lower triangle ----
     // For column j: L[j,j] = sqrt(G[j,j] - sum_{p<j} L[j,p]^2);
     //   L[i,j] = (G[i,j] - sum_{p<j} L[i,p]*L[j,p]) / L[j,j]   (i > j)
-    // Column j is computed sequentially in j; the (k-j) sub-diagonal entries of the
-    // column parallelize across threads. Each thread reads row-i and row-j segments
-    // from the packed triangle (both fully materialized for columns < j).
-    for (int j = 0; j < k; j++) {
-        // diagonal (thread 0), then broadcast via SMEM
-        if (tid == 0) {
-            float s = Gp[pidx(j, j)];
-            for (int p = 0; p < j; p++) { float v = Gp[pidx(j, p)]; s -= v * v; }
-            s = (s > 1e-30f) ? sqrtf(s) : 1e-15f;
-            Gp[pidx(j, j)] = s;
+    // BLOCKED right-looking Cholesky, block width NB. Per outer step over the NB
+    // diagonal columns [jb, jb+nb): (1) factor the NB diagonal block IN PLACE using
+    // the already-materialized left part (columns < jb), then (2) rank-NB update the
+    // trailing subdiagonal (rows > jb+nb-1, columns [jb,jb+nb)) in parallel. This
+    // cuts the __syncthreads count from k (~300) to ~k/NB (~10) and makes each
+    // trailing update a big parallel rank-NB pass -> far more work per barrier than
+    // the per-column left-looking form.
+    const int NB = 24;
+    for (int jb = 0; jb < k; jb += NB) {
+        int nb = min(NB, k - jb);
+        // (1) factor the nb x nb diagonal block, columns jb..jb+nb-1, sequentially in
+        // the local column c; the subdiagonal of each local column parallelizes. The
+        // dot uses the FULL left part p<j (already factored) so the block is finished
+        // correctly in one pass.
+        for (int c = 0; c < nb; c++) {
+            int j = jb + c;
+            if (tid == 0) {
+                float s = Gp[pidx(j, j)];
+                const float* Lj = Gp + pidx(j, 0);
+                for (int p = 0; p < j; p++) { float v = Lj[p]; s -= v * v; }
+                s = (s > 1e-30f) ? sqrtf(s) : 1e-15f;
+                Gp[pidx(j, j)] = s;
+            }
+            __syncthreads();
+            float inv = 1.0f / Gp[pidx(j, j)];
+            // finish the rest of the diagonal block's column j (rows j+1 .. jb+nb-1)
+            for (int i = j + 1 + tid; i < jb + nb; i += nt) {
+                float s = Gp[pidx(i, j)];
+                const float* Li = Gp + pidx(i, 0);
+                const float* Lj = Gp + pidx(j, 0);
+                for (int p = 0; p < j; p++) s -= Li[p] * Lj[p];
+                Gp[pidx(i, j)] = s * inv;
+            }
+            __syncthreads();
         }
-        __syncthreads();
-        float Ljj = Gp[pidx(j, j)];
-        float inv = 1.0f / Ljj;
-        for (int i = j + 1 + tid; i < k; i += nt) {
-            float s = Gp[pidx(i, j)];
+        // (2) rank-nb update + scale of the trailing panel: for each row i >= jb+nb,
+        // compute L[i, j] for j in [jb, jb+nb) left-to-right (they depend on earlier
+        // columns of the SAME block via the p<j sum). Each thread owns a set of rows.
+        for (int i = jb + nb + tid; i < k; i += nt) {
             const float* Li = Gp + pidx(i, 0);
-            const float* Lj = Gp + pidx(j, 0);
-            #pragma unroll 4
-            for (int p = 0; p < j; p++) s -= Li[p] * Lj[p];
-            Gp[pidx(i, j)] = s * inv;
+            for (int c = 0; c < nb; c++) {
+                int j = jb + c;
+                float s = Gp[pidx(i, j)];
+                const float* Lj = Gp + pidx(j, 0);
+                #pragma unroll 4
+                for (int p = 0; p < j; p++) s -= Li[p] * Lj[p];
+                Gp[pidx(i, j)] = s / Gp[pidx(j, j)];
+            }
         }
         __syncthreads();
     }
