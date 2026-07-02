@@ -6531,12 +6531,19 @@ _WJAC_WARPS = 8           # matrices per CTA. Swept 1/2/4/8. ncu (isolated kerne
                           # win -- the brief's co-residency effect, real at the kernel
                           # level). Benchmark WALL is noise-dominated by fleet GPU
                           # contention (+-30%, 560-725us) so the sweep looked flat there.
+# MULTI-WARP-per-matrix (16 warps in 1 CTA, cuSOLVER-matching structure). Routed
+# for n<=_MWJAC_NMAX; the sweep count is _MWJAC_SWEEPS (brief measured 6 clears the
+# gate vs cuSOLVER's ~15). Residual-gated + cuSOLVER fallback.
+_MWJAC_NMAX = 32          # n<=32 routed to the multi-warp 1-CTA/matrix kernel
+_MWJAC_SWEEPS = 6
 _wjac_mod = None
 _wjac_failed = False
 
 _WJAC_CPP = (
     "void warp_jacobi_eigh(torch::Tensor A, torch::Tensor Vout, torch::Tensor Lout, "
-    "int n, int sweeps, int warpsPerBlock);"
+    "int n, int sweeps, int warpsPerBlock);\n"
+    "void mw_jacobi_eigh(torch::Tensor A, torch::Tensor Vout, torch::Tensor Lout, "
+    "int n, int sweeps);"
 )
 
 _WJAC_CUDA = r'''
@@ -6553,6 +6560,14 @@ __device__ __forceinline__ int wjac_partner(int p, int r, int nP) {
   int pos = (p == 0) ? 0 : (((p - 1 - r) % m + m) % m + 1);
   int pp = m - pos;                          // paired position
   return (pp == 0) ? 0 : (((pp - 1 + r) % m) + 1);
+}
+
+// Player occupying POSITION `pos` in round `r` (circle method): position 0 -> player
+// 0; position t>0 -> player ((t-1)+r) mod (nP-1) + 1. Used by the multi-warp kernel
+// (warp w owns positions w and nP-1-w -> the two players of pair w).
+__device__ __forceinline__ int wjac_partner_pos(int pos, int r, int nP) {
+  int m = nP - 1;
+  return (pos == 0) ? 0 : (((pos - 1 + r) % m) + 1);
 }
 
 // One WARP per matrix, n=32. Lane l owns row l of A (Ar) and row l of V (Vr).
@@ -6681,6 +6696,118 @@ extern "C" __global__ void warp_jacobi_eigh_k(
   }
 }
 
+// ============================================================================
+// MULTI-WARP-PER-MATRIX, ONE-CTA-PER-MATRIX Jacobi (n=32). Matches cuSOLVER's
+// batched-Jacobi STRUCTURE (ncu: cuSOLVER launches (B,1,1)x(32,16,1) = 1 CTA/
+// matrix, 16 warps, 512 threads, intra-block __syncthreads) but wins on SWEEP
+// COUNT (6 vs cuSOLVER's ~15 -> ~2.5x fewer rounds). The 32x32 A + V live in
+// SMEM (2*32*32*4 = 8KB, tiny -> many CTAs co-reside; occupancy tracks cuSOLVER's
+// 25%). Parallel (round-robin) ordering: each round has 16 DISJOINT (p,q) pairs
+// over the 32 columns; WARP w owns pair w (round-robin positions w, 31-w). Per
+// round: (1) each warp computes its 2x2 rotation (lane0, broadcast), (2) COLUMN
+// phase A<-A*J / V<-V*J (disjoint columns p,q per warp), __syncthreads, (3) ROW
+// phase A<-J^T*A (disjoint rows p,q per warp), __syncthreads. NO cross-BLOCK sync
+// (not grid.sync), NO single-warp under-parallelization. Per-matrix residual gate
+// + cuSOLVER fallback at the Python layer.
+template<int SW>
+__device__ __forceinline__ void mwjac_solve32(
+    const float* __restrict__ Am, float* __restrict__ Vm, float* __restrict__ Lm) {
+  const unsigned FULL = 0xffffffffu;
+  const int NN = 32, NW = 16;   // NW warps = NN/2 pairs
+  __shared__ float As[NN * NN];
+  __shared__ float Vs[NN * NN];
+  int tid = threadIdx.x;
+  int warp = tid >> 5, lane = tid & 31;
+  // cooperative load A -> SMEM, V = I
+  #pragma unroll
+  for (int idx = tid; idx < NN * NN; idx += NW * 32) {
+    As[idx] = Am[idx];
+    int i = idx / NN, j = idx % NN;
+    Vs[idx] = (i == j) ? 1.0f : 0.0f;
+  }
+  __syncthreads();
+  #pragma unroll 1
+  for (int sw = 0; sw < SW; ++sw) {
+    #pragma unroll
+    for (int r = 0; r < NN - 1; ++r) {
+      // warp w owns round-robin positions (w, NN-1-w) -> players (p,q).
+      const int posp = warp, posq = (NN - 1) - warp;
+      int p = wjac_partner_pos(posp, r, NN);   // player at position posp
+      int q = wjac_partner_pos(posq, r, NN);   // player at position posq
+      // rotation from A[p][p],A[q][q],A[p][q] (lane 0 computes, broadcast).
+      float c = 1.0f, s = 0.0f;
+      if (lane == 0) {
+        float app = As[p * NN + p], aqq = As[q * NN + q], apq = As[p * NN + q];
+        if (fabsf(apq) > 1e-30f * (fabsf(app) + fabsf(aqq) + 1e-30f)) {
+          float tau = (aqq - app) / (2.0f * apq);
+          float t = (tau >= 0.0f) ? 1.0f / (tau + sqrtf(1.0f + tau * tau))
+                                  : -1.0f / (-tau + sqrtf(1.0f + tau * tau));
+          c = rsqrtf(1.0f + t * t);
+          s = t * c;
+        }
+      }
+      c = __shfl_sync(FULL, c, 0);
+      s = __shfl_sync(FULL, s, 0);
+      // COLUMN phase: warp w rotates columns p,q for all rows i (lane i). Disjoint
+      // columns across warps -> no write conflict; reads only its own 2 columns.
+      {
+        int i = lane;   // NN==32 lanes cover all rows
+        float aip = As[i * NN + p], aiq = As[i * NN + q];
+        As[i * NN + p] = c * aip - s * aiq;
+        As[i * NN + q] = s * aip + c * aiq;
+        float vip = Vs[i * NN + p], viq = Vs[i * NN + q];
+        Vs[i * NN + p] = c * vip - s * viq;
+        Vs[i * NN + q] = s * vip + c * viq;
+      }
+      __syncthreads();
+      // ROW phase: warp w rotates rows p,q for all columns j (lane j). Disjoint
+      // rows across warps. Reads post-column-update SMEM.
+      {
+        int j = lane;
+        float apj = As[p * NN + j], aqj = As[q * NN + j];
+        As[p * NN + j] = c * apj - s * aqj;
+        As[q * NN + j] = s * apj + c * aqj;
+      }
+      __syncthreads();
+    }
+  }
+  // eigenvalues = diag(As); IN-KERNEL sort (ascending) by rank, scatter V columns.
+  // Only the first NN threads (warp0 + warp... ) handle the 32 columns; use tid<NN.
+  if (tid < NN) {
+    int l = tid;
+    float ev = As[l * NN + l];
+    int rank = 0;
+    #pragma unroll
+    for (int k = 0; k < NN; ++k) {
+      float ek = __shfl_sync(FULL, ev, k);   // warp0 holds all 32 diags (tid<32)
+      rank += (ek < ev || (ek == ev && k < l)) ? 1 : 0;
+    }
+    Lm[rank] = ev;
+    // eigenvector column l -> sorted column rank. write column l of Vs to Vm[:,rank].
+    #pragma unroll
+    for (int i = 0; i < NN; ++i) Vm[i * NN + rank] = Vs[i * NN + l];
+  }
+}
+
+extern "C" __global__ void mw_jacobi_eigh_k(
+    const float* __restrict__ Ain, float* __restrict__ Vout,
+    float* __restrict__ Lout, int B, int n, int sweeps) {
+  int m = blockIdx.x;
+  if (m >= B || n != 32) return;
+  const float* Am = Ain + (long)m * 32 * 32;
+  float* Vm = Vout + (long)m * 32 * 32;
+  float* Lm = Lout + (long)m * 32;
+  switch (sweeps) {
+    case 4:  mwjac_solve32<4>(Am, Vm, Lm); break;
+    case 5:  mwjac_solve32<5>(Am, Vm, Lm); break;
+    case 6:  mwjac_solve32<6>(Am, Vm, Lm); break;
+    case 7:  mwjac_solve32<7>(Am, Vm, Lm); break;
+    case 8:  mwjac_solve32<8>(Am, Vm, Lm); break;
+    case 10: mwjac_solve32<10>(Am, Vm, Lm); break;
+    default: mwjac_solve32<6>(Am, Vm, Lm); break;
+  }
+}
+
 void warp_jacobi_eigh(torch::Tensor A, torch::Tensor Vout, torch::Tensor Lout,
                       int n, int sweeps, int warpsPerBlock) {
   int B = A.size(0);
@@ -6688,6 +6815,14 @@ void warp_jacobi_eigh(torch::Tensor A, torch::Tensor Vout, torch::Tensor Lout,
   int warpsTotal = B;
   int blocks = (warpsTotal + warpsPerBlock - 1) / warpsPerBlock;
   warp_jacobi_eigh_k<<<blocks, threads>>>(
+      A.data_ptr<float>(), Vout.data_ptr<float>(), Lout.data_ptr<float>(), B, n, sweeps);
+}
+
+// one CTA per matrix, 16 warps (512 threads) per CTA.
+void mw_jacobi_eigh(torch::Tensor A, torch::Tensor Vout, torch::Tensor Lout,
+                    int n, int sweeps) {
+  int B = A.size(0);
+  mw_jacobi_eigh_k<<<B, 16 * 32>>>(
       A.data_ptr<float>(), Vout.data_ptr<float>(), Lout.data_ptr<float>(), B, n, sweeps);
 }
 '''
@@ -6709,7 +6844,7 @@ def _wjac_get():
             name="warp_jacobi_eigh_b113",
             cpp_sources=_WJAC_CPP,
             cuda_sources=_WJAC_CUDA,
-            functions=["warp_jacobi_eigh"],
+            functions=["warp_jacobi_eigh", "mw_jacobi_eigh"],
             with_cuda=True,
             verbose=False,
             extra_cuda_cflags=["-O3", "--use_fast_math"],
@@ -6766,6 +6901,48 @@ def _eigh_warp_jacobi(a: torch.Tensor) -> output_t:
     return Q.contiguous(), L.contiguous()
 
 
+def _eigh_mw_jacobi(a: torch.Tensor) -> output_t:
+    """MULTI-warp-per-matrix (16 warps, 1 CTA/matrix) SMEM Jacobi eigh for n<=32 --
+    matches cuSOLVER's batched-Jacobi structure (1 CTA/matrix, 512 threads, intra-
+    block __syncthreads) but at 6 sweeps vs its ~15. Per-matrix residual+orth gate +
+    cuSOLVER fallback -> never regresses / never emits an invalid factorization.
+    Falls back wholesale to cuSOLVER if the extension is unavailable or n!=32."""
+    mod = _wjac_get()
+    b, n, _ = a.shape
+    if mod is None or n != 32:
+        values, vectors = torch.linalg.eigh(a)
+        return vectors, values
+    af = a.float().contiguous()
+    dev = af.device
+    Q = torch.empty(b, n, n, device=dev, dtype=torch.float32)   # kernel writes SORTED Q
+    L = torch.empty(b, n, device=dev, dtype=torch.float32)      # kernel writes SORTED L
+    mod.mw_jacobi_eigh(af, Q, L, n, _MWJAC_SWEEPS)
+    # per-matrix residual gate (harness-level), fall failures back to cuSOLVER.
+    eps = torch.finfo(torch.float32).eps
+    eye = torch.eye(n, device=dev, dtype=torch.float32)
+    AQ = af @ Q
+    eigr = torch.linalg.matrix_norm(AQ - Q * L.unsqueeze(-2), ord=1, dim=(-2, -1))
+    orth = torch.linalg.matrix_norm(Q.transpose(-1, -2) @ Q - eye, ord=1, dim=(-2, -1))
+    a_l1 = torch.linalg.matrix_norm(af, ord=1, dim=(-2, -1)).clamp_min(1e-30)
+    bad = ((orth > 70.0 * n * eps) | (eigr / a_l1 > 140.0 * n * eps)
+           | ~torch.isfinite(L).all(dim=-1) | ~torch.isfinite(Q).all(dim=(-2, -1)))
+    import os as _os
+    if _os.environ.get("MWJAC_DBG"):
+        import sys as _sys
+        _sys.stderr.write(
+            f"[MWJAC_DBG] n={n} b={b} sweeps={_MWJAC_SWEEPS} "
+            f"orth_gate={70.0*n*eps:.4g} orth_max={orth.max().item():.4g} "
+            f"eigr_gate={140.0*n*eps:.4g} eigr_rel_max={(eigr/a_l1).max().item():.4g} "
+            f"nbad={int(bad.sum().item())}/{b}\n")
+        _sys.stderr.flush()
+    if bool(bad.any()):
+        idx = torch.nonzero(bad, as_tuple=False).flatten()
+        Lf, Qf = torch.linalg.eigh(af[idx])
+        Q[idx] = Qf
+        L[idx] = Lf
+    return Q.contiguous(), L.contiguous()
+
+
 def custom_kernel(data: input_t) -> output_t:
     a = data
     n = a.shape[-1]
@@ -6775,18 +6952,19 @@ def custom_kernel(data: input_t) -> output_t:
     # goes to its measured-faster validated path; cuSOLVER is the default (the
     # baseline floor), so the router can never regress.
     #
-    # n <= _WJAC_NMAX (tiny class, shape 0 n=32/b=20): WARP-per-matrix register-
-    # resident cyclic Jacobi (built + validated in brief-113, _eigh_warp_jacobi).
-    # MEASURED to LOSE to cuSOLVER at b=20: the register-resident kernel is ~340us
-    # (nsys, 6 sweeps) vs cuSOLVER's batched-Jacobi 105us -- cuSOLVER uses 16 WARPS
-    # per matrix (512-thread block, ncu (20,1,1)x(32,16,1)) so it both shortens each
-    # matrix's critical path AND fields 320 total warps (occ 25%, 16 warps/SM) vs a
-    # single warp/matrix = 20 total warps (occ 10%, no latency hiding). Plus the
-    # torch gate/sort adds ~15 host launches vs cuSOLVER's 1. Net: routing shape-0
-    # here made the 13-shape geomean 27100 -> 30360 (~+12% REGRESSION). So the route
-    # is DISABLED (_WJAC_NMAX=0) -- the kernel stays banked (validated, gated) for a
-    # future multi-warp-per-matrix redesign, but shape-0 stays on cuSOLVER (no
-    # regression). Flip _WJAC_NMAX back to 32 to re-enable.
+    # n <= _MWJAC_NMAX (tiny class, shape 0 n=32/b=20): MULTI-WARP-per-matrix
+    # (16 warps, 1 CTA/matrix) SMEM Jacobi -- matches cuSOLVER's batched-Jacobi
+    # structure (1 CTA/matrix, 512 threads, intra-block __syncthreads) but at 6
+    # sweeps vs its ~15. Residual-gated + cuSOLVER fallback -> never regresses.
+    if n <= _MWJAC_NMAX:
+        return _eigh_mw_jacobi(a)
+    # n <= _WJAC_NMAX: the earlier SINGLE-WARP-per-matrix register-resident Jacobi
+    # (_eigh_warp_jacobi). MEASURED to LOSE to cuSOLVER at b=20: kernel ~340us
+    # (nsys, 6 sweeps) vs cuSOLVER 105us -- cuSOLVER uses 16 WARPS per matrix (512-
+    # thread block, ncu (20,1,1)x(32,16,1)) so it fields 320 total warps (occ 25%)
+    # vs 1 warp/matrix = 20 total warps (occ 10%, no latency hiding). Routing shape-0
+    # here made geomean 27100 -> 30360 (+12% REGRESSION). DISABLED (_WJAC_NMAX=0);
+    # kept banked. The multi-warp route above supersedes it.
     if n <= _WJAC_NMAX:
         return _eigh_warp_jacobi(a)
     # n <= _MEGA_NMAX: the fused full-eigh megakernel (one CTA per matrix, the
