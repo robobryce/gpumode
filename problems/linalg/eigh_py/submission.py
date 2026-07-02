@@ -4336,11 +4336,109 @@ ns_bgemm_tf32_kernel(const float* __restrict__ A, const float* __restrict__ B,
     }
 }
 
+// -------------------------------------------------------------------------
+// Larger 128x128 output tile, 8 warps (256 threads). Each warp owns a 32x64
+// sub-tile = 2 (M) x 4 (N) WMMA 16x16x8 fragments. Bigger tiles amortize the
+// SMEM panel traffic (fewer CTAs, higher arithmetic intensity) -> closes some
+// of the gap to cutlass vs the 64x64 kernel. SMEM: As 128x8 + Bs 8x128 + Cs
+// 128x128 = 4+4+64 = 72KB.
+// -------------------------------------------------------------------------
+#define NSB_TM 128
+#define NSB_TN 128
+#define NSB_TK 8
+
+extern "C" __global__ void __launch_bounds__(256)
+ns_bgemm_tf32_big_kernel(const float* __restrict__ A, const float* __restrict__ B,
+                         float* __restrict__ C, const float* __restrict__ Cadd,
+                         int N, float alpha, float beta) {
+    const int mat = blockIdx.z;
+    const long moff = (long)mat * N * N;
+    const float* Am = A + moff;
+    const float* Bm = B + moff;
+    float* Cm = C + moff;
+    const float* Dm = (beta != 0.0f) ? (Cadd + moff) : nullptr;
+
+    const int row0 = blockIdx.y * NSB_TM;
+    const int col0 = blockIdx.x * NSB_TN;
+
+    const int warp = threadIdx.x >> 5;      // 0..7
+    const int wrow = (warp >> 1) * 32;      // 4 warp-rows: 0,32,64,96
+    const int wcol = (warp & 1) * 64;       // 2 warp-cols: 0,64
+
+    __shared__ float As[NSB_TM][NSB_TK];    // 128 x 8
+    __shared__ float Bs[NSB_TK][NSB_TN];    // 8 x 128
+
+    wmma::fragment<wmma::accumulator, 16, 16, 8, float> acc[2][4];
+    #pragma unroll
+    for (int i = 0; i < 2; i++)
+        #pragma unroll
+        for (int j = 0; j < 4; j++)
+            wmma::fill_fragment(acc[i][j], 0.0f);
+
+    for (int k0 = 0; k0 < N; k0 += NSB_TK) {
+        #pragma unroll
+        for (int e = threadIdx.x; e < NSB_TM * NSB_TK; e += 256) {
+            int ar = e >> 3, ac = e & 7;
+            As[ar][ac] = Am[(long)(row0 + ar) * N + (k0 + ac)];
+        }
+        #pragma unroll
+        for (int e = threadIdx.x; e < NSB_TK * NSB_TN; e += 256) {
+            int br = e >> 7, bc = e & 127;
+            Bs[br][bc] = Bm[(long)(k0 + br) * N + (col0 + bc)];
+        }
+        __syncthreads();
+
+        wmma::fragment<wmma::matrix_a, 16, 16, 8, wmma::precision::tf32, wmma::row_major> af[2];
+        wmma::fragment<wmma::matrix_b, 16, 16, 8, wmma::precision::tf32, wmma::row_major> bf[4];
+        #pragma unroll
+        for (int i = 0; i < 2; i++) {
+            wmma::load_matrix_sync(af[i], &As[wrow + i * 16][0], NSB_TK);
+            #pragma unroll
+            for (int e = 0; e < af[i].num_elements; e++)
+                af[i].x[e] = wmma::__float_to_tf32(af[i].x[e]);
+        }
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            wmma::load_matrix_sync(bf[j], &Bs[0][wcol + j * 16], NSB_TN);
+            #pragma unroll
+            for (int e = 0; e < bf[j].num_elements; e++)
+                bf[j].x[e] = wmma::__float_to_tf32(bf[j].x[e]);
+        }
+        #pragma unroll
+        for (int i = 0; i < 2; i++)
+            #pragma unroll
+            for (int j = 0; j < 4; j++)
+                wmma::mma_sync(acc[i][j], af[i], bf[j], acc[i][j]);
+        __syncthreads();
+    }
+
+    __shared__ float Cs[NSB_TM][NSB_TN];   // 128 x 128 stage (64KB)
+    #pragma unroll
+    for (int i = 0; i < 2; i++)
+        #pragma unroll
+        for (int j = 0; j < 4; j++)
+            wmma::store_matrix_sync(&Cs[wrow + i * 16][wcol + j * 16], acc[i][j],
+                                    NSB_TN, wmma::mem_row_major);
+    __syncthreads();
+    for (int idx = threadIdx.x; idx < NSB_TM * NSB_TN; idx += 256) {
+        int rr = idx / NSB_TN, cc = idx % NSB_TN;
+        long g = (long)(row0 + rr) * N + (col0 + cc);
+        float v = alpha * Cs[rr][cc];
+        if (Dm != nullptr) v += beta * Dm[g];
+        Cm[g] = v;
+    }
+}
+
 static void ns_launch_gemm(const float* A, const float* B, float* C,
                            const float* Cadd, int BATCH, int N,
                            float alpha, float beta) {
-    dim3 grid(N / NSG_TN, N / NSG_TM, BATCH);
-    ns_bgemm_tf32_kernel<<<grid, 128>>>(A, B, C, Cadd, N, alpha, beta);
+    if (N % NSB_TM == 0) {
+        dim3 grid(N / NSB_TN, N / NSB_TM, BATCH);
+        ns_bgemm_tf32_big_kernel<<<grid, 256>>>(A, B, C, Cadd, N, alpha, beta);
+    } else {
+        dim3 grid(N / NSG_TN, N / NSG_TM, BATCH);
+        ns_bgemm_tf32_kernel<<<grid, 128>>>(A, B, C, Cadd, N, alpha, beta);
+    }
 }
 
 // ---- one-shot timed GEMM (for the route-a vs cuBLAS per-GEMM comparison) ----
@@ -4383,8 +4481,14 @@ int64_t ns_graph_build(torch::Tensor Xbuf, torch::Tensor Sbuf,
     int& Nint = h->Nint;    // referenced by the kernel-node arg arrays
     cudaGraphCreate(&h->graph, 0);
 
-    dim3 grid(N / NSG_TN, N / NSG_TM, BATCH);
-    dim3 blk(128);
+    // pick the same kernel + launch config the direct launcher would use, so the
+    // graph replays the exact route-a GEMM (big 128x128 tile when N%128==0).
+    bool big = (N % NSB_TM == 0);
+    void* kfunc = big ? (void*)ns_bgemm_tf32_big_kernel
+                      : (void*)ns_bgemm_tf32_kernel;
+    dim3 grid = big ? dim3(N / NSB_TN, N / NSB_TM, BATCH)
+                    : dim3(N / NSG_TN, N / NSG_TM, BATCH);
+    dim3 blk  = big ? dim3(256) : dim3(128);
 
     // Ping-pong: iteration reads `cur`, writes X2 into `tmp` (S), then writes
     // Xnew into the OTHER buffer. We keep the iterate always in X across iters
@@ -4431,7 +4535,7 @@ int64_t ns_graph_build(torch::Tensor Xbuf, torch::Tensor Sbuf,
                       (void*)&ptrCur[it], (void*)&Nint, (void*)&vAlpha0[it],
                       (void*)&vBeta0[it] };
         cudaKernelNodeParams pA = {};
-        pA.func = (void*)ns_bgemm_tf32_kernel;
+        pA.func = kfunc;
         pA.gridDim = grid; pA.blockDim = blk; pA.sharedMemBytes = 0;
         pA.kernelParams = argsA[it].data(); pA.extra = nullptr;
         cudaGraphNode_t nA;
@@ -4446,7 +4550,7 @@ int64_t ns_graph_build(torch::Tensor Xbuf, torch::Tensor Sbuf,
                       (void*)&ptrCur[it], (void*)&Nint, (void*)&vNegc3[it],
                       (void*)&vC1[it] };
         cudaKernelNodeParams pB = {};
-        pB.func = (void*)ns_bgemm_tf32_kernel;
+        pB.func = kfunc;
         pB.gridDim = grid; pB.blockDim = blk; pB.sharedMemBytes = 0;
         pB.kernelParams = argsB[it].data(); pB.extra = nullptr;
         cudaGraphNode_t nB;
