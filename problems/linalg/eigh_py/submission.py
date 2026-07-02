@@ -3098,16 +3098,20 @@ _SIGN_DC_BASE_MAX = 1300   # blocks <= this go to _lr_reduced_eigh (<=448 one-CT
                           # 449..836 C-CTA cluster, >836 cuSOLVER). At 1300 the n=2048
                           # ~1229-wide halves land on the base solver directly (depth-1,
                           # cuSOLVER halves); no second split (which mixes junk, above).
-_SIGN_DC_REC_MARGIN = 0.03  # oversample margin (fraction of m) added to ceil(m/2) for
+_SIGN_DC_REC_MARGIN = 0.0234  # oversample margin (fraction of m) added to ceil(m/2) for
                           # the split width K. The sign(A - trace/m*I) split of a
                           # semicircle (GOE) spectrum is well-BALANCED (measured max_side
                           # ~1030 for the n=2048 shape5 seed, m/2=1024), so a small margin
                           # suffices -- the cuSOLVER base cost is ~K^3, so shrinking K
                           # toward the true half-count is the dominant win. K = ceil(m/2)
-                          # + ceil(margin*m); n=2048 -> K=1117 (~87 slack over 1030, ~2x
-                          # the ~sqrt(n)~45 balance fluctuation). Swept 0.10/0.05/0.035
-                          # -> shape5 123/111/107ms; any matrix whose side > K just falls
-                          # back to cuSOLVER via the gate (correctness preserved).
+                          # + ceil(margin*m); n=2048 -> K=1072 (~42 slack over 1030, ~1x
+                          # the ~sqrt(n)~45 balance fluctuation). brief-63 swept the margin
+                          # down from 0.03 (K=1086, shape5 96.3ms) to 0.0234 (K=1072,
+                          # shape5 90.2ms) with eigr 3.3x cushion under the gate and 0
+                          # fallback; K<=1053 (margin<=~0.0142) is CATASTROPHIC (eigr 0.14,
+                          # full fallback), so 1072 is a sharp sweet spot -- do not tighten
+                          # further. Any matrix whose side > K just falls back to cuSOLVER
+                          # via the gate (correctness preserved).
 _SIGN_DC_REC_NS_ITERS = 16  # NS sign iters for the split. A semicircle (GOE) spectrum
                           # has its highest eigenvalue density at the median shift sigma,
                           # so near-sigma eigenvalues get a fuzzy sign -> some P+/P-
