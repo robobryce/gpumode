@@ -3677,6 +3677,213 @@ def _sign_dc_omega(b, n, K, dev):
     return om
 
 
+# ---------------------------------------------------------------------------
+# FUSED BATCHED CholeskyQR kernel (brief-92).
+#
+# The sign-DC proj_cqr stage (CholeskyQR2 orthonormalization of the stacked
+# (2b, n, K=300) projected bases) is the biggest torch component of shape 11's
+# pipeline (SIGNDC_TIME: proj_cqr 20.2ms of 81ms). torch does it as separate
+# bmm(Gram) + potrf + trsm launches per pass, twice; the k*k Gram factor
+# round-trips through HBM between the potrf and the tall n*k trsm each pass, and
+# the ~14 dependent launches per proj_cqr accumulate ~10ms of inter-kernel gap on
+# top of the ~10ms of kernel work (Gram 0.58 + potrf 3.21 + trsm 5.48 + projapply
+# 1.14ms measured; the remainder is launch/dispatch gap).
+#
+# This module fuses Gram + shifted-Cholesky into ONE launch, one CTA per matrix,
+# with the k*k packed lower-triangle Gram/factor RESIDENT in shared memory (no
+# HBM round-trip of the Gram between the accumulation and the potrf). The factor
+# L is written to HBM once; torch's backward-stable solve_triangular then does
+# the tall n*k trsm (the inv-GEMM / NS substitutes both broke the orthogonality
+# gate in brief-87, so the FP32 trsm is kept). Collapsing the Gram bmm + the
+# diagonal/shift elementwise + the potrf into one kernel removes those launches
+# and their dependency gaps.
+#
+# SMEM: packed lower triangle k(k+1)/2 floats (k=300 -> 176KB) + a small row-tile
+# staging buffer. Requires the opt-in (>48KB) dynamic-SMEM carveout on sm_100.
+# ---------------------------------------------------------------------------
+_FUSED_CQR_CPP = r"""
+#include <torch/extension.h>
+torch::Tensor fused_gram_chol(torch::Tensor Q, double shift);
+"""
+
+_FUSED_CQR_CUDA = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+// One CTA per matrix. Computes G = Q^T Q (k x k, symmetric) for a tall Q (n x k),
+// adds shift*max_diag to the diagonal, then does an in-place left-looking Cholesky
+// of the packed lower triangle in shared memory, and writes the lower factor L to
+// HBM. Q is (B, n, k) row-major; out L is (B, k, k) row-major (lower-triangular,
+// upper part zeroed).
+//
+// Shared memory layout (dynamic):
+//   float Gp[k*(k+1)/2];      // packed lower triangle, row-major-by-row: Gp[i*(i+1)/2 + j], i>=j
+//   float tile[RB*k];         // row-block staging for the Gram accumulation
+// plus a few scalars in static smem.
+
+#ifndef FUSED_CQR_RB
+#define FUSED_CQR_RB 16
+#endif
+
+__device__ __forceinline__ int pidx(int i, int j) { return (i*(i+1))/2 + j; }  // i>=j
+
+extern "C" __global__ void fused_gram_chol_kernel(
+        const float* __restrict__ Q, float* __restrict__ Lout,
+        int B, int n, int k, float shift) {
+    const int mat = blockIdx.x;
+    if (mat >= B) return;
+    const int tid = threadIdx.x;
+    const int nt  = blockDim.x;
+    const int tri = (k*(k+1))/2;
+
+    extern __shared__ float smem[];
+    float* Gp   = smem;             // tri floats
+    float* tile = smem + tri;       // RB*k floats
+
+    const float* Qm = Q + (long)mat * n * k;
+    float*       Lm = Lout + (long)mat * k * k;
+
+    // ---- zero the packed Gram ----
+    for (int e = tid; e < tri; e += nt) Gp[e] = 0.0f;
+    __syncthreads();
+
+    // ---- Gram accumulation, walked over row-blocks of RB rows ----
+    for (int r0 = 0; r0 < n; r0 += FUSED_CQR_RB) {
+        int rb = min(FUSED_CQR_RB, n - r0);
+        // coalesced load of the row-block into SMEM tile (rb x k)
+        for (int e = tid; e < rb * k; e += nt) tile[e] = Qm[(long)r0 * k + e];
+        __syncthreads();
+        // rank-rb symmetric update of the packed lower triangle
+        for (int e = tid; e < tri; e += nt) {
+            // recover (i,j) from packed index e: i is the row s.t. i(i+1)/2 <= e < (i+1)(i+2)/2
+            // solve i = floor((sqrt(8e+1)-1)/2)
+            int i = (int)((sqrtf(8.0f * e + 1.0f) - 1.0f) * 0.5f);
+            while (pidx(i + 1, 0) <= e) i++;
+            while (pidx(i, 0) > e) i--;
+            int j = e - pidx(i, 0);
+            float acc = 0.0f;
+            #pragma unroll 4
+            for (int t = 0; t < rb; t++) acc += tile[t * k + i] * tile[t * k + j];
+            Gp[e] += acc;
+        }
+        __syncthreads();
+    }
+
+    // ---- shift the diagonal: add shift * max_i |G[i,i]| ----
+    // reduce max diagonal into tile[0]
+    float local_max = 0.0f;
+    for (int i = tid; i < k; i += nt) {
+        float d = fabsf(Gp[pidx(i, i)]);
+        local_max = fmaxf(local_max, d);
+    }
+    // block reduce via SMEM (reuse tile[])
+    tile[tid] = local_max;
+    __syncthreads();
+    for (int s = nt >> 1; s > 0; s >>= 1) {
+        if (tid < s) tile[tid] = fmaxf(tile[tid], tile[tid + s]);
+        __syncthreads();
+    }
+    float dmax = tile[0];
+    float sh = shift * fmaxf(dmax, 1e-30f);
+    __syncthreads();
+    for (int i = tid; i < k; i += nt) Gp[pidx(i, i)] += sh;
+    __syncthreads();
+
+    // ---- in-place left-looking Cholesky of the packed lower triangle ----
+    // For column j: L[j,j] = sqrt(G[j,j] - sum_{p<j} L[j,p]^2);
+    //   L[i,j] = (G[i,j] - sum_{p<j} L[i,p]*L[j,p]) / L[j,j]   (i > j)
+    // Column j is computed sequentially in j; the (k-j) sub-diagonal entries of the
+    // column parallelize across threads. Each thread reads row-i and row-j segments
+    // from the packed triangle (both fully materialized for columns < j).
+    for (int j = 0; j < k; j++) {
+        // diagonal (thread 0), then broadcast via SMEM
+        if (tid == 0) {
+            float s = Gp[pidx(j, j)];
+            for (int p = 0; p < j; p++) { float v = Gp[pidx(j, p)]; s -= v * v; }
+            s = (s > 1e-30f) ? sqrtf(s) : 1e-15f;
+            Gp[pidx(j, j)] = s;
+        }
+        __syncthreads();
+        float Ljj = Gp[pidx(j, j)];
+        float inv = 1.0f / Ljj;
+        for (int i = j + 1 + tid; i < k; i += nt) {
+            float s = Gp[pidx(i, j)];
+            const float* Li = Gp + pidx(i, 0);
+            const float* Lj = Gp + pidx(j, 0);
+            #pragma unroll 4
+            for (int p = 0; p < j; p++) s -= Li[p] * Lj[p];
+            Gp[pidx(i, j)] = s * inv;
+        }
+        __syncthreads();
+    }
+
+    // ---- write L to HBM (lower part; zero the upper) ----
+    for (int e = tid; e < k * k; e += nt) {
+        int i = e / k, j = e % k;
+        Lm[e] = (i >= j) ? Gp[pidx(i, j)] : 0.0f;
+    }
+}
+
+torch::Tensor fused_gram_chol(torch::Tensor Q, double shift) {
+    TORCH_CHECK(Q.dim() == 3, "Q must be (B,n,k)");
+    TORCH_CHECK(Q.scalar_type() == torch::kFloat32, "Q must be float32");
+    auto Qc = Q.contiguous();
+    int B = Qc.size(0), n = Qc.size(1), k = Qc.size(2);
+    auto L = torch::empty({B, k, k}, Qc.options());
+    int tri = (k * (k + 1)) / 2;
+    size_t shbytes = (size_t)(tri + FUSED_CQR_RB * k) * sizeof(float);
+    int nt = 256;
+    static int configured = 0;
+    if (!configured) {
+        cudaFuncSetAttribute(fused_gram_chol_kernel,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, (int)shbytes);
+        configured = 1;
+    } else {
+        cudaFuncSetAttribute(fused_gram_chol_kernel,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, (int)shbytes);
+    }
+    fused_gram_chol_kernel<<<B, nt, shbytes>>>(
+        Qc.data_ptr<float>(), L.data_ptr<float>(), B, n, k, (float)shift);
+    return L;
+}
+"""
+
+_fused_cqr_mod = None
+_fused_cqr_failed = False
+
+
+def _fused_cqr_get():
+    """Lazily compile + cache the fused CholeskyQR extension. Returns the module,
+    or None if compilation failed (caller falls back to the torch CQR path)."""
+    global _fused_cqr_mod, _fused_cqr_failed
+    if _fused_cqr_mod is not None:
+        return _fused_cqr_mod
+    if _fused_cqr_failed:
+        return None
+    try:
+        import os
+        from torch.utils.cpp_extension import load_inline
+        os.environ["TORCH_CUDA_ARCH_LIST"] = "10.0a"
+        _fused_cqr_mod = load_inline(
+            name="fused_cqr_b92",
+            cpp_sources=_FUSED_CQR_CPP,
+            cuda_sources=_FUSED_CQR_CUDA,
+            functions=["fused_gram_chol"],
+            with_cuda=True,
+            verbose=False,
+            extra_cuda_cflags=["-O3", "--use_fast_math"],
+        )
+        return _fused_cqr_mod
+    except Exception:
+        _fused_cqr_failed = True
+        return None
+
+
+# Master switch + minimum k for the fused Gram+Cholesky path inside _sign_dc_cqr.
+_FUSED_CQR_GRAMCHOL = True
+
+
 def _sign_dc_cqr(Y, passes=2, shift=1e-4, ns_refine=0):
     """Shifted batched CholeskyQR orthonormalization (Gram -> Cholesky -> trsm, all
     BLAS3). The shift regularizes the rank-deficient directions of P+/P- @ Omega
@@ -3696,10 +3903,22 @@ def _sign_dc_cqr(Y, passes=2, shift=1e-4, ns_refine=0):
     c = Y.shape[-1]
     eyek = torch.eye(c, device=Y.device, dtype=Y.dtype)
     n_chol = passes - ns_refine
+    _fmod = _fused_cqr_get() if _FUSED_CQR_GRAMCHOL else None
     for _ in range(n_chol):
-        G = torch.bmm(Qc.transpose(-1, -2), Qc)
-        dm = G.diagonal(dim1=-2, dim2=-1).abs().amax(-1).clamp_min(1e-30)
-        L = torch.linalg.cholesky(G + (shift * dm).view(-1, 1, 1) * eyek)
+        if _fmod is not None:
+            # brief-92: fused Gram + shifted-Cholesky in ONE launch (packed k*k
+            # factor resident in SMEM, no HBM round-trip between the Gram and the
+            # potrf). Falls back to torch on any exception (shape/compile).
+            try:
+                L = _fmod.fused_gram_chol(Qc.contiguous(), float(shift))
+            except Exception:
+                G = torch.bmm(Qc.transpose(-1, -2), Qc)
+                dm = G.diagonal(dim1=-2, dim2=-1).abs().amax(-1).clamp_min(1e-30)
+                L = torch.linalg.cholesky(G + (shift * dm).view(-1, 1, 1) * eyek)
+        else:
+            G = torch.bmm(Qc.transpose(-1, -2), Qc)
+            dm = G.diagonal(dim1=-2, dim2=-1).abs().amax(-1).clamp_min(1e-30)
+            L = torch.linalg.cholesky(G + (shift * dm).view(-1, 1, 1) * eyek)
         if _SIGN_DC_CQR_INV_GEMM:
             # brief-87: Q = Qc @ L^{-T} via a SMALL K x K triangular inverse + one
             # tensor-core GEMM, instead of the wide (K x n) triangular solve. The
