@@ -47,7 +47,10 @@ _MEGA_NMAX = 200          # largest n routed to the megakernel. n=200 FP32 V =
 #   "med"   - medium split path (TC batched back-transform + FP16-triangle kernel)
 #   "clust" - C-CTA cluster path (multi-CTA-per-matrix cooperative tridiag via GPC
 #             cl.sync + TC back-transform): C*b CTAs to fill the machine at low batch
-_MEGA_SMALL_PATH = "clust"
+# MEASURED (brief-114 t3/t4): "clust" C=2 PB in {1,4} regressed shape 1 (1949->2918us)
+# -- multi-CTA cooperative tridiag is cross-CTA-data-movement-bound at n=176/b40, not
+# occupancy-reachable. "med" (TC back-transform, single-CTA tridiag) is the best path.
+_MEGA_SMALL_PATH = "med"
 _MEGA_NT = 256            # threads per CTA
 _MEGA_BISITERS = 45       # Sturm-bisection iterations (FP32 converged)
 _mega_mod = None          # lazily-compiled extension module (None until built)
@@ -253,6 +256,10 @@ _MEGA_MED_CPP = (
     "torch::Tensor dpscr, torch::Tensor dmscr, torch::Tensor tauscr, "
     "int n, int nt, int bisIters);\n"
     "void mega_eigh_med_split(torch::Tensor A, torch::Tensor Vout, torch::Tensor Lout, "
+    "torch::Tensor rscr, torch::Tensor dscr, torch::Tensor escr, "
+    "torch::Tensor dpscr, torch::Tensor dmscr, torch::Tensor tauscr, "
+    "torch::Tensor Tout, int n, int nt, int bisIters, int nb, int fastRed);\n"
+    "void mega_eigh_sq_split(torch::Tensor A, torch::Tensor Vout, torch::Tensor Lout, "
     "torch::Tensor rscr, torch::Tensor dscr, torch::Tensor escr, "
     "torch::Tensor dpscr, torch::Tensor dmscr, torch::Tensor tauscr, "
     "torch::Tensor Tout, int n, int nt, int bisIters, int nb, int fastRed);"
@@ -631,6 +638,159 @@ extern "C" __global__ void mega_eigh_med_split_k(const float* __restrict__ Ain,
   }
   #undef AGET
   #undef ASET
+}
+
+// brief-114: SQUARE-storage split kernel for the small-n class (n<=200). Identical
+// pipeline to mega_eigh_med_split_k (tridiag + Sturm bisection + twisted eigenvectors
+// + persist per-panel compact-WY block-T for the torch tensor-core back-transform),
+// but stores the FP16 A as a FULL n x n matrix (Ah[i*n+j]) instead of the packed
+// lower triangle. At n<=200 the square A (n*n*2B <= 80KB) fits SMEM easily, and direct
+// indexing removes the packed-triangle overhead the med kernel pays: the per-element
+// AGET branch ((j<=i)?Ah[_tri(i,j)+j]:Ah[_tri(j,i)+i]) + the _tri() recompute in the
+// two O(n^3)-per-column loops (symv p=A@v and the rank-2 trailing update) that dominate
+// the kernel. The symv reads full rows (no symmetry branch); the trailing update writes
+// FULL rows (both triangles, symmetric-redundant like the original mega_eigh_k) so the
+// next column's symv reads a consistent square. Everything after stage 1 is byte-for-
+// byte the med kernel (global DP/DM twisted recurrence, block-T persist).
+extern "C" __global__ void mega_eigh_sq_split_k(const float* __restrict__ Ain,
+    float* __restrict__ Vout, float* __restrict__ Lout,
+    float* __restrict__ rscr, float* __restrict__ dscr, float* __restrict__ escr,
+    float* __restrict__ dpscr, float* __restrict__ dmscr, float* __restrict__ tauscr,
+    float* __restrict__ Tout,
+    int B, int n, int bisIters, int nb, int fastRed){
+  int m=blockIdx.x; if(m>=B) return; int tid=threadIdx.x, nt=blockDim.x;
+  extern __shared__ char shc[];
+  __half* Ah=(__half*)shc;                 // full n*n FP16 matrix
+  size_t voff=((size_t)n*n*sizeof(__half)); voff=(voff+15u)&~15u;
+  float* v=(float*)(shc+voff); float* p=v+n;
+  __shared__ float red[1024];
+  float* Rm=rscr+(long)m*n*n; float* Dm=dscr+(long)m*n; float* Em=escr+(long)m*(n-1);
+  float* DP=dpscr+(long)m*n*n; float* DM=dmscr+(long)m*n*n;
+  float* Tau=tauscr+(long)m*n;
+  float* Vg=Vout+(long)m*n*n;
+  const float* Am=Ain+(long)m*n*n;
+  float amax=0.f;
+  for(int idx=tid; idx<n*n; idx+=nt){ float x=fabsf(Am[idx]); amax=fmaxf(amax,x); }
+  red[tid]=amax; __syncthreads();
+  for(int s=nt>>1;s>0;s>>=1){ if(tid<s)red[tid]=fmaxf(red[tid],red[tid+s]); __syncthreads(); }
+  float scale=red[0]; if(scale<1e-30f) scale=1.f; __syncthreads();
+  float invs=1.f/scale;
+  for(int idx=tid; idx<n*n; idx+=nt) Ah[idx]=__float2half(Am[idx]*invs);
+  __syncthreads();
+  for(int c=0;c<n-2;++c){
+    float s2=0.f;
+    for(int i=c+1+tid;i<n;i+=nt){ float x=__half2float(Ah[i*n+c]); s2+=x*x; }
+    float xnorm2;
+    if(fastRed){ xnorm2=_mega_fast_sum(s2,red,tid,nt); }
+    else { red[tid]=s2; __syncthreads();
+      for(int s=nt>>1;s>0;s>>=1){ if(tid<s)red[tid]+=red[tid+s]; __syncthreads(); }
+      xnorm2=red[0]; }
+    float alpha=__half2float(Ah[(c+1)*n+c]); float tail2=xnorm2-alpha*alpha;
+    if(tail2<=1e-20f){ if(tid==0){Em[c]=alpha;Tau[c]=0.f;} for(int i=tid;i<n;i+=nt) Rm[i*n+c]=(i==c+1)?1.f:0.f; __syncthreads(); continue; }
+    float xnorm=sqrtf(xnorm2); float beta=(alpha>=0.f)?-xnorm:xnorm; float tau=(beta-alpha)/beta; float denom=alpha-beta;
+    for(int i=tid;i<n;i+=nt) v[i]=(i<=c)?0.f:((i==c+1)?1.f:__half2float(Ah[i*n+c])/denom);
+    __syncthreads();
+    for(int i=tid;i<n;i+=nt) Rm[i*n+c]=v[i];
+    // symv p=tau*A@v over rows i in [c+1,n), reading the full row (square storage).
+    for(int i=c+1+tid;i<n;i+=nt){ float acc=0.f; for(int j=c+1;j<n;++j) acc+=__half2float(Ah[i*n+j])*v[j]; p[i]=tau*acc; }
+    float vp=0.f; for(int i=c+1+tid;i<n;i+=nt) vp+=v[i]*p[i];
+    float vpr;
+    if(fastRed){ vpr=_mega_fast_sum(vp,red,tid,nt); }
+    else { red[tid]=vp; __syncthreads();
+      for(int s=nt>>1;s>0;s>>=1){ if(tid<s)red[tid]+=red[tid+s]; __syncthreads(); }
+      vpr=red[0]; }
+    float K=0.5f*tau*vpr;
+    for(int i=c+1+tid;i<n;i+=nt) p[i]=p[i]-K*v[i];
+    __syncthreads();
+    // rank-2 symmetric trailing update, FULL rows (both triangles) so the next
+    // column's symv reads a consistent square (no symmetry branch anywhere).
+    for(int i=c+1+tid;i<n;i+=nt){ float vi=v[i],wi=p[i]; for(int j=c+1;j<n;++j){ float a=__half2float(Ah[i*n+j]); Ah[i*n+j]=__float2half(a-vi*p[j]-wi*v[j]); } }
+    if(tid==0){Em[c]=beta;Tau[c]=tau;}
+    __syncthreads();
+  }
+  if(tid==0) Em[n-2]=__half2float(Ah[(n-1)*n+(n-2)]);
+  for(int i=tid;i<n;i+=nt) Dm[i]=__half2float(Ah[i*n+i]);
+  for(int i=tid;i<n;i+=nt){ Rm[i*n+(n-2)]=0.f; Rm[i*n+(n-1)]=0.f; }
+  __syncthreads();
+  float glo=1e30f, ghi=-1e30f;
+  for(int i=tid;i<n;i+=nt){ float r=(i>0?fabsf(Em[i-1]):0.f)+(i<n-1?fabsf(Em[i]):0.f); glo=fminf(glo,Dm[i]-r); ghi=fmaxf(ghi,Dm[i]+r); }
+  red[tid]=glo; __syncthreads(); for(int s=nt>>1;s>0;s>>=1){ if(tid<s)red[tid]=fminf(red[tid],red[tid+s]); __syncthreads(); } glo=red[0]; __syncthreads();
+  red[tid]=ghi; __syncthreads(); for(int s=nt>>1;s>0;s>>=1){ if(tid<s)red[tid]=fmaxf(red[tid],red[tid+s]); __syncthreads(); } ghi=red[0]; __syncthreads();
+  for(int ev=tid; ev<n; ev+=nt){
+    float lo=glo, hi=ghi;
+    for(int it=0;it<bisIters;++it){
+      float mid=0.5f*(lo+hi);
+      float q=Dm[0]-mid; int cnt=(q<0.f);
+      for(int k=1;k<n;++k){ float d2=(fabsf(q)<1e-30f)?1e-30f:q; q=(Dm[k]-mid)-Em[k-1]*Em[k-1]/d2; cnt+=(q<0.f); }
+      if(cnt<=ev) lo=mid; else hi=mid;
+    }
+    Lout[(long)m*n+ev]=0.5f*(lo+hi);
+  }
+  __syncthreads();
+  for(int i=tid;i<n*n;i+=nt) Vg[i]=0.f;
+  __syncthreads();
+  float eps=1e-30f;
+  for(int ev=tid; ev<n; ev+=nt){
+    float lam=Lout[(long)m*n+ev];
+    float dpk=Dm[0]-lam; DP[0*n+ev]=dpk;
+    for(int k=1;k<n;++k){ float prev=(fabsf(dpk)<eps)?eps:dpk; dpk=(Dm[k]-lam)-Em[k-1]*Em[k-1]/prev; DP[k*n+ev]=dpk; }
+    float dmk=Dm[n-1]-lam; DM[(n-1)*n+ev]=dmk;
+    for(int k=n-2;k>=0;--k){ float nx=(fabsf(dmk)<eps)?eps:dmk; dmk=(Dm[k]-lam)-Em[k]*Em[k]/nx; DM[k*n+ev]=dmk; }
+    int r=0; float best=1e38f;
+    for(int k=0;k<n;++k){ float g=fabsf(DP[k*n+ev]+DM[k*n+ev]-(Dm[k]-lam)); if(g<best){best=g; r=k;} }
+    Vg[r*n+ev]=1.f;
+    for(int k=r-1;k>=0;--k){ float dpkk=DP[k*n+ev]; dpkk=(fabsf(dpkk)<eps)?eps:dpkk; Vg[k*n+ev]=-(Em[k]/dpkk)*Vg[(k+1)*n+ev]; }
+    for(int k=r+1;k<n;++k){ float dmkk=DM[k*n+ev]; dmkk=(fabsf(dmkk)<eps)?eps:dmkk; Vg[k*n+ev]=-(Em[k-1]/dmkk)*Vg[(k-1)*n+ev]; }
+    float nrm=0.f; for(int k=0;k<n;++k) nrm+=Vg[k*n+ev]*Vg[k*n+ev]; nrm=sqrtf(nrm)+1e-30f;
+    for(int k=0;k<n;++k) Vg[k*n+ev]/=nrm;
+  }
+  __syncthreads();
+  for(int ev=tid; ev<n; ev+=nt) Lout[(long)m*n+ev]*=scale;
+  // build + persist per-panel compact-WY block-T (reuse the free square-A SMEM).
+  int nref=n-2;
+  int npan=(nref + nb - 1)/nb;
+  float* Yp=(float*)shc;
+  float* Gp=Yp + (long)n*nb;
+  float* Tp=Gp + (long)nb*nb;
+  for(int c0=0;c0<nref;c0+=nb){
+    int k=nref-c0; if(k>nb) k=nb;
+    int pidx=c0/nb;
+    float* Tg=Tout + ((long)m*npan + pidx)*(long)nb*nb;
+    for(int idx=tid; idx<n*nb; idx+=nt){ int i=idx/nb, a=idx%nb; Yp[i*nb+a]=(a<k)?Rm[i*n+(c0+a)]:0.f; }
+    __syncthreads();
+    for(int idx=tid; idx<nb*nb; idx+=nt) Tp[idx]=0.f;
+    for(int idx=tid; idx<k*k; idx+=nt){ int a=idx/k, b=idx%k; float s=0.f; for(int i=0;i<n;++i) s+=Yp[i*nb+a]*Yp[i*nb+b]; Gp[a*nb+b]=s; }
+    __syncthreads();
+    for(int a=0;a<k;++a){
+      float ta=Tau[c0+a];
+      if(tid<a){
+        float val=0.f;
+        for(int e=0;e<a;++e) val += Tp[tid*nb+e]*Gp[e*nb+a];
+        Tp[tid*nb+a] = -ta*val;
+      } else if(tid==a){
+        Tp[a*nb+a] = ta;
+      }
+      __syncthreads();
+    }
+    for(int idx=tid; idx<nb*nb; idx+=nt){ int a=idx/nb, b=idx%nb; Tg[a*nb+b]=(a<k&&b<k)?Tp[a*nb+b]:0.f; }
+    __syncthreads();
+  }
+}
+void mega_eigh_sq_split(torch::Tensor A, torch::Tensor Vout, torch::Tensor Lout,
+    torch::Tensor rscr, torch::Tensor dscr, torch::Tensor escr,
+    torch::Tensor dpscr, torch::Tensor dmscr, torch::Tensor tauscr,
+    torch::Tensor Tout, int n, int nt, int bisIters, int nb, int fastRed){
+  int B=A.size(0);
+  size_t voff=((size_t)n*n*sizeof(__half)); voff=(voff+15u)&~15u;
+  size_t shm=voff + (size_t)2*n*sizeof(float);
+  size_t shmT=((size_t)n*nb + (size_t)2*nb*nb)*sizeof(float);
+  if(shmT>shm) shm=shmT;
+  cudaFuncSetAttribute(mega_eigh_sq_split_k, cudaFuncAttributeMaxDynamicSharedMemorySize, shm);
+  cudaFuncSetAttribute(mega_eigh_sq_split_k, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+  mega_eigh_sq_split_k<<<B,nt,shm>>>(A.data_ptr<float>(),Vout.data_ptr<float>(),Lout.data_ptr<float>(),
+    rscr.data_ptr<float>(),dscr.data_ptr<float>(),escr.data_ptr<float>(),
+    dpscr.data_ptr<float>(),dmscr.data_ptr<float>(),tauscr.data_ptr<float>(),
+    Tout.data_ptr<float>(),B,n,bisIters,nb,fastRed);
 }
 void mega_eigh_med_split(torch::Tensor A, torch::Tensor Vout, torch::Tensor Lout,
     torch::Tensor rscr, torch::Tensor dscr, torch::Tensor escr,
@@ -1056,7 +1216,7 @@ def _mega_get():
             cpp_sources=_MEGA_CPP + "\n" + _MEGA_MED_CPP + "\n" + _MEGA_CLUST_CPP,
             cuda_sources=_MEGA_CUDA + "\n" + _MEGA_MED_CUDA + "\n" + _MEGA_CLUST_CUDA,
             functions=["mega_eigh", "mega_eigh_med", "mega_eigh_med_split",
-                       "mega_eigh_clust_split"],
+                       "mega_eigh_sq_split", "mega_eigh_clust_split"],
             with_cuda=True,
             verbose=False,
             # -O3/--use_fast_math is the LIVE-ACCEPTED best-lineage flag set (8b9b6f40,
@@ -1576,6 +1736,33 @@ def _mega_med_split_solve(af, dev, b, n, nt, nb):
     return Q, L
 
 
+# brief-114: at n<=200 the SQUARE-storage split kernel replaces the packed-triangle
+# med kernel to remove the per-element AGET branch + _tri recompute from the two
+# dominant O(n^3)-per-column tridiag loops (kernel = 86% of shape-1 time, ncu t2).
+_MEGA_MED_SQUARE = True    # use mega_eigh_sq_split for n<=_MEGA_MED_SQ_NMAX
+_MEGA_MED_SQ_NMAX = 200    # square FP16 A = n*n*2B <= 80KB fits SMEM up to n=200
+
+
+def _mega_sq_split_solve(af, dev, b, n, nt, nb):
+    """Like _mega_med_split_solve but runs the SQUARE-storage split kernel
+    (mega_eigh_sq_split) -- full n x n FP16 A, branch-free indexing. Same Z/panel/
+    block-T outputs -> same torch tensor-core WY back-transform. (Q, L) UNSORTED."""
+    mod = _mega_get()
+    V = torch.empty(b, n, n, device=dev, dtype=torch.float32)
+    L = torch.empty(b, n, device=dev, dtype=torch.float32)
+    rscr = torch.empty(b, n, n, device=dev, dtype=torch.float32)
+    dscr = torch.empty(b, n, device=dev, dtype=torch.float32)
+    escr = torch.empty(b, n - 1, device=dev, dtype=torch.float32)
+    dpscr = torch.empty(b, n, n, device=dev, dtype=torch.float32)
+    dmscr = torch.empty(b, n, n, device=dev, dtype=torch.float32)
+    tauscr = torch.empty(b, n, device=dev, dtype=torch.float32)
+    T, npan = _mega_med_split_T(b, n, nb, dev)
+    mod.mega_eigh_sq_split(af, V, L, rscr, dscr, escr, dpscr, dmscr, tauscr,
+                           T, n, nt, _MEGA_BISITERS, nb, 1)
+    Q = _mega_med_backtransform(V, rscr, T, n, nb, npan)
+    return Q, L
+
+
 def _eigh_megakernel_med(a: torch.Tensor) -> output_t:
     """Medium-n fused megakernel (packed FP16 lower-triangle A in SMEM, global
     eigenvector matrix). Same contract + per-matrix residual gate as
@@ -1592,7 +1779,13 @@ def _eigh_megakernel_med(a: torch.Tensor) -> output_t:
     # the Householder panel + per-panel block-T; Q = (I - V T V^T) Z is formed
     # by batched TF32 tensor-core GEMMs (the ~70%-of-kernel back-transform moved
     # off the single-CTA SIMT path). Q is UNSORTED here (paired with L).
-    Qz, L = _mega_med_split_solve(af, dev, b, n, _MEGA_MED_NT, _MEGA_MED_SPLIT_NB)
+    # brief-114: n<=200 uses the SQUARE-storage split kernel (branch-free FP16 A)
+    # to shed the packed-triangle AGET/_tri overhead in the dominant tridiag loops;
+    # larger n keeps the packed-triangle med kernel (square A would overflow SMEM).
+    if _MEGA_MED_SQUARE and n <= _MEGA_MED_SQ_NMAX:
+        Qz, L = _mega_sq_split_solve(af, dev, b, n, _MEGA_MED_NT, _MEGA_MED_SPLIT_NB)
+    else:
+        Qz, L = _mega_med_split_solve(af, dev, b, n, _MEGA_MED_NT, _MEGA_MED_SPLIT_NB)
     L, order = torch.sort(L, dim=-1)
     Q = torch.gather(Qz, 2, order.unsqueeze(1).expand(b, n, n))
     # Recon=||Q L Q^T - A||_1 is REDUNDANT given eigr + orth and is NOT recomputed
