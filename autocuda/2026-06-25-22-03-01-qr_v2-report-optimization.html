@@ -1,0 +1,374 @@
+<h1
+id="optimization-report-linalgqr_v2-2026-06-25-22-03-01-qr_v2">Optimization
+Report — linalg/qr_v2 (<code>2026-06-25-22-03-01-qr_v2</code>)</h1>
+<h2 id="executive-summary">Executive Summary</h2>
+<p>This run found <strong>many small latency wins, no structural
+one</strong> — it opened on an already-heavily-tuned custom
+blocked-Householder kernel (the prior run’s canonical best), so the
+entire search lived in the last percent. Three workers across 52
+brief-branches spent the bulk of their attempts <em>disproving</em> big
+algorithmic levers (whole-matrix CholeskyQR, MGS2, thread-block-cluster
+/ TSQR device-fill, FP8 GEMMs) and the durable gains came instead from a
+handful of warp-level micro-optimizations on the dominant per-shape
+panel kernels. The honest end-to-end improvement over the baseline is
+<strong>~0.7%</strong> (baseline geomean 1756.07us → clean best
+<code>0ace2e05b</code> ~1744us); the manager’s headline
+<code>56a93c18</code> (1738us) sits on the held-out-fragile n2048
+demote-skip lineage and is a doc-only commit, so the safe, PR-ready
+number is the ~1744us figure.</p>
+<table>
+<colgroup>
+<col style="width: 50%" />
+<col style="width: 50%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Metric</th>
+<th>Value</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Overall best speedup (× vs baseline)</td>
+<td><strong>1.010×</strong> (1756.07 → 1738.3us, manager headline
+<code>56a93c18</code>)</td>
+</tr>
+<tr class="even">
+<td>Honest held-out-safe best</td>
+<td>~1.007× (~1744us, clean best <code>0ace2e05b</code> /
+<code>5dfc0c54</code>)</td>
+</tr>
+<tr class="odd">
+<td>Baseline</td>
+<td>1756.07us (geomean of 12 benchmark shapes)</td>
+</tr>
+<tr class="even">
+<td>Distinct techniques identified</td>
+<td>11 (4 kept-and-banked, 7 failed/dead-end families)</td>
+</tr>
+<tr class="odd">
+<td>Trials accepted / attempted</td>
+<td>185 kept / 196 rows (11 outright <code>failed</code>); 3,690 folded
+observations</td>
+</tr>
+<tr class="even">
+<td>Workers</td>
+<td>3 (worker-0/1/2), 52 brief-branches</td>
+</tr>
+<tr class="odd">
+<td>Most prevalent kept technique</td>
+<td>Small-shape 4-wide bulk + shfl_xor butterfly (n176/n352), ~38% of
+branches</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Key takeaways</strong></p>
+<ul>
+<li>The single best <em>honest</em> lever is the <strong>n512 fused
+single-reduction pivot look-ahead</strong> — collapses two serial
+warp-reduction trees into one closed-form pass, peak marginal
+<strong>1.06×</strong> on its combine graft (<code>0ace2e05</code>),
+independently found by worker-1 (<code>931546a6</code>) and banked by
+the combine.</li>
+<li>The second real win is the <strong>n1024 PAF 4-wide bulk-apply,
+template-scoped off n512</strong> (peak <strong>1.03×</strong>,
+<code>a3e6c9f8</code>): porting it un-scoped <em>regressed</em> n512
++18%, so the win required a compile-time <code>BULK4</code> gate by
+<code>NWARPS</code>.</li>
+<li>The <strong>4-wide bulk + shfl_xor butterfly on the small
+shapes</strong> (n176 mega kernel, n352 <code>__half</code> panel) was
+the most-rediscovered family (~38% of branches,
+<code>5dfc0c54</code>/<code>4787bb32</code>/<code>f7421c0b</code>) — a
+~2–3% per-shape latency cut that survives into the canonical best.</li>
+<li><strong>Every big algorithmic lever was rigorously measured and
+killed.</strong> The largest step-speedups in the data
+(<code>4a372365</code> 2.77×, <code>5372bed6</code> 1.66×,
+<code>8fbcde47</code> 1.50×, the cluster rows 1.08–1.15×) are
+<em>reverts recovering from a regressed experiment</em>, not new
+techniques — the attribution caveat the skill warns about. The genuine
+new-technique ceiling in this run is ~1.06×.</li>
+<li>The search was <strong>diverse in hypotheses but concentrated in
+outcome</strong>: workers attacked occupancy (cluster/TSQR), precision
+(FP8/FP4/TF32-Gram), the n2048 8-CTA starvation, and the n4096 serial
+recon, and <em>all</em> of them bottomed out against the same two walls
+— the benchmark’s ill-conditioned members forcing FP64/geqrf, and the
+device-starved large shapes being occupancy-floored.</li>
+</ul>
+<h2 id="most-impactful-optimization-techniques">Most Impactful
+Optimization Techniques</h2>
+<table>
+<colgroup>
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Technique</th>
+<th>Peak contribution</th>
+<th>Prevalence</th>
+<th>Representative commits</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>n512 fused single-reduction pivot look-ahead</td>
+<td>1.06x</td>
+<td>2 workers, ~6 branches, several attempts</td>
+<td><code>0ace2e05</code>, <code>931546a6</code>, <code>30</code></td>
+</tr>
+<tr class="even">
+<td>n1024 PAF 4-wide bulk apply, template-scoped off n512</td>
+<td>1.03x</td>
+<td>1 worker, ~17 branches (banked widely), ~6 attempts</td>
+<td><code>a3e6c9f8</code>, <code>fcc6682d</code>,
+<code>1653fc6a</code></td>
+</tr>
+<tr class="odd">
+<td>Small-shape 4-wide bulk + shfl_xor butterfly (n176/n352)</td>
+<td>1.01x</td>
+<td>~38% of branches (20), most-rediscovered, ~8 attempts</td>
+<td><code>5dfc0c54</code>, <code>4787bb32</code>,
+<code>f7421c0b</code></td>
+</tr>
+<tr class="even">
+<td>Per-shape coop-panel HELP / launch-knob tuning</td>
+<td>1.01x</td>
+<td>2 workers, many branches, 20+ sweep attempts</td>
+<td><code>171cdb6b</code>, <code>242dedef</code>,
+<code>36fe76a1</code></td>
+</tr>
+<tr class="odd">
+<td>n2048 demote-mask skip (local-rule latency cut)</td>
+<td>1.01x</td>
+<td>2 workers, ~5 branches</td>
+<td><code>e7ae379a</code>, <code>832401a7</code>,
+<code>840181d7</code></td>
+</tr>
+</tbody>
+</table>
+<p><strong>n512 fused single-reduction pivot look-ahead</strong> is the
+run’s best genuine lever. The original
+<code>panel_cm_ov_bf16_body</code> warp-0 look-ahead ran <em>two</em>
+sequential full-<code>m</code> reduction trees per column — loop-A
+computed <code>ssum = sum(colj*colc)</code> and reduced, which then
+gated loop-B’s rank-1 update and <code>next_norm2 = sum(nv^2)</code>
+reduce — both on warp-0’s per-column critical path. The fused version
+(<code>931546a6</code>, cherry-picked into the combine
+<code>0ace2e05</code>) co-accumulates
+<code>s_jc</code>/<code>s_cc</code>/<code>s_jj</code> in one
+<code>m</code>-pass with a single 3-wide <code>shfl_xor</code>
+butterfly, then computes
+<code>next_norm2 = s_cc - 2·twinv·s_jc + twinv²·s_jj</code> in closed
+form (the exact algebraic expansion of
+<code>sum((colc - twinv·colj)²)</code>), with an
+exact-<code>sum(nv²)</code> fallback fired only on catastrophic
+cancellation (a warp-uniform data property, so no divergence). It
+touches the OV (outer-V-fold) panel, ~10% of n512-dense; the bottleneck
+angle is reduction-tree <em>depth</em> on the serial pivot path (1
+tree/column vs 2). The combine graft measured a 1.06× step over
+<code>fcc6682d</code> and the kept-disjoint integration is bit-identical
+on the written column — and because worker-1 found it independently of
+the worker that banked it, it is a real win, not a single-trial
+fluke.</p>
+<p><strong>The n1024 PAF 4-wide bulk apply</strong> widens the
+trailing-column update in <code>qr_panel_apply_fused_kernel</code> (the
+dominant n1024 kernel at 41.6% of shape4, found via nsys) from one
+column per <code>shfl</code> butterfly to four, amortizing the reduction
+over 4 dot-products. The decisive detail is that it had to be a
+<strong>compile-time <code>BULK4</code> template parameter wired by
+<code>NWARPS</code></strong> (<code>a3e6c9f8</code>): turning it on for
+the shared n512 instances (<code>&lt;8,*&gt;</code>) <em>regressed n512
++18%</em> because those lean panels are register-bound
+(<code>BlockLimitRegs=5</code>), so the win only exists when scoped ON
+for the <code>&lt;32,2,true&gt;</code> n1024 instance and OFF for n512.
+ncu pins the residual n1024 floor as inter-CTA, not intra-CTA:
+barrier-stall imbalance between the pivot stripe and the bulk warps
+(6.2-cycle “highly different durations per warp”), and Grid=60 on 148
+SMs (88 idle). This is why the technique tops out near parity-plus
+(~1.03× marginal, geomean 1741.7).</p>
+<p><strong>The small-shape 4-wide bulk + shfl_xor butterfly</strong> is
+the same widening idea applied to the two GPU-bound tiny shapes: the
+n176 <code>qr_mega_resident_kernel</code> bulk (2-wide → 4-wide) and the
+n352 <code>cmf __half</code> panel bulk (1-wide → 4-wide, the n352 bulk
+was a <em>full</em> <code>warp_reduce_bcast</code> per column). The
+<code>shfl_xor</code> butterfly lands the warp sum in all lanes
+directly, dropping the separate broadcast <code>shfl</code> (5
+<code>shfl</code>/var vs 6) on the latency-bound critical path. It
+bought ~3.0% on n352 (620.5→602us) and ~1.9% on n176 (261.5→256.6us),
+all guards bit-identical within gate tolerance. It is the
+<strong>most-rediscovered</strong> family (≈20 branches / ~38%), carried
+into the canonical best (<code>5dfc0c54</code>), which makes it the
+most-trusted win even though its geomean contribution is small (the
+small shapes are a minor fraction of the geomean).</p>
+<p><strong>Per-shape coop-panel HELP / launch-knob tuning</strong> is
+the long tail of sweep work: making the pivot-helper count
+<code>HELP</code> and inner-block <code>IB</code> runtime/template knobs
+on the long-<code>m</code> coop panels and sweeping them
+(<code>36fe76a1</code>, <code>171cdb6b</code>, <code>242dedef</code>).
+The recurring verdict was that <code>HELP=2</code> is the
+barrier-balanced optimum for both the n1024 OV-coop and n2048
+<code>cm_coop_h</code> panels (the <code>HELP</code> curve is
+<code>1 &gt; 2 &lt; 4 &lt; 8</code>), and that the kernels are
+<em>trailing-bulk-warp-bound, not pivot-stripe-bound</em>, so the lever
+is flat (~1.005–1.009× at best). This family is mostly negative
+knowledge — it proves the intra-CTA balance lever is exhausted — but it
+is high-prevalence because every worker re-swept it.</p>
+<p><strong>The n2048 demote-mask skip</strong>
+(<code>_N2048_SKIP_DEMOTE 0→1</code>,
+<code>e7ae379a</code>/<code>832401a7</code>) is a local-rule win: the
+demote mask exists <em>solely</em> for held-out-secret robustness (an
+embedded ill-cond member in a held-out n2048 MIXED B≥4 batch), so
+skipping it saves ~60–70us on the scored n2048 shape-5
+(<sub>7375→</sub>7300us) with no overlap effect locally. It is a genuine
+speedup but <strong>held-out-fragile</strong> — the canonical final
+candidate (<code>840181d7</code>) re-enables the mask for safety, which
+is why the honest headline is ~1744us, not the 1738us the skip-lineage
+shows.</p>
+<h2 id="failed-optimization-techniques">Failed Optimization
+Techniques</h2>
+<p><strong>CholeskyQR (whole-matrix, per-panel, and shifted
+variants).</strong> This was the single most-attempted dead-end and was
+disproven from every angle. The benchmark’s conditioning is the
+structural wall: the dense n512 members reach cond(A)~1e5, so
+cond(Gram)~1e10 and <code>smin²/smax²~1e-10</code> sit <em>below any
+TF32 floor</em>, forcing an <strong>exact FP64-accumulated Gram + FP64
+Cholesky</strong> (<code>e95bbe3a</code>, <code>21f199bd</code>,
+<code>5372bed6</code> with an Ozaki INT8 exact Gram + custom FP64 DMMA
+blocked Cholesky). Those FP64/Ozaki ops run ~10–67 TFLOP/s on B200 vs
+~960 for TF32, so the full pipeline costs ~6.5× the tuned
+FP16-Householder on dense shape3 (21.5ms vs 3.3ms) — the brief’s
+“all-tensor-core GEMM” premise fails because the conditioning forbids
+TF32 in the Gram. The per-matrix <em>hybrid</em> (CholeskyQR for
+well-conditioned members, geqrf for ill-cond,
+<code>aca104f8</code>/<code>130e89eb</code>/<code>2c5386bd</code>) is
+correct-on-all-inputs but a ~+59× perf dead-end: the batched cuSOLVER
+Cholesky/TRSM + O(n³) <code>orhr_col</code> recon = ~213ms GPU vs 3.5ms
+FP16, and the ill-cond fraction still needs serial geqrf, so the “fill
+148 SMs with a uniform path” pitch is unachievable. The whole-matrix
+shifted-CQR3 + Ballard-LU reconstruction (<code>56a93c18</code>) was
+likewise disproven on its own load-bearing test: the Ballard
+reconstruction is bit-exact and the <em>dense</em> n1024 (kappa~1e5)
+passes the FP64 gate, but the n1024 stress members are kappa~6e301 (3n/4
+columns exactly zero) / 2.6e9 / 1.7e12, and shifting all passes to avoid
+the non-PD Cholesky crash biases the factorization ~1000× past the gate.
+CholeskyQR only <em>wins</em> where geqrf is catastrophic — n4096 —
+where it already lives in the baseline.</p>
+<p><strong>Block-MGS2 panel.</strong> A full
+modified-Gram-Schmidt-with-reorthogonalization panel was built,
+math-gate-verified, and benchmarked
+(<code>00ca6dc4</code>/<code>d7f71a32</code>). It validates correct on
+n1024 dense/mixed/nearrank, but ran ~62× slower (222,900us vs 3588): the
+FP16 MGS2 R-diagonal collapses for large <code>n</code>, the gate
+over-flags the whole batch to geqrf (184ms), and even sans-geqrf the GPU
+work exceeds the blocked-Householder. Kill-mode is rank-deficiency,
+decorrelated from the CholeskyQR family.</p>
+<p><strong>Thread-block-cluster and TSQR device-fill.</strong> Multiple
+multi-CTA-per-matrix panels were built and verified correct on B200:
+2-CTA row-split clusters
+(<code>b9fcec36</code>/<code>caf1a560</code>/<code>568796d6</code>),
+column-interleaved clusters (<code>4a0cac96</code>), and TSQR-HR cluster
+panels at K=2/K=4
+(<code>20c49213</code>/<code>f2e8a21e</code>/<code>0abe58e0</code>).
+They achieve the device-fill goal — ncu confirms 0.41→0.81 waves/SM
+(clusters) and 1.62 waves/SM (TSQR K=4) — but <strong>all
+regress</strong> (geomean 1846–2488us vs ~1752 baseline) because the
+per-column <code>cluster.sync</code> barriers (~1024 cluster-wide
+barriers/iteration at n1024) and the TSQR merge-idle (64–71%
+barrier-stall: only the low partner works per tree level) cost more than
+the de-starve saves. The cluster-barrier latency is the floor.</p>
+<p><strong>FP8 / FP4 trailing GEMM.</strong> Two FP8-E4M3 single-pass
+trailing-apply variants were built end-to-end with 3-term
+GEMM-refinement (<code>9b90c02d</code>/<code>eea56ccb</code>). Both
+failed for stacked reasons: the per-block quant overhead exceeds the
+GEMM saving on the short-K apply; <code>cublasLtMatmul</code> returns
+<code>CUBLAS_STATUS_NOT_SUPPORTED</code> (err 13) on the real
+strided-batch B=640 shape (the heuristic finds an algo at batch=1 but
+not strided-640); the sm_100 <code>wmma</code> FP8 path does not
+compile; and <code>cublasLt</code> needs the banned <code>stream</code>
+construct. Net: FP8 left OFF, a measured dead-end on this apply.</p>
+<p><strong>IB-widening and OB-widening.</strong> Widening the inner
+block (IB 16→32, <code>b8171a97</code>) regressed dense shape3 +18% —
+the PAF panel smem <code>m·IB</code> doubles to 64KB at m=512, dropping
+occupancy ~7→3 CTAs/SM and exposing the warp-0 pivot
+<code>m</code>-pass; per-column sync is OB-bound, not IB-bound. Widening
+the outer block (OB=128/IB=64, <code>4ee0712d</code>) builds but
+<em>fails correctness</em> — the FP16 trailing apply at w=128 amplifies
+error past the demote-mask thresholds tuned for w=64 — and OB=64/IB=64
+(<code>74defb83</code>) crashes with <code>cudaErrorInvalidValue</code>
+on an unsupported launch config. The OB=64/IB=32 two-level geometry is
+load-bearing for both accuracy and launch-validity. (n352 OB=88,
+<code>04aaa7f8</code>, similarly failed: the <code>minv_blk4</code>
+T-inverse geometry assumes b=64.)</p>
+<p><strong>CUDA-graph capture.</strong> Tried on the n176 megakernel
+(<code>9b19d903</code>) and the n1024/n2048 panel/trailing loop
+(<code>d4e7299f</code>), and explicitly on n32 (<code>9e651cea</code>).
+Measured NEUTRAL: the recurring ~3% inter-kernel gaps brief-15 found are
+<strong>data-dependency stalls, not launch overhead</strong> — n176 is a
+single GPU-bound megakernel (0.27 waves/SM, latency-bound on serial
+Householder), and the n1024/n2048 loops have a trailing data dependency
+a graph cannot collapse. Graphs only help the truly launch-bound tiny
+path and that path is already near its floor.</p>
+<p><strong>Another-stream look-ahead pipelining and composition
+failures.</strong> The brief’s headline n2048 lever — pipelining the far
+outer trailing apply on a <em>second CUDA stream</em> to overlap the
+next panel factor — was built correct (double-buffered events, no buffer
+race) but <strong>hard-fails the banned-construct scan</strong>: the GPU
+MODE leaderboard rejects any submission doing work on another stream
+(<code>1b819c26</code>). Among <code>Combine</code> attempts, the n2048
+device-filling Gram+solve decomposition (<code>7998c001</code>)
+regressed 23.6→31.3ms because the extra kernels’ Python-loop launch gaps
++ atomics exceed the de-starve gain (it needs a C++ fused loop with no
+Python gaps to pay off), and several n2048 BGS combines hit a
+geqrf-fallback in the <em>corner</em> panel
+(<code>c771c424</code>/<code>e176b698</code>) where R-diag shrinks
+40→1.9e-8 and the FP32 Cholesky breaks — gram-shift regularization
+either leaves NaNs or biases the corner factorization past the gate.</p>
+<h2 id="unexplored-areas">Unexplored Areas</h2>
+<p><strong>The device-starved large shapes (n2048 B=8, n4096 B=2) have
+no occupancy lever left to try.</strong> They dominate the absolute
+runtime (n2048 shape-5 ~7376us, n4096 shape-6 ~11418us) but every
+device-fill approach this run tried — clusters, TSQR, persistent
+work-stealing, device-filling Gram+solve — was measured and regressed
+against the <code>cluster.sync</code>/merge-idle/launch-gap walls. The
+floor here is intrinsic: at B=8 on 148 SMs the panel kernel is
+1-CTA/matrix barrier-wait-bound, and B=2 n4096 is 2 CTAs no matter how
+many threads are added. The only untried angle is a <em>single fused
+CUDA-C loop</em> (no Python-launch gaps) wrapping the entire n2048
+pipeline — workers repeatedly noted “device-fill needs the C++ fused
+loop to pay off” but none completed one; it is the highest-leverage
+unexplored item, though the conditioning still pins the ill-cond
+fraction to serial geqrf.</p>
+<p><strong>The n4096 serial reconstruction (~37% of non-Cholesky n4096
+cost) was profiled but never restructured.</strong> The
+back-substitution <code>recon_lu_cpp</code> / <code>diag_lu</code> chain
+is B=2-intrinsic GPU-bound (2/148 SMs, serial dependency chain;
+<code>panel_solve</code> register-capped at 6% occupancy). The one
+attempt to parallelize it across smem-cooperative warps
+(<code>3d140436</code>) regressed +27% because more threads don’t add
+SMs. A genuinely different recon algorithm (e.g. a blocked/recursive
+triangular inverse that exposes more parallel work per SM) was never
+built — only the LU-fold variant (<code>419c813d</code>), which failed
+correctness.</p>
+<p><strong>BF16/TF32 mixed-precision <em>within the Householder
+path</em> (as opposed to replacing it with CholeskyQR) was barely
+touched.</strong> Every precision experiment targeted the Gram/Cholesky
+of a CholeskyQR replacement; nothing tried, e.g., a TF32 trailing-GEMM
+inside the existing blocked-Householder for the well-conditioned dense
+majority with an FP32 fallback gate, which would keep the proven
+Householder backbone and only swap the apply precision where the
+conditioning allows. The n512 <code>g_prec 0→3</code> (3xTF32 trailing)
+attempt (<code>9fc3177b</code>) failed the factor gate on the <em>bad
+subset</em>, but a per-member-gated TF32 apply on the <em>good</em>
+subset only was not isolated.</p>
+<p><strong>No external high-performance library path (CUTLASS, cuSOLVER
+<code>geqrf</code>-batched as a tuned fast path, cuDNN) was benchmarked
+as a candidate baseline for the well-conditioned shapes.</strong> The
+run is entirely hand-written kernels plus the existing cuSOLVER
+fallbacks; whether a CUTLASS blocked-QR or a more aggressively-tuned
+batched library call could beat the custom panel on the dense majority
+is unmeasured. Given how thin the remaining margin is (~0.7%), a library
+comparison is more likely to <em>confirm the kernel is at
+speed-of-light</em> than to win, but it would close the loop on the “are
+we leaving anything on the table” question.</p>
