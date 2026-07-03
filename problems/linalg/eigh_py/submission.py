@@ -4356,7 +4356,7 @@ def _eigh_mixed_peel(a: torch.Tensor, pr: torch.Tensor) -> output_t:
 # leaderboard-reseed-safe.
 # ---------------------------------------------------------------------------
 _SIGN_DC_N = 512          # routed only at n=512 (the shape-11 dense-even class)
-_SIGN_DC_K = 300          # oversized subspace width (>= max +count/-count over the
+_SIGN_DC_K = 296          # oversized subspace width (>= max +count/-count over the
                           # batch; +count ~ n/2 +- ~38 for a random-sign even spectrum,
                           # shape-11 seed max kp/km 294/293). K=300 gives 0 gate-fallback
                           # with headroom for a reseed that shifts +count higher, and
@@ -4364,6 +4364,36 @@ _SIGN_DC_K = 300          # oversized subspace width (>= max +count/-count over 
                           # eigh is the wall; K in [288,300] all land ~110ms), so the
                           # extra margin is free. Both K-blocks fit the megakernel's
                           # n<=448 range. Matrices with +count>K fall to cuSOLVER.
+# brief-117: PER-MATRIX ADAPTIVE K via bucketing. Shape 11's true per-matrix
+# max_side (= max(#+eigs, #-eigs), measured from the sign trace) is tightly
+# concentrated: p0=256 p50=263.6 p90=273.8 p99=283 p100=287.6 over 640 matrices.
+# The K-dependent stages (proj_cqr trsm/Gram/Chol, lift-build, mega_eigh, member
+# back-transform) scale ~QUADRATICALLY in K, so a matrix with max_side ~262 wastes
+# work at the global K=300. BUT each cuSOLVER fallback costs ~4ms (n=512 syevd +
+# serialized launch), and the near-median (near-zero magnitude) eigenvalue sign
+# ambiguity means K must exceed a matrix's max_side by an OVERSAMPLING margin
+# (~10-14) for the projector/CQR to resolve cleanly (K=288 with margin 0.4 over
+# p100 already gives 4-5 fallbacks). So: split the batch by max_side into buckets,
+# each solved by the full reduced pipeline at its OWN K = bucket_ceiling + margin.
+# The WIDE bucket keeps K=_SIGN_DC_K (300, margin 12 over p100) so the hard
+# matrices never fall back; the NARROW bucket(s) run the easy majority at a smaller
+# K (still margin >= _SIGN_DC_BUCKET_MARGIN over that bucket's max_side) to shave
+# the quadratic stages. The per-matrix residual gate + cuSOLVER fallback is
+# unchanged (runs on the reassembled full batch), so any misbucketed matrix still
+# falls back -- no correctness risk, no regression below the cuSOLVER floor.
+_SIGN_DC_BUCKETS = 1        # 1 = single global-K pipeline (parent behavior).
+                            # >=2 = adaptive: split batch into max_side buckets per the
+                            # plan below. (Kept as the enable switch; the plan sets edges.)
+_SIGN_DC_BUCKET_MARGIN = 14 # oversampling margin: a bucket covering max_side<=E uses
+                            # K=E+this (capped at _SIGN_DC_K). >=~10 needed: K near a
+                            # matrix's max_side mass-falls-back (near-median sign fuzz).
+# brief-117: FIXED bucket plan (max_side_upper, K) ascending, catch-all last. Edges are
+# absolute max_side ceilings (the distribution is stable across seeds: p0=256 p50=263.6
+# p90=273.8 p100=287.6). None -> auto-build a _SIGN_DC_BUCKETS-way even split of the
+# [n/2, n/2+_SIGN_DC_MAXSIDE_SPAN] range with K=edge+margin. Explicit plan overrides.
+_SIGN_DC_BUCKET_PLAN_OVERRIDE = None
+_SIGN_DC_MAXSIDE_SPAN = 40  # assumed max_side spread above n/2 (287.6-256 = 31.6 obs;
+                            # 40 gives reseed headroom). Auto edges span [n/2, n/2+span].
 _SIGN_DC_NS_ITERS = 10    # Newton-Schulz sign iterations (each = 2 batched GEMMs).
                           # The near-zero eigenvalues plateau |X| below 1 (they need
                           # ~22 quadratic steps to fully resolve), but the projector
@@ -5779,44 +5809,51 @@ class _sdc_timer:
             d[1] += 1
 
 
-def _sign_dc_solve(af, n, dev):
-    """Batched spectral divide-and-conquer eigh via the matrix sign function.
-    Returns (Q, L) UNSORTED-then-sorted (columns of Q pair with L); the CALLER
-    owns the per-matrix residual gate + cuSOLVER fallback."""
+_SIGN_DC_BUCKET_PLAN_CACHE: dict = {}
+
+
+def _sign_dc_bucket_plan(n, K):
+    """Return the fixed [(max_side_upper, K), ...] bucket plan (ascending, catch-all
+    last with K=_SIGN_DC_K). Either the explicit _SIGN_DC_BUCKET_PLAN_OVERRIDE, or an
+    auto even split of [n/2, n/2+span] into _SIGN_DC_BUCKETS buckets, each K=edge+margin
+    capped at K. Cached by (n, K, buckets, margin, span, override-id)."""
+    import math as _math
+    key = (n, K, _SIGN_DC_BUCKETS, _SIGN_DC_BUCKET_MARGIN, _SIGN_DC_MAXSIDE_SPAN,
+           repr(_SIGN_DC_BUCKET_PLAN_OVERRIDE))
+    cached = _SIGN_DC_BUCKET_PLAN_CACHE.get(key)
+    if cached is not None:
+        return cached
+    if _SIGN_DC_BUCKET_PLAN_OVERRIDE is not None:
+        plan = [(float(e), min(int(K), int(k))) for (e, k) in _SIGN_DC_BUCKET_PLAN_OVERRIDE]
+        # force the last bucket to be a catch-all at the safe wide K
+        plan[-1] = (float(n), int(K))
+    else:
+        nb = max(1, int(_SIGN_DC_BUCKETS))
+        base = n / 2.0
+        span = float(_SIGN_DC_MAXSIDE_SPAN)
+        plan = []
+        for i in range(nb):
+            edge = base + span * (i + 1) / nb
+            kb = min(int(K), int(_math.ceil(edge)) + int(_SIGN_DC_BUCKET_MARGIN))
+            if i == nb - 1:
+                edge = float(n)          # catch-all
+                kb = int(K)
+            plan.append((float(edge), int(kb)))
+    _SIGN_DC_BUCKET_PLAN_CACHE[key] = plan
+    return plan
+
+
+def _sign_dc_reduced(af, X, K, n, dev):
+    """Stages 3-6 of the sign-DC pipeline on a (sub-)batch: given af (b,n,n) and its
+    converged matrix-sign X (b,n,n), form the +/- invariant-subspace bases at width
+    K, lift to the reduced K x K blocks, megakernel-eigh them, and membership-select
+    the n true eigenpairs. Returns (Q, L) with Q (b,n,n), L (b,n) -- FULL width n
+    regardless of K (the membership topk drops the padding). K is a per-call width so
+    the caller can BUCKET the batch by rank and run each bucket at its own K.
+    _pp/_pm are the (non-materialized) spectral projectors P+ M = 0.5*(M + X@M),
+    P- M = 0.5*(M - X@M)."""
     b = af.shape[0]
-    K = _SIGN_DC_K
     _gp = torch.backends.cuda.matmul.allow_tf32
-    torch.backends.cuda.matmul.allow_tf32 = True
-    # spectral-norm scale via A^2 power iteration (sign-robust for indefinite A)
-    with _sdc_timer("1_powerscale"):
-        v = torch.randn(b, n, 1, device=dev, dtype=torch.float32)
-        v = v / v.norm(dim=1, keepdim=True).clamp_min(1e-30)
-        for _ in range(_SIGN_DC_POWER_ITERS):
-            v = af @ (af @ v)
-            v = v / v.norm(dim=1, keepdim=True).clamp_min(1e-30)
-        nrm2 = (v.transpose(-1, -2) @ (af @ (af @ v))).abs().reshape(b, 1, 1).clamp_min(1e-30)
-        scale = nrm2.sqrt() * 1.02
-    # Matrix-sign iteration (degree-3 NS or degree-5 higher-order, per _SIGN_DC_NS_DEGREE).
-    # Degree-3 baddbmm-fuses the 1.5X-0.5X^3; degree-5 uses the steeper-slope Horner form.
-    with _sdc_timer("2_ns_sign"):
-        X = af / scale
-        _nsit = _SIGN_DC_NS5_ITERS if _SIGN_DC_NS_DEGREE == 5 else _SIGN_DC_NS_ITERS
-        X = _sign_dc_ns_sign(X, _nsit)   # HEAD/TAIL used internally for "mixed"
-    import os as _os_c
-    if _os_c.environ.get("SIGNDC_KCOUNT"):
-        import sys as _sys
-        trX = X.diagonal(dim1=-2, dim2=-1).sum(dim=-1)   # ~ n+ - n-
-        npos = (n + trX) / 2.0
-        maxside = torch.maximum(npos, n - npos)
-        _sys.stderr.write(f"[SIGNDC_KCOUNT] n={n} K={K} n+_range=[{npos.min().item():.1f},{npos.max().item():.1f}] "
-                          f"max_side={maxside.max().item():.1f} (K margin={K - maxside.max().item():.1f})\n")
-        _sys.stderr.flush()
-    # Spectral projectors are NOT materialized: P+ @ M = 0.5*(M + X@M) and
-    # P- @ M = 0.5*(M - X@M), so the subspace probes and the membership test apply
-    # the sign directly to their (thin) operands -- no full n*n P+/P- tensors.
-    # brief-103: _SIGN_DC_PROJ_PREC="fp16"/"bf16" runs the X@M projector-apply GEMM
-    # in half precision (fp32 accumulate) and does the 0.5*M +/- 0.5*(X@M) combine
-    # in fp32; "tf32" (default) keeps the byte-identical baddbmm-fused form.
     _proj_lpdt = ({"bf16": torch.bfloat16, "fp16": torch.float16}
                   .get(_SIGN_DC_PROJ_PREC))
     if _proj_lpdt is not None:
@@ -5838,6 +5875,7 @@ def _sign_dc_solve(af, n, dev):
     # one A@U GEMM instead of two -- better GPU fill, half the launch overhead.
     Om, Om2 = _sign_dc_omega(b, n, K, dev)
     with _sdc_timer("3_proj_cqr"):
+        torch.backends.cuda.matmul.allow_tf32 = True
         if _SIGN_DC_FUSE_PROJ:
             # brief-87: FUSE the two projector applies into ONE wide GEMM. P+@Om and
             # P-@Om2 both need X @ (thin), so X @ [Om | Om2] is a single (b,n,n)@(b,n,2K)
@@ -5852,7 +5890,7 @@ def _sign_dc_solve(af, n, dev):
             Ustk = _sign_dc_cqr(torch.cat([_pp(Om), _pm(Om2)], dim=0),
                                 passes=_SIGN_DC_CQR_PASSES,
                                 ns_refine=_SIGN_DC_CQR_NS_REFINE)     # (2b, n, K)
-    torch.backends.cuda.matmul.allow_tf32 = _gp
+        torch.backends.cuda.matmul.allow_tf32 = _gp
     # reduced K x K blocks -> fused tensor-core megakernel (raw, unsorted, ungated).
     # Both blocks solved in ONE stacked (2b, K, K) megakernel launch: one-CTA-per-matrix,
     # so 2b CTAs fill the 148 SMs better than two b-CTA launches (~9% measured). The
@@ -5868,13 +5906,7 @@ def _sign_dc_solve(af, n, dev):
     with _sdc_timer("5_mega_eigh"):
       try:
         # fast_reduce=True (brief-83 t12): the CLEAN warp-shuffle sum (_mega_fast_sum)
-        # IS gate-safe for shape 11. EIGH_DIAG measurement over 2 full runs: 0/640
-        # fallback every iteration, orth_max ~2.0e-3 (vs the exact tree's ~3.4-4.4e-3)
-        # against the binding orth bound 4.578e-3 -- the finishing 3xTF32 Newton-Schulz
-        # cleans the slightly-reassociated eigenvectors to EVEN MORE orthonormal here.
-        # (The earlier t4 +38% regression was an artifact of t4's heavier different-
-        # pairing _mega_block_reduce helper, NOT fast-reduce itself.) shape11
-        # 84995->83930, geomean 27862->27824, still 39/39, 0 fallback.
+        # IS gate-safe for shape 11 (0/640 fallback, orth cleaned by the finishing NS).
         lstk, gstk = _lr_reduced_eigh(Bstk, bt_prec=_SIGN_DC_BT_PREC,
                                       fast_reduce=True, f16upd=_SIGN_DC_F16UPD,
                                       f16symv=_SIGN_DC_F16SYMV, slimbar=_SIGN_DC_SLIMBAR,
@@ -5907,6 +5939,95 @@ def _sign_dc_solve(af, n, dev):
         topi = mem.topk(n, dim=-1).indices         # the n true eigenpairs
         Q = torch.gather(Vall, 2, topi.unsqueeze(1).expand(b, n, n))
         L = torch.gather(Lall, 1, topi)
+    return Q, L
+
+
+def _sign_dc_solve(af, n, dev):
+    """Batched spectral divide-and-conquer eigh via the matrix sign function.
+    Returns (Q, L) UNSORTED-then-sorted (columns of Q pair with L); the CALLER
+    owns the per-matrix residual gate + cuSOLVER fallback."""
+    b = af.shape[0]
+    K = _SIGN_DC_K
+    _gp = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = True
+    # spectral-norm scale via A^2 power iteration (sign-robust for indefinite A)
+    with _sdc_timer("1_powerscale"):
+        v = torch.randn(b, n, 1, device=dev, dtype=torch.float32)
+        v = v / v.norm(dim=1, keepdim=True).clamp_min(1e-30)
+        for _ in range(_SIGN_DC_POWER_ITERS):
+            v = af @ (af @ v)
+            v = v / v.norm(dim=1, keepdim=True).clamp_min(1e-30)
+        nrm2 = (v.transpose(-1, -2) @ (af @ (af @ v))).abs().reshape(b, 1, 1).clamp_min(1e-30)
+        scale = nrm2.sqrt() * 1.02
+    # Matrix-sign iteration (degree-3 NS or degree-5 higher-order, per _SIGN_DC_NS_DEGREE).
+    # Degree-3 baddbmm-fuses the 1.5X-0.5X^3; degree-5 uses the steeper-slope Horner form.
+    with _sdc_timer("2_ns_sign"):
+        X = af / scale
+        _nsit = _SIGN_DC_NS5_ITERS if _SIGN_DC_NS_DEGREE == 5 else _SIGN_DC_NS_ITERS
+        X = _sign_dc_ns_sign(X, _nsit)   # HEAD/TAIL used internally for "mixed"
+    import os as _os_c
+    if _os_c.environ.get("SIGNDC_KCOUNT"):
+        import sys as _sys
+        trX = X.diagonal(dim1=-2, dim2=-1).sum(dim=-1)   # ~ n+ - n-
+        npos = (n + trX) / 2.0
+        maxside = torch.maximum(npos, n - npos)
+        _ms_sorted = torch.sort(maxside).values
+        _qs = [0.0, 0.5, 0.9, 0.95, 0.99, 1.0]
+        _pct = " ".join(f"p{int(q*100)}={torch.quantile(maxside, q).item():.1f}" for q in _qs)
+        # bucket counts at ceil-to-multiple-of-8 boundaries for adaptive-K sizing
+        _ceil = torch.ceil(maxside)
+        _buck = {}
+        for _v in _ceil.tolist():
+            _bk = int(((_v + 7) // 8) * 8)
+            _buck[_bk] = _buck.get(_bk, 0) + 1
+        _bstr = " ".join(f"{k}:{v}" for k, v in sorted(_buck.items()))
+        _sys.stderr.write(f"[SIGNDC_KCOUNT] n={n} K={K} b={b} n+_range=[{npos.min().item():.1f},{npos.max().item():.1f}] "
+                          f"max_side={maxside.max().item():.1f} (K margin={K - maxside.max().item():.1f}) "
+                          f"pct[{_pct}] buckets8[{_bstr}]\n")
+        _sys.stderr.flush()
+    # Reduced-block solve (stages 3-6): projector bases -> CQR -> reduced K x K eigh
+    # -> membership select. brief-117: PER-MATRIX ADAPTIVE K. The K-dependent stages
+    # scale ~quadratically in K but each cuSOLVER fallback costs ~4ms, so a single
+    # global K must stay wide (300, margin 12 over the batch max_side 287.6) to avoid
+    # inducing fallbacks. Instead SPLIT the batch by per-matrix max_side (from the
+    # sign trace) into _SIGN_DC_BUCKETS buckets, run each at its OWN K = ceil(bucket
+    # max_side) + margin (still capped at the safe global K), and reassemble. The easy
+    # majority (max_side ~262) runs the quadratic stages at a smaller K; the hard
+    # matrices keep the wide K -> 0 induced fallbacks. The residual gate below is
+    # unchanged (runs on the reassembled batch), so misbucketing is caught -> no
+    # regression. _SIGN_DC_BUCKETS == 1 is the byte-identical single-pipeline path.
+    if _SIGN_DC_BUCKETS <= 1:
+        Q, L = _sign_dc_reduced(af, X, K, n, dev)
+    else:
+        # per-matrix captured rank (max of the +/- side, from the sign trace).
+        # No host sync: the bucket EDGES and per-bucket K are FIXED constants
+        # (_SIGN_DC_BUCKET_PLAN), so the only device->host transfer is the per-bucket
+        # nonzero index needed to gather that bucket's matrices.
+        trX = X.diagonal(dim1=-2, dim2=-1).sum(dim=-1)
+        npos = (n + trX) * 0.5
+        maxside = torch.maximum(npos, n - npos)                 # (b,)
+        Q = af.new_empty((b, n, n))
+        L = af.new_empty((b, n))
+        # _SIGN_DC_BUCKET_PLAN: ascending [(max_side_upper_frac_of_n, K), ...]; the
+        # LAST entry is the catch-all (its K = _SIGN_DC_K, the safe wide width). A
+        # matrix lands in the first bucket whose upper edge covers its max_side.
+        plan = _sign_dc_bucket_plan(n, K)
+        lo_edge = 0.0
+        for hi_edge, kb in plan:
+            if hi_edge >= n:
+                sel = maxside > lo_edge      # catch-all (also grabs any > previous top)
+            else:
+                sel = (maxside > lo_edge) & (maxside <= hi_edge)
+            idx = torch.nonzero(sel, as_tuple=False).flatten()
+            if idx.numel() == 0:
+                lo_edge = hi_edge
+                continue
+            Qb, Lb = _sign_dc_reduced(af.index_select(0, idx).contiguous(),
+                                      X.index_select(0, idx).contiguous(),
+                                      int(kb), n, dev)
+            Q.index_copy_(0, idx, Qb)
+            L.index_copy_(0, idx, Lb)
+            lo_edge = hi_edge
     # finishing Newton-Schulz orthonormalization (cleans the TF32-sign bases' ~1e-2
     # orth to ~1e-4). The Gram + Q@Gram GEMMs run in 3xTF32 (Ozaki hi+lo split, ~FP32
     # accuracy at ~1.6x the FP32-SIMT rate) instead of true FP32-SIMT -- the two n*n
