@@ -1,0 +1,649 @@
+<h1 id="cost-report-2026-07-03-05-14-36">Cost Report:
+2026-07-03-05-14-36</h1>
+<h2 id="executive-summary">Executive Summary</h2>
+<p>This single optimize-tree experiment consumed 23.3 aggregate
+session-hours across 12 workers and two steered sessions, spanning 6.43
+elapsed hours, with estimated inference spend of about $941. Inference
+dominated dollars, especially 1.62B cached-input tokens, while measured
+walltime also lost 3.28 worker-hours to the single-GPU lock queue; this
+is one experiment, so there is no cross-run cost comparison.</p>
+<p><strong>Key takeaways</strong></p>
+<ul>
+<li>The covered sessions processed 1.64B tokens; 98.9% were cached
+input, but those reads still cost about $810 at the public GPT-5.6 Sol
+rate.</li>
+<li>Paired records show 2.70h of exclusive GPU execution, 0.14h of
+builds, and 3.28h of lock wait; the remainder is agent reasoning,
+editing, orchestration, and trace coverage gaps.</li>
+<li>Brief 2 was the most expensive worker at about $116 and had two
+compactions, but no brief exceeded 2x the $78.23 fleet median.</li>
+<li>The manager and one Claude dashboard session are included as steered
+rows; reporting subagents launched after shutdown are excluded.</li>
+</ul>
+<p><strong>Run:</strong> 23.3 aggregate session-hours, approximately
+$941 inference spend, 15.8M uncached input tokens, 1.62B cached input
+tokens, 1.7M output tokens, and 17 compactions. The average paired GPU
+call was 31.6s and average paired build 3.6s, consistent with
+<code>environment.md</code>; total cost grew from the 254-trial search
+volume and queueing, not individual timeout overruns.</p>
+<h2 id="token-totals">Token Totals</h2>
+<p><strong>1.64B tokens</strong></p>
+<table>
+<thead>
+<tr class="header">
+<th>Token type</th>
+<th style="text-align: right;">Tokens</th>
+<th style="text-align: right;">Share</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Input</td>
+<td style="text-align: right;">15.8M</td>
+<td style="text-align: right;">0.97%</td>
+</tr>
+<tr class="even">
+<td>Cached input</td>
+<td style="text-align: right;">1.62B</td>
+<td style="text-align: right;">98.92%</td>
+</tr>
+<tr class="odd">
+<td>Output</td>
+<td style="text-align: right;">1.7M</td>
+<td style="text-align: right;">0.10%</td>
+</tr>
+<tr class="even">
+<td><strong>Total</strong></td>
+<td style="text-align: right;"><strong>1.64B</strong></td>
+<td style="text-align: right;"><strong>100.00%</strong></td>
+</tr>
+</tbody>
+</table>
+<p>Codex reports uncached input and cache reads as disjoint counters, so
+Input is not a cumulative total with cache reads subtracted. The grand
+total also contains 0.2M Claude cache-creation tokens (0.01%), omitted
+as a display row to preserve the required table shape. The total
+includes both steered sessions.</p>
+<h2 id="walltime-breakdown">Walltime Breakdown</h2>
+<p><code>Bench calls</code> below means observed exclusive
+<code>gpu-0</code> acquisitions and therefore includes benchmarks,
+validations, and profiles. <code>Other tool calls</code> is the
+remaining harness-recorded tool traffic after observed build/GPU
+acquisitions; paired lock releases give 514.9s of build execution and
+9,733.0s of exclusive GPU execution in aggregate.</p>
+<table>
+<thead>
+<tr class="header">
+<th>Branch</th>
+<th style="text-align: right;">Duration</th>
+<th style="text-align: right;">Build calls</th>
+<th style="text-align: right;">Bench calls</th>
+<th style="text-align: right;">Other tool calls</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>brief-0</td>
+<td style="text-align: right;">55m05s</td>
+<td style="text-align: right;">11</td>
+<td style="text-align: right;">26</td>
+<td style="text-align: right;">304</td>
+</tr>
+<tr class="even">
+<td>brief-1</td>
+<td style="text-align: right;">1h54m21s</td>
+<td style="text-align: right;">16</td>
+<td style="text-align: right;">28</td>
+<td style="text-align: right;">597</td>
+</tr>
+<tr class="odd">
+<td>brief-2</td>
+<td style="text-align: right;">2h47m41s</td>
+<td style="text-align: right;">20</td>
+<td style="text-align: right;">41</td>
+<td style="text-align: right;">892</td>
+</tr>
+<tr class="even">
+<td>brief-3</td>
+<td style="text-align: right;">2h05m40s</td>
+<td style="text-align: right;">17</td>
+<td style="text-align: right;">46</td>
+<td style="text-align: right;">576</td>
+</tr>
+<tr class="odd">
+<td>brief-4</td>
+<td style="text-align: right;">1h53m05s</td>
+<td style="text-align: right;">13</td>
+<td style="text-align: right;">27</td>
+<td style="text-align: right;">548</td>
+</tr>
+<tr class="even">
+<td>brief-5</td>
+<td style="text-align: right;">1h50m33s</td>
+<td style="text-align: right;">21</td>
+<td style="text-align: right;">46</td>
+<td style="text-align: right;">480</td>
+</tr>
+<tr class="odd">
+<td>brief-6</td>
+<td style="text-align: right;">1h27m45s</td>
+<td style="text-align: right;">15</td>
+<td style="text-align: right;">33</td>
+<td style="text-align: right;">396</td>
+</tr>
+<tr class="even">
+<td>brief-7</td>
+<td style="text-align: right;">0s*</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">52</td>
+</tr>
+<tr class="odd">
+<td>brief-8</td>
+<td style="text-align: right;">1h20m58s</td>
+<td style="text-align: right;">9</td>
+<td style="text-align: right;">25</td>
+<td style="text-align: right;">456</td>
+</tr>
+<tr class="even">
+<td>brief-9</td>
+<td style="text-align: right;">51m57s</td>
+<td style="text-align: right;">17</td>
+<td style="text-align: right;">32</td>
+<td style="text-align: right;">227</td>
+</tr>
+<tr class="odd">
+<td>brief-10</td>
+<td style="text-align: right;">1h03m37s</td>
+<td style="text-align: right;">0**</td>
+<td style="text-align: right;">1**</td>
+<td style="text-align: right;">340</td>
+</tr>
+<tr class="even">
+<td>brief-11</td>
+<td style="text-align: right;">23m26s</td>
+<td style="text-align: right;">5</td>
+<td style="text-align: right;">19</td>
+<td style="text-align: right;">85</td>
+</tr>
+<tr class="odd">
+<td>steered/manager</td>
+<td style="text-align: right;">6h44m31s</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">515</td>
+</tr>
+<tr class="even">
+<td>steered/dashboard</td>
+<td style="text-align: right;">1m02s</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">8</td>
+</tr>
+</tbody>
+</table>
+<p><code>*</code> The CSV cannot derive duration from brief 7’s sole
+trial; its lifecycle interval was 8m14s. <code>**</code> Brief 10’s
+Codex trace retained almost none of its worker lock output, so these are
+lower bounds. Counts use acquisition records; execution-time sums use
+only the 452 calls with matched acquire/release records.</p>
+<h2 id="tool-call-distribution">Tool Call Distribution</h2>
+<p>The stock data builder recognized Claude’s <code>Bash</code> records
+but not Codex <code>custom_tool_call</code>/<code>function_call</code>
+records. This table is reconstructed directly from the same JSONLs; the
+schema-valid CSV intentionally retains the builder’s blank Codex
+breakdown so the parser gap remains visible.</p>
+<table>
+<thead>
+<tr class="header">
+<th>Branch</th>
+<th>Tool</th>
+<th style="text-align: right;">Count</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>brief-0</td>
+<td>exec</td>
+<td style="text-align: right;">245</td>
+</tr>
+<tr class="even">
+<td>brief-0</td>
+<td>wait</td>
+<td style="text-align: right;">95</td>
+</tr>
+<tr class="odd">
+<td>brief-0</td>
+<td>send_message</td>
+<td style="text-align: right;">1</td>
+</tr>
+<tr class="even">
+<td>brief-1</td>
+<td>exec</td>
+<td style="text-align: right;">484</td>
+</tr>
+<tr class="odd">
+<td>brief-1</td>
+<td>wait</td>
+<td style="text-align: right;">157</td>
+</tr>
+<tr class="even">
+<td>brief-2</td>
+<td>exec</td>
+<td style="text-align: right;">795</td>
+</tr>
+<tr class="odd">
+<td>brief-2</td>
+<td>wait</td>
+<td style="text-align: right;">153</td>
+</tr>
+<tr class="even">
+<td>brief-2</td>
+<td>send_message</td>
+<td style="text-align: right;">4</td>
+</tr>
+<tr class="odd">
+<td>brief-2</td>
+<td>list_agents</td>
+<td style="text-align: right;">1</td>
+</tr>
+<tr class="even">
+<td>brief-3</td>
+<td>exec</td>
+<td style="text-align: right;">416</td>
+</tr>
+<tr class="odd">
+<td>brief-3</td>
+<td>wait</td>
+<td style="text-align: right;">218</td>
+</tr>
+<tr class="even">
+<td>brief-3</td>
+<td>send_message</td>
+<td style="text-align: right;">4</td>
+</tr>
+<tr class="odd">
+<td>brief-3</td>
+<td>list_agents</td>
+<td style="text-align: right;">1</td>
+</tr>
+<tr class="even">
+<td>brief-4</td>
+<td>exec</td>
+<td style="text-align: right;">431</td>
+</tr>
+<tr class="odd">
+<td>brief-4</td>
+<td>wait</td>
+<td style="text-align: right;">156</td>
+</tr>
+<tr class="even">
+<td>brief-4</td>
+<td>send_message</td>
+<td style="text-align: right;">1</td>
+</tr>
+<tr class="odd">
+<td>brief-5</td>
+<td>exec</td>
+<td style="text-align: right;">385</td>
+</tr>
+<tr class="even">
+<td>brief-5</td>
+<td>wait</td>
+<td style="text-align: right;">160</td>
+</tr>
+<tr class="odd">
+<td>brief-5</td>
+<td>send_message</td>
+<td style="text-align: right;">1</td>
+</tr>
+<tr class="even">
+<td>brief-5</td>
+<td>list_agents</td>
+<td style="text-align: right;">1</td>
+</tr>
+<tr class="odd">
+<td>brief-6</td>
+<td>exec</td>
+<td style="text-align: right;">314</td>
+</tr>
+<tr class="even">
+<td>brief-6</td>
+<td>wait</td>
+<td style="text-align: right;">128</td>
+</tr>
+<tr class="odd">
+<td>brief-6</td>
+<td>spawn_agent</td>
+<td style="text-align: right;">1</td>
+</tr>
+<tr class="even">
+<td>brief-6</td>
+<td>send_message</td>
+<td style="text-align: right;">1</td>
+</tr>
+<tr class="odd">
+<td>brief-7</td>
+<td>exec</td>
+<td style="text-align: right;">33</td>
+</tr>
+<tr class="even">
+<td>brief-7</td>
+<td>wait</td>
+<td style="text-align: right;">21</td>
+</tr>
+<tr class="odd">
+<td>brief-8</td>
+<td>exec</td>
+<td style="text-align: right;">396</td>
+</tr>
+<tr class="even">
+<td>brief-8</td>
+<td>wait</td>
+<td style="text-align: right;">91</td>
+</tr>
+<tr class="odd">
+<td>brief-8</td>
+<td>send_message</td>
+<td style="text-align: right;">2</td>
+</tr>
+<tr class="even">
+<td>brief-8</td>
+<td>list_agents</td>
+<td style="text-align: right;">1</td>
+</tr>
+<tr class="odd">
+<td>brief-9</td>
+<td>exec</td>
+<td style="text-align: right;">190</td>
+</tr>
+<tr class="even">
+<td>brief-9</td>
+<td>wait</td>
+<td style="text-align: right;">86</td>
+</tr>
+<tr class="odd">
+<td>brief-10</td>
+<td>exec</td>
+<td style="text-align: right;">254</td>
+</tr>
+<tr class="even">
+<td>brief-10</td>
+<td>wait</td>
+<td style="text-align: right;">87</td>
+</tr>
+<tr class="odd">
+<td>brief-11</td>
+<td>exec</td>
+<td style="text-align: right;">76</td>
+</tr>
+<tr class="even">
+<td>brief-11</td>
+<td>wait</td>
+<td style="text-align: right;">29</td>
+</tr>
+<tr class="odd">
+<td>brief-11</td>
+<td>wait_agent</td>
+<td style="text-align: right;">4</td>
+</tr>
+<tr class="even">
+<td>steered/manager</td>
+<td>exec</td>
+<td style="text-align: right;">293</td>
+</tr>
+<tr class="odd">
+<td>steered/manager</td>
+<td>wait</td>
+<td style="text-align: right;">161</td>
+</tr>
+<tr class="even">
+<td>steered/manager</td>
+<td>wait_agent</td>
+<td style="text-align: right;">29</td>
+</tr>
+<tr class="odd">
+<td>steered/manager</td>
+<td>spawn_agent</td>
+<td style="text-align: right;">15</td>
+</tr>
+<tr class="even">
+<td>steered/manager</td>
+<td>list_agents</td>
+<td style="text-align: right;">7</td>
+</tr>
+<tr class="odd">
+<td>steered/manager</td>
+<td>send_message</td>
+<td style="text-align: right;">6</td>
+</tr>
+<tr class="even">
+<td>steered/manager</td>
+<td>followup_task</td>
+<td style="text-align: right;">5</td>
+</tr>
+<tr class="odd">
+<td>steered/dashboard</td>
+<td>Bash</td>
+<td style="text-align: right;">8</td>
+</tr>
+</tbody>
+</table>
+<h2 id="inference-breakdown">Inference Breakdown</h2>
+<table>
+<colgroup>
+<col style="width: 9%" />
+<col style="width: 12%" />
+<col style="width: 12%" />
+<col style="width: 12%" />
+<col style="width: 12%" />
+<col style="width: 12%" />
+<col style="width: 12%" />
+<col style="width: 12%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Branch</th>
+<th style="text-align: right;">Input tokens</th>
+<th style="text-align: right;">Output tokens</th>
+<th style="text-align: right;">Cached input tokens</th>
+<th style="text-align: right;">Cache creation tokens</th>
+<th style="text-align: right;">Cache hit %</th>
+<th style="text-align: right;">Compactions</th>
+<th style="text-align: right;">Estimated USD</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>brief-0</td>
+<td style="text-align: right;">951,571</td>
+<td style="text-align: right;">114,632</td>
+<td style="text-align: right;">74,065,920</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">98.73%</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">$45.23</td>
+</tr>
+<tr class="even">
+<td>brief-1</td>
+<td style="text-align: right;">1,346,213</td>
+<td style="text-align: right;">145,199</td>
+<td style="text-align: right;">136,302,336</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">99.02%</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">$79.24</td>
+</tr>
+<tr class="odd">
+<td>brief-2</td>
+<td style="text-align: right;">1,732,277</td>
+<td style="text-align: right;">213,508</td>
+<td style="text-align: right;">201,844,736</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">99.15%</td>
+<td style="text-align: right;">2</td>
+<td style="text-align: right;">$115.99</td>
+</tr>
+<tr class="even">
+<td>brief-3</td>
+<td style="text-align: right;">1,489,667</td>
+<td style="text-align: right;">164,967</td>
+<td style="text-align: right;">133,853,184</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">98.90%</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">$79.32</td>
+</tr>
+<tr class="odd">
+<td>brief-4</td>
+<td style="text-align: right;">1,317,919</td>
+<td style="text-align: right;">121,319</td>
+<td style="text-align: right;">143,091,968</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">99.09%</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">$81.78</td>
+</tr>
+<tr class="even">
+<td>brief-5</td>
+<td style="text-align: right;">1,492,804</td>
+<td style="text-align: right;">154,330</td>
+<td style="text-align: right;">149,009,664</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">99.01%</td>
+<td style="text-align: right;">2</td>
+<td style="text-align: right;">$86.60</td>
+</tr>
+<tr class="odd">
+<td>brief-6</td>
+<td style="text-align: right;">1,294,028</td>
+<td style="text-align: right;">152,697</td>
+<td style="text-align: right;">130,162,944</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">99.02%</td>
+<td style="text-align: right;">2</td>
+<td style="text-align: right;">$76.13</td>
+</tr>
+<tr class="even">
+<td>brief-7</td>
+<td style="text-align: right;">677,552</td>
+<td style="text-align: right;">50,154</td>
+<td style="text-align: right;">64,136,192</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">98.96%</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">$36.96</td>
+</tr>
+<tr class="odd">
+<td>brief-8</td>
+<td style="text-align: right;">1,404,627</td>
+<td style="text-align: right;">159,872</td>
+<td style="text-align: right;">145,466,880</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">99.04%</td>
+<td style="text-align: right;">2</td>
+<td style="text-align: right;">$84.55</td>
+</tr>
+<tr class="even">
+<td>brief-9</td>
+<td style="text-align: right;">1,129,066</td>
+<td style="text-align: right;">114,826</td>
+<td style="text-align: right;">122,301,184</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">99.09%</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">$70.24</td>
+</tr>
+<tr class="odd">
+<td>brief-10</td>
+<td style="text-align: right;">1,160,559</td>
+<td style="text-align: right;">117,027</td>
+<td style="text-align: right;">135,801,088</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">99.15%</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">$77.21</td>
+</tr>
+<tr class="even">
+<td>brief-11</td>
+<td style="text-align: right;">993,140</td>
+<td style="text-align: right;">98,246</td>
+<td style="text-align: right;">92,456,192</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">98.94%</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">$54.14</td>
+</tr>
+<tr class="odd">
+<td>steered/manager</td>
+<td style="text-align: right;">803,368</td>
+<td style="text-align: right;">63,236</td>
+<td style="text-align: right;">91,535,616</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">99.13%</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">$51.68</td>
+</tr>
+<tr class="even">
+<td>steered/dashboard</td>
+<td style="text-align: right;">23,717</td>
+<td style="text-align: right;">13,993</td>
+<td style="text-align: right;">650,991</td>
+<td style="text-align: right;">188,144</td>
+<td style="text-align: right;">75.45%</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">$1.97</td>
+</tr>
+</tbody>
+</table>
+<p>Cache hit is
+<code>cached / (uncached + cache creation + cached)</code>. Codex did
+not expose cache-creation counters, so its hit percentages and costs
+cover only reported uncached input and cache reads. The manager row is
+frozen through 11:56 UTC, including shutdown and report dispatch but
+excluding the reporting subagents themselves.</p>
+<h2 id="cost-optimization-opportunities">Cost-Optimization
+Opportunities</h2>
+<ul>
+<li>Reduce inherited context size between trials and continuations. The
+99% hit rate is excellent, but 1.62B cache-read tokens still contribute
+about $810, 86% of estimated spend.</li>
+<li>Shorten or split the longest worker threads after a stable
+checkpoint. Brief 2 cost $115.99, used two compactions, and paid the
+most lock wait; it is 1.48x the fleet median even though it remains
+below the 2x runaway threshold.</li>
+<li>Schedule profiles and full benchmarks explicitly around the one
+B200. Observed exclusive calls outnumber builds by 326 to 145, and
+matched lock waits (3.28h) exceed matched exclusive execution
+(2.70h).</li>
+<li>Extend <code>autocuda report data cost</code> to parse Codex
+<code>custom_tool_call</code> records and async lock output. The current
+CSV accurately captures tokens but leaves Codex tool counts blank and
+under-covers brief 10.</li>
+</ul>
+<h2 id="analysis">Analysis</h2>
+<p>The local best improved from 25,511.859 us to 25,150.416 us, about
+1.42%, at roughly $664 of estimated inference spend per percentage
+point. That is a costly marginal gain, but the search did produce
+independent classifier, spectral-split, and dependent-launch
+improvements rather than spending the whole budget on one lane.</p>
+<p>Dollar cost is overwhelmingly a context-volume problem, not an
+output-monologue problem. Uncached input contributes about $79 and
+output about $50, while discounted cache reads contribute about $810.
+The high cache hit rate prevented a much larger bill, but continuing
+long threads through multiple pushes retained enormous histories; brief
+2 alone read 201.8M cached tokens.</p>
+<p>Aggregate session-hours should not be confused with elapsed runtime
+because three workers and the manager overlap. Within the worker fleet,
+matched GPU work accounts for 2.70 of 16.57 hours and lock waits for
+3.28 hours; the remaining time covers reasoning, source edits, compiler
+activity outside matched pairs, and incomplete lock telemetry. The
+observed per-call durations fit the environment’s timeout guidance, so
+tighter single-call timeouts would not address the main cost shape.</p>
+<p><strong>Recommendations:</strong> preserve the three-worker search
+width but start replacement briefs one at a time around profiling;
+checkpoint and spawn a fresh worker after one compaction instead of
+repeatedly resuming a large inherited context; and add model-aware,
+per-session pricing plus native Codex tool parsing to the cost
+collector. These changes target the two dominant costs: cached context
+volume and single-GPU queueing.</p>

@@ -1,0 +1,148 @@
+<h1 id="autocuda-skill-audit-2026-07-03-05-14-36">Autocuda Skill Audit:
+2026-07-03-05-14-36</h1>
+<h2 id="executive-summary">Executive Summary</h2>
+<p>The audit found two likely bugs, both in the
+<code>report-skill</code> data scanner rather than in
+<code>optimize-tree</code> or <code>explore-brief</code>: incomplete
+Codex tool-output coverage and duplicate incident emission. All 12
+optimize-branch harness records were mapped and readable, so the
+run-level audit has complete branch coverage.</p>
+<ul>
+<li>The generated CSV has 20 rows, but they reduce to seven execution
+events: one worker environment mistake and six normal kernel, compiler,
+or validation failures.</li>
+<li>Four explicit autocuda CLI argument rejections in Codex
+<code>custom_tool_call_output</code> records are absent from the
+CSV.</li>
+<li>Fifteen CSV rows describe only two source records; the scanner
+repeatedly flags overlapping windows from each multiline traceback.</li>
+<li>No agent asked the operator for permission to continue, and no
+harness record was missing or unreadable.</li>
+</ul>
+<h2 id="skill-issue-candidates">Skill Issue Candidates</h2>
+<table style="width:100%;">
+<colgroup>
+<col style="width: 16%" />
+<col style="width: 16%" />
+<col style="width: 16%" />
+<col style="width: 16%" />
+<col style="width: 16%" />
+<col style="width: 16%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Branch</th>
+<th>Skill</th>
+<th>Severity</th>
+<th>Category</th>
+<th>Evidence</th>
+<th>Recommendation</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>brief-2</code>, <code>brief-5</code>,
+<code>brief-6</code></td>
+<td><code>report-skill</code></td>
+<td>high</td>
+<td>harness_parser_coverage</td>
+<td>Four autocuda CLI rejections in <code>custom_tool_call_output</code>
+records are absent from the 20-row CSV.</td>
+<td>Parse Codex custom tool outputs recursively, including JSON-wrapped
+nested <code>output</code>, and add regression fixtures.</td>
+</tr>
+<tr class="even">
+<td><code>brief-2</code>, <code>brief-3</code></td>
+<td><code>report-skill</code></td>
+<td>medium</td>
+<td>incident_deduplication</td>
+<td>Thirteen rows repeat brief 2 line 632, and two rows repeat brief 3
+line 611.</td>
+<td>Deduplicate signals within one harness record by source line,
+category, and signal while retaining repeats from distinct records.</td>
+</tr>
+</tbody>
+</table>
+<p>The missed rejections occur at these directly reviewed records:</p>
+<ul>
+<li><code>brief-2</code>, <code>2026-07-03T07:36:55.782Z</code>:
+<code>/home/shadeform/.codex/sessions/2026/07/03/rollout-2026-07-03T05-29-02-019f2673-ab81-7813-8e48-4cb138f5a49e.jsonl</code>,
+line 2597, rejected unsupported <code>start --description</code>.</li>
+<li><code>brief-2</code>, <code>2026-07-03T07:46:49.444Z</code>: the
+same harness, line 2849, rejected nonexistent
+<code>autocuda profile</code>.</li>
+<li><code>brief-5</code>, <code>2026-07-03T09:48:42.226Z</code>:
+<code>/home/shadeform/.codex/sessions/2026/07/03/rollout-2026-07-03T08-35-49-019f271e-add1-7cc2-a842-30c1f4431a23.jsonl</code>,
+line 1678, rejected unsupported <code>start --description</code>.</li>
+<li><code>brief-6</code>, <code>2026-07-03T09:52:46.905Z</code>:
+<code>/home/shadeform/.codex/sessions/2026/07/03/rollout-2026-07-03T08-58-23-019f2733-541b-7a21-9ab7-2cd2bf6e74d6.jsonl</code>,
+line 1436, rejected <code>autocuda log trial</code> without the
+<code>optimize-tree</code> namespace.</li>
+</ul>
+<p>Those four commands were agent mistakes, not defects in
+<code>explore-brief</code>: its examples give the accepted start,
+profiler, and trial commands. They should still have appeared as
+candidates for triage because <code>report-skill/SKILL.md</code>
+explicitly says the data command detects autocuda CLI argument
+rejections.</p>
+<p>All 20 generated candidates were also reviewed against their source
+records. They collapse to seven non-skill events:
+<code>ModuleNotFoundError</code> from a direct system-Python probe, a
+custom-kernel launch limit error, a Triton indexing compile failure, an
+extension ABI symbol error, a custom-kernel illegal access, an SM100
+Triton lowering failure, and a CUDA fault surfaced by a later cuBLAS
+call. The workers diagnosed, logged, and continued from each failure;
+none was caused by autocuda instructions or a CLI contract.</p>
+<h2 id="root-causes">Root Causes</h2>
+<p>The implementation does not meet the harness coverage promised by
+<code>/home/shadeform/.codex/plugins/cache/brycelelbach-autocuda/autocuda/0.4.0/skills/report-skill/SKILL.md</code>,
+Procedure 2. In
+<code>/home/shadeform/.codex/plugins/cache/brycelelbach-autocuda/autocuda/0.4.0/lib/_report.py</code>,
+<code>_iter_codex_payload_texts</code> accepts
+<code>function_call_output</code> and <code>tool_result</code> but omits
+Codex <code>custom_tool_call_output</code>, which is where direct
+<code>functions.exec</code> results are stored.</p>
+<p>The same module’s <code>_skill_issue_signals_from_text</code> scans
+every overlapping window returned by <code>_local_text_windows</code>.
+Its local <code>seen</code> key includes the full window, so one
+traceback marker can produce many distinct rows from a single source
+record. This conflicts with the report contract’s
+one-candidate-incident-per-row semantics. No <code>SKILL.md</code>
+command example is stale, and no setup prerequisite or confirmation-gate
+defect was confirmed.</p>
+<h2 id="fix-plan">Fix Plan</h2>
+<ol type="1">
+<li>Extend <code>_iter_codex_payload_texts</code> to treat
+<code>custom_tool_call_output</code> as <code>tool_result</code> context
+and recursively unwrap string, array, and JSON-encoded nested outputs.
+Add a fixture containing the four observed output shapes. Validate with
+<code>pytest -q tests/test_autocuda_reports.py -k 'report_skill_reads_codex_jsonl_payloads or custom_tool_call_output'</code>.</li>
+<li>Deduplicate signals within one JSONL record by
+<code>(source line, context, category, signal)</code>, choosing the
+shortest useful evidence window, while preserving identical incidents on
+different records. Validate with
+<code>pytest -q tests/test_autocuda_reports.py -k 'report_skill_keeps_repeated_incidents or report_skill_deduplicates_multiline_record'</code>.</li>
+<li>Re-run <code>autocuda report data skill</code> with the same 12
+branch mappings and verify that the four CLI rejections appear once
+each, each multiline traceback appears once, and
+<code>autocuda schema check report-skill-csv --output 2026-07-03-05-14-36</code>
+still passes.</li>
+</ol>
+<h2 id="verification">Verification</h2>
+<ul>
+<li>Generated
+<code>/home/shadeform/gpumode-eigh-manager-20260703/autocuda/2026-07-03-05-14-36-report-skill.csv</code>
+from the final run state with explicit harness mappings for branches 0
+through 11.</li>
+<li><code>autocuda schema check report-skill-csv --output 2026-07-03-05-14-36</code>
+passed.</li>
+<li>Reviewed source context for every CSV row, reducing 20 rows to seven
+execution events, and directly searched all 12 JSONLs for skill names,
+CLI errors, schema failures, contradictory instructions, and
+confirmation gates.</li>
+<li>Harness coverage gaps: 0 missing, 0 unreadable, 12 of 12 optimize
+branches covered.</li>
+<li><code>autocuda schema check report-skill-markdown --output 2026-07-03-05-14-36</code>
+passed, and <code>autocuda report html</code> rendered the corresponding
+HTML artifact.</li>
+</ul>

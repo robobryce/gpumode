@@ -1,0 +1,4 @@
+timestamp,brief_id,trial,linalg/qr_v2,status,commit,description
+2026-07-06T18:35:14.074493,1,N/A,N/A,brief_start,N/A,"Build a cluster-tiled n=512 single-launch QR megakernel: four CTAs per matrix, an FP32 NB=16 panel producer publishing compact-WY V/T through DSM, and CTAs updating independent 128-column tiles via cta_group::1 tcgen05/TMA between cluster barriers while preserving hard-case routing and compact Householder output."
+2026-07-06T18:44:03.962181,1,0,N/A,build_error,fcf9b88576e7dc6274d313a03fad8a877f9d01dc,Four-CTA clustered FP32 QR prototype; explicit NVRTC compile failed because math.h is unavailable in the runtime include path.
+2026-07-06T18:49:39.559654,1,1,N/A,validation_error,a7163044842c33c9f9b6d28f272462a68a8a3a18,"Cluster launch compiled; official tests passed, but differential guard found NaN/Inf in 8/8 dense n512 calls and 2/8 mixed calls."

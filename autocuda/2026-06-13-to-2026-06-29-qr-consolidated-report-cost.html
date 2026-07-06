@@ -1,0 +1,730 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GPUMODE QR — Cost</title>
+<style>
+  body{max-width:1100px;margin:2rem auto;padding:0 1.5rem;font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;color:#1a1a1a}table{border-collapse:collapse;width:100%;margin:1rem 0;font-size:14px}th,td{border:1px solid #ccc;padding:6px 10px;text-align:left;vertical-align:top}th{background:#f4f4f4}code{background:#f4f4f4;padding:1px 4px;border-radius:3px}pre:not(.mermaid){background:#f7f7f7;padding:10px;overflow-x:auto;border-radius:5px}pre.mermaid{background:transparent;text-align:center}h1,h2,h3{line-height:1.25}h1{border-bottom:2px solid #eee;padding-bottom:.3rem}h2{border-bottom:1px solid #eee;padding-bottom:.2rem;margin-top:2rem}blockquote{border-left:3px solid #ccc;margin-left:0;padding-left:1rem;color:#555}a{color:#0645ad}
+</style>
+</head>
+<body>
+<h1 id="gpumode-qr-cost">GPUMODE QR — Cost</h1>
+<h2 id="executive-summary">Executive Summary</h2>
+<p>The QR optimization work burned an estimated <strong>~$62K of
+inference on 77.6B tokens and ~399 GPU-locked hours</strong> across all
+41 runs. The spend is <strong>inference-cheap per token but token-heavy
+per unit of code</strong>: <strong>94.5% of tokens were prompt-cache
+reads</strong> as agents re-read a large, stable context every session,
+while raw output — the tokens that encode kernel edits — is just 0.25%.
+<strong>Benchmarking, not reasoning, dominated walltime</strong> (18:1
+bench:build). The cost splits across the three lineages — the two
+primary B200 lineages (the winning CUDA C++ line and the shorter
+Triton-steered line, both on the same hardware) plus the separate RTX
+Pro 6K kernel-language experiments:</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Lineage</th>
+<th>Est. cost</th>
+<th>Tokens</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><strong>B200 CUDA C++</strong> — incl. the earlier qr_py run
+(~$10.6K)</td>
+<td><strong>~$31.9K</strong></td>
+<td>~43.3B</td>
+</tr>
+<tr class="even">
+<td><strong>B200 Triton-steered</strong> — 4 tags</td>
+<td><strong>~$17.0K</strong></td>
+<td>~19.9B</td>
+</tr>
+<tr class="odd">
+<td><strong>RTX Pro 6K evals</strong> — 24 runs</td>
+<td><strong>~$13.2K</strong></td>
+<td>~14.4B</td>
+</tr>
+<tr class="even">
+<td><strong>Total</strong></td>
+<td><strong>~$62.1K</strong></td>
+<td><strong>77.6B</strong></td>
+</tr>
+</tbody>
+</table>
+<p>(The ~399 GPU-locked hours are ~246 h across the two B200 lineages +
+~153 h on the RTX Pro 6K. Cost is attributed over 42 session-bearing
+export tags — the 41 runs plus one extra export that carries only
+session logs; per-tag session attribution is coarse, so treat the two
+B200 lineages’ split as approximate.)</p>
+<p><strong>Key takeaways</strong></p>
+<ul>
+<li><strong>Deduplication halves the bill</strong> — 50% of shipped
+session logs are cumulative re-bundles; report $62K, not the naive
+$105.7K.</li>
+<li><strong>Cache hit is already excellent (94.7%) — don’t chase
+it.</strong> The lever is shrinking the context each trial
+re-reads.</li>
+<li><strong>Benchmark time is the walltime sink</strong> — 21,635 GPU
+calls (328h) vs 1,211 builds (71h).</li>
+<li><strong>The two primary B200 lineages are ~79% of the bill</strong>
+(~$48.9K of $62K — ~$31.9K CUDA C++ + ~$17.0K Triton-steered); the RTX
+Pro 6K kernel-language experiments delivered their language comparison
+for ~$13.2K (~21%).</li>
+<li><strong>Triton was the most token-efficient language</strong> — best
+42.8× at 157 Mtok per unit-×, ~2.1× better than CUDA C++.</li>
+</ul>
+<h2 id="token-totals">Token Totals</h2>
+<p><strong>≈ 77.6B tokens</strong> across every deduplicated agent
+session (the two primary B200 lineages — winning CUDA C++ +
+Triton-steered — plus the 24 RTX Pro 6K kernel-language runs and the
+earlier qr_py run; the late <code>2026-06-19-19-06-14</code> tag is
+excluded, see below).</p>
+<table>
+<thead>
+<tr class="header">
+<th>Token type</th>
+<th>Tokens</th>
+<th>Share</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Input (uncached)</td>
+<td>126.8M</td>
+<td>0.16%</td>
+</tr>
+<tr class="even">
+<td>Cache creation (write, billed at input rate)</td>
+<td>3.98B</td>
+<td>5.13%</td>
+</tr>
+<tr class="odd">
+<td>Cached input (read)</td>
+<td>73.34B</td>
+<td>94.46%</td>
+</tr>
+<tr class="even">
+<td>Output</td>
+<td>193.3M</td>
+<td>0.25%</td>
+</tr>
+<tr class="odd">
+<td><strong>Total</strong></td>
+<td><strong>77.64B</strong></td>
+<td><strong>100%</strong></td>
+</tr>
+</tbody>
+</table>
+<p>Cache-read at 94.5% is the whole story: a small body of novel text
+(output + uncached input + cache writes = 4.3B, 5.5%) rides on an
+enormous re-read prefix. The three input fields are disjoint — the
+harness records uncached input, cache-creation, and cache-read
+separately — so “Input (uncached)” is the raw <code>input_tokens</code>
+column, not a net figure.</p>
+<h2 id="walltime-breakdown">Walltime Breakdown</h2>
+<p>Two views of walltime. <strong>Per-branch span</strong> (the
+<code>Duration</code> column) is the first→last timestamp across a tag’s
+deduplicated logs; it overlaps <em>within</em> a run’s export chain
+(cumulative exports share sessions), so those rows are not additive —
+treat them as per-run activity windows. <strong>GPU-locked time</strong>
+is summed per call from the harness’s
+<code>released lock=… ran=&lt;s&gt;</code> lines (shared lock = build;
+exclusive = bench/profile/validate) and deduplicated by owning session;
+these <em>are</em> additive and are the authoritative compute-time
+figure. The Build/Bench columns below are call counts; the group totals
+carry the summed seconds.</p>
+<table>
+<colgroup>
+<col style="width: 20%" />
+<col style="width: 20%" />
+<col style="width: 20%" />
+<col style="width: 20%" />
+<col style="width: 20%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Branch</th>
+<th>Duration</th>
+<th>Build calls</th>
+<th>Bench calls</th>
+<th>Other tool calls</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>2026-06-19-04-54-07-qr_v2</td>
+<td>13.9 h</td>
+<td>6</td>
+<td>216</td>
+<td>~2,050</td>
+</tr>
+<tr class="even">
+<td>2026-06-20-04-33-52-qr_v2_simplify</td>
+<td>17.8 h</td>
+<td>12</td>
+<td>300</td>
+<td>~2,900</td>
+</tr>
+<tr class="odd">
+<td>2026-06-20-22-03-57-qr_v2_with_logs</td>
+<td>65.3 h</td>
+<td>71</td>
+<td>1,400</td>
+<td>~15,300</td>
+</tr>
+<tr class="even">
+<td>2026-06-22-09-10-03-qr_v2</td>
+<td>58.6 h</td>
+<td>152</td>
+<td>2,600</td>
+<td>~24,800</td>
+</tr>
+<tr class="odd">
+<td>2026-06-24-20-40-28-qr_v2</td>
+<td>(subset)</td>
+<td>6</td>
+<td>55</td>
+<td>~440</td>
+</tr>
+<tr class="even">
+<td>2026-06-25-08-42-00-qr_v2_simplify</td>
+<td>(subset)</td>
+<td>12</td>
+<td>260</td>
+<td>~2,470</td>
+</tr>
+<tr class="odd">
+<td>2026-06-25-22-03-01-qr_v2</td>
+<td>(subset)</td>
+<td>30</td>
+<td>620</td>
+<td>~5,600</td>
+</tr>
+<tr class="even">
+<td>2026-06-25-23-41-18-qr_v2</td>
+<td>(subset)</td>
+<td>50</td>
+<td>~800</td>
+<td>~7,700</td>
+</tr>
+<tr class="odd">
+<td>2026-06-29-06-40-42-qr_v2</td>
+<td>(subset)</td>
+<td>~30</td>
+<td>~530</td>
+<td>~5,200</td>
+</tr>
+<tr class="even">
+<td><strong>Main B200 (17 tags)</strong></td>
+<td><strong>49.5 h build + 178.3 h GPU</strong></td>
+<td><strong>580</strong></td>
+<td><strong>11,850</strong></td>
+<td><strong>102,685</strong></td>
+</tr>
+<tr class="odd">
+<td><strong>Kernel-language, RTX Pro 6000 (24 tags)</strong></td>
+<td><strong>10.1 h build + 142.7 h GPU</strong></td>
+<td><strong>161</strong></td>
+<td><strong>2,385</strong></td>
+<td><strong>16,372</strong></td>
+</tr>
+<tr class="even">
+<td><strong>qr_py (1 tag)</strong></td>
+<td><strong>11.4 h build + 6.9 h GPU</strong></td>
+<td><strong>470</strong></td>
+<td><strong>7,400</strong></td>
+<td><strong>48,553</strong></td>
+</tr>
+<tr class="odd">
+<td><strong>TOTAL (dedup)</strong></td>
+<td><strong>71.0 h build + 327.9 h GPU-exclusive = 398.8 h
+locked</strong></td>
+<td><strong>1,211</strong></td>
+<td><strong>21,635</strong></td>
+<td><strong>167,610</strong></td>
+</tr>
+</tbody>
+</table>
+<p><code>(subset)</code> marks later main-run exports whose unique-owned
+session count is small after dedup (most of their sessions belong to an
+earlier export); their duration span is not meaningful in isolation.
+<code>2026-06-23-17-54-06-qr_v2</code> is a <strong>near-identical
+re-bundle</strong> of <code>2026-06-20-22-03-57</code>: all 621 session
+logs are byte-identical, and it owns only <strong>1</strong> extra
+unique file (a <code>memory/codex/history.jsonl</code> artifact, $0
+billable), so it contributes no cost — it is carried as an all-zero CSV
+row and omitted from the walltime rows above. Bench-call counts are the
+harness’s <code>Bash … bench</code> tool_use tally; the independent
+<code>ran=</code> sum is the figure to trust for compute cost.</p>
+<h2 id="tool-call-distribution">Tool Call Distribution</h2>
+<p>Counts are Claude Code <code>tool_use</code> records. The 12
+Codex/GPT-5.5 kernel-language runs don’t emit Claude-style
+<code>tool_use</code> blocks, so their bash/read/edit calls are absent
+here (their tokens are still counted everywhere else); the
+kernel-language block below is almost entirely the 12 Opus runs.</p>
+<table>
+<thead>
+<tr class="header">
+<th>Branch</th>
+<th>Tool</th>
+<th>Count</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Main B200</td>
+<td>Bash</td>
+<td>73,313</td>
+</tr>
+<tr class="even">
+<td>Main B200</td>
+<td>Read</td>
+<td>22,190</td>
+</tr>
+<tr class="odd">
+<td>Main B200</td>
+<td>Edit</td>
+<td>12,900</td>
+</tr>
+<tr class="even">
+<td>Main B200</td>
+<td>WebFetch</td>
+<td>2,300</td>
+</tr>
+<tr class="odd">
+<td>Main B200</td>
+<td>Agent</td>
+<td>1,616</td>
+</tr>
+<tr class="even">
+<td>Main B200</td>
+<td>WebSearch</td>
+<td>1,518</td>
+</tr>
+<tr class="odd">
+<td>Main B200</td>
+<td>Write</td>
+<td>1,204</td>
+</tr>
+<tr class="even">
+<td>Main B200</td>
+<td>SendMessage</td>
+<td>955</td>
+</tr>
+<tr class="odd">
+<td>Main B200</td>
+<td>Skill</td>
+<td>806</td>
+</tr>
+<tr class="even">
+<td>Main B200</td>
+<td>TaskStop</td>
+<td>308</td>
+</tr>
+<tr class="odd">
+<td>Kernel-language (Opus)</td>
+<td>Bash</td>
+<td>10,473</td>
+</tr>
+<tr class="even">
+<td>Kernel-language (Opus)</td>
+<td>Read</td>
+<td>1,660</td>
+</tr>
+<tr class="odd">
+<td>Kernel-language (Opus)</td>
+<td>Edit</td>
+<td>1,636</td>
+</tr>
+<tr class="even">
+<td>Kernel-language (Opus)</td>
+<td>SendMessage</td>
+<td>470</td>
+</tr>
+<tr class="odd">
+<td>Kernel-language (Opus)</td>
+<td>Write</td>
+<td>405</td>
+</tr>
+<tr class="even">
+<td>Kernel-language (Opus)</td>
+<td>WebSearch</td>
+<td>330</td>
+</tr>
+<tr class="odd">
+<td>Kernel-language (Opus)</td>
+<td>WebFetch</td>
+<td>306</td>
+</tr>
+<tr class="even">
+<td>Kernel-language (Opus)</td>
+<td>Agent</td>
+<td>237</td>
+</tr>
+<tr class="odd">
+<td>Kernel-language (Opus)</td>
+<td>Skill</td>
+<td>104</td>
+</tr>
+<tr class="even">
+<td>qr_py</td>
+<td>Bash</td>
+<td>36,628</td>
+</tr>
+<tr class="odd">
+<td>qr_py</td>
+<td>Read</td>
+<td>10,940</td>
+</tr>
+<tr class="even">
+<td>qr_py</td>
+<td>Edit</td>
+<td>5,981</td>
+</tr>
+<tr class="odd">
+<td>qr_py</td>
+<td>Write</td>
+<td>955</td>
+</tr>
+<tr class="even">
+<td>qr_py</td>
+<td>Monitor</td>
+<td>808</td>
+</tr>
+<tr class="odd">
+<td>qr_py</td>
+<td>WebFetch</td>
+<td>441</td>
+</tr>
+<tr class="even">
+<td>qr_py</td>
+<td>TaskStop</td>
+<td>439</td>
+</tr>
+<tr class="odd">
+<td>qr_py</td>
+<td>WebSearch</td>
+<td>175</td>
+</tr>
+</tbody>
+</table>
+<p><code>Bash</code> dominates every group (build/bench/profile all
+shell out through it) — 120,414 calls total, 58% of all tool use. The
+<code>Read:Edit</code> ratio is ~1.7:1 across the corpus (34,790 :
+20,517): the agents read more than they edit, consistent with the high
+cache-read share — they re-scan the large submission before making
+targeted changes. WebFetch+WebSearch is only 5,070 calls (2.4%), so the
+runs leaned on training-data CUDA knowledge rather than reaching to the
+web — that keeps inference latency down and is a <em>good</em> sign for
+the skill prose.</p>
+<h2 id="inference-breakdown">Inference Breakdown</h2>
+<p>Cache-hit % =
+<code>cache_read / (input + cache_creation + cache_read) × 100</code>.
+USD is priced at the rates in Scope &amp; Methodology (Opus 4.8 for
+every row except the 12 Codex/GPT-5.5 kernel-language runs).</p>
+<table>
+<colgroup>
+<col style="width: 12%" />
+<col style="width: 12%" />
+<col style="width: 12%" />
+<col style="width: 12%" />
+<col style="width: 12%" />
+<col style="width: 12%" />
+<col style="width: 12%" />
+<col style="width: 12%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Branch</th>
+<th>Input tokens</th>
+<th>Output tokens</th>
+<th>Cached input tokens</th>
+<th>Cache creation tokens</th>
+<th>Cache hit %</th>
+<th>Compactions</th>
+<th>Estimated USD</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Main B200 (17 tags)</td>
+<td>37.9M</td>
+<td>114.0M</td>
+<td>43.37B</td>
+<td>2.71B</td>
+<td>94.0%</td>
+<td>26</td>
+<td>$38,274</td>
+</tr>
+<tr class="even">
+<td>Kernel-language, RTX Pro 6000 (24 tags)</td>
+<td>78.6M</td>
+<td>35.0M</td>
+<td>13.19B</td>
+<td>1.06B</td>
+<td>92.0%</td>
+<td>49</td>
+<td>$13,192</td>
+</tr>
+<tr class="odd">
+<td>  — Codex/GPT-5.5 (12 runs)</td>
+<td>70.5M</td>
+<td>5.2M</td>
+<td>2.48B</td>
+<td>0</td>
+<td>97.2%</td>
+<td>45</td>
+<td>$1,745</td>
+</tr>
+<tr class="even">
+<td>  — Opus 4.8 (12 runs)</td>
+<td>8.1M</td>
+<td>29.8M</td>
+<td>10.72B</td>
+<td>1.06B</td>
+<td>90.9%</td>
+<td>4</td>
+<td>$11,447</td>
+</tr>
+<tr class="odd">
+<td>qr_py (1 tag)</td>
+<td>10.2M</td>
+<td>44.3M</td>
+<td>16.79B</td>
+<td>0.21B</td>
+<td>98.7%</td>
+<td>0</td>
+<td>$10,599</td>
+</tr>
+<tr class="even">
+<td><strong>Total (dedup)</strong></td>
+<td><strong>126.8M</strong></td>
+<td><strong>193.3M</strong></td>
+<td><strong>73.34B</strong></td>
+<td><strong>3.98B</strong></td>
+<td><strong>94.7%</strong></td>
+<td><strong>75</strong></td>
+<td><strong>$62,065</strong></td>
+</tr>
+</tbody>
+</table>
+<p>Cache hit is <strong>above 50% everywhere</strong> — no low-cache-hit
+alarm to raise. The one structural note: the Codex runs show
+<code>cache_creation = 0</code> because Codex’s <code>token_count</code>
+schema reports only cumulative input/cached/output (no cache-write
+field), and its <code>input_tokens</code> is inclusive of the cached
+portion — the CLI subtracts the cached tokens back out to land in the
+same disjoint buckets. That is why the Codex “Input” (70.5M) looks large
+next to Opus (8.1M): it is the un-cached remainder of a cumulative
+counter, not extra novel prompt. The dollar consequence is small ($1,745
+for all 12 Codex runs).</p>
+<h2 id="cost-optimization-opportunities">Cost-Optimization
+Opportunities</h2>
+<ul>
+<li><strong>Deduplicate exports before costing anything.</strong> The
+single biggest “cost” error available here is counting cumulative
+re-bundles: 50% of shipped session logs are duplicates, and two exports
+are near-identical (621 of their session logs byte-for-byte the same).
+Any cost tally that sums per-tag without content-hash dedup over-reports
+by ~1.67×. This is a reporting fix, not a spend fix, but it is the
+highest-impact correction.</li>
+<li><strong>Cache hit is already excellent (94.7%) — don’t chase
+it.</strong> The lever is <em>trial count against a huge prefix</em>,
+not cache mechanics. The main run carried a ~9,000-line best-so-far
+submission that every trial re-reads; the marginal trial costs
+~$0.50/Mtok × (prefix size). Shrinking the resident context the workers
+must re-read each iteration (e.g. summarizing that submission, or
+diff-only context) would cut the 73.3B read tokens more than any caching
+tweak.</li>
+<li><strong>Benchmark, not inference, is the walltime sink.</strong>
+21,635 exclusive GPU calls / 328 GPU-hours vs 1,211 builds / 71h — an
+18:1 bench:build ratio. If <code>environment.md</code>’s per-shape
+benchmark budget (~50s baseline, up to 300s) is loose, tightening the
+repeat count or early-exit threshold on the 12-shape geomean would
+directly reduce GPU-hours; the search made ~21.6K measurements.</li>
+<li><strong>Compactions are low (75 across 3,204 sessions).</strong>
+Only the longer main-run and Opus kernel-language runs compact at all;
+context-window pressure is not a cost driver here. No action
+needed.</li>
+<li><strong>Per-run cost concentration.</strong> Within the main run,
+<code>2026-06-22-09-10-03-qr_v2</code> ($12.5K, 891 owned sessions) and
+<code>2026-06-25-23-41-18-qr_v2</code> ($4.5K) are the largest; no
+single run exceeds 2× the median after dedup, so nothing flags a runaway
+loop. The qr_py run (optimize tag <code>2026-06-13-03-45-35</code>: 434
+branches, 1,161 kept trials; sessions bundled under export
+<code>2026-06-13-03-37-53-qr_py</code>) is $10.6K on 498 sessions —
+expensive per session because it has the highest cache-read share
+(98.7%), i.e. it re-read the most context per trial. It is a full
+optimize run with trial logs on disk, and its 498 session logs (all
+unique, distinct from the qr_v2 runs) attribute cleanly to it.</li>
+<li><strong>Codex kernel-language runs were ~6.5× cheaper per run than
+Opus kernel-language runs</strong> ($145/run vs $950/run) but delivered
+far less speedup (≤5× vs up to 42.8×). Cheap but unproductive; see
+Analysis.</li>
+</ul>
+<h2 id="analysis">Analysis</h2>
+<p><strong>Was the spend justified by the improvement?</strong> For the
+main B200 run, yes on a per-token basis, though the search was long:
+$38.3K bought a per-shape-routed CUDA C++ submission (~9,000 lines) over
+a 06-15→06-29 arc. The cost shape is dominated by re-reading that
+submission — 43.4B cache-read tokens — the price of a <em>stateful,
+growing</em> codebase under tree search, where every worker re-ingests
+the current best each iteration. The cheapest available saving was
+carrying less resident context per trial; the most expensive decision
+embedded in the data is the cumulative-export packaging, which summed
+naively would misattribute $43K of phantom re-bundled spend.</p>
+<p><strong>The kernel-language token-efficiency headline.</strong>
+Per-abstraction best speedups are each run’s fastest kept trial over its
+<strong>own</strong> <code>status=baseline</code> log row (the RTX Pro
+6K QR baseline is ~116K µs per run — <em>not</em> the B200 baseline;
+reusing the B200 figure would roughly double every ×). These reconcile
+with the final optimization report (Triton 42.8× / CUDA C++ 21.5× / CUTE
+DSL 1.69×). The consolidated optimization CSV’s
+<code>best_speedup</code> column is blank on 100% of rows (a confirmed
+<code>report data optimization</code> join bug), and
+<code>autocuda status</code> reads the now-eigh-configured live
+directory, so the figures come straight from the raw
+<code>linalg/qr_v2</code> metric columns. Against deduplicated token
+spend:</p>
+<table>
+<colgroup>
+<col style="width: 12%" />
+<col style="width: 12%" />
+<col style="width: 12%" />
+<col style="width: 12%" />
+<col style="width: 12%" />
+<col style="width: 12%" />
+<col style="width: 12%" />
+<col style="width: 12%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Abstraction</th>
+<th>Runs</th>
+<th>Total tokens</th>
+<th>Output</th>
+<th>Best speedup</th>
+<th>Mean speedup</th>
+<th>Mtok per unit-×</th>
+<th>$ per unit-×</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><strong>Triton</strong></td>
+<td>10</td>
+<td>6.71B</td>
+<td>17.1M</td>
+<td><strong>42.8×</strong></td>
+<td>18.3×</td>
+<td><strong>157</strong></td>
+<td><strong>$147.4</strong></td>
+</tr>
+<tr class="even">
+<td>CUDA C++</td>
+<td>10</td>
+<td>6.92B</td>
+<td>16.2M</td>
+<td>21.5×</td>
+<td>11.0×</td>
+<td>322</td>
+<td>$296.4</td>
+</tr>
+<tr class="odd">
+<td>CUTE DSL</td>
+<td>4</td>
+<td>0.73B</td>
+<td>1.6M</td>
+<td>1.69×</td>
+<td>1.4×</td>
+<td>429</td>
+<td>$302.8</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Triton was decisively the most token-efficient
+abstraction</strong>: it reached the highest peak speedup (42.8×) on the
+<em>fewest</em> tokens per unit of speedup (157 Mtok/×), 2.1× better
+than CUDA C++ and 2.7× better than CUTE DSL. This is not just faster
+convergence — per-run output volume is comparable across the Opus-run
+abstractions (~2.5M/run) — but a given token budget in Triton
+<em>landed</em> far more speedup: <code>q1nb1oliq</code> (Triton) hit
+42.8× (2,744.5 µs over its 117,536 µs baseline), while the best CUDA C++
+run (<code>ocix8g7hp</code>) reached 21.5×. CUTE DSL was genuinely
+<strong>token-hungry for little return</strong>: the model’s relative
+unfamiliarity with the DSL shows up as many trials that never cleared
+~1.7× (all 4 CUTE runs were Codex/GPT-5.5, which capped low regardless
+of language).</p>
+<p><strong>The confound, stated plainly.</strong> This is <em>not</em> a
+clean controlled experiment, because kernel language and model are
+entangled: all 4 CUTE DSL runs and the 12 Codex/GPT-5.5 kernel-language
+runs topped out at ~1.3–5× on <em>every</em> language, while the
+high-speedup runs (17–42.8×) were all Opus 4.8.
+(<code>t5sr96or9</code>’s 4.6× is excluded — its baseline is a bogus
+timeout-inflated 116M µs.) The honest same-model comparison is
+Opus-only: <strong>Triton 42.8× peak / 28.9× mean vs CUDA C++ 21.5× /
+18.3× mean, at essentially identical token spend (~2,571K vs ~2,398K
+output/run, ~$954 vs ~$953/run)</strong>. Even controlling for model,
+Triton bought more speedup per token — so the token-efficiency verdict
+holds, while acknowledging that Codex’s uniformly-low ceiling (not the
+abstraction alone) explains most of CUTE DSL’s poor showing.</p>
+<p><strong>Did inference cost grow super-linearly with trial
+count?</strong> No — caching makes it grow <em>sub</em>-linearly per
+trial: the Nth trial adds mostly cache-read tokens at 0.1× rate, so a
+251-branch run (<code>p9y2rr1gw</code>) is not 251× the cost of a
+25-branch run. The dominant cost driver is prefix size, not trial count,
+which is why the qr_py run (498 sessions, highest cache-read share) is
+nearly as expensive as much larger main-run branches. The most expensive
+branch (<code>2026-06-22</code>, $12.5K) was also among the most
+productive (891 owned sessions building toward the best submission); the
+cheapest productive branches were the Opus Triton kernel-language runs
+(~$950 each for up to 42.8×).</p>
+<p><strong>Recommendations.</strong> (1) Always content-hash-dedup
+cumulative exports before cost aggregation — it is the difference
+between $62K and $105.7K here, and the CLI does not do it for you. (2)
+To cut the 73.3B cache-read tokens, reduce the resident context each
+worker re-reads per trial (summarize or diff the best submission rather
+than re-ingesting ~9K lines) — this attacks 94.5% of the token bill
+directly, whereas cache tuning cannot (hit-rate is already 94.7%). (3)
+For future kernel-language studies, hold the model fixed — the current
+design entangles abstraction with Codex-vs-Opus, so route all
+abstractions through Opus 4.8 (or all through one model) before drawing
+language-efficiency conclusions. On the evidence available,
+<strong>Triton is the token-efficiency choice</strong>, delivering the
+most kernel speedup per dollar and per token.</p>
+<h2 id="scope-methodology">Scope &amp; Methodology</h2>
+<p><strong>Deduplication.</strong> All token, call, and walltime figures
+are <strong>deduplicated by session-log content hash</strong> — each
+unique session attributed to the earliest export that captured it —
+because the main-run export branches are cumulative and re-bundle
+earlier sessions. Of 6,408 shipped session logs, 3,204 are unique. No
+separate human-driven sessions were identified: the Codex
+kernel-language runs are the harness’s own workers, not hand-driven side
+sessions, so they are counted as ordinary run rows rather than
+steered-session rows.</p>
+<p><strong>Model and rates (USD is approximate).</strong> Model was
+identified from <code>message.model</code> across the harness logs. The
+dominant model is <strong><code>claude-opus-4-8</code></strong> (Claude
+Opus 4.8), used by the 17 main B200 tags, the qr_py tag, and the 12 Opus
+kernel-language runs; the other 12 kernel-language runs ran on
+<strong><code>openai/openai/gpt-5.5</code></strong> (Codex/GPT-5.5),
+priced separately. Public per-1M-token list rates were applied via
+<code>--pricing-*-per-mtok</code>: <strong>Opus 4.8</strong> — input
+$5.00, output $25.00, cache-read $0.50 (≈0.1× input), cache-creation
+billed at the $5.00 input rate; <strong>GPT-5.5</strong> — input $5.00,
+output $30.00, cached-input $0.50. Estimated cost is the CLI’s per-row
+sum
+<code>input×in_rate + cache_creation×in_rate + cache_read×cached_rate + output×out_rate</code>
+— an order-of-magnitude estimate, not an invoice.</p>
+
+
+</body>
+</html>

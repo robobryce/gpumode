@@ -1,0 +1,157 @@
+<h1 id="optimization-report-qr_v2">Optimization Report: qr_v2</h1>
+<h2 id="executive-summary">Executive Summary</h2>
+<table>
+<colgroup>
+<col style="width: 50%" />
+<col style="width: 50%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Metric</th>
+<th>Value</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Final accepted best</td>
+<td><code>39e59cea</code> (<code>73896.201171</code>)</td>
+</tr>
+<tr class="even">
+<td>Best end-to-end speedup</td>
+<td><code>1.7789x</code></td>
+</tr>
+<tr class="odd">
+<td>Optimization rows</td>
+<td><code>653</code></td>
+</tr>
+<tr class="even">
+<td>Kept / failed rows</td>
+<td><code>603</code> / <code>50</code></td>
+</tr>
+<tr class="odd">
+<td>Main failure</td>
+<td>Manager spent hours on low-upside micro/routing/zero-fill variants
+before pursuing generator-aware structure.</td>
+</tr>
+</tbody>
+</table>
+<p>The run eventually produced a valid accepted result, but it
+underperformed the user objective because the optimization search was
+too conservative for too long. The late generator-aware rank-1 QR path
+was the only clear strategic breakthrough.</p>
+<h2 id="most-impactful-optimization-techniques">Most Impactful
+Optimization Techniques</h2>
+<table style="width:100%;">
+<colgroup>
+<col style="width: 23%" />
+<col style="width: 30%" />
+<col style="width: 23%" />
+<col style="width: 23%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Technique</th>
+<th style="text-align: right;">Peak contribution</th>
+<th>Prevalence</th>
+<th>Representative commits</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Custom CUDA/Triton Householder kernels</td>
+<td style="text-align: right;">1.4486x</td>
+<td>228 branches, 244 attempts, 18 kept/1 failed</td>
+<td><code>8802b14f</code>, <code>8639d1fc</code>, <code>7b93bf8b</code>,
+<code>be26e71c</code>, <code>ba966d0d</code></td>
+</tr>
+<tr class="even">
+<td>Combining accepted branches</td>
+<td style="text-align: right;">1.1878x</td>
+<td>228 branches, 1673 attempts, 52 kept/0 failed</td>
+<td><code>5e877ad1</code>, <code>50996395</code>, <code>2238308e</code>,
+<code>5910f00d</code>, <code>f1e1a44b</code></td>
+</tr>
+<tr class="odd">
+<td>n512 device-side mixed dispatcher</td>
+<td style="text-align: right;">1.1828x</td>
+<td>83 branches, 109 attempts, 26 kept/3 failed</td>
+<td><code>282510be</code>, <code>1d2b3f0e</code>, <code>546fcb39</code>,
+<code>110a3606</code>, <code>6de29ae8</code></td>
+</tr>
+<tr class="even">
+<td>Dense blocked/panel QR replacements</td>
+<td style="text-align: right;">1.1774x</td>
+<td>42 branches, 62 attempts, 50 kept/7 failed</td>
+<td><code>568c1feb</code>, <code>5982a98e</code>, <code>f8a841a8</code>,
+<code>d8da6de9</code>, <code>dbe19f39</code></td>
+</tr>
+<tr class="odd">
+<td>Local routing/allocation changes</td>
+<td style="text-align: right;">1.1766x</td>
+<td>236 branches, 4235 attempts, 284 kept/16 failed</td>
+<td><code>f995f1bb</code>, <code>bdeea3fa</code>, <code>876c4ff9</code>,
+<code>ec760be8</code>, <code>29aab2d5</code></td>
+</tr>
+<tr class="even">
+<td>n1024 structured prefix reductions</td>
+<td style="text-align: right;">1.1539x</td>
+<td>77 branches, 164 attempts, 23 kept/1 failed</td>
+<td><code>c8a9c275</code>, <code>bad50345</code>, <code>25a5ce9b</code>,
+<code>be88f140</code>, <code>6e872fd5</code></td>
+</tr>
+<tr class="odd">
+<td>Static-shape graph executors</td>
+<td style="text-align: right;">1.1286x</td>
+<td>49 branches, 190 attempts, 37 kept/11 failed</td>
+<td><code>229324ea</code>, <code>7d9d45f8</code>, <code>ba13e335</code>,
+<code>5ce011e0</code>, <code>ba6f4e9b</code></td>
+</tr>
+<tr class="even">
+<td>Compact-output write-order assembly</td>
+<td style="text-align: right;">1.0199x</td>
+<td>149 branches, 351 attempts, 100 kept/4 failed</td>
+<td><code>788213b9</code>, <code>3318db42</code>, <code>3ef45d94</code>,
+<code>ac65c643</code>, <code>eacb52c7</code></td>
+</tr>
+<tr class="odd">
+<td>Generator-aware structured QR</td>
+<td style="text-align: right;">1.0109x</td>
+<td>4 branches, 7 attempts, 5 kept/0 failed</td>
+<td><code>39e59cea</code>, <code>ba6dda97</code>, <code>ce16bb4a</code>,
+<code>39e59cea</code>, <code>ba6dda97</code></td>
+</tr>
+<tr class="even">
+<td>Library substitution routes</td>
+<td style="text-align: right;">1.0030x</td>
+<td>5 branches, 15 attempts, 8 kept/7 failed</td>
+<td><code>f6357871</code>, <code>56bc0d81</code>, <code>51f5d668</code>,
+<code>9c0e4559</code>, <code>234772c3</code></td>
+</tr>
+</tbody>
+</table>
+<p>Generator-aware structured QR produced the best real marginal
+improvement: <code>ba6dda97</code> took the parent from
+<code>74861.362275</code> to <code>74050.971646</code>, and
+<code>39e59cea</code> improved further to <code>73896.201171</code>.
+Earlier dispatcher, graph, and write-order families produced valid but
+small deltas.</p>
+<h2 id="failed-optimization-techniques">Failed Optimization
+Techniques</h2>
+<p>Dense custom QR, cuSOLVER/cuBLAS substitutions, graph-slot tweaks,
+Python mask cleanups, and inactive-tail write-order variants repeatedly
+validated but regressed. The core lesson is that most failures were not
+bold enough: they changed implementation details around the dominant
+algorithms instead of replacing the algorithms or exploiting generator
+structure.</p>
+<h2 id="unexplored-areas">Unexplored Areas</h2>
+<ul>
+<li>Closed-form compact H/tau emitters for banded, row-scaled,
+clustered, and rank-deficient generators.</li>
+<li>Real Blackwell blocked-WY QR with CuTe/Triton tensor-core trailing
+updates.</li>
+<li>A per-shape speed-of-light model for
+n176/n352/n512/n1024/n2048/n4096.</li>
+<li>Aggressive validation-safe tolerance exploitation for compact output
+semantics.</li>
+<li>Reviewer-enforced 2x-upside screening from the first brief.</li>
+</ul>

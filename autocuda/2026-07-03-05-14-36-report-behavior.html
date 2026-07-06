@@ -1,0 +1,245 @@
+<h1 id="behavior-report-2026-07-03-05-14-36">Behavior Report:
+2026-07-03-05-14-36</h1>
+<h2 id="executive-summary">Executive Summary</h2>
+<p>This single optimize-tree experiment was productive but queue-bound:
+254 logged trials consumed 16.57 worker-hours, for a pooled 15.33
+trials/hour. Reliability was mixed: all logs pass schema validation, but
+six branches contain 12 trial-to-trial gaps over ten minutes and four
+continued briefs made five early completion attempts before the manager
+sent them back to unfinished work; there is no cross-run variance signal
+from one experiment.</p>
+<p><strong>Key takeaways</strong></p>
+<ul>
+<li>The fleet held the requested three active briefs for 5.73 of 6.43
+elapsed hours (89.1%); the longest under-strength stretch was 14m09s
+during a two-slot replacement.</li>
+<li>Matched lock records show 3h16m56s of aggregate queue wait, 19.8% of
+fleet worker-time; brief 2 paid the most at 35m47s.</li>
+<li>Productive branches ranged from 9.07 to 18.89 trials/hour, with no
+genuine branch more than 2x from the fleet median.</li>
+<li>Five early completion attempts occurred after trials 12 and 29 on
+brief 2, trial 14 on brief 3, trial 21 on brief 5, and trial 15 on brief
+6; every one was recovered by a continuation.</li>
+</ul>
+<p><strong>Run:</strong> 12 branches, 254 trials, 16h34m08s aggregate
+worker walltime; arithmetic mean 13.35 trials/hour, pooled rate 15.33
+trials/hour, and worst reported rate 0.00 on the single-trial combine
+artifact (9.07 worst meaningful rate). Overall reliability: acceptable
+logging and recovery, with material single-GPU contention and avoidable
+stop/resume churn.</p>
+<h2 id="fleet-behavior">Fleet Behavior</h2>
+<h3 id="concurrency-over-time">Concurrency Over Time</h3>
+<p>Pairing every <code>brief_start</code> with its following
+<code>brief_stop</code> and bucketing the resulting intervals into
+five-minute windows gives a peak of three concurrent briefs. Exact
+interval integration shows 20,616.8s at the requested width of three and
+2,526.1s below it; 65 of 78 five-minute midpoint buckets were at width
+three. The longest continuous under-strength interval was 848.9s, from
+10:34:00 to 10:48:09 UTC, after briefs 5 and 6 stopped and before briefs
+9 and 10 restored the fleet. The fleet was not at width three at all
+times, but replacement latency was usually under three minutes outside
+that one transition.</p>
+<h3 id="brief-cycle-timing">Brief-Cycle Timing</h3>
+<p>Under the report contract’s manager-to-first-trial definition, median
+handoff latency was 504.0s (8m24s) and nearest-rank p95 was 1,078.3s
+(17m58s). Eleven briefs exceeded five minutes: brief 0 1,078.3s; brief 1
+763.2s; brief 2 782.1s; brief 3 521.0s; brief 4 487.0s; brief 5 442.0s;
+brief 6 405.9s; brief 7 485.2s; brief 8 339.3s; brief 9 674.1s; and
+brief 11 772.0s. Brief 10 was 128.4s. This metric includes worker setup,
+editing, builds, and the first validation/benchmark before trial 0 is
+logged; lifecycle <code>brief_start</code> rows were normally emitted
+within seconds, so these are not pure manager dispatch delays.</p>
+<h3 id="lock-contention">Lock Contention</h3>
+<p>There were 144 matched shared-build calls and 308 matched exclusive
+GPU calls. Shared-build locks accumulated 2,833.1s of wait and 514.9s of
+execution; <code>gpu-0</code> exclusive locks accumulated 8,982.8s of
+wait and 9,733.0s of execution. Total matched wait was 11,815.8s
+(3h16m56s), 19.8% of aggregate fleet worker-time. The worst single wait
+was 541.6s on brief 2, which also paid the largest per-brief total at
+2,146.5s. Because asynchronously yielded Codex records left some
+acquire/release markers unpaired and brief 10’s worker trace exposed
+almost none of its run-lock calls, these totals are conservative lower
+bounds.</p>
+<h3 id="per-brief-reliability">Per-Brief Reliability</h3>
+<p>The median reported branch rate is 15.04 trials/hour. Brief 7 reports
+0.00 because the data builder cannot derive a duration from its sole
+combine trial, although its lifecycle lasted 8m14s and the trial
+succeeded; it is not a worker failure. Excluding that artifact, no
+branch is more than 2x from the median. Brief 3 is the low outlier at
+9.07 trials/hour, explained by long Jacobi implementation and benchmark
+cycles, while brief 1 leads at 18.89.</p>
+<h2 id="throughput">Throughput</h2>
+<p>Tree brief logs do not carry <code>pct_change</code>, so Improvement
+is <code>+0.00%</code> by construction rather than evidence that no
+candidate improved.</p>
+<table>
+<thead>
+<tr class="header">
+<th>Branch</th>
+<th style="text-align: right;">Trials</th>
+<th style="text-align: right;">Duration</th>
+<th style="text-align: right;">Trials/hour</th>
+<th style="text-align: right;">Improvement %</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>brief-1</td>
+<td style="text-align: right;">37</td>
+<td style="text-align: right;">1h54m21s</td>
+<td style="text-align: right;">18.89</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="even">
+<td>brief-6</td>
+<td style="text-align: right;">26</td>
+<td style="text-align: right;">1h27m45s</td>
+<td style="text-align: right;">17.10</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="odd">
+<td>brief-5</td>
+<td style="text-align: right;">31</td>
+<td style="text-align: right;">1h50m33s</td>
+<td style="text-align: right;">16.28</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="even">
+<td>brief-9</td>
+<td style="text-align: right;">15</td>
+<td style="text-align: right;">51m57s</td>
+<td style="text-align: right;">16.17</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="odd">
+<td>brief-4</td>
+<td style="text-align: right;">31</td>
+<td style="text-align: right;">1h53m05s</td>
+<td style="text-align: right;">15.92</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="even">
+<td>brief-0</td>
+<td style="text-align: right;">15</td>
+<td style="text-align: right;">55m05s</td>
+<td style="text-align: right;">15.25</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="odd">
+<td>brief-8</td>
+<td style="text-align: right;">21</td>
+<td style="text-align: right;">1h20m58s</td>
+<td style="text-align: right;">14.82</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="even">
+<td>brief-2</td>
+<td style="text-align: right;">38</td>
+<td style="text-align: right;">2h47m41s</td>
+<td style="text-align: right;">13.24</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="odd">
+<td>brief-10</td>
+<td style="text-align: right;">15</td>
+<td style="text-align: right;">1h03m37s</td>
+<td style="text-align: right;">13.20</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="even">
+<td>brief-11</td>
+<td style="text-align: right;">5</td>
+<td style="text-align: right;">23m26s</td>
+<td style="text-align: right;">10.24</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="odd">
+<td>brief-3</td>
+<td style="text-align: right;">20</td>
+<td style="text-align: right;">2h05m40s</td>
+<td style="text-align: right;">9.07</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="even">
+<td>brief-7</td>
+<td style="text-align: right;">0*</td>
+<td style="text-align: right;">0s*</td>
+<td style="text-align: right;">0.00*</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+</tbody>
+</table>
+<p><code>*</code> Brief 7 logged one successful combine trial; the CSV
+reports zero because one trial has no inter-trial duration.</p>
+<h2 id="gaps-and-stalls">Gaps And Stalls</h2>
+<p><strong>Brief 2:</strong> Four gaps, longest 1,438.8s between trials
+29 and 30. The harness explains these as a full validation cycle, two
+completion/resume boundaries after trials 12 and 29, and a long NCU
+capture that began redundant 43-pass replays before being stopped and
+rerun with <code>launch-count=1</code>.</p>
+<p><strong>Brief 3:</strong> Four gaps, longest 1,554.0s between trials
+17 and 18. One includes the trial-14 completion/resume boundary; the
+others contain implementation, compilation, full validation, and long
+benchmarks for dynamic pivot planning and persistent TF32/FP16 Jacobi
+variants rather than unexplained silence.</p>
+<p><strong>Brief 4:</strong> One 647.6s gap between trials 3 and 4. The
+worker was executing the expensive n=2048 spectral divide-and-conquer
+validation and benchmark path during this interval.</p>
+<p><strong>Brief 6:</strong> One 722.8s gap between trials 15 and 16.
+Trial 15 was followed by a completion attempt and manager continuation,
+then setup and measurement of the structure-aware block-tridiagonal
+follow-up.</p>
+<p><strong>Brief 8:</strong> One 703.9s gap between trials 15 and 16.
+The harness records required profiling and cache/persistence work around
+the mixed-n512 route; there is no evidence of an idle agent stall.</p>
+<p><strong>Brief 10:</strong> One 653.6s gap between trial 0’s
+validation error and trial 1. The worker fixed the candidate, rebuilt
+it, and ran the full 39-case validation before logging the successful
+trial.</p>
+<h2 id="early-termination-attempts">Early-Termination Attempts</h2>
+<p>Five pre-final <code>task_complete</code> events matched
+completion/done language: brief 2 after trials 12 and 29, brief 3 after
+trial 14, brief 5 after trial 21, and brief 6 after trial 15. Each event
+had a valid <code>brief_stop</code>, and the manager subsequently
+reopened the same brief because concrete work remained. Final completion
+events for all 12 briefs are not counted as attempts.</p>
+<h2 id="other-aberrant-behavior">Other Aberrant Behavior</h2>
+<ul>
+<li>Brief 7’s one successful combine trial is represented as zero trials
+and zero duration in the behavior CSV; this is a report-data edge case,
+not a missing log row.</li>
+<li>Some Codex async tool outputs expose only one side of an
+<code>autocuda run</code> lock pair. Lock aggregates therefore use 452
+fully matched pairs and deliberately exclude unmatched markers.</li>
+<li>Manager, reference, and all 12 brief logs pass
+<code>autocuda schema check log</code>; timestamps are monotonic and no
+hand-edited or fabricated log row was found.</li>
+</ul>
+<h2 id="analysis">Analysis</h2>
+<p>The fleet manager generally replenished slots quickly. The
+exact-width result is stronger than the five-minute bucket count
+suggests: 89.1% of elapsed time had all three briefs live, and most
+short replacement gaps disappear inside a bucket. The notable exception
+is the 14-minute transition at 10:34 UTC, which accounts for a third of
+all under-strength time and followed two simultaneous worker
+completions.</p>
+<p>Throughput is governed more by experiment shape than by agent
+inactivity. Brief 1’s classifier work sustained 18.89 trials/hour, while
+brief 3’s persistent Jacobi kernels required long compile, validation,
+and benchmark cycles and reached 9.07. The gap narratives and harness
+messages consistently show active builds, profiling, or measurement;
+there is no unexplained silent interval over ten minutes.</p>
+<p>The shared B200 is the operational bottleneck. Matched GPU-lock wait
+alone was 2h29m43s, and build-lock wait added 47m13s. Brief 2 paid the
+most and also had the longest worker lifetime, four gaps, and two early
+completion cycles. Its 3.28h fleet-wide lock-wait total is large enough
+that adding more workers on one GPU would probably reduce per-worker
+throughput rather than increase measured trials.</p>
+<p><strong>Recommendations:</strong> keep three workers only when their
+compile/edit phases are staggered; serialize long NCU captures
+explicitly and require focused launch filters; and replace the
+completion/resume loop with a mandatory open-directions check before
+<code>task_complete</code>. Add first-class Codex
+<code>custom_tool_call</code> parsing to the report data builder so
+single-trial briefs and async lock pairs no longer require
+reconstruction.</p>

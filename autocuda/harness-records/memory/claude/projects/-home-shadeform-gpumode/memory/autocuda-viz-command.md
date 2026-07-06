@@ -1,0 +1,16 @@
+---
+name: autocuda-viz-command
+description: "autocuda viz {progress,graph} lives on fork/autocuda-viz (PR"
+metadata: 
+  node_type: memory
+  type: reference
+  originSessionId: 38c6fa93-e03e-4d27-a324-a669066a9f42
+---
+
+`autocuda viz {progress,graph}` (run-map + progress-chart generator) is NOT in the installed 0.4.0 CLI (only the old `autocuda plot`). It lives on branch `fork/autocuda-viz` = **PR #313** (`robobryce:autocuda-viz` → `brycelelbach-private/autocuda`, OPEN). A dedicated `autocuda:viz` SKILL.md is on that branch too but is not registered as a user skill here.
+
+**STATUS 2026-07-02: fixed + rebased + pushed.** The version-skew bug below is fixed on PR #313 (force-pushed, tip `e7f5421e`, MERGEABLE, 30/30 viz tests pass). To run viz locally use the rebased worktree at `/home/shadeform/autocuda-viz-wt` (branch `autocuda-viz-rebase`): `/opt/python-venv/bin/python3 <wt>/plugins/autocuda/lib/autocuda_cli.py viz ...`. New options added in the same commit: `--color-by {brief-kind,speedup}` (speedup = commit-centric slow→fast fill ramp + gradient legend) and `--collapse/--no-collapse` (`--no-collapse` draws every commit vs the collapsed backbone). Also fixed spring (`neato` needs edge `len`), circular (`circo`→`sfdp`, circo blows up on deep near-linear DAGs), and a graphviz `bb` comma/space parse crash.
+
+**Version-skew bug (found & fixed 2026-07-02):** PR #313 forked from `e503f23` and was ~30 commits behind main. Trunk later renamed optimize-tree sibling logs `worker-<N>`→`brief-<N>`, the per-trial unit `iteration`→`trial`, and `_dashboard._is_tree_iteration_row`→`_is_tree_trial_row`. The branch's inherited `_dashboard.load_log` globbed `…-worker-*-log.csv`, so on a modern `brief-*` run it folded in ZERO siblings → `viz graph` errored "no tree-search data ... yet". Main's `load_log` was already correct. **Fix = rebase the branch onto main** (brings the fixed `load_log`), then repair `_viz.py`: `dash._is_tree_iteration_row`→`_is_tree_trial_row`; `_run_stats` count distinct `brief_id` (not `agent_id`) as fan-out width and rename workers/iterations→briefs/trials in the title; guard the title-unit `bench_cols[0]` against the synthesized `parent_trial` pseudo-benchmark. Also fixed a graphviz `bb` parse (`A.graph_attr["bb"]` is space- OR comma-separated by pygraphviz build — normalize both). Test fixtures in `test_autocuda_viz.py` also needed porting to the brief-keyed schema (canonical helpers: `test_autocuda_dashboard.py`).
+
+**To generate graphs for a run** (need graphviz binaries + pygraphviz — present on this host): run the branch CLI directly with venv python, e.g. `/opt/python-venv/bin/python3 <viz-worktree>/plugins/autocuda/lib/autocuda_cli.py viz graph --data-dir <dd> --tag <tag> --list-milestones` → write plain-language `<dd>/<tag>-viz-labels.json` ({sha: one-sentence, ~12-20 words, no jargon; include `best` sha} for the 6 milestones) → `viz graph --labels ... --engine all --kernel linalg/eigh --gpu B200 --harness autocuda:optimize-tree --model "Opus 4.8"` (7 layout PNGs) and `viz progress <manager-log.csv>` (folds all briefs into one running-best curve). Outputs land in the data dir as `<tag>-runmap-<layout>.png` and `<tag>-progress.png`. See [[eigh-tree-run-2026-06-30-resume]].

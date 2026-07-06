@@ -1,0 +1,3351 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang xml:lang>
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>Cost Report: 2026-07-03-13-39-25</title>
+  <style>
+code{white-space: pre-wrap;}
+span.smallcaps{font-variant: small-caps;}
+div.columns{display: flex; gap: min(4vw, 1.5em);}
+div.column{flex: auto; overflow-x: auto;}
+div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
+
+ul.task-list[class]{list-style: none;}
+ul.task-list li input[type="checkbox"] {
+font-size: inherit;
+width: 0.8em;
+margin: 0 0.8em 0.2em -1.6em;
+vertical-align: middle;
+}
+.display.math{display: block; text-align: center; margin: 0.5rem auto;}
+</style>
+  <style type="text/css">body { max-width:1100px; margin:2rem auto; padding:0 1.5rem; font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif; color:#1a1a1a; }
+table { border-collapse:collapse; width:100%; margin:1rem 0; font-size:14px; }
+th,td { border:1px solid #ccc; padding:6px 10px; text-align:left; vertical-align:top; }
+th { background:#f4f4f4; }
+code { background:#f4f4f4; padding:1px 4px; border-radius:3px; }
+pre:not(.mermaid) { background:#f7f7f7; padding:10px; overflow-x:auto; border-radius:5px; }
+pre.mermaid { background:transparent; text-align:center; }
+h1,h2,h3 { line-height:1.25; }
+h1 { border-bottom:2px solid #eee; padding-bottom:.3rem; }
+h2 { border-bottom:1px solid #eee; padding-bottom:.2rem; margin-top:2rem; }
+blockquote { border-left:3px solid #ccc; margin-left:0; padding-left:1rem; color:#555; }
+a { color:#0645ad; }
+</style>
+</head>
+<body>
+<h1 id="cost-report-2026-07-03-13-39-25">Cost Report:
+2026-07-03-13-39-25</h1>
+<h2 id="executive-summary">Executive Summary</h2>
+<p>This single optimize-tree experiment was expensive: 268.6 aggregate
+session-hours over 76.5 elapsed hours through the reporting cutoff, with
+approximately $33.3K of inference spend at public list rates. Inference
+drove dollars through 59.16B cached-input tokens, while walltime
+included 60.4 hours of matched GPU-lock wait and 67.7 hours of measured
+build/GPU execution; this is one run, so there is no cross-experiment
+cost comparison.</p>
+<p><strong>Key takeaways</strong></p>
+<ul>
+<li>The covered sessions processed 59.70B tokens; 99.10% were cached
+input, but those reads still contributed about $29.6K, or 88.7% of
+estimated spend.</li>
+<li>The run compacted 794 times. Late worker and audit sessions
+inherited very large histories: 32 of 80 worker-session anchors cost
+more than 2x the $160 fleet median, and brief 91 reached about $869 with
+20 compactions.</li>
+<li>Paired lock records show 35.2 hours of builds, 32.6 hours of
+exclusive GPU execution, and 60.4 hours of lock wait. The remaining
+140.5 aggregate hours cover inference, reasoning, editing,
+orchestration, and trace gaps.</li>
+<li>The honest result was a 2.486x speedup, from 56.277 ms to 22.648 ms,
+at roughly $558 per percentage point of runtime reduction. Cost from the
+invalidated output-replay work is retained because it was still
+incurred.</li>
+<li>Eighty long-lived worker traces cover all 95 briefs. Fifteen
+continuation briefs have blank inference fields to avoid billing the
+same cumulative thread twice; their usage remains in the session’s
+first-brief anchor.</li>
+</ul>
+<p><strong>Run:</strong> 268.6 aggregate session-hours, approximately
+$33.3K inference spend, 495.6M uncached input tokens, 59.16B cached
+input tokens, 42.4M output tokens, and 794 compactions. Average paired
+build and exclusive-GPU calls were 46.9s and 20.1s; the 85.6s longest
+build and 571.5s longest exclusive call fit
+<code>environment.md</code>’s custom-build and profiler budgets, so the
+run cost came from volume, context growth, and queueing rather than
+systematically undersized timeouts.</p>
+<h3 id="cost-flow">Cost Flow</h3>
+<pre class="mermaid">flowchart LR
+    I["495.6M uncached input"] --> T["59.70B total tokens"]
+    C["59.16B cached input"] --> T
+    O["42.4M output"] --> T
+    T --> D["Approximately USD 33.3K<br/>inference spend"]
+    S["268.6 session-hours"] --> E["67.7h measured execution"]
+    S --> W["60.4h lock wait"]
+    S --> A["140.5h inference, reasoning,<br/>editing, orchestration, and trace gaps"]
+    D --> R["Honest result<br/>2.486x speedup"]</pre>
+<h2 id="token-totals">Token Totals</h2>
+<p><strong>59.70B tokens</strong></p>
+<table>
+<thead>
+<tr class="header">
+<th>Token type</th>
+<th style="text-align: right;">Tokens</th>
+<th style="text-align: right;">Share</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Input</td>
+<td style="text-align: right;">495.6M</td>
+<td style="text-align: right;">0.83%</td>
+</tr>
+<tr class="even">
+<td>Cached input</td>
+<td style="text-align: right;">59.16B</td>
+<td style="text-align: right;">99.10%</td>
+</tr>
+<tr class="odd">
+<td>Output</td>
+<td style="text-align: right;">42.4M</td>
+<td style="text-align: right;">0.07%</td>
+</tr>
+<tr class="even">
+<td><strong>Total</strong></td>
+<td style="text-align: right;"><strong>59.70B</strong></td>
+<td style="text-align: right;"><strong>100.00%</strong></td>
+</tr>
+</tbody>
+</table>
+<p>Codex reports cumulative input inclusive of cache reads; the data
+builder subtracts cached input to make the Input and Cached input rows
+disjoint. The total includes the manager, pre-run research, three
+interrupted worker attempts, and seven post-run experiment audit/cleanup
+sessions. Codex exposed no cache-creation counter, so cache writes are
+absent from both tokens and cost.</p>
+<h2 id="walltime-breakdown">Walltime Breakdown</h2>
+<p><code>Bench calls</code> means observed exclusive <code>gpu-0</code>
+acquisitions and therefore includes validation, benchmark, and profile
+calls. Counts below are reconstructed from raw Codex traces because the
+stock cost builder does not parse Codex custom tool calls; 2,696 build
+and 5,823 exclusive records had matched releases, totaling 126,535.9s
+and 117,319.6s of execution, with 217,418.4s of paired lock wait.</p>
+<p>Durations for briefs are numeric-trial spans from the CSV, so
+<code>0s</code> means the log had only one numeric trial. The
+<code>n/a</code> rows are continuation briefs 42-46, 50, 52-57, and
+66-68; their calls and tokens are already included in the earlier
+long-lived worker-session anchors that executed them. An anchor’s call
+count can therefore span later briefs and should not be divided by its
+displayed first-brief duration. This is single-experiment mode, so there
+is no totals row.</p>
+<table>
+<thead>
+<tr class="header">
+<th>Branch</th>
+<th style="text-align: right;">Duration</th>
+<th style="text-align: right;">Build calls</th>
+<th style="text-align: right;">Bench calls</th>
+<th style="text-align: right;">Other tool calls</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>brief-0</td>
+<td style="text-align: right;">3h26m30s</td>
+<td style="text-align: right;">40</td>
+<td style="text-align: right;">84</td>
+<td style="text-align: right;">947</td>
+</tr>
+<tr class="even">
+<td>brief-1</td>
+<td style="text-align: right;">3h43m37s</td>
+<td style="text-align: right;">40</td>
+<td style="text-align: right;">80</td>
+<td style="text-align: right;">1013</td>
+</tr>
+<tr class="odd">
+<td>brief-2</td>
+<td style="text-align: right;">5h31m42s</td>
+<td style="text-align: right;">78</td>
+<td style="text-align: right;">152</td>
+<td style="text-align: right;">1313</td>
+</tr>
+<tr class="even">
+<td>brief-3</td>
+<td style="text-align: right;">2h31m51s</td>
+<td style="text-align: right;">33</td>
+<td style="text-align: right;">69</td>
+<td style="text-align: right;">672</td>
+</tr>
+<tr class="odd">
+<td>brief-4</td>
+<td style="text-align: right;">5h08m42s</td>
+<td style="text-align: right;">58</td>
+<td style="text-align: right;">114</td>
+<td style="text-align: right;">1084</td>
+</tr>
+<tr class="even">
+<td>brief-5</td>
+<td style="text-align: right;">2h52m56s</td>
+<td style="text-align: right;">48</td>
+<td style="text-align: right;">80</td>
+<td style="text-align: right;">725</td>
+</tr>
+<tr class="odd">
+<td>brief-6</td>
+<td style="text-align: right;">1h02m50s</td>
+<td style="text-align: right;">25</td>
+<td style="text-align: right;">41</td>
+<td style="text-align: right;">323</td>
+</tr>
+<tr class="even">
+<td>brief-7</td>
+<td style="text-align: right;">4h00m57s</td>
+<td style="text-align: right;">54</td>
+<td style="text-align: right;">125</td>
+<td style="text-align: right;">1057</td>
+</tr>
+<tr class="odd">
+<td>brief-8</td>
+<td style="text-align: right;">2h48m52s</td>
+<td style="text-align: right;">48</td>
+<td style="text-align: right;">95</td>
+<td style="text-align: right;">894</td>
+</tr>
+<tr class="even">
+<td>brief-9</td>
+<td style="text-align: right;">37m02s</td>
+<td style="text-align: right;">8</td>
+<td style="text-align: right;">24</td>
+<td style="text-align: right;">182</td>
+</tr>
+<tr class="odd">
+<td>brief-10</td>
+<td style="text-align: right;">1h53m05s</td>
+<td style="text-align: right;">32</td>
+<td style="text-align: right;">61</td>
+<td style="text-align: right;">467</td>
+</tr>
+<tr class="even">
+<td>brief-11</td>
+<td style="text-align: right;">2h56m05s</td>
+<td style="text-align: right;">18</td>
+<td style="text-align: right;">113</td>
+<td style="text-align: right;">665</td>
+</tr>
+<tr class="odd">
+<td>brief-12</td>
+<td style="text-align: right;">58m20s</td>
+<td style="text-align: right;">14</td>
+<td style="text-align: right;">41</td>
+<td style="text-align: right;">255</td>
+</tr>
+<tr class="even">
+<td>brief-13</td>
+<td style="text-align: right;">3h21m13s</td>
+<td style="text-align: right;">49</td>
+<td style="text-align: right;">110</td>
+<td style="text-align: right;">990</td>
+</tr>
+<tr class="odd">
+<td>brief-14</td>
+<td style="text-align: right;">1h21m42s</td>
+<td style="text-align: right;">16</td>
+<td style="text-align: right;">45</td>
+<td style="text-align: right;">424</td>
+</tr>
+<tr class="even">
+<td>brief-15</td>
+<td style="text-align: right;">29m30s</td>
+<td style="text-align: right;">8</td>
+<td style="text-align: right;">33</td>
+<td style="text-align: right;">156</td>
+</tr>
+<tr class="odd">
+<td>brief-16</td>
+<td style="text-align: right;">38m59s</td>
+<td style="text-align: right;">9</td>
+<td style="text-align: right;">27</td>
+<td style="text-align: right;">170</td>
+</tr>
+<tr class="even">
+<td>brief-17</td>
+<td style="text-align: right;">55m41s</td>
+<td style="text-align: right;">17</td>
+<td style="text-align: right;">35</td>
+<td style="text-align: right;">257</td>
+</tr>
+<tr class="odd">
+<td>brief-18</td>
+<td style="text-align: right;">8m00s</td>
+<td style="text-align: right;">2</td>
+<td style="text-align: right;">10</td>
+<td style="text-align: right;">103</td>
+</tr>
+<tr class="even">
+<td>brief-19</td>
+<td style="text-align: right;">1h20m16s</td>
+<td style="text-align: right;">25</td>
+<td style="text-align: right;">54</td>
+<td style="text-align: right;">396</td>
+</tr>
+<tr class="odd">
+<td>brief-20</td>
+<td style="text-align: right;">0s</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">5</td>
+<td style="text-align: right;">58</td>
+</tr>
+<tr class="even">
+<td>brief-21</td>
+<td style="text-align: right;">0s</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">10</td>
+<td style="text-align: right;">68</td>
+</tr>
+<tr class="odd">
+<td>brief-22</td>
+<td style="text-align: right;">7m59s</td>
+<td style="text-align: right;">2</td>
+<td style="text-align: right;">6</td>
+<td style="text-align: right;">117</td>
+</tr>
+<tr class="even">
+<td>brief-23</td>
+<td style="text-align: right;">1h23m56s</td>
+<td style="text-align: right;">26</td>
+<td style="text-align: right;">58</td>
+<td style="text-align: right;">402</td>
+</tr>
+<tr class="odd">
+<td>brief-24</td>
+<td style="text-align: right;">20m24s</td>
+<td style="text-align: right;">4</td>
+<td style="text-align: right;">16</td>
+<td style="text-align: right;">194</td>
+</tr>
+<tr class="even">
+<td>brief-25</td>
+<td style="text-align: right;">3h10m46s</td>
+<td style="text-align: right;">46</td>
+<td style="text-align: right;">95</td>
+<td style="text-align: right;">1117</td>
+</tr>
+<tr class="odd">
+<td>brief-26</td>
+<td style="text-align: right;">6m21s</td>
+<td style="text-align: right;">2</td>
+<td style="text-align: right;">7</td>
+<td style="text-align: right;">71</td>
+</tr>
+<tr class="even">
+<td>brief-27</td>
+<td style="text-align: right;">35m05s</td>
+<td style="text-align: right;">11</td>
+<td style="text-align: right;">29</td>
+<td style="text-align: right;">191</td>
+</tr>
+<tr class="odd">
+<td>brief-28</td>
+<td style="text-align: right;">6m20s</td>
+<td style="text-align: right;">3</td>
+<td style="text-align: right;">15</td>
+<td style="text-align: right;">59</td>
+</tr>
+<tr class="even">
+<td>brief-29</td>
+<td style="text-align: right;">1h34m10s</td>
+<td style="text-align: right;">26</td>
+<td style="text-align: right;">55</td>
+<td style="text-align: right;">558</td>
+</tr>
+<tr class="odd">
+<td>brief-30</td>
+<td style="text-align: right;">3h36m07s</td>
+<td style="text-align: right;">48</td>
+<td style="text-align: right;">157</td>
+<td style="text-align: right;">856</td>
+</tr>
+<tr class="even">
+<td>brief-31</td>
+<td style="text-align: right;">1h20m14s</td>
+<td style="text-align: right;">24</td>
+<td style="text-align: right;">51</td>
+<td style="text-align: right;">368</td>
+</tr>
+<tr class="odd">
+<td>brief-32</td>
+<td style="text-align: right;">2h15m13s</td>
+<td style="text-align: right;">27</td>
+<td style="text-align: right;">55</td>
+<td style="text-align: right;">545</td>
+</tr>
+<tr class="even">
+<td>brief-33</td>
+<td style="text-align: right;">2h31m48s</td>
+<td style="text-align: right;">39</td>
+<td style="text-align: right;">88</td>
+<td style="text-align: right;">665</td>
+</tr>
+<tr class="odd">
+<td>brief-34</td>
+<td style="text-align: right;">1h02m03s</td>
+<td style="text-align: right;">13</td>
+<td style="text-align: right;">28</td>
+<td style="text-align: right;">288</td>
+</tr>
+<tr class="even">
+<td>brief-35</td>
+<td style="text-align: right;">1h07m51s</td>
+<td style="text-align: right;">17</td>
+<td style="text-align: right;">43</td>
+<td style="text-align: right;">309</td>
+</tr>
+<tr class="odd">
+<td>brief-36</td>
+<td style="text-align: right;">53m03s</td>
+<td style="text-align: right;">16</td>
+<td style="text-align: right;">29</td>
+<td style="text-align: right;">260</td>
+</tr>
+<tr class="even">
+<td>brief-37</td>
+<td style="text-align: right;">14m01s</td>
+<td style="text-align: right;">4</td>
+<td style="text-align: right;">9</td>
+<td style="text-align: right;">70</td>
+</tr>
+<tr class="odd">
+<td>brief-38</td>
+<td style="text-align: right;">15m46s</td>
+<td style="text-align: right;">7</td>
+<td style="text-align: right;">15</td>
+<td style="text-align: right;">116</td>
+</tr>
+<tr class="even">
+<td>brief-39</td>
+<td style="text-align: right;">2m54s</td>
+<td style="text-align: right;">158</td>
+<td style="text-align: right;">342</td>
+<td style="text-align: right;">2746</td>
+</tr>
+<tr class="odd">
+<td>brief-40</td>
+<td style="text-align: right;">1h58m18s</td>
+<td style="text-align: right;">28</td>
+<td style="text-align: right;">56</td>
+<td style="text-align: right;">554</td>
+</tr>
+<tr class="even">
+<td>brief-41</td>
+<td style="text-align: right;">38m56s</td>
+<td style="text-align: right;">27</td>
+<td style="text-align: right;">58</td>
+<td style="text-align: right;">626</td>
+</tr>
+<tr class="odd">
+<td>brief-42</td>
+<td style="text-align: right;">49m36s</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+</tr>
+<tr class="even">
+<td>brief-43</td>
+<td style="text-align: right;">1m53s</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+</tr>
+<tr class="odd">
+<td>brief-44</td>
+<td style="text-align: right;">18m27s</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+</tr>
+<tr class="even">
+<td>brief-45</td>
+<td style="text-align: right;">4h47m42s</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+</tr>
+<tr class="odd">
+<td>brief-46</td>
+<td style="text-align: right;">24m46s</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+</tr>
+<tr class="even">
+<td>brief-47</td>
+<td style="text-align: right;">55m17s</td>
+<td style="text-align: right;">41</td>
+<td style="text-align: right;">86</td>
+<td style="text-align: right;">608</td>
+</tr>
+<tr class="odd">
+<td>brief-48</td>
+<td style="text-align: right;">9m12s</td>
+<td style="text-align: right;">2</td>
+<td style="text-align: right;">6</td>
+<td style="text-align: right;">98</td>
+</tr>
+<tr class="even">
+<td>brief-49</td>
+<td style="text-align: right;">3h30m16s</td>
+<td style="text-align: right;">150</td>
+<td style="text-align: right;">327</td>
+<td style="text-align: right;">3012</td>
+</tr>
+<tr class="odd">
+<td>brief-50</td>
+<td style="text-align: right;">1h12m17s</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+</tr>
+<tr class="even">
+<td>brief-51</td>
+<td style="text-align: right;">1h21m46s</td>
+<td style="text-align: right;">73</td>
+<td style="text-align: right;">152</td>
+<td style="text-align: right;">1307</td>
+</tr>
+<tr class="odd">
+<td>brief-52</td>
+<td style="text-align: right;">1m36s</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+</tr>
+<tr class="even">
+<td>brief-53</td>
+<td style="text-align: right;">3h08m08s</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+</tr>
+<tr class="odd">
+<td>brief-54</td>
+<td style="text-align: right;">57m23s</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+</tr>
+<tr class="even">
+<td>brief-55</td>
+<td style="text-align: right;">4h57m02s</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+</tr>
+<tr class="odd">
+<td>brief-56</td>
+<td style="text-align: right;">56m48s</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+</tr>
+<tr class="even">
+<td>brief-57</td>
+<td style="text-align: right;">5h07m41s</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+</tr>
+<tr class="odd">
+<td>brief-58</td>
+<td style="text-align: right;">1h00m45s</td>
+<td style="text-align: right;">13</td>
+<td style="text-align: right;">42</td>
+<td style="text-align: right;">355</td>
+</tr>
+<tr class="even">
+<td>brief-59</td>
+<td style="text-align: right;">1m30s</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">4</td>
+<td style="text-align: right;">66</td>
+</tr>
+<tr class="odd">
+<td>brief-60</td>
+<td style="text-align: right;">2h05m52s</td>
+<td style="text-align: right;">25</td>
+<td style="text-align: right;">52</td>
+<td style="text-align: right;">618</td>
+</tr>
+<tr class="even">
+<td>brief-61</td>
+<td style="text-align: right;">7h17m17s</td>
+<td style="text-align: right;">82</td>
+<td style="text-align: right;">170</td>
+<td style="text-align: right;">1784</td>
+</tr>
+<tr class="odd">
+<td>brief-62</td>
+<td style="text-align: right;">4h10m39s</td>
+<td style="text-align: right;">47</td>
+<td style="text-align: right;">104</td>
+<td style="text-align: right;">1038</td>
+</tr>
+<tr class="even">
+<td>brief-63</td>
+<td style="text-align: right;">5h30m30s</td>
+<td style="text-align: right;">167</td>
+<td style="text-align: right;">304</td>
+<td style="text-align: right;">2821</td>
+</tr>
+<tr class="odd">
+<td>brief-64</td>
+<td style="text-align: right;">4h05m42s</td>
+<td style="text-align: right;">53</td>
+<td style="text-align: right;">114</td>
+<td style="text-align: right;">1018</td>
+</tr>
+<tr class="even">
+<td>brief-65</td>
+<td style="text-align: right;">16m15s</td>
+<td style="text-align: right;">65</td>
+<td style="text-align: right;">153</td>
+<td style="text-align: right;">1267</td>
+</tr>
+<tr class="odd">
+<td>brief-66</td>
+<td style="text-align: right;">21m24s</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+</tr>
+<tr class="even">
+<td>brief-67</td>
+<td style="text-align: right;">5h13m53s</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+</tr>
+<tr class="odd">
+<td>brief-68</td>
+<td style="text-align: right;">3h37m05s</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+</tr>
+<tr class="even">
+<td>brief-69</td>
+<td style="text-align: right;">2h24m12s</td>
+<td style="text-align: right;">37</td>
+<td style="text-align: right;">75</td>
+<td style="text-align: right;">644</td>
+</tr>
+<tr class="odd">
+<td>brief-70</td>
+<td style="text-align: right;">1h24m05s</td>
+<td style="text-align: right;">30</td>
+<td style="text-align: right;">55</td>
+<td style="text-align: right;">466</td>
+</tr>
+<tr class="even">
+<td>brief-71</td>
+<td style="text-align: right;">2h29m26s</td>
+<td style="text-align: right;">29</td>
+<td style="text-align: right;">81</td>
+<td style="text-align: right;">635</td>
+</tr>
+<tr class="odd">
+<td>brief-72</td>
+<td style="text-align: right;">2h56m42s</td>
+<td style="text-align: right;">36</td>
+<td style="text-align: right;">78</td>
+<td style="text-align: right;">749</td>
+</tr>
+<tr class="even">
+<td>brief-73</td>
+<td style="text-align: right;">2h24m57s</td>
+<td style="text-align: right;">32</td>
+<td style="text-align: right;">73</td>
+<td style="text-align: right;">652</td>
+</tr>
+<tr class="odd">
+<td>brief-74</td>
+<td style="text-align: right;">39m34s</td>
+<td style="text-align: right;">9</td>
+<td style="text-align: right;">27</td>
+<td style="text-align: right;">192</td>
+</tr>
+<tr class="even">
+<td>brief-75</td>
+<td style="text-align: right;">42m12s</td>
+<td style="text-align: right;">10</td>
+<td style="text-align: right;">24</td>
+<td style="text-align: right;">215</td>
+</tr>
+<tr class="odd">
+<td>brief-76</td>
+<td style="text-align: right;">1h57m22s</td>
+<td style="text-align: right;">24</td>
+<td style="text-align: right;">51</td>
+<td style="text-align: right;">648</td>
+</tr>
+<tr class="even">
+<td>brief-77</td>
+<td style="text-align: right;">23m35s</td>
+<td style="text-align: right;">8</td>
+<td style="text-align: right;">21</td>
+<td style="text-align: right;">164</td>
+</tr>
+<tr class="odd">
+<td>brief-78</td>
+<td style="text-align: right;">2h59m59s</td>
+<td style="text-align: right;">41</td>
+<td style="text-align: right;">93</td>
+<td style="text-align: right;">885</td>
+</tr>
+<tr class="even">
+<td>brief-79</td>
+<td style="text-align: right;">3h18m29s</td>
+<td style="text-align: right;">39</td>
+<td style="text-align: right;">88</td>
+<td style="text-align: right;">860</td>
+</tr>
+<tr class="odd">
+<td>brief-80</td>
+<td style="text-align: right;">3h05m10s</td>
+<td style="text-align: right;">40</td>
+<td style="text-align: right;">86</td>
+<td style="text-align: right;">845</td>
+</tr>
+<tr class="even">
+<td>brief-81</td>
+<td style="text-align: right;">2h25m03s</td>
+<td style="text-align: right;">32</td>
+<td style="text-align: right;">50</td>
+<td style="text-align: right;">582</td>
+</tr>
+<tr class="odd">
+<td>brief-82</td>
+<td style="text-align: right;">3h13m12s</td>
+<td style="text-align: right;">45</td>
+<td style="text-align: right;">89</td>
+<td style="text-align: right;">887</td>
+</tr>
+<tr class="even">
+<td>brief-83</td>
+<td style="text-align: right;">1h11m25s</td>
+<td style="text-align: right;">18</td>
+<td style="text-align: right;">43</td>
+<td style="text-align: right;">319</td>
+</tr>
+<tr class="odd">
+<td>brief-84</td>
+<td style="text-align: right;">31m12s</td>
+<td style="text-align: right;">10</td>
+<td style="text-align: right;">25</td>
+<td style="text-align: right;">172</td>
+</tr>
+<tr class="even">
+<td>brief-85</td>
+<td style="text-align: right;">38m53s</td>
+<td style="text-align: right;">12</td>
+<td style="text-align: right;">23</td>
+<td style="text-align: right;">193</td>
+</tr>
+<tr class="odd">
+<td>brief-86</td>
+<td style="text-align: right;">38m09s</td>
+<td style="text-align: right;">11</td>
+<td style="text-align: right;">20</td>
+<td style="text-align: right;">185</td>
+</tr>
+<tr class="even">
+<td>brief-87</td>
+<td style="text-align: right;">45m42s</td>
+<td style="text-align: right;">16</td>
+<td style="text-align: right;">28</td>
+<td style="text-align: right;">204</td>
+</tr>
+<tr class="odd">
+<td>brief-88</td>
+<td style="text-align: right;">1h34m45s</td>
+<td style="text-align: right;">26</td>
+<td style="text-align: right;">57</td>
+<td style="text-align: right;">435</td>
+</tr>
+<tr class="even">
+<td>brief-89</td>
+<td style="text-align: right;">7h22m22s</td>
+<td style="text-align: right;">91</td>
+<td style="text-align: right;">150</td>
+<td style="text-align: right;">1624</td>
+</tr>
+<tr class="odd">
+<td>brief-90</td>
+<td style="text-align: right;">2h25m12s</td>
+<td style="text-align: right;">37</td>
+<td style="text-align: right;">74</td>
+<td style="text-align: right;">632</td>
+</tr>
+<tr class="even">
+<td>brief-91</td>
+<td style="text-align: right;">7h37m20s</td>
+<td style="text-align: right;">83</td>
+<td style="text-align: right;">133</td>
+<td style="text-align: right;">1894</td>
+</tr>
+<tr class="odd">
+<td>brief-92</td>
+<td style="text-align: right;">5h19m47s</td>
+<td style="text-align: right;">55</td>
+<td style="text-align: right;">125</td>
+<td style="text-align: right;">1195</td>
+</tr>
+<tr class="even">
+<td>brief-93</td>
+<td style="text-align: right;">1h39m27s</td>
+<td style="text-align: right;">12</td>
+<td style="text-align: right;">26</td>
+<td style="text-align: right;">408</td>
+</tr>
+<tr class="odd">
+<td>brief-94</td>
+<td style="text-align: right;">0s</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">4</td>
+<td style="text-align: right;">73</td>
+</tr>
+<tr class="even">
+<td>steered/audit_brief93</td>
+<td style="text-align: right;">2m16s</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">11</td>
+</tr>
+<tr class="odd">
+<td>steered/audit_brief94_submit</td>
+<td style="text-align: right;">3m23s</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">18</td>
+</tr>
+<tr class="even">
+<td>steered/audit_log_edits</td>
+<td style="text-align: right;">1m43s</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">15</td>
+</tr>
+<tr class="odd">
+<td>steered/audit_runwide_cache</td>
+<td style="text-align: right;">5m06s</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">30</td>
+</tr>
+<tr class="even">
+<td>steered/b200_eigh_research</td>
+<td style="text-align: right;">4m41s</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">31</td>
+</tr>
+<tr class="odd">
+<td>steered/best_clean_local</td>
+<td style="text-align: right;">1m18s</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">10</td>
+</tr>
+<tr class="even">
+<td>steered/best_clean_submission</td>
+<td style="text-align: right;">1m04s</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">11</td>
+</tr>
+<tr class="odd">
+<td>steered/brief-87-interrupted</td>
+<td style="text-align: right;">3m40s</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">21</td>
+</tr>
+<tr class="even">
+<td>steered/brief-88-interrupted</td>
+<td style="text-align: right;">3m38s</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">17</td>
+</tr>
+<tr class="odd">
+<td>steered/brief-89-interrupted</td>
+<td style="text-align: right;">3m21s</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">17</td>
+</tr>
+<tr class="even">
+<td>steered/launch-attempt</td>
+<td style="text-align: right;">9s</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">0</td>
+</tr>
+<tr class="odd">
+<td>steered/manager</td>
+<td style="text-align: right;">76h27m50s</td>
+<td style="text-align: right;">60</td>
+<td style="text-align: right;">116</td>
+<td style="text-align: right;">7444</td>
+</tr>
+<tr class="even">
+<td>steered/popcorn_delete_help</td>
+<td style="text-align: right;">1m54s</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">17</td>
+</tr>
+</tbody>
+</table>
+<h2 id="tool-call-distribution">Tool Call Distribution</h2>
+<p>The stock CSV’s Codex tool breakdown is blank, so this table is
+reconstructed directly from the same 93 selected session JSONLs. The
+traces contain 48,949 <code>exec</code>, 15,067 <code>wait</code>, and
+3,773 <code>wait_agent</code> calls; no web tool calls were recorded.
+Long-lived worker continuations remain attributed to the first brief in
+each session.</p>
+<table>
+<thead>
+<tr class="header">
+<th>Branch</th>
+<th>Tool</th>
+<th style="text-align: right;">Count</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>brief-0</td>
+<td>exec</td>
+<td style="text-align: right;">607</td>
+</tr>
+<tr class="even">
+<td>brief-0</td>
+<td>wait</td>
+<td style="text-align: right;">459</td>
+</tr>
+<tr class="odd">
+<td>brief-0</td>
+<td>send_message</td>
+<td style="text-align: right;">4</td>
+</tr>
+<tr class="even">
+<td>brief-0</td>
+<td>list_agents</td>
+<td style="text-align: right;">1</td>
+</tr>
+<tr class="odd">
+<td>brief-1</td>
+<td>exec</td>
+<td style="text-align: right;">923</td>
+</tr>
+<tr class="even">
+<td>brief-1</td>
+<td>wait</td>
+<td style="text-align: right;">203</td>
+</tr>
+<tr class="odd">
+<td>brief-1</td>
+<td>send_message</td>
+<td style="text-align: right;">6</td>
+</tr>
+<tr class="even">
+<td>brief-1</td>
+<td>list_agents</td>
+<td style="text-align: right;">1</td>
+</tr>
+<tr class="odd">
+<td>brief-2</td>
+<td>exec</td>
+<td style="text-align: right;">1110</td>
+</tr>
+<tr class="even">
+<td>brief-2</td>
+<td>wait</td>
+<td style="text-align: right;">424</td>
+</tr>
+<tr class="odd">
+<td>brief-2</td>
+<td>send_message</td>
+<td style="text-align: right;">8</td>
+</tr>
+<tr class="even">
+<td>brief-2</td>
+<td>list_agents</td>
+<td style="text-align: right;">1</td>
+</tr>
+<tr class="odd">
+<td>brief-3</td>
+<td>exec</td>
+<td style="text-align: right;">652</td>
+</tr>
+<tr class="even">
+<td>brief-3</td>
+<td>wait</td>
+<td style="text-align: right;">120</td>
+</tr>
+<tr class="odd">
+<td>brief-3</td>
+<td>send_message</td>
+<td style="text-align: right;">2</td>
+</tr>
+<tr class="even">
+<td>brief-4</td>
+<td>exec</td>
+<td style="text-align: right;">794</td>
+</tr>
+<tr class="odd">
+<td>brief-4</td>
+<td>wait</td>
+<td style="text-align: right;">458</td>
+</tr>
+<tr class="even">
+<td>brief-4</td>
+<td>send_message</td>
+<td style="text-align: right;">4</td>
+</tr>
+<tr class="odd">
+<td>brief-5</td>
+<td>exec</td>
+<td style="text-align: right;">615</td>
+</tr>
+<tr class="even">
+<td>brief-5</td>
+<td>wait</td>
+<td style="text-align: right;">237</td>
+</tr>
+<tr class="odd">
+<td>brief-5</td>
+<td>wait_agent</td>
+<td style="text-align: right;">1</td>
+</tr>
+<tr class="even">
+<td>brief-6</td>
+<td>exec</td>
+<td style="text-align: right;">305</td>
+</tr>
+<tr class="odd">
+<td>brief-6</td>
+<td>wait</td>
+<td style="text-align: right;">82</td>
+</tr>
+<tr class="even">
+<td>brief-6</td>
+<td>send_message</td>
+<td style="text-align: right;">2</td>
+</tr>
+<tr class="odd">
+<td>brief-7</td>
+<td>exec</td>
+<td style="text-align: right;">1053</td>
+</tr>
+<tr class="even">
+<td>brief-7</td>
+<td>wait</td>
+<td style="text-align: right;">174</td>
+</tr>
+<tr class="odd">
+<td>brief-7</td>
+<td>send_message</td>
+<td style="text-align: right;">9</td>
+</tr>
+<tr class="even">
+<td>brief-8</td>
+<td>exec</td>
+<td style="text-align: right;">696</td>
+</tr>
+<tr class="odd">
+<td>brief-8</td>
+<td>wait</td>
+<td style="text-align: right;">340</td>
+</tr>
+<tr class="even">
+<td>brief-8</td>
+<td>send_message</td>
+<td style="text-align: right;">1</td>
+</tr>
+<tr class="odd">
+<td>brief-9</td>
+<td>exec</td>
+<td style="text-align: right;">160</td>
+</tr>
+<tr class="even">
+<td>brief-9</td>
+<td>wait</td>
+<td style="text-align: right;">54</td>
+</tr>
+<tr class="odd">
+<td>brief-10</td>
+<td>exec</td>
+<td style="text-align: right;">393</td>
+</tr>
+<tr class="even">
+<td>brief-10</td>
+<td>wait</td>
+<td style="text-align: right;">166</td>
+</tr>
+<tr class="odd">
+<td>brief-10</td>
+<td>send_message</td>
+<td style="text-align: right;">1</td>
+</tr>
+<tr class="even">
+<td>brief-11</td>
+<td>exec</td>
+<td style="text-align: right;">548</td>
+</tr>
+<tr class="odd">
+<td>brief-11</td>
+<td>wait</td>
+<td style="text-align: right;">247</td>
+</tr>
+<tr class="even">
+<td>brief-11</td>
+<td>send_message</td>
+<td style="text-align: right;">1</td>
+</tr>
+<tr class="odd">
+<td>brief-12</td>
+<td>exec</td>
+<td style="text-align: right;">238</td>
+</tr>
+<tr class="even">
+<td>brief-12</td>
+<td>wait</td>
+<td style="text-align: right;">72</td>
+</tr>
+<tr class="odd">
+<td>brief-13</td>
+<td>exec</td>
+<td style="text-align: right;">1008</td>
+</tr>
+<tr class="even">
+<td>brief-13</td>
+<td>wait</td>
+<td style="text-align: right;">141</td>
+</tr>
+<tr class="odd">
+<td>brief-14</td>
+<td>exec</td>
+<td style="text-align: right;">485</td>
+</tr>
+<tr class="even">
+<td>brief-15</td>
+<td>exec</td>
+<td style="text-align: right;">148</td>
+</tr>
+<tr class="odd">
+<td>brief-15</td>
+<td>wait</td>
+<td style="text-align: right;">49</td>
+</tr>
+<tr class="even">
+<td>brief-16</td>
+<td>exec</td>
+<td style="text-align: right;">159</td>
+</tr>
+<tr class="odd">
+<td>brief-16</td>
+<td>wait</td>
+<td style="text-align: right;">47</td>
+</tr>
+<tr class="even">
+<td>brief-17</td>
+<td>exec</td>
+<td style="text-align: right;">231</td>
+</tr>
+<tr class="odd">
+<td>brief-17</td>
+<td>wait</td>
+<td style="text-align: right;">78</td>
+</tr>
+<tr class="even">
+<td>brief-18</td>
+<td>exec</td>
+<td style="text-align: right;">98</td>
+</tr>
+<tr class="odd">
+<td>brief-18</td>
+<td>wait</td>
+<td style="text-align: right;">17</td>
+</tr>
+<tr class="even">
+<td>brief-19</td>
+<td>exec</td>
+<td style="text-align: right;">357</td>
+</tr>
+<tr class="odd">
+<td>brief-19</td>
+<td>wait</td>
+<td style="text-align: right;">118</td>
+</tr>
+<tr class="even">
+<td>brief-20</td>
+<td>exec</td>
+<td style="text-align: right;">50</td>
+</tr>
+<tr class="odd">
+<td>brief-20</td>
+<td>wait</td>
+<td style="text-align: right;">14</td>
+</tr>
+<tr class="even">
+<td>brief-21</td>
+<td>exec</td>
+<td style="text-align: right;">79</td>
+</tr>
+<tr class="odd">
+<td>brief-22</td>
+<td>exec</td>
+<td style="text-align: right;">94</td>
+</tr>
+<tr class="even">
+<td>brief-22</td>
+<td>wait</td>
+<td style="text-align: right;">31</td>
+</tr>
+<tr class="odd">
+<td>brief-23</td>
+<td>exec</td>
+<td style="text-align: right;">385</td>
+</tr>
+<tr class="even">
+<td>brief-23</td>
+<td>wait</td>
+<td style="text-align: right;">100</td>
+</tr>
+<tr class="odd">
+<td>brief-23</td>
+<td>list_agents</td>
+<td style="text-align: right;">1</td>
+</tr>
+<tr class="even">
+<td>brief-24</td>
+<td>exec</td>
+<td style="text-align: right;">214</td>
+</tr>
+<tr class="odd">
+<td>brief-25</td>
+<td>exec</td>
+<td style="text-align: right;">1257</td>
+</tr>
+<tr class="even">
+<td>brief-25</td>
+<td>send_message</td>
+<td style="text-align: right;">1</td>
+</tr>
+<tr class="odd">
+<td>brief-26</td>
+<td>exec</td>
+<td style="text-align: right;">56</td>
+</tr>
+<tr class="even">
+<td>brief-26</td>
+<td>wait</td>
+<td style="text-align: right;">24</td>
+</tr>
+<tr class="odd">
+<td>brief-27</td>
+<td>exec</td>
+<td style="text-align: right;">185</td>
+</tr>
+<tr class="even">
+<td>brief-27</td>
+<td>wait</td>
+<td style="text-align: right;">46</td>
+</tr>
+<tr class="odd">
+<td>brief-28</td>
+<td>exec</td>
+<td style="text-align: right;">59</td>
+</tr>
+<tr class="even">
+<td>brief-28</td>
+<td>wait</td>
+<td style="text-align: right;">17</td>
+</tr>
+<tr class="odd">
+<td>brief-28</td>
+<td>send_message</td>
+<td style="text-align: right;">1</td>
+</tr>
+<tr class="even">
+<td>brief-29</td>
+<td>exec</td>
+<td style="text-align: right;">602</td>
+</tr>
+<tr class="odd">
+<td>brief-29</td>
+<td>wait</td>
+<td style="text-align: right;">37</td>
+</tr>
+<tr class="even">
+<td>brief-30</td>
+<td>exec</td>
+<td style="text-align: right;">773</td>
+</tr>
+<tr class="odd">
+<td>brief-30</td>
+<td>wait</td>
+<td style="text-align: right;">280</td>
+</tr>
+<tr class="even">
+<td>brief-30</td>
+<td>send_message</td>
+<td style="text-align: right;">8</td>
+</tr>
+<tr class="odd">
+<td>brief-31</td>
+<td>exec</td>
+<td style="text-align: right;">330</td>
+</tr>
+<tr class="even">
+<td>brief-31</td>
+<td>wait</td>
+<td style="text-align: right;">111</td>
+</tr>
+<tr class="odd">
+<td>brief-31</td>
+<td>send_message</td>
+<td style="text-align: right;">2</td>
+</tr>
+<tr class="even">
+<td>brief-32</td>
+<td>exec</td>
+<td style="text-align: right;">470</td>
+</tr>
+<tr class="odd">
+<td>brief-32</td>
+<td>wait</td>
+<td style="text-align: right;">157</td>
+</tr>
+<tr class="even">
+<td>brief-33</td>
+<td>exec</td>
+<td style="text-align: right;">577</td>
+</tr>
+<tr class="odd">
+<td>brief-33</td>
+<td>wait</td>
+<td style="text-align: right;">213</td>
+</tr>
+<tr class="even">
+<td>brief-33</td>
+<td>send_message</td>
+<td style="text-align: right;">2</td>
+</tr>
+<tr class="odd">
+<td>brief-34</td>
+<td>exec</td>
+<td style="text-align: right;">245</td>
+</tr>
+<tr class="even">
+<td>brief-34</td>
+<td>wait</td>
+<td style="text-align: right;">84</td>
+</tr>
+<tr class="odd">
+<td>brief-35</td>
+<td>exec</td>
+<td style="text-align: right;">274</td>
+</tr>
+<tr class="even">
+<td>brief-35</td>
+<td>wait</td>
+<td style="text-align: right;">95</td>
+</tr>
+<tr class="odd">
+<td>brief-36</td>
+<td>exec</td>
+<td style="text-align: right;">224</td>
+</tr>
+<tr class="even">
+<td>brief-36</td>
+<td>wait</td>
+<td style="text-align: right;">81</td>
+</tr>
+<tr class="odd">
+<td>brief-37</td>
+<td>exec</td>
+<td style="text-align: right;">55</td>
+</tr>
+<tr class="even">
+<td>brief-37</td>
+<td>wait</td>
+<td style="text-align: right;">28</td>
+</tr>
+<tr class="odd">
+<td>brief-38</td>
+<td>exec</td>
+<td style="text-align: right;">111</td>
+</tr>
+<tr class="even">
+<td>brief-38</td>
+<td>wait</td>
+<td style="text-align: right;">27</td>
+</tr>
+<tr class="odd">
+<td>brief-39</td>
+<td>exec</td>
+<td style="text-align: right;">2462</td>
+</tr>
+<tr class="even">
+<td>brief-39</td>
+<td>wait</td>
+<td style="text-align: right;">778</td>
+</tr>
+<tr class="odd">
+<td>brief-39</td>
+<td>send_message</td>
+<td style="text-align: right;">4</td>
+</tr>
+<tr class="even">
+<td>brief-39</td>
+<td>list_agents</td>
+<td style="text-align: right;">1</td>
+</tr>
+<tr class="odd">
+<td>brief-39</td>
+<td>spawn_agent</td>
+<td style="text-align: right;">1</td>
+</tr>
+<tr class="even">
+<td>brief-40</td>
+<td>exec</td>
+<td style="text-align: right;">419</td>
+</tr>
+<tr class="odd">
+<td>brief-40</td>
+<td>wait</td>
+<td style="text-align: right;">219</td>
+</tr>
+<tr class="even">
+<td>brief-41</td>
+<td>exec</td>
+<td style="text-align: right;">533</td>
+</tr>
+<tr class="odd">
+<td>brief-41</td>
+<td>wait</td>
+<td style="text-align: right;">178</td>
+</tr>
+<tr class="even">
+<td>brief-47</td>
+<td>exec</td>
+<td style="text-align: right;">548</td>
+</tr>
+<tr class="odd">
+<td>brief-47</td>
+<td>wait</td>
+<td style="text-align: right;">187</td>
+</tr>
+<tr class="even">
+<td>brief-48</td>
+<td>exec</td>
+<td style="text-align: right;">76</td>
+</tr>
+<tr class="odd">
+<td>brief-48</td>
+<td>wait</td>
+<td style="text-align: right;">30</td>
+</tr>
+<tr class="even">
+<td>brief-49</td>
+<td>exec</td>
+<td style="text-align: right;">2797</td>
+</tr>
+<tr class="odd">
+<td>brief-49</td>
+<td>wait</td>
+<td style="text-align: right;">674</td>
+</tr>
+<tr class="even">
+<td>brief-49</td>
+<td>send_message</td>
+<td style="text-align: right;">11</td>
+</tr>
+<tr class="odd">
+<td>brief-49</td>
+<td>list_agents</td>
+<td style="text-align: right;">4</td>
+</tr>
+<tr class="even">
+<td>brief-49</td>
+<td>spawn_agent</td>
+<td style="text-align: right;">3</td>
+</tr>
+<tr class="odd">
+<td>brief-51</td>
+<td>exec</td>
+<td style="text-align: right;">1250</td>
+</tr>
+<tr class="even">
+<td>brief-51</td>
+<td>wait</td>
+<td style="text-align: right;">277</td>
+</tr>
+<tr class="odd">
+<td>brief-51</td>
+<td>send_message</td>
+<td style="text-align: right;">4</td>
+</tr>
+<tr class="even">
+<td>brief-51</td>
+<td>list_agents</td>
+<td style="text-align: right;">1</td>
+</tr>
+<tr class="odd">
+<td>brief-58</td>
+<td>exec</td>
+<td style="text-align: right;">293</td>
+</tr>
+<tr class="even">
+<td>brief-58</td>
+<td>wait</td>
+<td style="text-align: right;">115</td>
+</tr>
+<tr class="odd">
+<td>brief-58</td>
+<td>list_agents</td>
+<td style="text-align: right;">1</td>
+</tr>
+<tr class="even">
+<td>brief-58</td>
+<td>spawn_agent</td>
+<td style="text-align: right;">1</td>
+</tr>
+<tr class="odd">
+<td>brief-59</td>
+<td>exec</td>
+<td style="text-align: right;">61</td>
+</tr>
+<tr class="even">
+<td>brief-59</td>
+<td>wait</td>
+<td style="text-align: right;">10</td>
+</tr>
+<tr class="odd">
+<td>brief-60</td>
+<td>exec</td>
+<td style="text-align: right;">586</td>
+</tr>
+<tr class="even">
+<td>brief-60</td>
+<td>wait</td>
+<td style="text-align: right;">108</td>
+</tr>
+<tr class="odd">
+<td>brief-60</td>
+<td>spawn_agent</td>
+<td style="text-align: right;">1</td>
+</tr>
+<tr class="even">
+<td>brief-61</td>
+<td>exec</td>
+<td style="text-align: right;">1504</td>
+</tr>
+<tr class="odd">
+<td>brief-61</td>
+<td>wait</td>
+<td style="text-align: right;">521</td>
+</tr>
+<tr class="even">
+<td>brief-61</td>
+<td>send_message</td>
+<td style="text-align: right;">6</td>
+</tr>
+<tr class="odd">
+<td>brief-61</td>
+<td>list_agents</td>
+<td style="text-align: right;">4</td>
+</tr>
+<tr class="even">
+<td>brief-61</td>
+<td>spawn_agent</td>
+<td style="text-align: right;">1</td>
+</tr>
+<tr class="odd">
+<td>brief-62</td>
+<td>exec</td>
+<td style="text-align: right;">855</td>
+</tr>
+<tr class="even">
+<td>brief-62</td>
+<td>wait</td>
+<td style="text-align: right;">326</td>
+</tr>
+<tr class="odd">
+<td>brief-62</td>
+<td>send_message</td>
+<td style="text-align: right;">6</td>
+</tr>
+<tr class="even">
+<td>brief-62</td>
+<td>list_agents</td>
+<td style="text-align: right;">2</td>
+</tr>
+<tr class="odd">
+<td>brief-63</td>
+<td>exec</td>
+<td style="text-align: right;">2522</td>
+</tr>
+<tr class="even">
+<td>brief-63</td>
+<td>wait</td>
+<td style="text-align: right;">760</td>
+</tr>
+<tr class="odd">
+<td>brief-63</td>
+<td>send_message</td>
+<td style="text-align: right;">9</td>
+</tr>
+<tr class="even">
+<td>brief-63</td>
+<td>spawn_agent</td>
+<td style="text-align: right;">1</td>
+</tr>
+<tr class="odd">
+<td>brief-64</td>
+<td>exec</td>
+<td style="text-align: right;">882</td>
+</tr>
+<tr class="even">
+<td>brief-64</td>
+<td>wait</td>
+<td style="text-align: right;">297</td>
+</tr>
+<tr class="odd">
+<td>brief-64</td>
+<td>send_message</td>
+<td style="text-align: right;">6</td>
+</tr>
+<tr class="even">
+<td>brief-65</td>
+<td>exec</td>
+<td style="text-align: right;">1163</td>
+</tr>
+<tr class="odd">
+<td>brief-65</td>
+<td>wait</td>
+<td style="text-align: right;">321</td>
+</tr>
+<tr class="even">
+<td>brief-65</td>
+<td>send_message</td>
+<td style="text-align: right;">1</td>
+</tr>
+<tr class="odd">
+<td>brief-69</td>
+<td>exec</td>
+<td style="text-align: right;">486</td>
+</tr>
+<tr class="even">
+<td>brief-69</td>
+<td>wait</td>
+<td style="text-align: right;">270</td>
+</tr>
+<tr class="odd">
+<td>brief-70</td>
+<td>exec</td>
+<td style="text-align: right;">479</td>
+</tr>
+<tr class="even">
+<td>brief-70</td>
+<td>wait</td>
+<td style="text-align: right;">72</td>
+</tr>
+<tr class="odd">
+<td>brief-71</td>
+<td>exec</td>
+<td style="text-align: right;">573</td>
+</tr>
+<tr class="even">
+<td>brief-71</td>
+<td>wait</td>
+<td style="text-align: right;">170</td>
+</tr>
+<tr class="odd">
+<td>brief-71</td>
+<td>list_agents</td>
+<td style="text-align: right;">2</td>
+</tr>
+<tr class="even">
+<td>brief-72</td>
+<td>exec</td>
+<td style="text-align: right;">616</td>
+</tr>
+<tr class="odd">
+<td>brief-72</td>
+<td>wait</td>
+<td style="text-align: right;">245</td>
+</tr>
+<tr class="even">
+<td>brief-72</td>
+<td>send_message</td>
+<td style="text-align: right;">2</td>
+</tr>
+<tr class="odd">
+<td>brief-73</td>
+<td>exec</td>
+<td style="text-align: right;">703</td>
+</tr>
+<tr class="even">
+<td>brief-73</td>
+<td>wait</td>
+<td style="text-align: right;">53</td>
+</tr>
+<tr class="odd">
+<td>brief-73</td>
+<td>send_message</td>
+<td style="text-align: right;">1</td>
+</tr>
+<tr class="even">
+<td>brief-74</td>
+<td>exec</td>
+<td style="text-align: right;">161</td>
+</tr>
+<tr class="odd">
+<td>brief-74</td>
+<td>wait</td>
+<td style="text-align: right;">65</td>
+</tr>
+<tr class="even">
+<td>brief-74</td>
+<td>send_message</td>
+<td style="text-align: right;">2</td>
+</tr>
+<tr class="odd">
+<td>brief-75</td>
+<td>exec</td>
+<td style="text-align: right;">179</td>
+</tr>
+<tr class="even">
+<td>brief-75</td>
+<td>wait</td>
+<td style="text-align: right;">68</td>
+</tr>
+<tr class="odd">
+<td>brief-75</td>
+<td>send_message</td>
+<td style="text-align: right;">2</td>
+</tr>
+<tr class="even">
+<td>brief-76</td>
+<td>exec</td>
+<td style="text-align: right;">650</td>
+</tr>
+<tr class="odd">
+<td>brief-76</td>
+<td>wait</td>
+<td style="text-align: right;">69</td>
+</tr>
+<tr class="even">
+<td>brief-76</td>
+<td>send_message</td>
+<td style="text-align: right;">4</td>
+</tr>
+<tr class="odd">
+<td>brief-77</td>
+<td>exec</td>
+<td style="text-align: right;">141</td>
+</tr>
+<tr class="even">
+<td>brief-77</td>
+<td>wait</td>
+<td style="text-align: right;">51</td>
+</tr>
+<tr class="odd">
+<td>brief-77</td>
+<td>send_message</td>
+<td style="text-align: right;">1</td>
+</tr>
+<tr class="even">
+<td>brief-78</td>
+<td>exec</td>
+<td style="text-align: right;">866</td>
+</tr>
+<tr class="odd">
+<td>brief-78</td>
+<td>wait</td>
+<td style="text-align: right;">150</td>
+</tr>
+<tr class="even">
+<td>brief-78</td>
+<td>send_message</td>
+<td style="text-align: right;">2</td>
+</tr>
+<tr class="odd">
+<td>brief-78</td>
+<td>list_agents</td>
+<td style="text-align: right;">1</td>
+</tr>
+<tr class="even">
+<td>brief-79</td>
+<td>exec</td>
+<td style="text-align: right;">734</td>
+</tr>
+<tr class="odd">
+<td>brief-79</td>
+<td>wait</td>
+<td style="text-align: right;">247</td>
+</tr>
+<tr class="even">
+<td>brief-79</td>
+<td>send_message</td>
+<td style="text-align: right;">5</td>
+</tr>
+<tr class="odd">
+<td>brief-79</td>
+<td>list_agents</td>
+<td style="text-align: right;">1</td>
+</tr>
+<tr class="even">
+<td>brief-80</td>
+<td>exec</td>
+<td style="text-align: right;">721</td>
+</tr>
+<tr class="odd">
+<td>brief-80</td>
+<td>wait</td>
+<td style="text-align: right;">246</td>
+</tr>
+<tr class="even">
+<td>brief-80</td>
+<td>send_message</td>
+<td style="text-align: right;">4</td>
+</tr>
+<tr class="odd">
+<td>brief-81</td>
+<td>exec</td>
+<td style="text-align: right;">461</td>
+</tr>
+<tr class="even">
+<td>brief-81</td>
+<td>wait</td>
+<td style="text-align: right;">200</td>
+</tr>
+<tr class="odd">
+<td>brief-81</td>
+<td>send_message</td>
+<td style="text-align: right;">3</td>
+</tr>
+<tr class="even">
+<td>brief-82</td>
+<td>exec</td>
+<td style="text-align: right;">819</td>
+</tr>
+<tr class="odd">
+<td>brief-82</td>
+<td>wait</td>
+<td style="text-align: right;">201</td>
+</tr>
+<tr class="even">
+<td>brief-82</td>
+<td>send_message</td>
+<td style="text-align: right;">1</td>
+</tr>
+<tr class="odd">
+<td>brief-83</td>
+<td>exec</td>
+<td style="text-align: right;">284</td>
+</tr>
+<tr class="even">
+<td>brief-83</td>
+<td>wait</td>
+<td style="text-align: right;">96</td>
+</tr>
+<tr class="odd">
+<td>brief-84</td>
+<td>exec</td>
+<td style="text-align: right;">157</td>
+</tr>
+<tr class="even">
+<td>brief-84</td>
+<td>wait</td>
+<td style="text-align: right;">50</td>
+</tr>
+<tr class="odd">
+<td>brief-85</td>
+<td>exec</td>
+<td style="text-align: right;">177</td>
+</tr>
+<tr class="even">
+<td>brief-85</td>
+<td>wait</td>
+<td style="text-align: right;">51</td>
+</tr>
+<tr class="odd">
+<td>brief-86</td>
+<td>exec</td>
+<td style="text-align: right;">173</td>
+</tr>
+<tr class="even">
+<td>brief-86</td>
+<td>wait</td>
+<td style="text-align: right;">43</td>
+</tr>
+<tr class="odd">
+<td>brief-87</td>
+<td>exec</td>
+<td style="text-align: right;">201</td>
+</tr>
+<tr class="even">
+<td>brief-87</td>
+<td>wait</td>
+<td style="text-align: right;">43</td>
+</tr>
+<tr class="odd">
+<td>brief-87</td>
+<td>send_message</td>
+<td style="text-align: right;">3</td>
+</tr>
+<tr class="even">
+<td>brief-87</td>
+<td>list_agents</td>
+<td style="text-align: right;">1</td>
+</tr>
+<tr class="odd">
+<td>brief-88</td>
+<td>exec</td>
+<td style="text-align: right;">409</td>
+</tr>
+<tr class="even">
+<td>brief-88</td>
+<td>wait</td>
+<td style="text-align: right;">101</td>
+</tr>
+<tr class="odd">
+<td>brief-88</td>
+<td>send_message</td>
+<td style="text-align: right;">7</td>
+</tr>
+<tr class="even">
+<td>brief-88</td>
+<td>list_agents</td>
+<td style="text-align: right;">1</td>
+</tr>
+<tr class="odd">
+<td>brief-89</td>
+<td>exec</td>
+<td style="text-align: right;">1351</td>
+</tr>
+<tr class="even">
+<td>brief-89</td>
+<td>wait</td>
+<td style="text-align: right;">503</td>
+</tr>
+<tr class="odd">
+<td>brief-89</td>
+<td>send_message</td>
+<td style="text-align: right;">9</td>
+</tr>
+<tr class="even">
+<td>brief-89</td>
+<td>list_agents</td>
+<td style="text-align: right;">2</td>
+</tr>
+<tr class="odd">
+<td>brief-90</td>
+<td>exec</td>
+<td style="text-align: right;">550</td>
+</tr>
+<tr class="even">
+<td>brief-90</td>
+<td>wait</td>
+<td style="text-align: right;">190</td>
+</tr>
+<tr class="odd">
+<td>brief-90</td>
+<td>send_message</td>
+<td style="text-align: right;">3</td>
+</tr>
+<tr class="even">
+<td>brief-91</td>
+<td>exec</td>
+<td style="text-align: right;">1534</td>
+</tr>
+<tr class="odd">
+<td>brief-91</td>
+<td>wait</td>
+<td style="text-align: right;">572</td>
+</tr>
+<tr class="even">
+<td>brief-91</td>
+<td>send_message</td>
+<td style="text-align: right;">3</td>
+</tr>
+<tr class="odd">
+<td>brief-91</td>
+<td>list_agents</td>
+<td style="text-align: right;">1</td>
+</tr>
+<tr class="even">
+<td>brief-92</td>
+<td>exec</td>
+<td style="text-align: right;">912</td>
+</tr>
+<tr class="odd">
+<td>brief-92</td>
+<td>wait</td>
+<td style="text-align: right;">463</td>
+</tr>
+<tr class="even">
+<td>brief-93</td>
+<td>exec</td>
+<td style="text-align: right;">281</td>
+</tr>
+<tr class="odd">
+<td>brief-93</td>
+<td>wait</td>
+<td style="text-align: right;">163</td>
+</tr>
+<tr class="even">
+<td>brief-93</td>
+<td>send_message</td>
+<td style="text-align: right;">2</td>
+</tr>
+<tr class="odd">
+<td>brief-94</td>
+<td>exec</td>
+<td style="text-align: right;">51</td>
+</tr>
+<tr class="even">
+<td>brief-94</td>
+<td>wait</td>
+<td style="text-align: right;">26</td>
+</tr>
+<tr class="odd">
+<td>brief-94</td>
+<td>send_message</td>
+<td style="text-align: right;">1</td>
+</tr>
+<tr class="even">
+<td>steered/audit_brief93</td>
+<td>exec</td>
+<td style="text-align: right;">11</td>
+</tr>
+<tr class="odd">
+<td>steered/audit_brief94_submit</td>
+<td>exec</td>
+<td style="text-align: right;">16</td>
+</tr>
+<tr class="even">
+<td>steered/audit_brief94_submit</td>
+<td>send_message</td>
+<td style="text-align: right;">2</td>
+</tr>
+<tr class="odd">
+<td>steered/audit_brief94_submit</td>
+<td>wait</td>
+<td style="text-align: right;">1</td>
+</tr>
+<tr class="even">
+<td>steered/audit_log_edits</td>
+<td>exec</td>
+<td style="text-align: right;">13</td>
+</tr>
+<tr class="odd">
+<td>steered/audit_log_edits</td>
+<td>send_message</td>
+<td style="text-align: right;">2</td>
+</tr>
+<tr class="even">
+<td>steered/audit_runwide_cache</td>
+<td>exec</td>
+<td style="text-align: right;">24</td>
+</tr>
+<tr class="odd">
+<td>steered/audit_runwide_cache</td>
+<td>wait</td>
+<td style="text-align: right;">4</td>
+</tr>
+<tr class="even">
+<td>steered/audit_runwide_cache</td>
+<td>send_message</td>
+<td style="text-align: right;">2</td>
+</tr>
+<tr class="odd">
+<td>steered/b200_eigh_research</td>
+<td>exec</td>
+<td style="text-align: right;">30</td>
+</tr>
+<tr class="even">
+<td>steered/b200_eigh_research</td>
+<td>wait</td>
+<td style="text-align: right;">1</td>
+</tr>
+<tr class="odd">
+<td>steered/best_clean_local</td>
+<td>exec</td>
+<td style="text-align: right;">9</td>
+</tr>
+<tr class="even">
+<td>steered/best_clean_local</td>
+<td>send_message</td>
+<td style="text-align: right;">1</td>
+</tr>
+<tr class="odd">
+<td>steered/best_clean_submission</td>
+<td>exec</td>
+<td style="text-align: right;">10</td>
+</tr>
+<tr class="even">
+<td>steered/best_clean_submission</td>
+<td>send_message</td>
+<td style="text-align: right;">1</td>
+</tr>
+<tr class="odd">
+<td>steered/brief-87-interrupted</td>
+<td>exec</td>
+<td style="text-align: right;">21</td>
+</tr>
+<tr class="even">
+<td>steered/brief-87-interrupted</td>
+<td>wait</td>
+<td style="text-align: right;">1</td>
+</tr>
+<tr class="odd">
+<td>steered/brief-88-interrupted</td>
+<td>exec</td>
+<td style="text-align: right;">17</td>
+</tr>
+<tr class="even">
+<td>steered/brief-89-interrupted</td>
+<td>exec</td>
+<td style="text-align: right;">17</td>
+</tr>
+<tr class="odd">
+<td>steered/brief-89-interrupted</td>
+<td>wait</td>
+<td style="text-align: right;">1</td>
+</tr>
+<tr class="even">
+<td>steered/manager</td>
+<td>wait_agent</td>
+<td style="text-align: right;">3772</td>
+</tr>
+<tr class="odd">
+<td>steered/manager</td>
+<td>exec</td>
+<td style="text-align: right;">2525</td>
+</tr>
+<tr class="even">
+<td>steered/manager</td>
+<td>wait</td>
+<td style="text-align: right;">1019</td>
+</tr>
+<tr class="odd">
+<td>steered/manager</td>
+<td>followup_task</td>
+<td style="text-align: right;">95</td>
+</tr>
+<tr class="even">
+<td>steered/manager</td>
+<td>spawn_agent</td>
+<td style="text-align: right;">91</td>
+</tr>
+<tr class="odd">
+<td>steered/manager</td>
+<td>list_agents</td>
+<td style="text-align: right;">78</td>
+</tr>
+<tr class="even">
+<td>steered/manager</td>
+<td>send_message</td>
+<td style="text-align: right;">37</td>
+</tr>
+<tr class="odd">
+<td>steered/manager</td>
+<td>interrupt_agent</td>
+<td style="text-align: right;">3</td>
+</tr>
+<tr class="even">
+<td>steered/popcorn_delete_help</td>
+<td>exec</td>
+<td style="text-align: right;">16</td>
+</tr>
+<tr class="odd">
+<td>steered/popcorn_delete_help</td>
+<td>send_message</td>
+<td style="text-align: right;">1</td>
+</tr>
+</tbody>
+</table>
+<h2 id="inference-breakdown">Inference Breakdown</h2>
+<p>Cache hit is
+<code>cached / (uncached + cache creation + cached)</code>. The
+aggregate hit rate was 99.17%, but discounted reads still dominated
+spend because the reused contexts were enormous. Fifteen
+<code>n/a</code> continuation rows are covered by their session anchors;
+all 93 selected traces are counted exactly once, 92 report nonzero
+usage, and there is no totals row in this single-experiment report.</p>
+<table>
+<colgroup>
+<col style="width: 9%" />
+<col style="width: 12%" />
+<col style="width: 12%" />
+<col style="width: 12%" />
+<col style="width: 12%" />
+<col style="width: 12%" />
+<col style="width: 12%" />
+<col style="width: 12%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Branch</th>
+<th style="text-align: right;">Input tokens</th>
+<th style="text-align: right;">Output tokens</th>
+<th style="text-align: right;">Cached input tokens</th>
+<th style="text-align: right;">Cache creation tokens</th>
+<th style="text-align: right;">Cache hit %</th>
+<th style="text-align: right;">Compactions</th>
+<th style="text-align: right;">Estimated USD</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>brief-0</td>
+<td style="text-align: right;">1,498,778</td>
+<td style="text-align: right;">155,389</td>
+<td style="text-align: right;">194,334,720</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">99.23%</td>
+<td style="text-align: right;">2</td>
+<td style="text-align: right;">$109.32</td>
+</tr>
+<tr class="even">
+<td>brief-1</td>
+<td style="text-align: right;">1,569,654</td>
+<td style="text-align: right;">197,393</td>
+<td style="text-align: right;">176,207,104</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">99.12%</td>
+<td style="text-align: right;">2</td>
+<td style="text-align: right;">$101.87</td>
+</tr>
+<tr class="odd">
+<td>brief-2</td>
+<td style="text-align: right;">2,757,735</td>
+<td style="text-align: right;">272,533</td>
+<td style="text-align: right;">274,601,472</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">99.01%</td>
+<td style="text-align: right;">3</td>
+<td style="text-align: right;">$159.27</td>
+</tr>
+<tr class="even">
+<td>brief-3</td>
+<td style="text-align: right;">1,417,528</td>
+<td style="text-align: right;">152,880</td>
+<td style="text-align: right;">150,558,208</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">99.07%</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">$86.95</td>
+</tr>
+<tr class="odd">
+<td>brief-4</td>
+<td style="text-align: right;">1,933,214</td>
+<td style="text-align: right;">224,908</td>
+<td style="text-align: right;">238,418,176</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">99.20%</td>
+<td style="text-align: right;">2</td>
+<td style="text-align: right;">$135.62</td>
+</tr>
+<tr class="even">
+<td>brief-5</td>
+<td style="text-align: right;">1,592,776</td>
+<td style="text-align: right;">202,667</td>
+<td style="text-align: right;">181,147,904</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">99.13%</td>
+<td style="text-align: right;">2</td>
+<td style="text-align: right;">$104.62</td>
+</tr>
+<tr class="odd">
+<td>brief-6</td>
+<td style="text-align: right;">1,302,171</td>
+<td style="text-align: right;">116,759</td>
+<td style="text-align: right;">109,996,288</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">98.83%</td>
+<td style="text-align: right;">2</td>
+<td style="text-align: right;">$65.01</td>
+</tr>
+<tr class="even">
+<td>brief-7</td>
+<td style="text-align: right;">2,203,913</td>
+<td style="text-align: right;">269,199</td>
+<td style="text-align: right;">253,763,328</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">99.14%</td>
+<td style="text-align: right;">3</td>
+<td style="text-align: right;">$145.98</td>
+</tr>
+<tr class="odd">
+<td>brief-8</td>
+<td style="text-align: right;">2,021,842</td>
+<td style="text-align: right;">224,488</td>
+<td style="text-align: right;">244,975,104</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">99.18%</td>
+<td style="text-align: right;">2</td>
+<td style="text-align: right;">$139.33</td>
+</tr>
+<tr class="even">
+<td>brief-9</td>
+<td style="text-align: right;">1,097,101</td>
+<td style="text-align: right;">125,590</td>
+<td style="text-align: right;">97,758,208</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">98.89%</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">$58.13</td>
+</tr>
+<tr class="odd">
+<td>brief-10</td>
+<td style="text-align: right;">1,612,144</td>
+<td style="text-align: right;">173,565</td>
+<td style="text-align: right;">163,888,384</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">99.03%</td>
+<td style="text-align: right;">2</td>
+<td style="text-align: right;">$95.21</td>
+</tr>
+<tr class="even">
+<td>brief-11</td>
+<td style="text-align: right;">2,223,915</td>
+<td style="text-align: right;">222,040</td>
+<td style="text-align: right;">229,644,032</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">99.04%</td>
+<td style="text-align: right;">2</td>
+<td style="text-align: right;">$132.60</td>
+</tr>
+<tr class="odd">
+<td>brief-12</td>
+<td style="text-align: right;">1,446,629</td>
+<td style="text-align: right;">148,921</td>
+<td style="text-align: right;">160,058,112</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">99.10%</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">$91.73</td>
+</tr>
+<tr class="even">
+<td>brief-13</td>
+<td style="text-align: right;">2,356,333</td>
+<td style="text-align: right;">265,346</td>
+<td style="text-align: right;">302,554,880</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">99.23%</td>
+<td style="text-align: right;">3</td>
+<td style="text-align: right;">$171.02</td>
+</tr>
+<tr class="odd">
+<td>brief-14</td>
+<td style="text-align: right;">1,812,205</td>
+<td style="text-align: right;">163,946</td>
+<td style="text-align: right;">197,955,072</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">99.09%</td>
+<td style="text-align: right;">2</td>
+<td style="text-align: right;">$112.96</td>
+</tr>
+<tr class="even">
+<td>brief-15</td>
+<td style="text-align: right;">1,410,588</td>
+<td style="text-align: right;">127,706</td>
+<td style="text-align: right;">135,171,584</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">98.97%</td>
+<td style="text-align: right;">2</td>
+<td style="text-align: right;">$78.47</td>
+</tr>
+<tr class="odd">
+<td>brief-16</td>
+<td style="text-align: right;">1,419,588</td>
+<td style="text-align: right;">145,303</td>
+<td style="text-align: right;">137,044,480</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">98.97%</td>
+<td style="text-align: right;">2</td>
+<td style="text-align: right;">$79.98</td>
+</tr>
+<tr class="even">
+<td>brief-17</td>
+<td style="text-align: right;">1,556,067</td>
+<td style="text-align: right;">150,110</td>
+<td style="text-align: right;">166,800,896</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">99.08%</td>
+<td style="text-align: right;">2</td>
+<td style="text-align: right;">$95.68</td>
+</tr>
+<tr class="odd">
+<td>brief-18</td>
+<td style="text-align: right;">1,431,349</td>
+<td style="text-align: right;">135,543</td>
+<td style="text-align: right;">126,965,248</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">98.89%</td>
+<td style="text-align: right;">2</td>
+<td style="text-align: right;">$74.71</td>
+</tr>
+<tr class="even">
+<td>brief-19</td>
+<td style="text-align: right;">1,992,087</td>
+<td style="text-align: right;">179,464</td>
+<td style="text-align: right;">193,476,096</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">98.98%</td>
+<td style="text-align: right;">3</td>
+<td style="text-align: right;">$112.08</td>
+</tr>
+<tr class="odd">
+<td>brief-20</td>
+<td style="text-align: right;">1,380,982</td>
+<td style="text-align: right;">122,669</td>
+<td style="text-align: right;">121,083,648</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">98.87%</td>
+<td style="text-align: right;">2</td>
+<td style="text-align: right;">$71.13</td>
+</tr>
+<tr class="even">
+<td>brief-21</td>
+<td style="text-align: right;">1,404,860</td>
+<td style="text-align: right;">124,406</td>
+<td style="text-align: right;">123,420,672</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">98.87%</td>
+<td style="text-align: right;">2</td>
+<td style="text-align: right;">$72.47</td>
+</tr>
+<tr class="odd">
+<td>brief-22</td>
+<td style="text-align: right;">1,462,290</td>
+<td style="text-align: right;">128,721</td>
+<td style="text-align: right;">129,908,224</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">98.89%</td>
+<td style="text-align: right;">2</td>
+<td style="text-align: right;">$76.13</td>
+</tr>
+<tr class="even">
+<td>brief-23</td>
+<td style="text-align: right;">2,076,771</td>
+<td style="text-align: right;">205,310</td>
+<td style="text-align: right;">207,592,704</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">99.01%</td>
+<td style="text-align: right;">3</td>
+<td style="text-align: right;">$120.34</td>
+</tr>
+<tr class="odd">
+<td>brief-24</td>
+<td style="text-align: right;">1,576,995</td>
+<td style="text-align: right;">143,555</td>
+<td style="text-align: right;">144,991,488</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">98.92%</td>
+<td style="text-align: right;">2</td>
+<td style="text-align: right;">$84.69</td>
+</tr>
+<tr class="even">
+<td>brief-25</td>
+<td style="text-align: right;">3,028,884</td>
+<td style="text-align: right;">325,038</td>
+<td style="text-align: right;">346,229,248</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">99.13%</td>
+<td style="text-align: right;">4</td>
+<td style="text-align: right;">$198.01</td>
+</tr>
+<tr class="odd">
+<td>brief-26</td>
+<td style="text-align: right;">1,530,643</td>
+<td style="text-align: right;">135,652</td>
+<td style="text-align: right;">136,717,568</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">98.89%</td>
+<td style="text-align: right;">2</td>
+<td style="text-align: right;">$80.08</td>
+</tr>
+<tr class="even">
+<td>brief-27</td>
+<td style="text-align: right;">1,756,251</td>
+<td style="text-align: right;">167,726</td>
+<td style="text-align: right;">165,125,632</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">98.95%</td>
+<td style="text-align: right;">2</td>
+<td style="text-align: right;">$96.38</td>
+</tr>
+<tr class="odd">
+<td>brief-28</td>
+<td style="text-align: right;">1,624,998</td>
+<td style="text-align: right;">142,980</td>
+<td style="text-align: right;">143,313,920</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">98.88%</td>
+<td style="text-align: right;">3</td>
+<td style="text-align: right;">$84.07</td>
+</tr>
+<tr class="even">
+<td>brief-29</td>
+<td style="text-align: right;">2,378,671</td>
+<td style="text-align: right;">218,962</td>
+<td style="text-align: right;">244,466,432</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">99.04%</td>
+<td style="text-align: right;">4</td>
+<td style="text-align: right;">$140.70</td>
+</tr>
+<tr class="odd">
+<td>brief-30</td>
+<td style="text-align: right;">3,180,508</td>
+<td style="text-align: right;">368,750</td>
+<td style="text-align: right;">345,915,136</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">99.09%</td>
+<td style="text-align: right;">6</td>
+<td style="text-align: right;">$199.92</td>
+</tr>
+<tr class="even">
+<td>brief-31</td>
+<td style="text-align: right;">2,295,290</td>
+<td style="text-align: right;">208,450</td>
+<td style="text-align: right;">222,654,720</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">98.98%</td>
+<td style="text-align: right;">4</td>
+<td style="text-align: right;">$129.06</td>
+</tr>
+<tr class="odd">
+<td>brief-32</td>
+<td style="text-align: right;">2,673,257</td>
+<td style="text-align: right;">285,528</td>
+<td style="text-align: right;">272,176,640</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">99.03%</td>
+<td style="text-align: right;">4</td>
+<td style="text-align: right;">$158.02</td>
+</tr>
+<tr class="even">
+<td>brief-33</td>
+<td style="text-align: right;">3,096,007</td>
+<td style="text-align: right;">313,308</td>
+<td style="text-align: right;">337,286,144</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">99.09%</td>
+<td style="text-align: right;">5</td>
+<td style="text-align: right;">$193.52</td>
+</tr>
+<tr class="odd">
+<td>brief-34</td>
+<td style="text-align: right;">2,725,453</td>
+<td style="text-align: right;">251,077</td>
+<td style="text-align: right;">258,954,240</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">98.96%</td>
+<td style="text-align: right;">5</td>
+<td style="text-align: right;">$150.64</td>
+</tr>
+<tr class="even">
+<td>brief-35</td>
+<td style="text-align: right;">2,714,133</td>
+<td style="text-align: right;">228,010</td>
+<td style="text-align: right;">282,365,952</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">99.05%</td>
+<td style="text-align: right;">5</td>
+<td style="text-align: right;">$161.59</td>
+</tr>
+<tr class="odd">
+<td>brief-36</td>
+<td style="text-align: right;">2,661,535</td>
+<td style="text-align: right;">233,031</td>
+<td style="text-align: right;">271,821,312</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">99.03%</td>
+<td style="text-align: right;">4</td>
+<td style="text-align: right;">$156.21</td>
+</tr>
+<tr class="even">
+<td>brief-37</td>
+<td style="text-align: right;">2,460,639</td>
+<td style="text-align: right;">194,222</td>
+<td style="text-align: right;">239,453,184</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">98.98%</td>
+<td style="text-align: right;">4</td>
+<td style="text-align: right;">$137.86</td>
+</tr>
+<tr class="odd">
+<td>brief-38</td>
+<td style="text-align: right;">2,594,504</td>
+<td style="text-align: right;">207,257</td>
+<td style="text-align: right;">254,119,936</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">98.99%</td>
+<td style="text-align: right;">4</td>
+<td style="text-align: right;">$146.25</td>
+</tr>
+<tr class="even">
+<td>brief-39</td>
+<td style="text-align: right;">7,775,235</td>
+<td style="text-align: right;">922,055</td>
+<td style="text-align: right;">845,443,072</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">99.09%</td>
+<td style="text-align: right;">13</td>
+<td style="text-align: right;">$489.26</td>
+</tr>
+<tr class="odd">
+<td>brief-40</td>
+<td style="text-align: right;">3,215,868</td>
+<td style="text-align: right;">288,175</td>
+<td style="text-align: right;">346,252,032</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">99.08%</td>
+<td style="text-align: right;">5</td>
+<td style="text-align: right;">$197.85</td>
+</tr>
+<tr class="even">
+<td>brief-41</td>
+<td style="text-align: right;">3,438,986</td>
+<td style="text-align: right;">307,301</td>
+<td style="text-align: right;">362,900,992</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">99.06%</td>
+<td style="text-align: right;">5</td>
+<td style="text-align: right;">$207.86</td>
+</tr>
+<tr class="odd">
+<td>brief-42</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+</tr>
+<tr class="even">
+<td>brief-43</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+</tr>
+<tr class="odd">
+<td>brief-44</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+</tr>
+<tr class="even">
+<td>brief-45</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+</tr>
+<tr class="odd">
+<td>brief-46</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+</tr>
+<tr class="even">
+<td>brief-47</td>
+<td style="text-align: right;">1,157,868</td>
+<td style="text-align: right;">138,256</td>
+<td style="text-align: right;">142,948,096</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">99.20%</td>
+<td style="text-align: right;">2</td>
+<td style="text-align: right;">$81.41</td>
+</tr>
+<tr class="odd">
+<td>brief-48</td>
+<td style="text-align: right;">187,044</td>
+<td style="text-align: right;">20,715</td>
+<td style="text-align: right;">10,713,344</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">98.28%</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">$6.91</td>
+</tr>
+<tr class="even">
+<td>brief-49</td>
+<td style="text-align: right;">5,958,424</td>
+<td style="text-align: right;">778,659</td>
+<td style="text-align: right;">615,956,992</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">99.04%</td>
+<td style="text-align: right;">10</td>
+<td style="text-align: right;">$361.13</td>
+</tr>
+<tr class="odd">
+<td>brief-50</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+</tr>
+<tr class="even">
+<td>brief-51</td>
+<td style="text-align: right;">5,869,230</td>
+<td style="text-align: right;">569,633</td>
+<td style="text-align: right;">646,922,752</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">99.10%</td>
+<td style="text-align: right;">10</td>
+<td style="text-align: right;">$369.90</td>
+</tr>
+<tr class="odd">
+<td>brief-52</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+</tr>
+<tr class="even">
+<td>brief-53</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+</tr>
+<tr class="odd">
+<td>brief-54</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+</tr>
+<tr class="even">
+<td>brief-55</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+</tr>
+<tr class="odd">
+<td>brief-56</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+</tr>
+<tr class="even">
+<td>brief-57</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+</tr>
+<tr class="odd">
+<td>brief-58</td>
+<td style="text-align: right;">749,540</td>
+<td style="text-align: right;">93,111</td>
+<td style="text-align: right;">73,753,344</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">98.99%</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">$43.42</td>
+</tr>
+<tr class="even">
+<td>brief-59</td>
+<td style="text-align: right;">164,569</td>
+<td style="text-align: right;">16,563</td>
+<td style="text-align: right;">6,787,072</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">97.63%</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">$4.71</td>
+</tr>
+<tr class="odd">
+<td>brief-60</td>
+<td style="text-align: right;">1,394,523</td>
+<td style="text-align: right;">174,871</td>
+<td style="text-align: right;">117,050,880</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">98.82%</td>
+<td style="text-align: right;">2</td>
+<td style="text-align: right;">$70.74</td>
+</tr>
+<tr class="even">
+<td>brief-61</td>
+<td style="text-align: right;">3,062,108</td>
+<td style="text-align: right;">411,937</td>
+<td style="text-align: right;">355,765,248</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">99.15%</td>
+<td style="text-align: right;">5</td>
+<td style="text-align: right;">$205.55</td>
+</tr>
+<tr class="odd">
+<td>brief-62</td>
+<td style="text-align: right;">2,075,345</td>
+<td style="text-align: right;">242,858</td>
+<td style="text-align: right;">227,890,176</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">99.10%</td>
+<td style="text-align: right;">3</td>
+<td style="text-align: right;">$131.61</td>
+</tr>
+<tr class="even">
+<td>brief-63</td>
+<td style="text-align: right;">10,551,306</td>
+<td style="text-align: right;">1,014,672</td>
+<td style="text-align: right;">1,183,504,128</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">99.12%</td>
+<td style="text-align: right;">18</td>
+<td style="text-align: right;">$674.95</td>
+</tr>
+<tr class="odd">
+<td>brief-64</td>
+<td style="text-align: right;">8,192,842</td>
+<td style="text-align: right;">693,859</td>
+<td style="text-align: right;">941,737,216</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">99.14%</td>
+<td style="text-align: right;">14</td>
+<td style="text-align: right;">$532.65</td>
+</tr>
+<tr class="even">
+<td>brief-65</td>
+<td style="text-align: right;">8,898,985</td>
+<td style="text-align: right;">745,865</td>
+<td style="text-align: right;">1,061,213,952</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">99.17%</td>
+<td style="text-align: right;">16</td>
+<td style="text-align: right;">$597.48</td>
+</tr>
+<tr class="odd">
+<td>brief-66</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+</tr>
+<tr class="even">
+<td>brief-67</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+</tr>
+<tr class="odd">
+<td>brief-68</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+</tr>
+<tr class="even">
+<td>brief-69</td>
+<td style="text-align: right;">8,060,226</td>
+<td style="text-align: right;">616,766</td>
+<td style="text-align: right;">951,194,368</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">99.16%</td>
+<td style="text-align: right;">13</td>
+<td style="text-align: right;">$534.40</td>
+</tr>
+<tr class="odd">
+<td>brief-70</td>
+<td style="text-align: right;">7,996,187</td>
+<td style="text-align: right;">647,123</td>
+<td style="text-align: right;">947,840,768</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">99.16%</td>
+<td style="text-align: right;">14</td>
+<td style="text-align: right;">$533.32</td>
+</tr>
+<tr class="even">
+<td>brief-71</td>
+<td style="text-align: right;">8,248,020</td>
+<td style="text-align: right;">648,734</td>
+<td style="text-align: right;">1,009,637,120</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">99.19%</td>
+<td style="text-align: right;">14</td>
+<td style="text-align: right;">$565.52</td>
+</tr>
+<tr class="odd">
+<td>brief-72</td>
+<td style="text-align: right;">8,444,746</td>
+<td style="text-align: right;">682,736</td>
+<td style="text-align: right;">1,034,476,288</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">99.19%</td>
+<td style="text-align: right;">14</td>
+<td style="text-align: right;">$579.94</td>
+</tr>
+<tr class="even">
+<td>brief-73</td>
+<td style="text-align: right;">8,457,268</td>
+<td style="text-align: right;">706,214</td>
+<td style="text-align: right;">1,034,350,848</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">99.19%</td>
+<td style="text-align: right;">14</td>
+<td style="text-align: right;">$580.65</td>
+</tr>
+<tr class="odd">
+<td>brief-74</td>
+<td style="text-align: right;">7,876,825</td>
+<td style="text-align: right;">589,643</td>
+<td style="text-align: right;">952,620,288</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">99.18%</td>
+<td style="text-align: right;">13</td>
+<td style="text-align: right;">$533.38</td>
+</tr>
+<tr class="even">
+<td>brief-75</td>
+<td style="text-align: right;">8,008,748</td>
+<td style="text-align: right;">602,186</td>
+<td style="text-align: right;">981,630,720</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">99.19%</td>
+<td style="text-align: right;">13</td>
+<td style="text-align: right;">$548.92</td>
+</tr>
+<tr class="odd">
+<td>brief-76</td>
+<td style="text-align: right;">8,768,038</td>
+<td style="text-align: right;">703,651</td>
+<td style="text-align: right;">1,092,367,104</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">99.20%</td>
+<td style="text-align: right;">15</td>
+<td style="text-align: right;">$611.13</td>
+</tr>
+<tr class="even">
+<td>brief-77</td>
+<td style="text-align: right;">8,009,870</td>
+<td style="text-align: right;">601,333</td>
+<td style="text-align: right;">976,586,752</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">99.19%</td>
+<td style="text-align: right;">14</td>
+<td style="text-align: right;">$546.38</td>
+</tr>
+<tr class="odd">
+<td>brief-78</td>
+<td style="text-align: right;">9,422,245</td>
+<td style="text-align: right;">789,157</td>
+<td style="text-align: right;">1,146,285,056</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">99.18%</td>
+<td style="text-align: right;">17</td>
+<td style="text-align: right;">$643.93</td>
+</tr>
+<tr class="even">
+<td>brief-79</td>
+<td style="text-align: right;">9,351,678</td>
+<td style="text-align: right;">787,933</td>
+<td style="text-align: right;">1,148,253,696</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">99.19%</td>
+<td style="text-align: right;">16</td>
+<td style="text-align: right;">$644.52</td>
+</tr>
+<tr class="odd">
+<td>brief-80</td>
+<td style="text-align: right;">9,598,986</td>
+<td style="text-align: right;">820,887</td>
+<td style="text-align: right;">1,168,030,976</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">99.18%</td>
+<td style="text-align: right;">16</td>
+<td style="text-align: right;">$656.64</td>
+</tr>
+<tr class="even">
+<td>brief-81</td>
+<td style="text-align: right;">9,016,377</td>
+<td style="text-align: right;">745,993</td>
+<td style="text-align: right;">1,178,914,560</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">99.24%</td>
+<td style="text-align: right;">15</td>
+<td style="text-align: right;">$656.92</td>
+</tr>
+<tr class="odd">
+<td>brief-82</td>
+<td style="text-align: right;">10,427,150</td>
+<td style="text-align: right;">834,660</td>
+<td style="text-align: right;">1,260,914,432</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">99.18%</td>
+<td style="text-align: right;">18</td>
+<td style="text-align: right;">$707.63</td>
+</tr>
+<tr class="even">
+<td>brief-83</td>
+<td style="text-align: right;">8,992,219</td>
+<td style="text-align: right;">716,694</td>
+<td style="text-align: right;">1,166,339,840</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">99.23%</td>
+<td style="text-align: right;">16</td>
+<td style="text-align: right;">$649.63</td>
+</tr>
+<tr class="odd">
+<td>brief-84</td>
+<td style="text-align: right;">8,917,333</td>
+<td style="text-align: right;">709,552</td>
+<td style="text-align: right;">1,125,177,344</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">99.21%</td>
+<td style="text-align: right;">15</td>
+<td style="text-align: right;">$628.46</td>
+</tr>
+<tr class="even">
+<td>brief-85</td>
+<td style="text-align: right;">9,029,039</td>
+<td style="text-align: right;">732,104</td>
+<td style="text-align: right;">1,143,042,816</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">99.22%</td>
+<td style="text-align: right;">15</td>
+<td style="text-align: right;">$638.63</td>
+</tr>
+<tr class="odd">
+<td>brief-86</td>
+<td style="text-align: right;">8,981,466</td>
+<td style="text-align: right;">717,805</td>
+<td style="text-align: right;">1,139,120,384</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">99.22%</td>
+<td style="text-align: right;">15</td>
+<td style="text-align: right;">$636.00</td>
+</tr>
+<tr class="even">
+<td>brief-87</td>
+<td style="text-align: right;">9,490,897</td>
+<td style="text-align: right;">754,872</td>
+<td style="text-align: right;">1,174,412,544</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">99.20%</td>
+<td style="text-align: right;">15</td>
+<td style="text-align: right;">$657.31</td>
+</tr>
+<tr class="odd">
+<td>brief-88</td>
+<td style="text-align: right;">9,971,941</td>
+<td style="text-align: right;">817,026</td>
+<td style="text-align: right;">1,221,313,024</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">99.19%</td>
+<td style="text-align: right;">16</td>
+<td style="text-align: right;">$685.03</td>
+</tr>
+<tr class="even">
+<td>brief-89</td>
+<td style="text-align: right;">12,353,280</td>
+<td style="text-align: right;">1,087,536</td>
+<td style="text-align: right;">1,444,571,136</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">99.15%</td>
+<td style="text-align: right;">19</td>
+<td style="text-align: right;">$816.68</td>
+</tr>
+<tr class="odd">
+<td>brief-90</td>
+<td style="text-align: right;">10,763,579</td>
+<td style="text-align: right;">872,389</td>
+<td style="text-align: right;">1,285,892,608</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">99.17%</td>
+<td style="text-align: right;">17</td>
+<td style="text-align: right;">$722.94</td>
+</tr>
+<tr class="even">
+<td>brief-91</td>
+<td style="text-align: right;">12,257,443</td>
+<td style="text-align: right;">1,084,405</td>
+<td style="text-align: right;">1,549,641,728</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">99.22%</td>
+<td style="text-align: right;">20</td>
+<td style="text-align: right;">$868.64</td>
+</tr>
+<tr class="odd">
+<td>brief-92</td>
+<td style="text-align: right;">11,493,698</td>
+<td style="text-align: right;">937,722</td>
+<td style="text-align: right;">1,449,754,112</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">99.21%</td>
+<td style="text-align: right;">18</td>
+<td style="text-align: right;">$810.48</td>
+</tr>
+<tr class="even">
+<td>brief-93</td>
+<td style="text-align: right;">10,392,044</td>
+<td style="text-align: right;">822,245</td>
+<td style="text-align: right;">1,330,778,368</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">99.23%</td>
+<td style="text-align: right;">16</td>
+<td style="text-align: right;">$742.02</td>
+</tr>
+<tr class="odd">
+<td>brief-94</td>
+<td style="text-align: right;">10,145,544</td>
+<td style="text-align: right;">796,985</td>
+<td style="text-align: right;">1,315,412,224</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">99.23%</td>
+<td style="text-align: right;">16</td>
+<td style="text-align: right;">$732.34</td>
+</tr>
+<tr class="even">
+<td>steered/audit_brief93</td>
+<td style="text-align: right;">10,408,849</td>
+<td style="text-align: right;">792,265</td>
+<td style="text-align: right;">1,324,467,456</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">99.22%</td>
+<td style="text-align: right;">16</td>
+<td style="text-align: right;">$738.05</td>
+</tr>
+<tr class="odd">
+<td>steered/audit_brief94_submit</td>
+<td style="text-align: right;">10,467,535</td>
+<td style="text-align: right;">797,269</td>
+<td style="text-align: right;">1,325,853,696</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">99.22%</td>
+<td style="text-align: right;">16</td>
+<td style="text-align: right;">$739.18</td>
+</tr>
+<tr class="even">
+<td>steered/audit_log_edits</td>
+<td style="text-align: right;">10,603,325</td>
+<td style="text-align: right;">809,210</td>
+<td style="text-align: right;">1,330,179,840</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">99.21%</td>
+<td style="text-align: right;">17</td>
+<td style="text-align: right;">$742.38</td>
+</tr>
+<tr class="odd">
+<td>steered/audit_runwide_cache</td>
+<td style="text-align: right;">10,542,879</td>
+<td style="text-align: right;">796,752</td>
+<td style="text-align: right;">1,327,553,536</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">99.21%</td>
+<td style="text-align: right;">16</td>
+<td style="text-align: right;">$740.39</td>
+</tr>
+<tr class="even">
+<td>steered/b200_eigh_research</td>
+<td style="text-align: right;">256,762</td>
+<td style="text-align: right;">11,063</td>
+<td style="text-align: right;">4,431,872</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">94.52%</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">$3.83</td>
+</tr>
+<tr class="odd">
+<td>steered/best_clean_local</td>
+<td style="text-align: right;">10,498,795</td>
+<td style="text-align: right;">805,968</td>
+<td style="text-align: right;">1,329,074,432</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">99.22%</td>
+<td style="text-align: right;">17</td>
+<td style="text-align: right;">$741.21</td>
+</tr>
+<tr class="even">
+<td>steered/best_clean_submission</td>
+<td style="text-align: right;">10,512,375</td>
+<td style="text-align: right;">804,736</td>
+<td style="text-align: right;">1,329,239,808</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">99.22%</td>
+<td style="text-align: right;">17</td>
+<td style="text-align: right;">$741.32</td>
+</tr>
+<tr class="odd">
+<td>steered/brief-87-interrupted</td>
+<td style="text-align: right;">8,902,882</td>
+<td style="text-align: right;">698,678</td>
+<td style="text-align: right;">1,124,783,872</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">99.21%</td>
+<td style="text-align: right;">15</td>
+<td style="text-align: right;">$627.87</td>
+</tr>
+<tr class="even">
+<td>steered/brief-88-interrupted</td>
+<td style="text-align: right;">8,899,481</td>
+<td style="text-align: right;">698,899</td>
+<td style="text-align: right;">1,124,593,152</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">99.21%</td>
+<td style="text-align: right;">15</td>
+<td style="text-align: right;">$627.76</td>
+</tr>
+<tr class="odd">
+<td>steered/brief-89-interrupted</td>
+<td style="text-align: right;">8,895,350</td>
+<td style="text-align: right;">699,628</td>
+<td style="text-align: right;">1,124,921,600</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">99.22%</td>
+<td style="text-align: right;">15</td>
+<td style="text-align: right;">$627.93</td>
+</tr>
+<tr class="even">
+<td>steered/launch-attempt</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">0.00%</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">$0.00</td>
+</tr>
+<tr class="odd">
+<td>steered/manager</td>
+<td style="text-align: right;">10,587,398</td>
+<td style="text-align: right;">817,722</td>
+<td style="text-align: right;">1,331,836,672</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">99.21%</td>
+<td style="text-align: right;">17</td>
+<td style="text-align: right;">$743.39</td>
+</tr>
+<tr class="even">
+<td>steered/popcorn_delete_help</td>
+<td style="text-align: right;">10,603,845</td>
+<td style="text-align: right;">808,450</td>
+<td style="text-align: right;">1,330,211,840</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">99.21%</td>
+<td style="text-align: right;">17</td>
+<td style="text-align: right;">$742.38</td>
+</tr>
+</tbody>
+</table>
+<h2 id="cost-optimization-opportunities">Cost-Optimization
+Opportunities</h2>
+<ul>
+<li>Rotate worker threads after one or two compactions instead of
+carrying them to 15-20. The run accumulated 794 compactions, and
+reported per-session cost rose with inherited context; brief 91 alone
+cost about $869.</li>
+<li>Launch narrow-context audit workers. Each post-run
+cache/submission/log audit inherited about 1.3B cached tokens and cost
+roughly $738-$742 despite lasting only 1-5 minutes; the three
+interrupted brief 87-89 attempts each cost about $628 before
+restart.</li>
+<li>Schedule full benchmarks and profiles around the single B200.
+Matched queue wait was 60.4 hours, nearly twice the 32.6 hours of
+exclusive GPU execution, and the longest wait was 646.8s.</li>
+<li>Fix <code>autocuda report data cost</code> to parse Codex
+<code>custom_tool_call</code> records and to represent several briefs in
+one persistent worker session. The current CSV gets tokens right but
+leaves tool columns blank and cannot attribute continuation-brief cost
+without double counting.</li>
+<li>Keep output concise, but prioritize context control: output was only
+0.07% of tokens and about $1.27K, whereas cached input cost about
+$29.58K.</li>
+</ul>
+<h2 id="analysis">Analysis</h2>
+<p>The run bought a material honest result: the optimization report
+reconstructs a 2.486x speedup, from 56,277.006 us to a reconfirmed
+22,648.370 us. Against 2,604 logged attempts, the cost averages about
+$12.80 and 22.9M reported tokens per attempt, or approximately $558 per
+percentage point of runtime reduction. The output-replay trials in
+briefs 93-94 do not count toward the speedup, but their inference and
+GPU costs correctly remain here.</p>
+<p>Inference cost grew with session age rather than trial productivity.
+Cache hit stayed above 97.6% for every covered worker anchor and reached
+99.17% in aggregate, yet late sessions repeatedly read billion-token
+cumulative histories. That shape explains why a high cache-hit rate
+coexists with $33.3K spend: the discount reduced the unit price, but not
+the volume.</p>
+<p>Cost was not predictive of success. Brief 91 was the most expensive
+worker anchor at $868.64 and explored a Jacobi line that remained slower
+than production, while brief 75 reconfirmed the honest production best
+at $548.92. Thirty-two anchors exceeded twice the $160.43 fleet median,
+mostly later in the run, so this is broad context inflation rather than
+one isolated runaway.</p>
+<p><strong>Recommendations:</strong> cap thread lifetime by compaction
+count, spawn post-run audits with only the target logs/commits instead
+of the full manager transcript, and batch GPU-heavy validation/profile
+work to reduce queue contention. Preserve the three-worker search width,
+but reset context between objectives and record per-continuation usage
+so cost can be tied to the brief that incurred it.</p>
+<script type="module">import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs'; mermaid.initialize({ startOnLoad: true, theme: 'default' });</script>
+</body>
+</html>
