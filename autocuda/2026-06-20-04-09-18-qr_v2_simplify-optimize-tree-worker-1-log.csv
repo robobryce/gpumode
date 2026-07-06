@@ -1,0 +1,3 @@
+timestamp,agent_id,brief_id,iteration,linalg/qr_v2,diff_lines,status,commit,description
+2026-06-20T04:13:29.161212,1,,N/A,130857.525,0,baseline,6e619b05330c0076bbe6c7ee691362d3eee23125,baseline
+2026-06-20T04:16:45.402716,1,,N/A,2062.936,7725,optimized,8705d6fe3b714312be043375b634baa782a797f3,optimized

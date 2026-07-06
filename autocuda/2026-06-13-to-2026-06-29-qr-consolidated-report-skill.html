@@ -1,0 +1,506 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GPUMODE QR — Skill Audit</title>
+<style>
+  body{max-width:1100px;margin:2rem auto;padding:0 1.5rem;font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;color:#1a1a1a}table{border-collapse:collapse;width:100%;margin:1rem 0;font-size:14px}th,td{border:1px solid #ccc;padding:6px 10px;text-align:left;vertical-align:top}th{background:#f4f4f4}code{background:#f4f4f4;padding:1px 4px;border-radius:3px}pre{background:#f7f7f7;padding:10px;overflow-x:auto;border-radius:5px}h1,h2,h3{line-height:1.25}h1{border-bottom:2px solid #eee;padding-bottom:.3rem}h2{border-bottom:1px solid #eee;padding-bottom:.2rem;margin-top:2rem}blockquote{border-left:3px solid #ccc;margin-left:0;padding-left:1rem;color:#555}a{color:#0645ad}
+</style>
+</head>
+<body>
+<h1 id="gpumode-qr-skill-audit">GPUMODE QR — Skill Audit</h1>
+<h2 id="executive-summary">Executive Summary</h2>
+<p>I found <strong>six confirmed autocuda skill/CLI issues (2 high, 3
+medium, 1 low)</strong> plus a coverage gap spanning the whole pre-built
+data CSV. Both high-severity bugs defeat core deliverables:
+<strong><code>report data optimization</code> blanks both speedup
+columns on 100% of optimize-tree rows</strong> (it resolves the metric
+name from a shared schema file that now holds eigh’s metric), and the
+<strong>optimize-tree manager issued a “revert-if-it-doesn’t-win”
+directive that contradicts explore-brief’s “commit what you measured”
+rule</strong>.</p>
+<p>Key takeaways:</p>
+<ul>
+<li><strong>High — tree-run speedups are unrecoverable from the
+tool</strong> — 0/5,602 rows carry a speedup, forcing manual recovery
+from raw logs.</li>
+<li><strong>High — the manager revert directive discarded measured
+regressions</strong> the branch existed to capture; self-corrected
+mid-run.</li>
+<li><strong>Medium — <code>schema check</code> crashes on large
+fields</strong> — 315 oversized <code>branches</code> cells trip
+Python’s 128 KB cap, wrongly gating a valid report.</li>
+<li><strong>The pre-built skill CSV is 100% coverage-gap rows</strong> —
+built without <code>--harness-jsonl</code>; findings come from a
+direct-JSONL scan.</li>
+<li><strong>The raw detector is ~87% false positives</strong> — and the
+one genuine operator-facing gate was correct behavior, not a bug.</li>
+</ul>
+<h2 id="skill-issue-candidates">Skill Issue Candidates</h2>
+<p>Severity order: critical, high, medium, low, info. “Branch” cites a
+representative branch/tag; detailed excerpts are in Root Causes below.
+Distinct-incident counts collapse the detector’s radius-4 window
+duplication (raw hits in parentheses).</p>
+<table style="width:100%;">
+<colgroup>
+<col style="width: 16%" />
+<col style="width: 16%" />
+<col style="width: 16%" />
+<col style="width: 16%" />
+<col style="width: 16%" />
+<col style="width: 16%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Branch</th>
+<th>Skill</th>
+<th>Severity</th>
+<th>Category</th>
+<th>Evidence</th>
+<th>Recommendation</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>autocuda/optimize/2026-06-25-22-03-01-qr_v2 (manager)</td>
+<td>optimize-tree</td>
+<td>high</td>
+<td>contradictory_instruction</td>
+<td>Manager issued a “MANDATORY DIRECTIVE: if it does NOT win → REVERT
+it entirely / do not leave gated-off” (session
+<code>ad61ef45…426d</code> line 1179, ts 2026-06-26T07:49:27Z), then
+admitted at line 1226 “I’ve now read the actual worker skill
+(explore-brief)… I had it backwards” — explore-brief §“Commit what you
+measured” mandates committing even a regression. Workers had been
+reverting real measurements.</td>
+<td>Add an explicit rule to optimize-tree/SKILL.md that workers commit
+every measured trial (even regressions) and the manager must never tell
+a worker to revert/gate-off a change; cross-link explore-brief §“Commit
+what you measured”.</td>
+</tr>
+<tr class="even">
+<td>autocuda/optimize/…/brief-* (all optimize-tree tags)</td>
+<td>report-optimization</td>
+<td>high</td>
+<td>metric_join_failure</td>
+<td><code>report data optimization</code> yields 0/5,602 non-blank
+<code>best_speedup</code> and <code>best_step_speedup</code>; reproduced
+live at 0/676 (<code>2026-06-22-09-10-03</code>) and 0/206
+(<code>2026-06-29-06-40-42</code>, current <code>brief-&lt;K&gt;</code>
+format + reference-log baseline 1639.170 µs). Raw brief/worker logs DO
+carry µs on the <code>linalg/qr_v2</code> column (394 succeeded rows for
+06-22); qr_py’s 1,436 rows are also all blank
+(<code>linalg/qr_py</code>). Root cause: <code>_primary_benchmark</code>
+(<code>_report.py:443</code>) reads the shared
+<code>log-schema-optimize.json</code> = <code>linalg/eigh_py</code>
+(concurrent eigh run’s schema), so
+<code>metric_name in r["metrics"]</code> is never true. Forcing the
+correct name makes speedups compute (0.946/1.001/1.008×).</td>
+<td>In <code>report data optimization</code>, resolve the metric name
+from the run’s own schema (per-tag) or from the trial rows’ metric
+column, not the shared <code>log-schema-optimize.json</code>; also match
+<code>worker-N-brief-K</code> leaves (see version-skew row). Add a
+tree-log fixture regression test asserting non-blank speedups.</td>
+</tr>
+<tr class="odd">
+<td>autocuda (schema-check CLI)</td>
+<td>report-optimization</td>
+<td>medium</td>
+<td>schema_contract</td>
+<td><code>autocuda schema check report-optimization-csv --output 2026-06-13-to-2026-06-29-qr-consolidated</code>
+→ uncaught
+<code>_csv.Error: field larger than field limit (131072)</code>, exit 1,
+traceback at <code>_schema_check.py:62</code>. 315/5,602 rows have a
+<code>branches</code> cell &gt; 128 KB (max 210,754 B); CSV is otherwise
+valid (all rows 10 fields).</td>
+<td>In <code>_check_csv_body</code> raise
+<code>csv.field_size_limit(sys.maxsize)</code> before reading (and/or
+the data builder should cap/repr aggregated <code>branches</code>
+cells); the checker must not crash on a structurally valid CSV, or
+report-optimization SKILL step 2 wrongly blocks shipping.</td>
+</tr>
+<tr class="even">
+<td>autocuda/optimize/2026-06-13-03-45-35/worker-1-brief-31 (qr_py);
++qr_v2</td>
+<td>explore-brief</td>
+<td>medium</td>
+<td>autocuda_cli_contract</td>
+<td><code>autocuda init brief</code> runs
+<code>git checkout -b &lt;branch&gt; &lt;sha&gt;</code> with
+<code>check=True</code> and no error handling
+(<code>_init.py:398</code>); on a dirty worktree git aborts (“Your local
+changes … would be overwritten by checkout … Please commit your changes
+or stash them. Aborting”) and the CLI dumps a raw
+<code>CalledProcessError</code> traceback
+(<code>autocuda_cli.py:2278</code>). 20 distinct incidents (72 raw)
+across 6 tags incl. qr_py 0.3.0 (13) and qr_v2 0.4.0.</td>
+<td>Catch the <code>CalledProcessError</code> in
+<code>cmd_init_brief</code>; either auto-stash/reset the worktree to the
+parent SHA or print a one-line actionable error. Add a worker-recovery
+note to explore-brief/SKILL.md for a dirty resume worktree.</td>
+</tr>
+<tr class="odd">
+<td>autocuda/optimize/…/brief-* (23 tags)</td>
+<td>optimize-tree</td>
+<td>medium</td>
+<td>autocuda_cli_contract</td>
+<td>733 distinct CLI-arg rejections (1,482 raw) across 23 tags: usage
+strings show <code>autocuda run slice --agent-id</code> REQUIRED and
+<code>autocuda log optimize-tree brief --agent-id</code>, but the
+current 0.4.0 CLI/SKILLs have removed <code>--agent-id</code> from
+<code>run</code> and never had it on <code>brief</code>; also
+<code>iteration</code>→<code>trial</code> and
+<code>brief_stop</code>/<code>brief-stop</code> verb mismatches.
+Historical version skew: the runs used an older autocuda than
+0.4.0.</td>
+<td>No 0.4.0 fix required for
+<code>--agent-id</code>/<code>iteration</code> (already reconciled).
+Bundle the CLI version into <code>autocuda/export/&lt;tag&gt;</code> and
+stamp SKILL.md with a min-CLI-version so a report reader can tell
+historical skew from a live contract break.</td>
+</tr>
+<tr class="even">
+<td>autocuda/optimize/2026-06-24-03-46-49-qrv2_kernel_languages_t5sr96or9</td>
+<td>discover</td>
+<td>low</td>
+<td>schema_contract</td>
+<td><code>autocuda schema check layout</code> reported every required
+section missing/out-of-order
+(<code>layout.md: missing or out-of-order section \</code>##
+Summary`<code>,</code>## Editable files<code>,</code>## Read-only
+files<code>,</code>## Build<code>,</code>## Validation<code>,</code>##
+Benchmarks<code>) on the kernel-language</code>layout.md<code>the agent generated. 1 distinct incident, 1 kernel-language tag. | discover/SKILL.md already lists the correct headings; add a "run</code>autocuda
+schema check
+layout<code>and fix before proceeding" step to the discover write-layout section so a mis-ordered/renamed template is caught at authoring time. | | all qr_py + qr_v2 branches (3,089 rows) | optimize-simple / optimize-tree | info | missing_harness | The pre-built</code>2026-06-13-to-2026-06-29-qr-consolidated-report-skill.csv<code>has 3,089 rows, every one</code>severity=info<code>,</code>category=missing_harness<code>, signal "No harness JSONL was available for automated skill issue scanning" — it was built without</code>–harness-jsonl<code>. qr_py now contributes 434 rows (was 0 before the rebuild). | Coverage gap, not a bug: re-run</code>autocuda
+report data skill –harness-jsonl <branch>=<path>
+…<code>with the</code>/tmp/qrwork/harness/**<code>JSONLs (or fix the SKILL to auto-discover</code>harness-records/`).
+This report’s findings come from the direct-JSONL scan instead.</td>
+<td></td>
+</tr>
+</tbody>
+</table>
+<h2 id="root-causes">Root Causes</h2>
+<p><strong>Contradictory instruction — optimize-tree manager
+vs. explore-brief worker (the one high-severity finding).</strong> In
+<code>2026-06-25-22-03-01-qr_v2</code> (manager session
+<code>ad61ef45-4766-4ffe-b847-6fc766eb426d.jsonl</code>) the manager
+broadcast a “MANDATORY MANAGER DIRECTIVE” to all three workers (lines
+1179/1181/1183, ts ~2026-06-26T07:49Z): <em>“It does NOT win → REVERT it
+ENTIRELY (git revert / restore to the clean parent). Do not leave it
+gated-off in the tree.”</em> This directly contradicts
+explore-brief/SKILL.md §“Commit what you measured”: <em>“Commit the live
+code you actually ran, with its real metric — even a regression… don’t
+return a brief reverted to its parent: that discards the measured result
+the branch exists to capture.”</em> The manager later admitted the error
+verbatim (line 1226, ts 07:54:02Z): <em>“I’ve now read the actual worker
+skill (explore-brief)… I had it backwards,”</em> and re-sent corrected
+instructions (lines 1235+). The root cause is an <strong>authoring gap
+in optimize-tree/SKILL.md</strong>: the manager skill never states that
+workers commit every measured trial (regressions included) and that the
+manager must not order reverts. The manager operated on an assumed model
+of the worker skill it had never read. This recurred and was
+self-corrected within the run, but it cost real trials (workers had
+“banked OFF” and reverted-to-parent commits, discarding measurements).
+This is version-independent and still latent in 0.4.0.</p>
+<p><strong>Report markdown/CSV schema-contract mismatch — the
+schema-check field limit.</strong>
+<code>_schema_check.py:_check_csv_body</code> opens the CSV with a bare
+<code>csv.reader(f)</code> and iterates rows (line 62) without ever
+calling <code>csv.field_size_limit()</code>. Python’s default 128 KB
+per-field cap raises <code>_csv.Error</code> on any cell above it, and
+the exception is uncaught, so
+<code>autocuda schema check report-optimization-csv</code> exits 1 with
+a traceback rather than a schema verdict. The consolidated optimization
+CSV has 315 <code>branches</code> cells over that cap (the aggregation
+concatenates every contributing branch name for a technique). Because
+report-optimization/SKILL.md step 2 says <em>“If it fails, do not ship
+the report — fix the data step first,”</em> this tooling crash would
+incorrectly gate a valid, large, multi-run report. The file to patch is
+<code>_schema_check.py</code> (raise the limit before reading);
+optionally the data builder in <code>_report.py</code> should cap or
+<code>repr</code>-truncate the <code>branches</code> cell.</p>
+<p><strong>Metric→speedup join failure —
+<code>report data optimization</code> blanks both speedup columns on
+every optimize-tree run (the second high-severity finding).</strong> The
+report-optimization SKILL’s whole point is to rank techniques by
+<code>best_step_speedup</code> (marginal) and headline by
+<code>best_speedup</code> (end-to-end), and SKILL step 3 tells the agent
+to cluster and rank on those columns. But
+<code>autocuda report data optimization</code> emits both columns blank
+for 100% of optimize-tree rows: 0/5,602 in the consolidated CSV
+(including all 1,436 qr_py rows), and I reproduced 0/676 for
+<code>2026-06-22-09-10-03-qr_v2</code> and 0/206 for
+<code>2026-06-29-06-40-42-qr_v2</code> by re-running the CLI. The data
+is NOT missing — the raw brief/worker logs carry real microsecond values
+in the <code>linalg/qr_v2</code> metric column (400 numeric rows, 394 on
+<code>succeeded</code> status, for the 06-22 tag). I traced the exact
+break in <code>_report.py</code>:
+<code>cmd_report_build_optimization</code> (lines 538–539) sets
+<code>metric_name = _primary_benchmark(experiments)["name"]</code>, and
+<code>_primary_benchmark</code> (line 443) loads the <strong>single
+shared <code>autocuda/log-schema-optimize.json</code></strong>. In this
+data dir that file currently describes the concurrent
+<strong>eigh</strong> run (<code>{"name": "linalg/eigh_py"}</code>), not
+qr_v2. Every speedup computation then guards on
+<code>metric_name in r["metrics"]</code>
+(e.g. <code>_baseline_value</code> line 487, <code>_metric_by_sha</code>
+line 515), and the qr_v2 trial rows carry
+<code>{"linalg/qr_v2": …}</code>, so the key never matches → baseline
+resolves to <code>None</code>, <code>metric_by_sha</code> is empty, and
+every <code>best_speedup</code>/<code>best_step_speedup</code> is left
+blank. I proved the mechanism by forcing
+<code>metric_name="linalg/qr_v2"</code>: the baseline immediately
+resolved (1639.17 µs) and per-trial speedups computed correctly (0.946 /
+1.001 / 1.008× on brief-6). So the primary, live root cause is that the
+aggregator resolves the benchmark <strong>name</strong> from a
+process-global schema file rather than from the run being reported —
+which also means a consolidated multi-run report inherits whichever
+single schema last landed in the data dir. A <strong>secondary,
+historical contributor</strong> compounds it on the older tags: their
+branch leaves are <code>worker-N-brief-K</code> and their logs are
+<code>&lt;tag&gt;-optimize-tree-worker-N-log.csv</code>, but the current
+0.4.0 <code>_LEAF_BRIEF_PATTERN</code> is <code>^brief-(\d+)$</code> and
+<code>_branch_log_paths</code> globs
+<code>…-optimize-tree-brief-&lt;K&gt;-log.csv</code>, so those branches
+resolve to no brief-log at all. The reference-log’s presence did NOT fix
+the 06-29 case (it uses the current naming and still gave 0/206), which
+confirms the schema-name join is the primary bug, independent of the
+missing-reference-log and naming-skew factors. Net effect:
+report-optimization is unusable as written on its primary target (tree
+runs) — the optimization-report agent had to recover every speedup by
+hand from raw logs and git commit messages.</p>
+<p><strong>Missing setup / uncaught subprocess error —
+<code>init brief</code> on a dirty worktree.</strong>
+<code>_init.py</code> <code>cmd_init_brief</code> (line 398,
+<code>else</code> branch) runs
+<code>subprocess.run(["git","checkout","-b",branch,primary_parent], check=True)</code>.
+When the brief worktree has uncommitted changes (a duplicate worker
+instance, or a resume after a crash left edits), git aborts with “Please
+commit your changes or stash them before you switch branches” and
+<code>check=True</code> raises <code>CalledProcessError</code>, which
+propagates to <code>autocuda_cli.py:2404</code>
+(<code>sys.exit(main())</code> in live 0.4.0; the recorded traceback
+shows the older CLI’s line) as a raw traceback handed to the worker.
+Observed 20 distinct times across 6 tags — 13 in qr_py (autocuda
+<strong>0.3.0</strong>, <code>_init.py:401</code>) and the rest in qr_v2
+0.4.0 (<code>_init.py:421</code> frame). Workers recovered by manually
+cleaning the worktree (e.g. <code>2026-06-19-04-54-07-qr_v2</code>:
+“There are leftover uncommitted changes… Let me find my worktree and
+clean it up”), so it was non-fatal but burned context and is poor UX.
+The fix is defensive handling in <code>cmd_init_brief</code> plus a
+recovery note in explore-brief/SKILL.md.</p>
+<p><strong>CLI version skew across the run history (largest by raw
+volume, mostly benign).</strong> 733 distinct CLI-arg rejections show
+the runs were executed on an <strong>older autocuda than the installed
+0.4.0</strong>. The evidence: usage strings in the records list
+<code>--agent-id AGENT_ID</code> as REQUIRED for
+<code>autocuda run slice</code> and present on
+<code>autocuda log optimize-tree brief</code>; the live 0.4.0
+<code>autocuda run slice/exclusive --help</code> has no
+<code>--agent-id</code>, and <code>log optimize-tree brief --help</code>
+uses <code>--tag/--parent-commit/--brief-kind/--description</code> with
+no <code>--agent-id</code>. Likewise the records show an
+<code>iteration</code> log verb and
+<code>brief_stop</code>/<code>brief-stop</code> status tokens, while
+0.4.0 uses <code>trial</code> and rejects those. The current 0.4.0
+SKILL.md prose is self-consistent with the current CLI
+(optimize-tree/explore-brief/discover all state “No
+<code>--agent-id</code>”; explore-brief uses
+<code>optimize-tree trial</code>). So these are <strong>already-fixed
+historical mismatches</strong>, not live skill bugs — but they are
+indistinguishable from a live break in the report unless the CLI version
+is captured. The remaining “invalid choice” rejections
+(<code>valid</code>, <code>success</code>, <code>keeper</code>,
+<code>show</code>) are agents guessing enum tokens, not skill-doc
+errors.</p>
+<p><strong>Layout schema-contract at discovery time (isolated).</strong>
+One kernel-language run (<code>t5sr96or9</code>) generated a
+<code>layout.md</code> that failed
+<code>autocuda schema check layout</code> on all nine required sections
+(the six in the table Evidence — Summary, Editable files, Read-only
+files, Build, Validation, Benchmarks — plus
+<code>## Cross-benchmark aggregation</code>,
+<code>## Dependencies</code>, and <code>## Log schema</code>).
+discover/SKILL.md line 92 documents the correct heading set and order,
+so this is an authoring miss (the agent wrote the file without the
+enforced <code>##</code>-heading structure) rather than a template that
+contradicts the schema. It is low severity (one run, caught by the
+checker) but argues for making the schema-check a mandatory gate in the
+discover write-layout step.</p>
+<h2 id="fix-plan">Fix Plan</h2>
+<ol type="1">
+<li><p><strong>optimize-tree/SKILL.md — close the revert/commit
+contradiction (high).</strong> Add to §“Methodology” and §“Operating
+rules”: <em>“Workers commit every measured trial, including regressions
+(see explore-brief §‘Commit what you measured’). Never instruct a worker
+to revert, gate-off, or restore-to-parent a change it measured — that
+discards the result the branch exists to capture. The manager selects
+parents; it does not order reverts.”</em> Validation: grep
+optimize-tree/SKILL.md for “revert” and confirm it forbids
+manager-ordered reverts; confirm the statement matches
+explore-brief/SKILL.md §“Commit what you measured”.</p></li>
+<li><p><strong><code>_report.py</code>
+<code>report data optimization</code> — join the metric so tree speedups
+populate (high).</strong> In <code>cmd_report_build_optimization</code>,
+stop resolving the benchmark name from the process-global
+<code>log-schema-optimize.json</code>: resolve it per-run (from the
+tag’s own schema, or fall back to the metric column present in the run’s
+brief/worker log rows) so <code>metric_name in r["metrics"]</code>
+matches. Also widen <code>_LEAF_BRIEF_PATTERN</code> (currently
+<code>^brief-(\d+)$</code>) and <code>_branch_log_paths</code> to accept
+<code>worker-N-brief-K</code> leaves and
+<code>…-optimize-tree-worker-N-log.csv</code> files so older-format tags
+resolve their brief-logs. Add a regression test on a tree-log fixture
+asserting non-blank
+<code>best_speedup</code>/<code>best_step_speedup</code>. Validation:
+<code>autocuda report data optimization --tag 2026-06-29-06-40-42-qr_v2 --output t</code>
+then assert &gt;0 non-blank <code>best_speedup</code> in
+<code>t-report-optimization.csv</code> (proven achievable: forcing the
+correct metric name yields 0.946/1.001/1.008× on brief-6).</p></li>
+<li><p><strong><code>_schema_check.py</code> — stop crashing on large
+fields (medium).</strong> At module load or the top of
+<code>_check_csv_body</code>, add
+<code>csv.field_size_limit(sys.maxsize)</code> (mirroring how any
+consumer must read these CSVs). Optionally, in <code>_report.py</code>
+cap the aggregated <code>branches</code> cell (store a count + first-N
+SHAs, or <code>repr</code>-truncate at ~100 KB). Validation:
+<code>autocuda schema check report-optimization-csv --output 2026-06-13-to-2026-06-29-qr-consolidated</code>
+must exit 0 (or report genuine field/row errors) instead of raising
+<code>_csv.Error</code>.</p></li>
+<li><p><strong><code>_init.py cmd_init_brief</code> — handle a dirty
+checkout (medium).</strong> Wrap the <code>git checkout -b</code> (0.4.0
+<code>_init.py:398</code>) in a
+<code>try/except subprocess.CalledProcessError</code>; on the “would be
+overwritten” abort, either
+<code>git stash</code>/<code>git reset --hard &lt;parent&gt;</code> the
+brief worktree (it is a scratch worktree) or print a single actionable
+line (“brief worktree has uncommitted changes; reset it to <sha> and
+re-run”). Add a short recovery note to explore-brief/SKILL.md §Setup for
+<code>MODE="resume"</code>. Validation: run
+<code>autocuda init brief</code> in a worktree with a dirty tracked file
+and confirm no Python traceback reaches the caller.</p></li>
+<li><p><strong>export/SKILL.md + report-skill/SKILL.md — record and
+surface CLI version (medium).</strong> Have <code>autocuda export</code>
+stamp the autocuda CLI version into the export branch, and have
+report-skill note the run’s CLI version so
+<code>--agent-id</code>/<code>iteration</code>-style rejections are
+labeled “historical version skew” vs. “live contract break.” Validation:
+an export branch contains a version marker; a skill report over an
+old-version run flags version skew rather than a current bug.</p></li>
+<li><p><strong>discover/SKILL.md — gate layout on the schema
+(low).</strong> Add a step after writing <code>layout.md</code>:
+<em>“Run <code>autocuda schema check layout</code> and fix any
+missing/out-of-order section before proceeding.”</em> Validation:
+<code>autocuda schema check layout</code> exits 0 on the generated
+<code>layout.md</code> before the optimize loop starts.</p></li>
+<li><p><strong>report-skill/SKILL.md / <code>report data skill</code> —
+default to discovering harness-records (info/coverage).</strong> The CLI
+already documents auto-searching
+<code>&lt;data-dir&gt;/harness-records/</code>,
+<code>.claude/projects/</code>, <code>.codex/sessions/</code> when no
+<code>--harness-jsonl</code> is passed, but the pre-built consolidated
+CSV shows it emitted only <code>missing_harness</code> rows — i.e. the
+auto-discovery either wasn’t triggered (paths outside the data dir) or
+found nothing. Fix: either always pass <code>--harness-jsonl</code> for
+consolidated runs, or make <code>report data skill</code> warn loudly
+when 100% of rows are <code>missing_harness</code>. Validation:
+re-running with the <code>/tmp/qrwork/harness/**</code> mappings yields
+non-coverage rows.</p></li>
+</ol>
+<h2 id="verification">Verification</h2>
+<ul>
+<li><strong>schema check (data CSV):</strong>
+<code>autocuda schema check report-skill-csv --output 2026-06-13-to-2026-06-29-qr-consolidated</code>
+→ <strong>PASS</strong> (“matches the built-in report-skill schema”).
+The rebuilt 3,089-row skill CSV is schema-valid; it is simply all
+coverage-gap rows.</li>
+<li><strong>schema check (this markdown):</strong>
+<code>autocuda schema check report-skill-markdown --output 2026-06-13-to-2026-06-29-qr-consolidated</code>
+— run as the final step; the required sections (Executive Summary, Skill
+Issue Candidates, Root Causes, Fix Plan, Verification) and the Skill
+Issue Candidates table columns (Branch, Skill, Severity, Category,
+Evidence, Recommendation) are present in order.</li>
+<li><strong>Data generation / direct scan:</strong> I did not build the
+skill CSV myself (the coordinator rebuilt it to 3,089 rows after adding
+two missed tags). Instead I imported the CLI’s own scanner
+(<code>_report._collect_skill_issue_incidents</code>) and ran it over
+6,408 of the 6,450 JSONLs (~4.2 GB) in
+<code>/tmp/qrwork/harness/**/harness-records/</code> (35 of 36 export
+dirs; the 42-file <code>2026-06-19-19-06-14</code> export was staged
+after my scan), reproducing exactly what the CLI would have emitted with
+full <code>--harness-jsonl</code> coverage: 8,791 raw candidate hits,
+triaged to 6 confirmed skill/CLI issues after removing 5,971
+kernel/torch-traceback false positives, 428 window-duplicate
+confirmation-gate hits, and 212
+<code>ncu</code>/<code>nvcc</code>/<code>HEAD</code> “command not found”
+false positives.</li>
+<li><strong>Confirmed-bug reproduction:</strong> the field-limit crash
+was reproduced live
+(<code>autocuda schema check report-optimization-csv</code> exits 1 with
+<code>_csv.Error</code>), and 315 oversized <code>branches</code> cells
+were counted directly. The <code>init brief</code> traceback origin was
+read from the live 0.4.0 <code>_init.py:398</code>; the
+<code>--agent-id</code>/verb skew was cross-checked against live 0.4.0
+<code>--help</code> output.</li>
+<li><strong>Metric-join bug reproduction (the second high
+finding):</strong> verified 0/5,602 non-blank
+<code>best_speedup</code>/<code>best_step_speedup</code> in the rebuilt
+consolidated optimization CSV (0/1,436 for qr_py alone); re-ran
+<code>autocuda report data optimization</code> live for
+<code>2026-06-22-09-10-03-qr_v2</code> (0/676) and
+<code>2026-06-29-06-40-42-qr_v2</code> (0/206, despite a reference-log
+baseline of 1639.170 µs). Confirmed the raw logs carry the metric (400
+numeric <code>linalg/qr_v2</code> cells, 394 succeeded, for 06-22).
+Traced the break to <code>_primary_benchmark</code> reading the shared
+<code>log-schema-optimize.json</code> (= <code>linalg/eigh_py</code>)
+and proved the fix by forcing <code>metric_name="linalg/qr_v2"</code>,
+which made the baseline resolve (1639.17) and speedups compute
+(0.946/1.001/1.008×). The transient single-tag CSVs I built for this
+reproduction were removed; only
+<code>2026-06-13-to-2026-06-29-qr-consolidated-*</code> files
+remain.</li>
+<li><strong>Source harness review:</strong> the high-severity
+contradiction (manager session <code>ad61ef45…426d.jsonl</code> lines
+1179/1215/1226), the genuine operator-gate/freeze standoff
+(<code>agent-a2d314d4a45bcd31.jsonl</code> lines 126–136), the
+<code>init brief</code> recovery
+(<code>agent-adbab7ed28b695824.jsonl</code> lines 16–19), and the
+kernel-language layout failure (<code>t5sr96or9</code> line 117) were
+all read directly in context.</li>
+<li><strong>Evidence gaps:</strong> (1) The <strong>pre-2026-06-19
+main-lineage tags</strong> (<code>2026-06-15-05-53-17</code>,
+<code>2026-06-18-00-40-34</code>, <code>2026-06-18-01-38-06</code>,
+<code>2026-06-19-00-34-18</code>, <code>2026-06-20-20-26-49</code>,
+<code>2026-06-24-21-01-44-simplify</code>,
+<code>2026-06-25-02-02-25</code>) have <strong>no extracted
+harness-records</strong> in the manifest, so their sessions were not
+scanned — the 3,089-branch CSV covers them, but only as coverage-gap
+rows. (2) <strong>qr_py</strong> (optimize tag
+<code>2026-06-13-03-45-35</code>) has both <strong>1,161 kept
+trials</strong> in its trial CSVs and <strong>498 session
+JSONLs</strong>; the JSONLs were scanned for skill incidents (init-brief
+tracebacks + reasoning gates), and its trials appear in the
+trial-granular data as coverage-gap rows like every other tag (the skill
+CSV carries no trial metrics regardless). (3) The <strong>exact autocuda
+version</strong> each run used is not stamped in the exports, so
+version-skew items are inferred from the recorded
+<code>--help</code>/usage strings, not a version string. (4)
+Harness-records are <strong>shared across export tags</strong>
+(e.g. <code>agent-a2d314d4a45bcd31.jsonl</code> appears under 4 tags),
+so per-tag incident counts can double-count one underlying session —
+distinct-incident counts above dedupe on <code>(tag, file, line)</code>
+but cross-tag file sharing is noted where it matters.</li>
+</ul>
+<h2 id="scope-methodology">Scope &amp; Methodology</h2>
+<p>Consolidated audit for bugs in the <strong>autocuda skills
+themselves</strong> across all qr_py + qr_v2 experiments: 18 qr_v2
+main-lineage tags (B200), 22 qr_v2 kernel_languages tags (RTX Pro 6K),
+and 1 qr_py tag (B200, <code>2026-06-13-03-45-35</code>, 1,161 kept
+trials) plus its stashes — 41 optimize tags, 3,089 experiment branches,
+6,450 session JSONLs (~4.2 GB). Kernel build/validation/optimization
+failures are <strong>out of scope</strong> and are treated as run
+outcomes, not skill bugs.</p>
+
+</body>
+</html>
