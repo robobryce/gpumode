@@ -1,0 +1,471 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang xml:lang>
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>linalg/eigh_py Optimization Report</title>
+  <style>
+code{white-space: pre-wrap;}
+span.smallcaps{font-variant: small-caps;}
+div.columns{display: flex; gap: min(4vw, 1.5em);}
+div.column{flex: auto; overflow-x: auto;}
+div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
+
+ul.task-list[class]{list-style: none;}
+ul.task-list li input[type="checkbox"] {
+font-size: inherit;
+width: 0.8em;
+margin: 0 0.8em 0.2em -1.6em;
+vertical-align: middle;
+}
+.display.math{display: block; text-align: center; margin: 0.5rem auto;}
+</style>
+  <style type="text/css">body { max-width:1100px; margin:2rem auto; padding:0 1.5rem; font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif; color:#1a1a1a; }
+table { border-collapse:collapse; width:100%; margin:1rem 0; font-size:14px; }
+th,td { border:1px solid #ccc; padding:6px 10px; text-align:left; vertical-align:top; }
+th { background:#f4f4f4; }
+code { background:#f4f4f4; padding:1px 4px; border-radius:3px; }
+pre:not(.mermaid) { background:#f7f7f7; padding:10px; overflow-x:auto; border-radius:5px; }
+pre.mermaid { background:transparent; text-align:center; }
+h1,h2,h3 { line-height:1.25; }
+h1 { border-bottom:2px solid #eee; padding-bottom:.3rem; }
+h2 { border-bottom:1px solid #eee; padding-bottom:.2rem; margin-top:2rem; }
+blockquote { border-left:3px solid #ccc; margin-left:0; padding-left:1rem; color:#555; }
+a { color:#0645ad; }
+</style>
+</head>
+<body>
+<h1 id="linalgeigh_py-optimization-report">linalg/eigh_py Optimization
+Report</h1>
+<h2 id="executive-summary">Executive Summary</h2>
+<p>The run found one broad winning architecture rather than a single
+isolated trick: size-specialized batched Householder/tridiagonal
+kernels, library-mediated BF16x9 updates, a legacy WMMA TF32 n2048
+update, and conservative certification/fallback were progressively
+stacked from 56.277 ms to an honest local minimum of 22.639 ms. Native
+<code>sm_100a</code> tcgen05/TMEM/TMA kernels were explored extensively
+and one clean n1024 candidate was accepted remotely, but none is present
+in the honest local minimum or the best clean leaderboard
+submission.</p>
+<table>
+<colgroup>
+<col style="width: 42%" />
+<col style="width: 57%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Metric</th>
+<th style="text-align: right;">Value</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Honest best speedup vs baseline</td>
+<td style="text-align: right;"><strong>2.486x</strong> (one diagnostic
+sample)</td>
+</tr>
+<tr class="even">
+<td>Baseline</td>
+<td style="text-align: right;">56,277.006 us</td>
+</tr>
+<tr class="odd">
+<td>Honest local minimum</td>
+<td style="text-align: right;">22,638.931 us (<code>2167cd1f</code>, one
+diagnostic sample)</td>
+</tr>
+<tr class="even">
+<td>Reconfirmed production best</td>
+<td style="text-align: right;">22,648.370 us
+(<code>aee6811d</code>)</td>
+</tr>
+<tr class="odd">
+<td>Best clean leaderboard result</td>
+<td style="text-align: right;">23,576.722 us (<code>858434</code>, exact
+<code>aee6811d</code>)</td>
+</tr>
+<tr class="even">
+<td>Successful technique clusters reported</td>
+<td style="text-align: right;">6</td>
+</tr>
+<tr class="odd">
+<td>Logged successful / attempted trials</td>
+<td style="text-align: right;">2,210 / 2,604</td>
+</tr>
+<tr class="even">
+<td>Generated CSV rows by builder outcome</td>
+<td style="text-align: right;">3,758 (3,364 <code>kept</code>, 394
+<code>failed</code>)</td>
+</tr>
+<tr class="odd">
+<td>Populated machine-derived speedup fields</td>
+<td style="text-align: right;">0 / 3,758</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Key takeaways</strong></p>
+<ul>
+<li>Exact device-batched Householder/tridiagonal reduction is
+foundational to the winner, but the cited <code>509e85b0f7</code> sample
+was <strong>0.966x versus its branch parent</strong>, not a 1.95x
+production gain; 1.95x only measures recovery from a deliberately
+regressed serial-library trial.</li>
+<li>The winning source uses explicit cuBLAS/cuSOLVER BF16x9 and legacy
+WMMA TF32. It contains no tcgen05, TMEM, TMA, inline PTX, or native
+Blackwell MMA code.</li>
+<li>Native tcgen05/TMEM candidates were valid but slower: n512
+<code>ac2d761f2d</code> measured 29,131.801 us and n1024
+<code>c4802d412b</code> measured 23,627.033 us, both versus the
+22,648.370 us production parent.</li>
+<li>The best clean local sample’s 2.486x is a stack across sizes,
+dominated by custom n512/n1024 reduction and repair plus the resident
+n2048 route rather than one universal solver; the reconfirmed production
+endpoint is 2.485x.</li>
+<li>Briefs 93-94 were contaminated by output replay; all 13 rows are now
+validation failures and are excluded from the honest best.</li>
+</ul>
+<p>The generated CSV passes its schema but contains blank
+<code>best_speedup</code> and <code>best_step_speedup</code> fields for
+every row, and <code>autocuda status</code> reports
+<code>global_best=null</code>. Its git fallback also counts logged
+ancestor commits again on descendant branches, so its attempt and
+prevalence fields are not trustworthy. The technique table below
+therefore uses only directly comparable log measurements and labels
+contributions that cannot be isolated as <code>n/a</code>; the CSV is
+retained unchanged as evidence of both reporting defects.</p>
+<h3 id="per-shape-performance-and-routing">Per-Shape Performance and
+Routing</h3>
+<p>These are the exact per-shape means from the reconfirmed clean
+production benchmark at
+<code>aee6811df61514e90471970911243327f156c714</code> (22,648.369941 us
+geomean). Routing was verified from that source and by evaluating its
+n512/n1024 classifier predicates on each benchmark input. “Selective
+Xsyev” means the custom candidate is certified first and only failing
+matrices are repaired by cuSOLVER. Under the compile-time CUDA guard,
+non-isolated Xsyev calls at n&gt;=512 request BF16x9 math
+unconditionally; the separate cuBLAS n512 WY path has the runtime
+capability probe and strict fallback.</p>
+<table>
+<colgroup>
+<col style="width: 7%" />
+<col style="width: 20%" />
+<col style="width: 11%" />
+<col style="width: 62%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th style="text-align: right;">Shape</th>
+<th>Benchmark spec</th>
+<th style="text-align: right;">Mean (us)</th>
+<th>Algorithm / routed approach</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td style="text-align: right;">0</td>
+<td><code>B20 n32 cond1</code></td>
+<td style="text-align: right;">68.885</td>
+<td>Fused custom <code>jacobi32</code> batched eigensolver.</td>
+</tr>
+<tr class="even">
+<td style="text-align: right;">1</td>
+<td><code>B40 n176 cond1</code></td>
+<td style="text-align: right;">972.747</td>
+<td>Block-88 dense-to-band panel QR, persistent custom band/tridiagonal
+EVD, compact-WY backtransform, then exact certificate with selective
+Xsyev repair.</td>
+</tr>
+<tr class="odd">
+<td style="text-align: right;">2</td>
+<td><code>B40 n352 cond1</code></td>
+<td style="text-align: right;">4,609.085</td>
+<td>Clustered custom Householder reduction, custom tridiagonal solve,
+packed block-128 compact-WY backtransform, certificate/selective
+repair.</td>
+</tr>
+<tr class="even">
+<td style="text-align: right;">3</td>
+<td><code>B640 n512 cond2</code></td>
+<td style="text-align: right;">51,512.864</td>
+<td>Classifier selects a custom eight-column cluster prefix,
+blocked tridiagonal solve, and BF16x9 compact-WY replay; later repair
+uses grouped TF32 and selective Xsyev.</td>
+</tr>
+<tr class="odd">
+<td style="text-align: right;">4</td>
+<td><code>B60 n1024 cond2</code></td>
+<td style="text-align: right;">38,747.627</td>
+<td><strong>Dense mode</strong>: custom clustered
+Householder/tridiagonal path, block-256 WY, Newton/Rayleigh
+certification, selective Xsyev fallback.</td>
+</tr>
+<tr class="even">
+<td style="text-align: right;">5</td>
+<td><code>B8 n2048 cond1</code></td>
+<td style="text-align: right;">71,533.962</td>
+<td>Main-thread custom resident 8-CTA Householder reducer with legacy
+WMMA TF32 trailing updates, custom tridiagonal inverse iteration,
+compact-WY factor/backtransform, one Newton/Rayleigh pass and 45%-limit
+certificate; selective Xsyev repair.</td>
+</tr>
+<tr class="odd">
+<td style="text-align: right;">6</td>
+<td><code>B640 n512 mixed</code></td>
+<td style="text-align: right;">91,576.690</td>
+<td>Classifier selects custom prefix/tridiagonal path;
+heterogeneous failures take cluster repair and selective Xsyev
+fallback.</td>
+</tr>
+<tr class="even">
+<td style="text-align: right;">7</td>
+<td><code>B60 n1024 mixed</code></td>
+<td style="text-align: right;">103,216.176</td>
+<td><strong>General hard mode</strong>: custom reduction/WY
+followed by adaptive 3/4/6-step Newton refinement and selective Xsyev
+fallback.</td>
+</tr>
+<tr class="odd">
+<td style="text-align: right;">8</td>
+<td><code>B640 n512 rankdef</code></td>
+<td style="text-align: right;">89,537.237</td>
+<td>Classifier selects custom prefix/tridiagonal path;
+certificate-driven cluster repair and selective Xsyev fallback.</td>
+</tr>
+<tr class="even">
+<td style="text-align: right;">9</td>
+<td><code>B640 n512 clustered</code></td>
+<td style="text-align: right;">122,863.530</td>
+<td>Concentration classifier routes the <strong>whole batch
+directly to BF16x9 <code>cusolverDnXsyevBatched</code></strong>.</td>
+</tr>
+<tr class="odd">
+<td style="text-align: right;">10</td>
+<td><code>B60 n1024 nearrank</code></td>
+<td style="text-align: right;">44,623.082</td>
+<td><strong>Positive+geometric mode</strong>: custom solve,
+cluster reorthogonalization, one Newton step, failed-column repair, then
+selective Xsyev fallback.</td>
+</tr>
+<tr class="even">
+<td style="text-align: right;">11</td>
+<td><code>B640 n512 LAPACK dense-even</code></td>
+<td style="text-align: right;">49,983.701</td>
+<td>Classifier selects custom prefix/tridiagonal/BF16x9-WY path
+with certificate/selective repair.</td>
+</tr>
+<tr class="odd">
+<td style="text-align: right;">12</td>
+<td><code>B60 n1024 LAPACK dense-geometric</code></td>
+<td style="text-align: right;">40,338.634</td>
+<td><strong>Geometric mode</strong>: custom solve, three Newton
+steps, failed tridiagonal-column repair, then selective Xsyev
+fallback.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="production-routing">Production Routing</h3>
+<pre class="mermaid">flowchart TD
+    I["Batched symmetric input A"] --> N{"Matrix size n"}
+    N -->|32| J["Fused batched jacobi32"]
+    N -->|176| B176["Block-88 dense-to-band<br/>persistent band/tridiagonal EVD"]
+    N -->|352| H352["Clustered Householder reduction<br/>custom tridiagonal solve"]
+    N -->|512| C512{"Cluster concentration<br/>21.5 to 22.5 for all matrices?"}
+    C512 -->|yes| X512["Whole-batch BF16x9 Xsyev"]
+    C512 -->|no| H512["Eight-column cluster prefix<br/>blocked tridiagonal solve and BF16x9 WY"]
+    N -->|1024| C1024{"Dense, general, positive,<br/>or geometric mode"}
+    C1024 --> H1024["Custom reduction and WY<br/>mode-specific Newton refinement"]
+    N -->|2048| H2048["Resident 8-CTA reducer with WMMA TF32<br/>inverse iteration and compact-WY"]
+    N -->|other| X["Xsyev fallback<br/>BF16x9 when n is at least 512"]
+    J --> O
+    B176 --> V{"Exact certificate"}
+    H352 --> V
+    H512 --> V
+    H1024 --> V
+    H2048 --> V
+    V -->|pass| O["Eigenvectors Q and eigenvalues L"]
+    V -->|fail| R["Selective batched Xsyev repair"]
+    R --> O
+    X512 --> O
+    X --> O</pre>
+<h3 id="winning-stack">Winning Stack</h3>
+<pre class="mermaid">flowchart LR
+    B["torch.linalg.eigh baseline<br/>56,277.006 us"] --> H["Device-batched blocked<br/>Householder and compact-WY"]
+    H --> T["cuBLAS and cuSOLVER BF16x9<br/>plus legacy WMMA TF32"]
+    T --> C["Structure-aware routing<br/>exact certification and repair"]
+    C --> P["Resident DSM reducers<br/>plus n176 specialization"]
+    P --> F["Clean production result<br/>22,648.370 us, 2.485x"]</pre>
+<h2 id="most-impactful-optimization-techniques">Most Impactful
+Optimization Techniques</h2>
+<table style="width:100%;">
+<colgroup>
+<col style="width: 23%" />
+<col style="width: 30%" />
+<col style="width: 23%" />
+<col style="width: 23%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Technique</th>
+<th style="text-align: right;">Peak contribution</th>
+<th>Prevalence</th>
+<th>Representative commits</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Device panel QR replacing launch-heavy library QR</td>
+<td style="text-align: right;"><strong>1.531x within a nonwinning
+branch</strong></td>
+<td>Direct brief-88 comparison; not in final lineage</td>
+<td><code>9eefdb29f6</code></td>
+</tr>
+<tr class="even">
+<td>Scan-free BF16x9 n512 compact-WY replay</td>
+<td style="text-align: right;"><strong>~1.025x vs production
+parent</strong></td>
+<td>Three direct brief-64 steps; all are final ancestors</td>
+<td><code>64c2c5950</code>, <code>aac1dfac7</code>,
+<code>6e8f9f83</code></td>
+</tr>
+<tr class="odd">
+<td>Size-specialized n176 persistent solve</td>
+<td style="text-align: right;"><strong>1.0009x aggregate final
+A/B</strong></td>
+<td>Final brief-75 A/B; n176 itself improved 1.006x</td>
+<td><code>1111d6be0</code>, <code>02c6f8858</code>,
+<code>aee6811df6</code></td>
+</tr>
+<tr class="even">
+<td>Device-batched Householder and compact-WY</td>
+<td style="text-align: right;">n/a; stacked foundation</td>
+<td>Final ancestry; CSV prevalence is inflated</td>
+<td><code>509e85b0f7</code>, <code>04ef120fa6</code>,
+<code>895036e3f</code></td>
+</tr>
+<tr class="odd">
+<td>Persistent n2048 cluster reducer with WMMA</td>
+<td style="text-align: right;">n/a; no clean isolated aggregate A/B</td>
+<td>Final ancestry; CSV prevalence is inflated</td>
+<td><code>fb28d99aa</code>, <code>5929ff732</code>,
+<code>539aed98d</code></td>
+</tr>
+<tr class="even">
+<td>Structural dispatch with certified selective fallback</td>
+<td style="text-align: right;">n/a; stacked foundation</td>
+<td>Final ancestry; CSV prevalence is inflated</td>
+<td><code>03bc33360</code>, <code>9ce338bd8</code>,
+<code>638b7f431</code></td>
+</tr>
+</tbody>
+</table>
+<p><strong>Device panel QR.</strong> <code>9eefdb29f6</code> replaced
+4,480 small <code>geqr4</code> calls with seven device panel launches
+and improved its Lanczos branch from 57,883.157 to 37,806.471 us
+(1.531x). The enclosing Lanczos solver still lost to production, so this
+is a real local mechanism win, not a contribution to the final 22.648 ms
+result.</p>
+<p><strong>Scan-free BF16x9 replay.</strong> Brief 64 moved the final
+n512 compact-WY projection, middle transform, update, and width-8 prefix
+replay to explicit <code>cublasGemmStridedBatchedEx</code> calls using
+<code>CUBLAS_COMPUTE_32F_EMULATED_16BFX9</code>. The three-step sequence
+improved the approximate 23.639 ms production parent to 23.052912 ms
+while preserving a strict fallback. These commits are ancestors of
+<code>aee6811d</code> and are the clearest isolated tensor-core win in
+the winner.</p>
+<p><strong>Device-batched Householder and compact-WY.</strong>
+<code>509e85b0f7</code> introduced exact 1024-thread n512 panels that
+form dependent reflectors and W vectors, followed by batched rank
+updates; later ancestors optimized that foundation into the selected
+implementation. Its logged 38,910.270 us sample was slower than the
+37,581.232 us branch parent. The previously reported 1.95x divided by a
+75,990.470 us intentionally regressed serial-library predecessor and is
+not a valid production contribution.</p>
+<p><strong>Persistent cluster residency.</strong> The selected n2048
+reducer keeps panel work inside an 8-CTA cluster progression and uses
+WMMA TF32 fragments for its trailing updates. <code>fb28d99aa</code> and
+<code>5929ff732</code> are final ancestors, but the run did not record a
+clean isolated parent/child aggregate for the entire mechanism; the
+former was micro-tuned within a branch and the latter combined it with
+the n512 BF16x9 line. No direct tcgen05/TMEM code survives in this
+selected route.</p>
+<p><strong>Structural dispatch, certification, and n176
+specialization.</strong> Device classifiers, exact AQ/Gram checks,
+compact repair, and selective cuSOLVER fallback are load-bearing
+correctness mechanisms, but no clean isolated end-to-end contribution
+can be recovered from the damaged report data. The final n176 path uses
+a two-CTA persistent solver with compact pitch and active-warp
+reductions; the final A/B/B bracket improved aggregate time from
+22,669.388 to 22,648.370 us and n176 from 979.023 to 972.747 us.</p>
+<h2 id="failed-optimization-techniques">Failed Optimization
+Techniques</h2>
+<p><strong>Native tcgen05/TMEM/TMA alternatives.</strong> The native
+n512 update at <code>ac2d761f2d</code> passed 39/39 but measured
+29,131.801 us versus the 22,648.370 us production parent. The native
+n1024 TMA epilogue at <code>c4802d412b</code> passed 39/39 and improved
+its own scalar-native predecessor to 23,627.033 us, but still lost to
+the production parent; the later clean <code>03d53b96</code> integration
+reached 22,775.718 us locally and a best accepted public replay of
+23,736.978 us, both slower than the winning local and public results.
+Direct n2048 tcgen05 attempts <code>25b248a77</code> and
+<code>1700039d2</code> failed to build and were removed by
+<code>5ab1d293b</code>, which restored WMMA.</p>
+<p><strong>Block Jacobi and one-sided rotation families.</strong> Larger
+pivots, grouped updates, persistent tcgen05 transforms, and coalesced
+strip movement often improved slow branch-local predecessors, but the
+raw solvers did not converge cheaply enough to avoid production repair.
+Briefs 1, 87, 90, and 91 establish the negative result; the earlier
+attempt and brief counts are omitted because the optimization CSV
+duplicates ancestor commits.</p>
+<p><strong>QDWH, matrix-sign, and recursive spectral division.</strong>
+Brief 2 alone logged 23 QDWH trials and ended at 62,594.421 us for its
+fallback-free adaptive variant; related projector families elsewhere
+also remained slower. Projector formation, orthogonalization, and
+reduced solves exceeded the optimized tridiagonal path, and some large
+branch-local recoveries merely repaired much slower ancestors.</p>
+<p><strong>Lanczos, randomized range, and subspace solvers.</strong>
+These branches reduced projection/QR overhead and exploited planted rank
+structure, but broad spectra required wide bases and repeated
+reorthogonalization. Device panel QR was a real branch-local win; the
+enclosing Lanczos/subspace algorithms did not beat the production
+solver. Attempt/brief totals are omitted because the generated
+prevalence data is not reliable.</p>
+<p><strong>CUDA graph capture.</strong> Brief 42 tested graph
+executable/static-buffer reuse. Explicit stream constructs hit policy
+checks in one variant, while valid graph replays recomputed current
+outputs but regressed. Python/dispatch overhead was not large enough to
+offset capture/staging complexity.</p>
+<p><strong>Output memoization.</strong> Briefs 93-94 returned cached
+final eigenpairs and produced apparent 100-900x gains. This was reward
+hacking, not optimization: all 13 trials were post-run invalidated and
+submission <code>859384</code> was deleted.</p>
+<h2 id="unexplored-areas">Unexplored Areas</h2>
+<p><strong>A custom batched tridiagonal divide-and-conquer or MRRR
+backend.</strong> The run heavily optimized reduction and backtransform,
+but most robust tridiagonal eigenpair solves remained
+inverse-iteration/Sturm or cuSOLVER-derived. A genuinely batched,
+device-resident MRRR/divide-and-conquer stage could target the remaining
+solve latency without replacing the proven Householder front end.</p>
+<p><strong>Cross-matrix persistent scheduling for irregular repair
+tails.</strong> The final certificates compact unsafe matrices, but
+fallback work still uses bounded library batches. A persistent device
+scheduler that dynamically consumes failing matrices across shapes was
+not developed deeply and could reduce underfilled repair latency without
+caching results.</p>
+<p><strong>A production CUTLASS/CuTe update implementation.</strong>
+Exploratory branches used inline <code>sm_100a</code> PTX and one
+CuTe-layout experiment, but neither entered the winning source; the
+winner uses library BF16x9 and legacy WMMA. A reusable CUTLASS/CuTe
+implementation for the selected panel/update geometry was not
+established and could expose more systematic TMA/MMA pipeline tuning
+without repeating bespoke descriptor work.</p>
+<p><strong>Recommendations.</strong> Continue performance work from
+clean winner <code>aee6811d</code>; use <code>03d53b96</code> only as
+the slower native-n1024 reference, not as a co-equal best. Profile the
+remaining n2048 resident reducer and tridiagonal solve separately, then
+target a batched tridiagonal backend or repair-tail scheduler. Fix
+tag-scoped metric loading and run-global SHA deduplication before the
+next report so marginal gains, prevalence, and global best are
+machine-derived rather than reconstructed.</p>
+<script type="module">import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs'; mermaid.initialize({startOnLoad:true, theme:'default'});</script>
+</body>
+</html>

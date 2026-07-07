@@ -1,0 +1,736 @@
+<h1 id="cost-report-2026-07-06-18-24-02">Cost Report:
+2026-07-06-18-24-02</h1>
+<h2 id="executive-summary">Executive Summary</h2>
+<p>This was an expensive run in walltime and inference volume: 18.37
+hours elapsed, 65.89 summed agent-hours were recorded across branch and
+steered rows, and the five sessions consumed 2.684B tokens. GPU work and
+scheduler contention drove walltime; a dollar estimate is intentionally
+unavailable because the recorded <code>gpt-5.6-sol</code> model has no
+public list rate that can be applied responsibly.</p>
+<p>The run was productive against its narrow dense n=512 target—the best
+kernel was 3.47× faster than the first full-valid port of the supplied
+baseline—but it did not beat the run’s 1234.320 µs full-suite geomean
+baseline. This is a single experiment, so the report does not imply
+cross-run cost variance.</p>
+<p><strong>Key takeaways</strong></p>
+<ul>
+<li>The fleet spent 17.29 completed GPU-hours executing and 28.29
+aggregate agent-hours waiting for scheduler locks; waiting consumed
+50.9% of the three worker sessions’ summed walltime.</li>
+<li>Cache reuse was exceptional: 2.663B cached-input tokens were 99.21%
+of total tokens, while uncached input was 19.5M.</li>
+<li>The three long workers consumed 777.1M–826.2M tokens each; none was
+a 2× cost outlier.</li>
+<li>Nineteen context compactions occurred: seven, six, and five in the
+workers plus one in the manager.</li>
+<li>Completed GPU calls stayed within the environment budgets; the
+longest recorded run was 346 seconds versus the documented 480-second
+benchmark and 600-second long-profile allowances.</li>
+</ul>
+<p><strong>Run summary:</strong> 65.9 summed agent-hours (18.37 physical
+hours), inference cost unavailable, 2.684B total tokens, 19 compactions;
+expensive but operationally in line with the configured per-call
+timeouts.</p>
+<h2 id="token-totals">Token Totals</h2>
+<p><strong>2.684B tokens</strong></p>
+<table>
+<thead>
+<tr class="header">
+<th>Token type</th>
+<th style="text-align: right;">Tokens</th>
+<th style="text-align: right;">Share</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Input</td>
+<td style="text-align: right;">19.5M</td>
+<td style="text-align: right;">0.73%</td>
+</tr>
+<tr class="even">
+<td>Cached input</td>
+<td style="text-align: right;">2.663B</td>
+<td style="text-align: right;">99.21%</td>
+</tr>
+<tr class="odd">
+<td>Output</td>
+<td style="text-align: right;">1.72M</td>
+<td style="text-align: right;">0.06%</td>
+</tr>
+<tr class="even">
+<td><strong>Total</strong></td>
+<td style="text-align: right;"><strong>2.684B</strong></td>
+<td style="text-align: right;"><strong>100.00%</strong></td>
+</tr>
+</tbody>
+</table>
+<p>Input is the Codex cumulative input count net of cache reads; the
+three fields are disjoint. Totals include the steered manager and
+baseline-research sessions. There were no cache-creation tokens in the
+Codex records.</p>
+<h2 id="walltime-breakdown">Walltime Breakdown</h2>
+<p>Branch durations come from the experiment logs; manager and baseline
+durations come from their rollouts. Because each long-lived worker
+handled several sequential briefs, its inference and tool counts appear
+exactly once on a representative row: worker C on <code>brief-0</code>
+(also briefs 3, 6, 7, 9, 15), worker B on <code>brief-1</code> (also 10,
+12, 14, 16), and worker A on <code>brief-2</code> (also 4, 5, 8, 11, 13,
+17). Blank call cells on the other brief rows are therefore
+shared-session attribution, not missing total coverage.</p>
+<p>Build and bench counts are completed lock releases reconstructed from
+the scrubbed Codex records. “Other” counts all remaining direct and
+nested tool calls; polling and collaboration calls are included.</p>
+<table>
+<thead>
+<tr class="header">
+<th>Branch</th>
+<th style="text-align: right;">Duration</th>
+<th style="text-align: right;">Build calls</th>
+<th style="text-align: right;">Bench calls</th>
+<th style="text-align: right;">Other tool calls</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>brief-0</code> (worker C aggregate)</td>
+<td style="text-align: right;">4h20m56s</td>
+<td style="text-align: right;">73</td>
+<td style="text-align: right;">157</td>
+<td style="text-align: right;">4,029</td>
+</tr>
+<tr class="even">
+<td><code>brief-1</code> (worker B aggregate)</td>
+<td style="text-align: right;">14h36m44s</td>
+<td style="text-align: right;">62</td>
+<td style="text-align: right;">148</td>
+<td style="text-align: right;">4,095</td>
+</tr>
+<tr class="odd">
+<td><code>brief-2</code> (worker A aggregate)</td>
+<td style="text-align: right;">5h56m34s</td>
+<td style="text-align: right;">61</td>
+<td style="text-align: right;">145</td>
+<td style="text-align: right;">3,856</td>
+</tr>
+<tr class="even">
+<td><code>brief-3</code></td>
+<td style="text-align: right;">5h10m33s</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+</tr>
+<tr class="odd">
+<td><code>brief-4</code></td>
+<td style="text-align: right;">2h18m45s</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+</tr>
+<tr class="even">
+<td><code>brief-5</code></td>
+<td style="text-align: right;">3h03m47s</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+</tr>
+<tr class="odd">
+<td><code>brief-6</code></td>
+<td style="text-align: right;">1h41m00s</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+</tr>
+<tr class="even">
+<td><code>brief-7</code></td>
+<td style="text-align: right;">2h22m20s</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+</tr>
+<tr class="odd">
+<td><code>brief-8</code></td>
+<td style="text-align: right;">1h48m05s</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+</tr>
+<tr class="even">
+<td><code>brief-9</code></td>
+<td style="text-align: right;">1h30m47s</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+</tr>
+<tr class="odd">
+<td><code>brief-10</code></td>
+<td style="text-align: right;">18m29s</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+</tr>
+<tr class="even">
+<td><code>brief-11</code></td>
+<td style="text-align: right;">1h12m34s</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+</tr>
+<tr class="odd">
+<td><code>brief-12</code></td>
+<td style="text-align: right;">50m22s</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+</tr>
+<tr class="even">
+<td><code>brief-13</code></td>
+<td style="text-align: right;">49m05s</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+</tr>
+<tr class="odd">
+<td><code>brief-14</code></td>
+<td style="text-align: right;">29m54s</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+</tr>
+<tr class="even">
+<td><code>brief-15</code></td>
+<td style="text-align: right;">39m48s</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+</tr>
+<tr class="odd">
+<td><code>brief-16</code></td>
+<td style="text-align: right;">0s</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+</tr>
+<tr class="even">
+<td><code>brief-17</code></td>
+<td style="text-align: right;">0s</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+</tr>
+<tr class="odd">
+<td><code>steered/manager</code></td>
+<td style="text-align: right;">18h39m58s</td>
+<td style="text-align: right;">2</td>
+<td style="text-align: right;">4</td>
+<td style="text-align: right;">1,737</td>
+</tr>
+<tr class="even">
+<td><code>steered/baseline_archaeology</code></td>
+<td style="text-align: right;">3m29s</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">22</td>
+</tr>
+</tbody>
+</table>
+<p>The branch rows sum to 47.16 active branch-hours; including manager
+and baseline rows gives 65.89 agent-hours. These overlap in real time
+and must not be interpreted as physical elapsed time. Across all
+sessions, 198 completed builds ran for 6m59s and 454 completed GPU calls
+ran for 17h17m11s.</p>
+<h2 id="tool-call-distribution">Tool Call Distribution</h2>
+<p>The installed report CLI parsed Codex token events but not this
+rollout version’s <code>custom_tool_call</code> records. The canonical
+CSV was therefore supplemented from the scrubbed transcripts by counting
+direct function calls and the underlying <code>tools.*</code> calls
+inside Codex <code>exec</code> records.</p>
+<table>
+<thead>
+<tr class="header">
+<th>Branch</th>
+<th>Tool</th>
+<th style="text-align: right;">Count</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>brief-0</code></td>
+<td>write_stdin</td>
+<td style="text-align: right;">1,637</td>
+</tr>
+<tr class="even">
+<td><code>brief-0</code></td>
+<td>wait</td>
+<td style="text-align: right;">1,635</td>
+</tr>
+<tr class="odd">
+<td><code>brief-0</code></td>
+<td>exec_command</td>
+<td style="text-align: right;">840</td>
+</tr>
+<tr class="even">
+<td><code>brief-0</code></td>
+<td>apply_patch</td>
+<td style="text-align: right;">103</td>
+</tr>
+<tr class="odd">
+<td><code>brief-0</code></td>
+<td>web__run</td>
+<td style="text-align: right;">33</td>
+</tr>
+<tr class="even">
+<td><code>brief-0</code></td>
+<td>send_message</td>
+<td style="text-align: right;">7</td>
+</tr>
+<tr class="odd">
+<td><code>brief-0</code></td>
+<td>view_image</td>
+<td style="text-align: right;">4</td>
+</tr>
+<tr class="even">
+<td><code>brief-1</code></td>
+<td>wait</td>
+<td style="text-align: right;">1,810</td>
+</tr>
+<tr class="odd">
+<td><code>brief-1</code></td>
+<td>write_stdin</td>
+<td style="text-align: right;">1,656</td>
+</tr>
+<tr class="even">
+<td><code>brief-1</code></td>
+<td>exec_command</td>
+<td style="text-align: right;">684</td>
+</tr>
+<tr class="odd">
+<td><code>brief-1</code></td>
+<td>apply_patch</td>
+<td style="text-align: right;">102</td>
+</tr>
+<tr class="even">
+<td><code>brief-1</code></td>
+<td>web__run</td>
+<td style="text-align: right;">32</td>
+</tr>
+<tr class="odd">
+<td><code>brief-1</code></td>
+<td>update_plan</td>
+<td style="text-align: right;">10</td>
+</tr>
+<tr class="even">
+<td><code>brief-1</code></td>
+<td>send_message</td>
+<td style="text-align: right;">9</td>
+</tr>
+<tr class="odd">
+<td><code>brief-1</code></td>
+<td>list_agents</td>
+<td style="text-align: right;">1</td>
+</tr>
+<tr class="even">
+<td><code>brief-1</code></td>
+<td>view_image</td>
+<td style="text-align: right;">1</td>
+</tr>
+<tr class="odd">
+<td><code>brief-2</code></td>
+<td>wait</td>
+<td style="text-align: right;">1,752</td>
+</tr>
+<tr class="even">
+<td><code>brief-2</code></td>
+<td>write_stdin</td>
+<td style="text-align: right;">1,500</td>
+</tr>
+<tr class="odd">
+<td><code>brief-2</code></td>
+<td>exec_command</td>
+<td style="text-align: right;">604</td>
+</tr>
+<tr class="even">
+<td><code>brief-2</code></td>
+<td>apply_patch</td>
+<td style="text-align: right;">93</td>
+</tr>
+<tr class="odd">
+<td><code>brief-2</code></td>
+<td>send_message</td>
+<td style="text-align: right;">64</td>
+</tr>
+<tr class="even">
+<td><code>brief-2</code></td>
+<td>web__run</td>
+<td style="text-align: right;">39</td>
+</tr>
+<tr class="odd">
+<td><code>brief-2</code></td>
+<td>update_plan</td>
+<td style="text-align: right;">7</td>
+</tr>
+<tr class="even">
+<td><code>brief-2</code></td>
+<td>spawn_agent</td>
+<td style="text-align: right;">2</td>
+</tr>
+<tr class="odd">
+<td><code>brief-2</code></td>
+<td>list_agents</td>
+<td style="text-align: right;">1</td>
+</tr>
+<tr class="even">
+<td><code>steered/manager</code></td>
+<td>wait_agent</td>
+<td style="text-align: right;">1,544</td>
+</tr>
+<tr class="odd">
+<td><code>steered/manager</code></td>
+<td>exec_command</td>
+<td style="text-align: right;">89</td>
+</tr>
+<tr class="even">
+<td><code>steered/manager</code></td>
+<td>list_agents</td>
+<td style="text-align: right;">32</td>
+</tr>
+<tr class="odd">
+<td><code>steered/manager</code></td>
+<td>followup_task</td>
+<td style="text-align: right;">21</td>
+</tr>
+<tr class="even">
+<td><code>steered/manager</code></td>
+<td>wait</td>
+<td style="text-align: right;">17</td>
+</tr>
+<tr class="odd">
+<td><code>steered/manager</code></td>
+<td>write_stdin</td>
+<td style="text-align: right;">16</td>
+</tr>
+<tr class="even">
+<td><code>steered/manager</code></td>
+<td>send_message</td>
+<td style="text-align: right;">9</td>
+</tr>
+<tr class="odd">
+<td><code>steered/manager</code></td>
+<td>spawn_agent</td>
+<td style="text-align: right;">5</td>
+</tr>
+<tr class="even">
+<td><code>steered/manager</code></td>
+<td>web__run</td>
+<td style="text-align: right;">5</td>
+</tr>
+<tr class="odd">
+<td><code>steered/manager</code></td>
+<td>update_plan</td>
+<td style="text-align: right;">3</td>
+</tr>
+<tr class="even">
+<td><code>steered/manager</code></td>
+<td>apply_patch</td>
+<td style="text-align: right;">2</td>
+</tr>
+<tr class="odd">
+<td><code>steered/baseline_archaeology</code></td>
+<td>exec_command</td>
+<td style="text-align: right;">19</td>
+</tr>
+<tr class="even">
+<td><code>steered/baseline_archaeology</code></td>
+<td>web__run</td>
+<td style="text-align: right;">2</td>
+</tr>
+<tr class="odd">
+<td><code>steered/baseline_archaeology</code></td>
+<td>send_message</td>
+<td style="text-align: right;">1</td>
+</tr>
+</tbody>
+</table>
+<p>Polling dominates worker tool traffic because long scheduler jobs
+yielded reusable execution sessions. Web research was modest—106 calls
+across all five sessions—and concentrated before or alongside
+implementation rather than replacing measured CUDA work.</p>
+<h2 id="inference-breakdown">Inference Breakdown</h2>
+<table>
+<colgroup>
+<col style="width: 9%" />
+<col style="width: 12%" />
+<col style="width: 12%" />
+<col style="width: 12%" />
+<col style="width: 12%" />
+<col style="width: 12%" />
+<col style="width: 12%" />
+<col style="width: 12%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Branch</th>
+<th style="text-align: right;">Input tokens</th>
+<th style="text-align: right;">Output tokens</th>
+<th style="text-align: right;">Cached input tokens</th>
+<th style="text-align: right;">Cache creation tokens</th>
+<th style="text-align: right;">Cache hit %</th>
+<th style="text-align: right;">Compactions</th>
+<th style="text-align: right;">Estimated USD</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>brief-0</code> (worker C aggregate)</td>
+<td style="text-align: right;">6,443,025</td>
+<td style="text-align: right;">562,354</td>
+<td style="text-align: right;">770,138,624</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">99.17%</td>
+<td style="text-align: right;">7</td>
+<td style="text-align: right;">n/a</td>
+</tr>
+<tr class="even">
+<td><code>brief-1</code> (worker B aggregate)</td>
+<td style="text-align: right;">5,675,882</td>
+<td style="text-align: right;">528,510</td>
+<td style="text-align: right;">820,017,152</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">99.31%</td>
+<td style="text-align: right;">6</td>
+<td style="text-align: right;">n/a</td>
+</tr>
+<tr class="odd">
+<td><code>brief-2</code> (worker A aggregate)</td>
+<td style="text-align: right;">5,101,926</td>
+<td style="text-align: right;">487,852</td>
+<td style="text-align: right;">786,998,016</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">99.36%</td>
+<td style="text-align: right;">5</td>
+<td style="text-align: right;">n/a</td>
+</tr>
+<tr class="even">
+<td><code>brief-3</code></td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+</tr>
+<tr class="odd">
+<td><code>brief-4</code></td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+</tr>
+<tr class="even">
+<td><code>brief-5</code></td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+</tr>
+<tr class="odd">
+<td><code>brief-6</code></td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+</tr>
+<tr class="even">
+<td><code>brief-7</code></td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+</tr>
+<tr class="odd">
+<td><code>brief-8</code></td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+</tr>
+<tr class="even">
+<td><code>brief-9</code></td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+</tr>
+<tr class="odd">
+<td><code>brief-10</code></td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+</tr>
+<tr class="even">
+<td><code>brief-11</code></td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+</tr>
+<tr class="odd">
+<td><code>brief-12</code></td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+</tr>
+<tr class="even">
+<td><code>brief-13</code></td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+</tr>
+<tr class="odd">
+<td><code>brief-14</code></td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+</tr>
+<tr class="even">
+<td><code>brief-15</code></td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+</tr>
+<tr class="odd">
+<td><code>brief-16</code></td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+</tr>
+<tr class="even">
+<td><code>brief-17</code></td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+<td style="text-align: right;">n/a</td>
+</tr>
+<tr class="odd">
+<td><code>steered/manager</code></td>
+<td style="text-align: right;">2,074,107</td>
+<td style="text-align: right;">125,192</td>
+<td style="text-align: right;">283,644,160</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">99.27%</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">n/a</td>
+</tr>
+<tr class="even">
+<td><code>steered/baseline_archaeology</code></td>
+<td style="text-align: right;">211,286</td>
+<td style="text-align: right;">13,794</td>
+<td style="text-align: right;">2,367,488</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">91.81%</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">n/a</td>
+</tr>
+</tbody>
+</table>
+<p>The three representative worker rows cover every worker token exactly
+once; the other brief rows are intentionally blank because the rollout
+format does not split cumulative token snapshots at brief boundaries.
+The full fleet total already includes all five sessions.</p>
+<h2 id="cost-optimization-opportunities">Cost-Optimization
+Opportunities</h2>
+<ul>
+<li>Reduce GPU queue depth. Three benchmark-heavy workers on one B200
+spent 22.87 aggregate hours waiting for <code>gpu-0</code>; one
+GPU-active worker with two research/edit workers would preserve
+concurrency without tripling queue pressure.</li>
+<li>Preserve the current context-cache behavior. A 99.21% cache-hit
+share is excellent and offsets the very large cumulative context
+volume.</li>
+<li>Bound shared worker-session growth. Nineteen compactions and 1.72M
+output tokens suggest that per-brief handoff summaries could reduce
+output and compaction overhead without giving up cache reuse.</li>
+<li>Add native Codex <code>custom_tool_call</code> parsing and
+multi-brief session attribution to
+<code>autocuda report data cost</code>; manual reconstruction should not
+be necessary.</li>
+<li>Record an explicit model pricing identifier if future deployments
+expose a billable public rate. This run cannot support a defensible USD
+estimate.</li>
+</ul>
+<h2 id="analysis">Analysis</h2>
+<p>The cost shape is dominated by a deliberately saturated one-GPU
+pipeline. Completed exclusive work occupied 94.1% of physical elapsed
+time, while the three workers simultaneously accumulated 28.29
+wait-hours. That kept the device productive but inflated agent walltime
+and context growth: the fleet spent roughly half its combined
+worker-session time waiting for a scheduler gate.</p>
+<p>Inference use was large but balanced. Workers A, B, and C consumed
+792.6M, 826.2M, and 777.1M total tokens respectively, so no branch ran
+away relative to its peers. Nearly all input was served from cache; the
+actionable inference signal is therefore the 19 compactions and 1.72M
+output tokens, not cache misses.</p>
+<p>Against the targeted dense n=512 case, the spend bought a reduction
+from 53.733 ms for the first full-valid supplied-kernel port to 15.474
+ms, a 3.47× speedup. Against the run-wide geomean baseline, however, the
+best reported 1419.742 µs remained about 15.0% slower than 1234.320 µs.
+The value judgment is consequently target-dependent: strong for the
+requested megakernel case, not a general-suite win.</p>
+<p><strong>Recommendations:</strong> Run only one GPU-owning worker on
+single-device nodes, assign parallel workers to offline design and code
+preparation, start fresh worker rollouts at natural brief boundaries
+when compaction pressure rises, and preserve the high cache-hit
+workflow. Add billing metadata before using this report for financial
+planning.</p>
+<p><em>Pricing note: all five records identify <code>gpt-5.6-sol</code>.
+No public per-million-token input, output, or cache-read rates were
+available or supplied, so <code>estimated_cost_usd</code> is blank and
+this report makes no dollar-cost claim.</em></p>

@@ -1,0 +1,1075 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GPUMODE QR — Languages &amp;amp; DSLs</title>
+<style>
+  body{max-width:1100px;margin:2rem auto;padding:0 1.5rem;font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;color:#1a1a1a}table{border-collapse:collapse;width:100%;margin:1rem 0;font-size:14px}th,td{border:1px solid #ccc;padding:6px 10px;text-align:left;vertical-align:top}th{background:#f4f4f4}code{background:#f4f4f4;padding:1px 4px;border-radius:3px}pre:not(.mermaid){background:#f7f7f7;padding:10px;overflow-x:auto;border-radius:5px}pre.mermaid{background:transparent;text-align:center}h1,h2,h3{line-height:1.25}h1{border-bottom:2px solid #eee;padding-bottom:.3rem}h2{border-bottom:1px solid #eee;padding-bottom:.2rem;margin-top:2rem}blockquote{border-left:3px solid #ccc;margin-left:0;padding-left:1rem;color:#555}a{color:#0645ad}
+</style>
+</head>
+<body>
+<h1 id="gpumode-qr-languages-dsls">GPUMODE QR — Languages &amp;
+DSLs</h1>
+<h2 id="executive-summary">Executive Summary</h2>
+<p>The runs authored these languages, DSLs, and library paths to attack
+the QR kernel, using the GPU techniques noted:</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Language / DSL / library</th>
+<th>Role</th>
+<th>Outcome</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><strong>Python / PyTorch</strong></td>
+<td>host language of every submission; <code>torch.geqrf</code> baseline
++ <code>torch.bmm</code>/<code>torch.linalg</code> prototypes</td>
+<td>baseline everywhere; kept in champions only as the correctness
+fallback</td>
+</tr>
+<tr class="even">
+<td><strong>CUDA C++</strong> (<code>load_inline</code>)</td>
+<td>the winning B200 lineage (best submission + earlier
+<code>qr_py</code> run) + 10 steered runs</td>
+<td><strong>won</strong> — the top-scoring B200 submission (~82×) is
+pure CUDA C++</td>
+</tr>
+<tr class="odd">
+<td><strong>Triton</strong> (<code>@triton.jit</code>,
+<code>tl.dot</code>)</td>
+<td>a full parallel B200 lineage (4 tags, ~3,000-line submissions) + 10
+steered runs</td>
+<td>reached ~64× on B200 at roughly a third of the winning lineage’s
+code; most token-efficient; 42.8× peak (RTX Pro 6K)</td>
+</tr>
+<tr class="even">
+<td><strong>CUTE DSL</strong> (CUTLASS Python:
+<code>@cute.kernel</code>)</td>
+<td>4 steered runs</td>
+<td>worst — 1.69× ceiling, real compute only at small
+<code>n</code></td>
+</tr>
+<tr class="odd">
+<td><strong>Inline PTX</strong></td>
+<td><code>cp.async</code> staging, <code>mma.sync</code>,
+<code>tcgen05.mma</code>, FP8 <code>e4m3</code></td>
+<td><code>cp.async</code> shipped; tensor-core PTX written but mostly
+gated off (regressed on B200)</td>
+</tr>
+<tr class="even">
+<td><strong>cuSOLVER / cuBLAS</strong></td>
+<td>cuSOLVER under <code>torch.geqrf</code>; cuBLAS
+<code>GemmStridedBatchedEx</code>/TRSM in-kernel</td>
+<td>cuBLAS is the workhorse GEMM inside every CUDA C++ champion</td>
+</tr>
+</tbody>
+</table>
+<p>GPU techniques exercised within them: <strong>WMMA</strong>
+(<code>nvcuda::wmma</code> FP16→FP32 fragments), <strong>cuBLAS
+strided-batched GEMM</strong>, <strong>3×FP16 / 3×TF32 Kahan precision
+splitting</strong> (≈FP32 accuracy at tensor-core rate), and — written
+but shelved for regressing on B200 — <strong>5th-gen
+<code>tcgen05</code></strong> and <strong>FP8 e4m3
+<code>mma.sync</code></strong>.</p>
+<p><strong>Key takeaways</strong></p>
+<ul>
+<li><strong>Two parallel B200 lineages — one CUDA C++, one Triton — are
+the core languages finding.</strong> The B200 CUDA C++ lineage reached
+~82× (1,600.9 µs) with a ~9,000-line submission; a distinct B200
+Triton-steered lineage on the <em>same</em> hardware reached ~64×
+(2,040.9 µs) with a ~3,000-line one. Higher score at 3× the code,
+vs. slightly lower score at far cleaner code — that trade-off, not a
+lone winner, is the story. (CUTE, tried only in the separate RTX Pro 6K
+evals, never got a real kernel onto the shape that matters.)</li>
+<li><strong>Precision splitting is the cross-language lever</strong> —
+3×TF32 diagonal + 3×FP16 trailing (Kahan hi/lo) was reinvented
+independently in CUDA C++, Triton, and cuBLAS compute modes.</li>
+<li><strong>The frontier PTX (<code>tcgen05</code>, FP8) was reachable
+but not yet worth it</strong> — real code exists in commits, but FP8
+runs at FP16 throughput on sm_100 and the 2–4× FP8 peak needs
+<code>tcgen05</code>.</li>
+<li><strong>The dominant failure mode is toolchain, not
+algorithm</strong> — CUDA C++’s non-portable cubin trap, Triton’s ~100
+KB/SM shared-memory wall, CUTE’s install/PTX/JIT walls.</li>
+<li><strong>Language and model are confounded</strong> — every 17–43×
+result is Opus 4.8; Codex/GPT-5.5 capped at 1.1–5× on <em>every</em>
+abstraction — but Opus-only, Triton still beats CUDA C++ per token.</li>
+</ul>
+<hr />
+<h2 id="the-language-landscape">The language landscape</h2>
+<p>These reports cover automated optimization runs: an agent iteratively
+rewrites the QR kernel, keeps every version that is both faster and
+still correct, and the fastest kept version is that run’s <em>winning
+submission</em>. This report asks which kernel-authoring language each
+run used and how far each got. The work splits into <strong>three
+lineages</strong>:</p>
+<ol type="1">
+<li><strong>The B200 CUDA C++ lineage.</strong> The longer, best-scoring
+line of work — convoluted CUDA C++, ~9,000-line submissions — plus an
+earlier run on the related <code>qr_py</code> problem in the same
+technique family. Its best submission (<code>292432ed7166</code>) hits
+<strong>1,600.9 µs, ~82×</strong> over the 131,025 µs
+<code>torch.geqrf</code> baseline: the top score.</li>
+<li><strong>The B200 Triton-steered lineage (B200).</strong> A distinct,
+deliberately Triton-dominant line of work on the <em>same</em>
+leaderboard hardware — ~3,000-line submissions across 4 tags — reaching
+<strong>2,040.9 µs, ~64×</strong> (tag
+<code>2026-06-22-09-10-03-qr_v2</code>). This is a primary B200 lineage
+in its own right, not a stray Triton detour inside the CUDA C++ run: it
+got to within striking distance of the winner on a third of the
+code.</li>
+<li><strong>The kernel-language experiment (RTX Pro 6K).</strong> A
+separate controlled study that steered each of 24 short runs to exactly
+one language (10 Triton / 10 CUDA C++ / 4 CUTE DSL) on a
+<em>different</em> GPU with its own ~116,000 µs baseline, isolating the
+language from everything else. Best: <strong>2,744.5 µs, 42.8×</strong>
+vs. its own baseline (not comparable to the B200 × figures).</li>
+</ol>
+<p>The two B200 lineages are the heart of a languages report: same
+hardware, same problem, same precision recipe — but one reached a higher
+score through sheer volume of CUDA C++, the other nearly matched it with
+far less, far cleaner Triton.</p>
+<p>The counts below are verified against actual submission code
+(<code>git show &lt;commit&gt;:problems/linalg/qr_v2/submission.py</code>),
+not raw keyword frequency — an earlier keyword scan’s “cute ~1103” hits
+turned out to be noise (<code>execute</code>, comments), so every
+CUTE/CUTLASS claim here was confirmed against real imports.</p>
+<p>The B200 CUDA C++ lineage’s best submission
+(<code>champion_qr_v2_submission.py</code>, 9,061 lines, commit
+<code>292432ed7166</code>) is <strong>pure CUDA C++</strong>:</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Marker</th>
+<th>Count</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>import triton</code> / <code>@triton.jit</code> /
+<code>tl.dot</code></td>
+<td><strong>0</strong></td>
+<td>no Triton in the winner</td>
+</tr>
+<tr class="even">
+<td><code>__global__</code></td>
+<td>54</td>
+<td>custom CUDA kernels</td>
+</tr>
+<tr class="odd">
+<td><code>nvcuda::wmma</code> fragment ops</td>
+<td>84</td>
+<td>WMMA tensor-core GEMM</td>
+</tr>
+<tr class="even">
+<td>WMMA <code>mma_sync</code></td>
+<td>8</td>
+<td>these are WMMA <code>mma_sync</code>, <em>not</em> raw PTX
+<code>mma.sync</code></td>
+</tr>
+<tr class="odd">
+<td><code>cp.async</code></td>
+<td>14</td>
+<td>async shared-memory staging PTX</td>
+</tr>
+<tr class="even">
+<td>cuBLAS refs</td>
+<td>162</td>
+<td>strided-batched GEMM / TRSM</td>
+</tr>
+<tr class="odd">
+<td><code>load_inline</code></td>
+<td>5</td>
+<td>5 CUDA translation units compiled at import</td>
+</tr>
+<tr class="even">
+<td>raw <code>mma.sync</code> / <code>tcgen05</code> PTX</td>
+<td><strong>0</strong></td>
+<td>none in the <em>shipped</em> winner</td>
+</tr>
+<tr class="odd">
+<td><code>cutlass</code></td>
+<td>1</td>
+<td>a profiling comment (“cutlass tf32 wide GEMM at ~20% throughput”) —
+<strong>not</strong> CUTLASS/CUTE usage</td>
+</tr>
+</tbody>
+</table>
+<p>That one submission is not the whole picture. Aggregated across all
+1,866 B200 <code>qr_v2</code> branches that carry a submission —
+spanning <em>both</em> B200 lineages — the language mix is:</p>
+<table>
+<thead>
+<tr class="header">
+<th>Language mix</th>
+<th>Branches</th>
+<th>Share</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>CUDA C++ only</td>
+<td>1,544</td>
+<td>82.7%</td>
+</tr>
+<tr class="even">
+<td>Triton only</td>
+<td>230</td>
+<td>12.3%</td>
+</tr>
+<tr class="odd">
+<td>Triton + CUDA C++</td>
+<td>69</td>
+<td>3.7%</td>
+</tr>
+<tr class="even">
+<td>Pure torch (no custom kernel)</td>
+<td>23</td>
+<td>1.2%</td>
+</tr>
+<tr class="odd">
+<td><strong>Any Triton</strong></td>
+<td><strong>299</strong></td>
+<td><strong>16.0%</strong></td>
+</tr>
+<tr class="even">
+<td><strong>Any CUDA C++</strong></td>
+<td><strong>1,613</strong></td>
+<td><strong>86.4%</strong></td>
+</tr>
+</tbody>
+</table>
+<p>“CUDA C++, zero Triton” is precisely true of the <em>top-scoring
+submission</em>, but Triton is not marginal across the B200 work: 299
+branches (16.0%) carry Triton, and the 230 Triton-only branches are
+largely the distinct B200 Triton-steered lineage — the 4 tags whose best
+submission hit ~64× on ~3,000 lines (many using the same
+<code>input_precision="tf32x3"</code> knob the RTX Pro 6K Triton runs
+later used) — not scattered exploration inside the CUDA C++ line. CUTE
+DSL never appears in any B200 branch.</p>
+<p>The earlier <code>qr_py</code> run — the origin of this same CUDA C++
+lineage, on a related B200 problem — tells the same story. Its winning
+submission (<code>94d3f325c466</code>, 12,566 lines) is pure CUDA C++ —
+0 Triton, 83 <code>__global__</code>, 82 <code>wmma</code>, cuBLAS
+<code>GemmStridedBatchedEx</code> with <code>CUDA_R_16F</code>, built
+for <code>compute_100,code=sm_100</code> (plain — no
+<code>a</code>-suffix, because it never shipped <code>tcgen05</code>).
+Across all 434 <code>qr_py</code> branches: <strong>98.2% CUDA C++, 0
+Triton, 0 CUTE</strong> (the lone
+<code>cutlass</code>(2)/<code>tcgen05</code>(1) hits are comments). This
+is where the whole CUDA C++ technique family — WMMA trailing updates,
+cuBLAS GEMM, CholeskyQR — was first built, then carried into
+<code>qr_v2</code>.</p>
+<p>The controlled RTX Pro 6K evals was steered by a single directive
+appended to an otherwise-bare optimization prompt — verbatim,
+e.g. <code>Write custom kernels with CUTE DSL.</code> The 24 runs split
+<strong>10 Triton / 10 CUDA C++ / 4 CUTE DSL</strong>
+(<code>kl_abstraction_map.tsv</code>), and each winning submission
+genuinely uses its assigned language: the CUTE one imports
+<code>cutlass.cute</code> and uses
+<code>@cute.kernel</code>/<code>@cute.jit</code>/<code>cute.arch.*</code>/<code>make_ptr</code>;
+the Triton one uses <code>import triton</code> with 7
+<code>@triton.jit</code> and 17 <code>tl.dot</code>; the CUDA one uses
+<code>load_inline</code> + <code>__global__</code> + cuBLAS.</p>
+<p>The baseline everywhere is <strong><code>torch.geqrf</code></strong>
+— a serial per-matrix cuSOLVER blocked-Householder loop (~73,000 kernel
+launches for one n=512, batch=640 shape; SIMT-only, no tensor cores on
+either GPU). Every language’s job was to replace it. It survives in all
+winning submissions only as the correctness fallback for off-grid,
+ill-conditioned, or small-batch inputs, never as a scored path.</p>
+<hr />
+<h2 id="head-to-head-one-language-per-run-rtx-pro-6k">Head-to-head: one
+language per run (RTX Pro 6K)</h2>
+<p>The cleanest comparison is the RTX Pro 6K evals, where each run used
+exactly one language against the same ~116,000 µs
+<code>torch.geqrf</code> baseline (sm_120; small 3-worker trees, ~97–251
+trials each). Speedups here are each run’s fastest kept trial ÷ its own
+measured baseline µs, recovered from the raw
+<code>autocuda/&lt;tag&gt;-optimize-tree-worker-*-log.csv</code> files
+because the consolidated CSV’s <code>best_speedup</code> column is blank
+(a known join bug); they reconcile exactly with the consolidated cost
+and optimization reports. Model per run is from
+<code>message.model</code> in the logs: 12 runs are Opus 4.8
+(<code>claude-opus-4-8</code>), 12 are GPT-5.5
+(<code>openai/openai/gpt-5.5</code>, “Codex”); <strong>all 4 CUTE runs
+are Codex.</strong></p>
+<table style="width:100%;">
+<colgroup>
+<col style="width: 14%" />
+<col style="width: 14%" />
+<col style="width: 14%" />
+<col style="width: 14%" />
+<col style="width: 14%" />
+<col style="width: 14%" />
+<col style="width: 14%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Run (short)</th>
+<th>Language</th>
+<th>Model</th>
+<th>Baseline µs</th>
+<th>Best µs</th>
+<th><strong>Best ×</strong></th>
+<th>Batch</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>q1nb1oliq</td>
+<td>Triton</td>
+<td>Opus</td>
+<td>117,536</td>
+<td>2,744.5</td>
+<td><strong>42.83</strong></td>
+<td>long (06-25)</td>
+</tr>
+<tr class="even">
+<td>kurboui6f</td>
+<td>Triton</td>
+<td>Opus</td>
+<td>115,820</td>
+<td>3,347.1</td>
+<td><strong>34.60</strong></td>
+<td>long</td>
+</tr>
+<tr class="odd">
+<td>g7v577r9x</td>
+<td>Triton</td>
+<td>Opus</td>
+<td>115,731</td>
+<td>4,194.5</td>
+<td><strong>27.59</strong></td>
+<td>long</td>
+</tr>
+<tr class="even">
+<td>j057n57jl</td>
+<td>Triton</td>
+<td>Opus</td>
+<td>116,122</td>
+<td>4,764.0</td>
+<td><strong>24.37</strong></td>
+<td>long</td>
+</tr>
+<tr class="odd">
+<td>tszacp309</td>
+<td>Triton</td>
+<td>Opus</td>
+<td>116,915</td>
+<td>5,118.3</td>
+<td><strong>22.84</strong></td>
+<td>long</td>
+</tr>
+<tr class="even">
+<td>ocix8g7hp</td>
+<td>CUDA C++</td>
+<td>Opus</td>
+<td>112,394</td>
+<td>5,234.1</td>
+<td><strong>21.47</strong></td>
+<td>long</td>
+</tr>
+<tr class="odd">
+<td>kj7cvsimx</td>
+<td>Triton</td>
+<td>Opus</td>
+<td>117,106</td>
+<td>5,500.5</td>
+<td><strong>21.29</strong></td>
+<td>long</td>
+</tr>
+<tr class="even">
+<td>3otwejh6b</td>
+<td>CUDA C++</td>
+<td>Opus</td>
+<td>116,323</td>
+<td>6,633.7</td>
+<td><strong>17.54</strong></td>
+<td>long</td>
+</tr>
+<tr class="odd">
+<td>w7jxbr46z</td>
+<td>CUDA C++</td>
+<td>Opus</td>
+<td>117,514</td>
+<td>6,854.2</td>
+<td><strong>17.14</strong></td>
+<td>long</td>
+</tr>
+<tr class="even">
+<td>kpnikqu5d</td>
+<td>CUDA C++</td>
+<td>Opus</td>
+<td>111,805</td>
+<td>6,563.6</td>
+<td><strong>17.03</strong></td>
+<td>long</td>
+</tr>
+<tr class="odd">
+<td>m7w1ravpo</td>
+<td>Triton</td>
+<td>Codex</td>
+<td>116,501</td>
+<td>23,156.6</td>
+<td><strong>5.03</strong></td>
+<td>short (06-24)</td>
+</tr>
+<tr class="even">
+<td>vcp095s3n</td>
+<td>Triton</td>
+<td>Codex</td>
+<td>115,764</td>
+<td>64,204.3</td>
+<td>1.80</td>
+<td>short</td>
+</tr>
+<tr class="odd">
+<td>ask3necgb</td>
+<td>CUTE DSL</td>
+<td>Codex</td>
+<td>117,112</td>
+<td>69,228.8</td>
+<td><strong>1.69</strong></td>
+<td>short</td>
+</tr>
+<tr class="even">
+<td>pcevwrpue</td>
+<td>CUTE DSL</td>
+<td>Codex</td>
+<td>115,824</td>
+<td>75,864.2</td>
+<td>1.53</td>
+<td>short</td>
+</tr>
+<tr class="odd">
+<td>5hrpmgplj</td>
+<td>CUDA C++</td>
+<td>Codex</td>
+<td>116,350</td>
+<td>78,388.1</td>
+<td>1.48</td>
+<td>short</td>
+</tr>
+<tr class="even">
+<td>ptv6z9eog</td>
+<td>CUDA C++</td>
+<td>Codex</td>
+<td>117,450</td>
+<td>83,901.9</td>
+<td>1.40</td>
+<td>short</td>
+</tr>
+<tr class="odd">
+<td>96364acw1</td>
+<td>CUTE DSL</td>
+<td>Codex</td>
+<td>115,659</td>
+<td>91,134.4</td>
+<td>1.27</td>
+<td>short</td>
+</tr>
+<tr class="even">
+<td>ohzemi9pv</td>
+<td>CUTE DSL</td>
+<td>Codex</td>
+<td>117,381</td>
+<td>94,558.8</td>
+<td>1.24</td>
+<td>short</td>
+</tr>
+<tr class="odd">
+<td>p9y2rr1gw</td>
+<td>Triton</td>
+<td>Codex</td>
+<td>115,508</td>
+<td>94,915.3</td>
+<td>1.22</td>
+<td>short</td>
+</tr>
+<tr class="even">
+<td>yxiwb80jg</td>
+<td>CUDA C++</td>
+<td>Codex</td>
+<td>116,406</td>
+<td>102,473.9</td>
+<td>1.14</td>
+<td>short</td>
+</tr>
+<tr class="odd">
+<td>q651pl8jg</td>
+<td>Triton</td>
+<td>Codex</td>
+<td>117,001</td>
+<td>108,226.9</td>
+<td>1.08</td>
+<td>short</td>
+</tr>
+<tr class="even">
+<td>t5sr96or9</td>
+<td>CUDA C++</td>
+<td>Codex</td>
+<td><em>(blank)</em></td>
+<td>—</td>
+<td>n/a</td>
+<td>short</td>
+</tr>
+</tbody>
+</table>
+<p><code>t5sr96or9</code> is excluded: its worker logs carry a
+blank/bogus baseline metric (flagged by the cost report as a
+timeout-inflated baseline), so no honest ratio can be computed. Two
+further CUDA C++ runs (<code>rlhgzw2ql</code>, <code>zgqpd77zz</code>)
+are export-only — JSONL logs but no optimize branches — giving the
+24-run / 22-optimize-tag split.</p>
+<p>The pattern is structural: <strong>the top 10 are all Opus, the
+bottom 12 all Codex.</strong> The language did not set the ceiling — the
+model did.</p>
+<h3 id="per-language">Per language</h3>
+<table style="width:100%;">
+<colgroup>
+<col style="width: 11%" />
+<col style="width: 11%" />
+<col style="width: 11%" />
+<col style="width: 11%" />
+<col style="width: 11%" />
+<col style="width: 11%" />
+<col style="width: 11%" />
+<col style="width: 11%" />
+<col style="width: 11%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Language</th>
+<th>Runs</th>
+<th>Model(s)</th>
+<th><strong>Best ×</strong></th>
+<th>Mean × (of run-bests)</th>
+<th>Token eff (Mtok/×)</th>
+<th>$/×</th>
+<th>Trial pass rate</th>
+<th>Ceiling reason</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><strong>Triton</strong></td>
+<td>10</td>
+<td>6 Opus + 4 Codex</td>
+<td><strong>42.8×</strong></td>
+<td>18.3×</td>
+<td><strong>157</strong></td>
+<td>$147</td>
+<td>86.6% (614/709)</td>
+<td>model, not language — Opus hit the tensor-core ceiling</td>
+</tr>
+<tr class="even">
+<td><strong>CUDA C++</strong></td>
+<td>10</td>
+<td>6 Opus + 4 Codex</td>
+<td>21.5×</td>
+<td>11.0× (7 valid)</td>
+<td>322</td>
+<td>$296</td>
+<td>88.5% (554/626)</td>
+<td>2× the tokens/× of Triton; verbose kernels + arch/compile
+friction</td>
+</tr>
+<tr class="odd">
+<td><strong>CUTE DSL</strong></td>
+<td>4</td>
+<td>4 Codex</td>
+<td>1.69×</td>
+<td>1.4×</td>
+<td>429</td>
+<td>$303</td>
+<td>81.8% (261/319)</td>
+<td>DSL not installed; never reached tensor-core MMA; dominant n=512
+punted to plain-SIMT CUDA C++</td>
+</tr>
+</tbody>
+</table>
+<p>Token-efficiency and per-language totals are recomputed from the cost
+CSV and reconcile with the consolidated cost report (Triton 157 / CUDA
+C++ 322 / CUTE 429 Mtok/×). Pass rate =
+<code>succeeded / (succeeded + validation_error + build_error + runtime_error)</code>
+over each language’s worker logs. The error-mode fingerprints
+differ:</p>
+<table>
+<thead>
+<tr class="header">
+<th>Language</th>
+<th>build-error %</th>
+<th>validation-error %</th>
+<th>runtime-error %</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Triton</td>
+<td><strong>0.7%</strong> (lowest)</td>
+<td>10.9%</td>
+<td>1.8%</td>
+</tr>
+<tr class="even">
+<td>CUDA C++</td>
+<td><strong>2.6%</strong> (highest)</td>
+<td>7.8%</td>
+<td>1.1%</td>
+</tr>
+<tr class="odd">
+<td>CUTE DSL</td>
+<td>3.1%</td>
+<td><strong>12.2%</strong> (highest)</td>
+<td>2.8%</td>
+</tr>
+</tbody>
+</table>
+<p>Triton almost never fails to build (its JIT compiles cleanly); CUDA
+C++ pays the most build failures (nvcc); CUTE DSL fails validation most
+often — immature kernels that compile but produce wrong factors, plus
+the install/JIT friction below.</p>
+<h3 id="removing-the-model-confound">Removing the model confound</h3>
+<p>Comparing Opus-only isolates the language from the model:</p>
+<table style="width:100%;">
+<colgroup>
+<col style="width: 14%" />
+<col style="width: 14%" />
+<col style="width: 14%" />
+<col style="width: 14%" />
+<col style="width: 14%" />
+<col style="width: 14%" />
+<col style="width: 14%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Language</th>
+<th>Opus runs</th>
+<th>Best ×</th>
+<th>Mean ×</th>
+<th>Codex runs</th>
+<th>Best ×</th>
+<th>Mean ×</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Triton</td>
+<td>6</td>
+<td><strong>42.8×</strong></td>
+<td>28.9×</td>
+<td>4</td>
+<td>5.03×</td>
+<td>2.28×</td>
+</tr>
+<tr class="even">
+<td>CUDA C++</td>
+<td>4</td>
+<td>21.5×</td>
+<td>18.3×</td>
+<td>3 valid</td>
+<td>1.48×</td>
+<td>1.34×</td>
+</tr>
+<tr class="odd">
+<td>CUTE DSL</td>
+<td>0</td>
+<td>—</td>
+<td>—</td>
+<td>4</td>
+<td>1.69×</td>
+<td>1.43×</td>
+</tr>
+</tbody>
+</table>
+<p>Even with the model fixed to Opus and near-identical spend (~$954/run
+Triton vs ~$953 CUDA C++), Triton bought more speedup per token. The
+verdict survives the confound for Triton-vs-CUDA C++; CUTE simply has no
+same-model datapoint. Overall: Opus was most productive in Triton (42.8×
+peak, 28.9× mean) and strong in CUDA C++ (21.5× / 18.3×); it has no CUTE
+run (all CUTE runs predate the Opus batch). Codex capped low on
+<em>every</em> language — best 5.03× (Triton), 1.69× (CUTE), 1.48× (CUDA
+C++) — and looked <em>relatively</em> better in CUTE and Triton only
+because its CUDA C++ runs mostly never wired cuBLAS tensor cores. Codex
+is the whole reason CUTE looks bad in aggregate.</p>
+<hr />
+<h2 id="cuda-c-the-workhorse">CUDA C++ — the workhorse</h2>
+<p>The B200 CUDA C++ lineage’s submissions — the top-scoring
+<code>qr_v2</code> one (~82×) and its earlier <code>qr_py</code>
+predecessor — are both pure CUDA C++, and in the controlled RTX Pro 6K
+evals CUDA C++ reached a strong 21.5× (<code>ocix8g7hp</code>, Opus) —
+but at ~2× Triton’s token cost per unit of speedup, the verbosity of
+hand-writing kernels plus build/link plumbing showing up as tokens. The
+trade-off against the parallel B200 Triton lineage is the sharper one:
+~82× on ~9,000 lines vs. ~64× on ~3,000.</p>
+<p><strong>Tensor cores on the B200 — two live FP16→FP32
+dialects.</strong> The winning <code>qr_v2</code> submission hits tensor
+cores through:</p>
+<ol type="1">
+<li><strong>WMMA (<code>nvcuda::wmma</code>).</strong> 84 fragment
+declarations, all <code>16,16,16</code> with <code>half</code> inputs
+and <code>float</code> accumulator
+(e.g. <code>fragment&lt;matrix_a,16,16,16,half,col_major&gt; a; … mma_sync(acc, a, b, acc);</code>),
+inside the resident megakernels. Instruction mix: 18
+<code>load_matrix_sync</code>, 8 <code>mma_sync</code>, 7
+<code>fill_fragment</code>, 11 <code>store_matrix_sync</code>.</li>
+<li><strong>cuBLAS <code>cublasGemmStridedBatchedEx</code></strong> with
+<code>CUDA_R_16F</code> operands and <code>CUBLAS_COMPUTE_32F</code> — a
+3-term FP16 Kahan hi/lo split (<code>Bh</code>/<code>Bl</code>, winner
+lines ~6764–6771) giving ~FP32-accurate trailing GEMM at ~2× the TF32
+rate, plus <code>CUBLAS_TF32_TENSOR_OP_MATH</code>
+(<code>cublasSetMathMode</code>) for the diagonal solve and TRSM.
+<code>cp.async</code> (<code>cp.async.ca.shared.global</code>,
+<code>cp.async.commit_group</code>/<code>wait_group</code>) stages BF16
+tiles into shared memory.</li>
+</ol>
+<p>It builds for <code>arch=compute_100a,code=sm_100a</code> — the
+<strong><code>a</code>-suffix</strong>.</p>
+<p><strong>Frontier dialects, built but shelved.</strong> 5th-generation
+<code>tcgen05</code> and FP8 <code>mma.sync</code> were written and
+validated in isolation, but gated off and never shipped:</p>
+<ul>
+<li>Commit <code>32e1c1d1f</code> integrated a real <code>tcgen05</code>
+substrate (41 PTX/marker lines:
+<code>tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32</code>,
+<code>tcgen05.mma.cta_group::1.kind::f16</code>,
+<code>tcgen05.ld.sync.aligned.32x32b.x8.b32</code>,
+<code>tcgen05.commit</code>/<code>wait</code>/<code>dealloc</code>/<code>relinquish_alloc_permit</code>,
+<code>mbarrier</code>, <code>_smem_desc</code>), citing the canonical
+gau-nernst <code>tcgen05</code> example and PTX ISA 9.7.17. Commit
+<code>95aa08480</code> describes the design:
+<code>tcgen05.mma.cta_group::1.kind::f16</code> produces garbage at
+M=64/M=32 and is correct only at M=128, TMEM-accumulating to escape the
+255-register / 12.5%-occupancy wall. It stayed dead code (“not wired
+into the live path → path byte-unchanged”).</li>
+<li>Commit <code>50f5935c5</code> built a real 4-slice,
+error-compensated FP8 GEMM
+(<code>mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32</code>).
+Verdict, verbatim: “even on real FP8 tensor cores fp8s2 regresses,
+because legacy mma.sync FP8=FP16 throughput on B200 (microbenchmarked
+0.96x, NOT 2-4x) … The 2-4x FP8 peak needs tcgen05/MXFP8 (5th-gen) which
+requires sm_100a (harness builds sm_100, unbuildable remotely).”</li>
+</ul>
+<p>This is what the <code>a</code>-suffix requirement means concretely:
+WMMA and <code>mma.sync</code> build fine under plain
+<code>sm_100</code>, but the 5th-gen
+<code>tcgen05</code>/TMEM/thread-block-cluster path requires
+<code>compute_100a,code=sm_100a</code>
+(<code>TORCH_CUDA_ARCH_LIST="10.0a"</code>). The <code>qr_v2</code>
+winner ships <code>sm_100a</code> for its WMMA/<code>cp.async</code>
+path; the <code>qr_py</code> winner, never attempting
+<code>tcgen05</code>, ships plain
+<code>compute_100,code=sm_100</code>.</p>
+<p><strong>On the RTX Pro 6K, cuBLAS only.</strong> Every CUDA C++ run
+there reached tensor cores exclusively through cuBLAS:
+<code>sgemm_sb()</code> dispatching <code>CUBLAS_COMPUTE_32F</code> /
+<code>..._FAST_TF32</code> / <code>..._32F_EMULATED_16BFX9</code>
+(BF16×9 ~FP32-accurate emulation) via
+<code>cublasGemmStridedBatchedEx</code> — no raw WMMA,
+<code>mma.sync</code>, or <code>tcgen05</code> (different GPU, sm_120).
+The one Codex run that wrote no cuBLAS at all (<code>ptv6z9eog</code>)
+stayed pure-SIMT and capped at 1.40×.</p>
+<p><strong>Failure modes.</strong></p>
+<ul>
+<li><strong>The <code>a</code>-suffix / cubin-portability trap (the
+standout finding).</strong> <code>ocix8g7hp</code> hit “no kernel image
+is available for execution on the device” <strong>40 times</strong>,
+then ran a controlled probe: case A (<code>code=sm_90</code> only, no
+PTX, on an sm_120 device — mimicking the sm_120-on-B200 bug) failed as
+predicted; case B (<code>code=compute_90</code> PTX only → JIT
+forward-compat to sm_120) ran OK. Root cause: hardcoding
+<code>code=sm_120</code> (the dev GPU) emits SASS with no PTX, so the
+B200/sm_100 leaderboard box has no runnable image. Fix (committed with a
+PORTABILITY comment): drop the hardcode and let torch inject default
+arch flags (running GPU + PTX for forward-compat JIT), so the module
+“compiles+runs on sm_100 (B200) and sm_120 alike.”</li>
+<li><strong>nvcc compile volume.</strong> Compile-error mentions scale
+with kernel complexity — <code>kpnikqu5d</code> ~2,018,
+<code>zgqpd77zz</code> ~1,097, <code>ocix8g7hp</code> ~987 — from
+redefinitions and name clashes across concatenated
+<code>load_inline</code> snippets, missing <code>cublas_v2.h</code>, and
+template/type errors. CUDA C++ carried the highest build-error rate
+(2.6%).</li>
+</ul>
+<hr />
+<h2 id="triton-the-token-efficient-challenger">Triton — the
+token-efficient challenger</h2>
+<p>Triton shows up twice, and both are primary results. On the
+<strong>B200 leaderboard hardware</strong>, a distinct B200
+Triton-steered lineage (4 tags, best
+<code>2026-06-22-09-10-03-qr_v2</code>) reached <strong>2,040.9 µs,
+~64×</strong> with ~3,000-line submissions — within striking distance of
+the B200 CUDA C++ lineage’s ~82× at roughly a third of the code, and
+reinventing the same precision recipe independently. On the separate
+<strong>RTX Pro 6K evals</strong>, Triton posted that study’s highest
+peak (<code>q1nb1oliq</code>, 2,744.5 µs, 42.8× vs. its own baseline)
+and the fewest tokens per unit of speedup (157 Mtok/×). The two are on
+different GPUs and baselines, so their × figures are not directly
+comparable — but together they are the report’s clearest evidence that
+Triton buys most of the speedup at a fraction of the code.</p>
+<p>The precision and launch details below are drawn from both the B200
+Triton lineage and the RTX Pro 6K Triton runs, which converged on the
+same recipe.</p>
+<p><strong>Precision dialects via <code>tl.dot</code>,</strong> chosen
+per sub-step: <code>input_precision="ieee"</code> (bit-exact FP32) for
+the orthogonality-critical Gram and T-factor dots that must stay
+orthonormal (<code>S += tl.dot(tl.trans(Vblk), Vblk)</code>), and either
+<code>input_precision="tf32x3"</code> (3-pass TF32 ≈ FP32) or a
+hand-written bf16 hi/lo 3-term split (<code>_bgemm3</code>:
+<code>a.to(tl.bfloat16)</code> + residual,
+<code>Ah@Bh + Ah@Bl + Al@Bh</code>, FP32 accumulate, used for n≥2048)
+for the trailing-update GEMMs that carry the FLOPs. The Opus runs kept a
+documented <code>_TRAIL_IP</code> tunable for exactly this choice
+(“Tensor-core precision for the trailing-update GEMMs ("ieee" | "tf32" |
+"tf32x3")”); <code>kurboui6f</code> leaned on <code>tf32x3</code> (28
+occurrences). <code>torch.backends.cuda.matmul.allow_tf32 = False</code>
+is set globally to keep the cuBLAS trailing GEMMs exact where
+needed.</p>
+<p><strong>Manual launch config.</strong> <code>num_warps</code>
+(<code>_PANEL_WARPS</code>/<code>_BUILDT_WARPS</code>) and
+<code>num_stages</code> (1 or 2) were set per kernel rather than paying
+the <code>@triton.autotune</code> first-launch sweep cost the
+environment warned about.</p>
+<p><strong>The one wall: shared memory.</strong> On sm_120 (~100 KB/SM),
+<code>q1nb1oliq</code> logged
+<code>W=128 fp32: FAILED out of resource: shared memory, Required: 131072, Hardware limit: 101376</code>;
+W=64 tiles fit (n=512 = 8,630 µs at fp16), forcing narrow, re-read
+panels. Otherwise Triton’s runtime was very clean — only a handful of
+runtime/API-error hits across all 6 Opus runs, and a 0.7% build-error
+rate (lowest of the three) because the JIT rarely fails to compile.</p>
+<hr />
+<h2 id="cute-dsl-not-yet-viable-here">CUTE DSL — not yet viable
+here</h2>
+<p>CUTE DSL topped out at 1.69× (<code>ask3necgb</code>), for five
+compounding, evidenced reasons:</p>
+<ol type="1">
+<li><strong>The DSL wasn’t installed.</strong> A probe in
+<code>ask3necgb</code> printed
+<code>cutlass ERR ModuleNotFoundError("No module named 'cutlass'") … triton OK</code>;
+the model had to <code>pip install nvidia-cutlass-dsl</code> (71 MB of
+libs, plus <code>cuda-core</code>/<code>cuda-bindings</code>) before its
+first <code>import cutlass.cute</code> — a bootstrapping tax Triton and
+CUDA C++ never paid (Triton 3.6.0 and
+<code>torch.utils.cpp_extension</code> were already present).</li>
+<li><strong>An sm_120a PTX gap.</strong> CuTe’s <code>redux_sync</code>
+lowers to <code>redux.f32</code>, which ptxas rejects on this GPU:
+<code>redux.f32' not supported on .target 'sm_120a'</code> (surfaced as
+an MLIRError through the pass pipeline). <code>pcevwrpue</code> worked
+around it by swapping in a <code>__shfl</code>-based warp reduction
+(commit <code>c8dccb524</code>, “use shuffle parallel cute qr32”) — but
+only after burning trials on the failure. This is the CUTE counterpart
+to CUDA C++’s arch trap: the DSL emitted a PTX op the sm_120a target
+does not support.</li>
+<li><strong>JIT instability under the validator.</strong> The eval
+harness runs <code>custom_kernel</code> in a spawned subprocess pool,
+and CuTe’s compile exceptions are not picklable across it
+(<code>Can't get local object '_site_initialize.&lt;locals&gt;.MLIRError'</code>),
+so one compile error corrupts the whole validation run rather than
+failing a single trial cleanly. <code>pcevwrpue</code> logged ~16 hard
+CUTE failures against ~42 “succeeded” rows (mostly re-tunes of ~5
+working kernel families), and one run’s own conclusion explicitly
+recommended to “switch away from CUTE DSL toward torch/CUDA extension
+approaches for QR.”</li>
+<li><strong>It never authored the shape that matters.</strong> In no
+CUTE run did a <code>@cute.kernel</code> carry the geomean-dominating
+dense n=512, batch=640 workload — that stayed on
+<code>torch.geqrf</code> (± cosmetic CUTE wrappers, or plain CUDA) in
+all four. Real CUTE compute reached only small n (32/176/352), via
+serial per-column Householder kernels that blew the runtime budget at
+n≥512. A steering directive to workers even reads “Implement a true CUTE
+DSL n352 specialization … no marker shortcuts, no n512 combine work, and
+avoid n4096” — the search consciously left the dominant n512/n4096
+shapes on non-CUTE paths.</li>
+<li><strong>No tensor-core MMA.</strong> A reference CUTLASS example on
+disk (<code>modal_nvfp4_dual_gemm/submission.py</code>, using
+<code>tcgen05</code>, <code>cute.TiledMma</code>,
+<code>cute.gemm</code>, <code>cute.make_copy_atom</code>) could not be
+adapted to QR; the CUTE kernels stayed scalar/warp-level and never
+reached the TF32/FP16 tensor-core trailing GEMM that got Triton and CUDA
+C++ to 17–43×.</li>
+</ol>
+<p><strong>What actually produced each CUTE run’s speedup (from a deep
+re-audit):</strong></p>
+<table>
+<colgroup>
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Run</th>
+<th>Best ×</th>
+<th>Where the gain came from</th>
+<th>Real CUTE compute?</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>ask3necgb</code></td>
+<td>1.69×</td>
+<td>Hand-written <code>load_inline</code> CUDA
+(<code>update512_kernel</code>, <code>block_sum512</code>, n=512 tiled)
++ <code>torch.geqrf</code>; CUTE code present but partly cosmetic (no-op
+<code>norm_hint*0.0</code> epilogues)</td>
+<td>n=32, n=352 only</td>
+</tr>
+<tr class="even">
+<td><code>pcevwrpue</code></td>
+<td>1.53×</td>
+<td><strong>No custom CUDA at all</strong> — genuine CUTE Householder
+(n=32 QR32 after the shuffle workaround, n=176, n=352 multi-launch
+panel) + <code>torch.geqrf</code> tau-pad/tail tricks for n≥512</td>
+<td><strong>most real CUTE of the four</strong></td>
+</tr>
+<tr class="odd">
+<td><code>96364acw1</code></td>
+<td>1.27×</td>
+<td>CUTE never imported/installed; pure <code>load_inline</code> CUDA
+(n=32, n=176) + <code>torch.geqrf</code></td>
+<td>none</td>
+</tr>
+<tr class="even">
+<td><code>ohzemi9pv</code></td>
+<td>1.24×</td>
+<td>Only real CUTE was the n=32 QR32 warp kernel; larger n used CUTE
+only as detector/probe/output-assembly kernels routing to
+<code>torch.geqrf</code></td>
+<td>n=32 only</td>
+</tr>
+</tbody>
+</table>
+<p>So the run with the <em>most</em> genuine CUTE compute
+(<code>pcevwrpue</code>, 1.53×) is <strong>not</strong> the fastest —
+the winner <code>ask3necgb</code> (1.69×) got there mostly on
+hand-written CUDA C++ with CUTE as a thin, partly cosmetic wrapper. That
+inversion is the single strongest sign that CUTE was not the productive
+lever here.</p>
+<p>Whether CUTE’s ceiling is <em>fundamentally</em> ~1.7× or partly a
+Codex + short-budget artifact is <strong>undetermined</strong> — all 4
+CUTE runs were Codex on the short 06-24 budget, with no Opus or
+long-budget CUTE run to disambiguate. The honest read: partly the Codex
+confound and substantially real, since three walls bite independently of
+model — the <code>nvidia-cutlass-dsl</code> install gap, the sm_120a
+<code>redux.f32</code> ptxas rejection, and the CuTe/MLIR JIT errors
+that are unpicklable across the eval subprocess pool.</p>
+<hr />
+<h2 id="the-library-path-cusolver-cublas-torch">The library path
+(cuSOLVER / cuBLAS / torch)</h2>
+<ul>
+<li><strong>cuSOLVER <code>geqrf</code> = the baseline</strong> on both
+GPUs (<code>torch.geqrf</code>, serial per-matrix, ~73K launches,
+SIMT-only). Every winning submission replaces it and keeps it only as
+the gold-standard fallback for off-grid n, ill-conditioned, small-batch,
+or secret-test inputs.</li>
+<li><strong>cuBLAS strided-batched</strong>
+(<code>cublasGemmStridedBatchedEx</code>,
+<code>cublasSgemmStridedBatched</code>, batched TRSM) is the primary
+library GEMM inside the custom CUDA kernels — the trailing-update FLOP
+sink at large n, and the device-filling path for the tiny-batch n=4096
+CholeskyQR.</li>
+<li><strong>Custom WMMA / <code>tl.dot</code> megakernels</strong>
+handle the launch-bound small/mid-n regime where even batched cuBLAS is
+launch-dominated.</li>
+<li><code>torch.bmm</code> appears only in early prototypes.</li>
+</ul>
+<hr />
+<h2 id="scope-methodology">Scope &amp; Methodology</h2>
+<p><em>A thematic slice over the same corpus as the five consolidated qr
+reports (41 tags / 3,089 experiments): which GPU-kernel authoring
+languages the runs used — Triton, CUDA C++ (via torch
+<code>load_inline</code>; incl. WMMA / <code>mma.sync</code> /
+<code>tcgen05</code> PTX / TMA), the CUTLASS Python <strong>CUTE
+DSL</strong>, and the torch/library path (cuSOLVER / cuBLAS /
+<code>torch.geqrf</code> / <code>bmm</code>) — and how far each got, per
+model and per GPU.</em></p>
+<ul>
+<li><strong>Scope — three lineages, 41 tags / 3,089
+experiments:</strong> (1) the B200 CUDA C++ lineage on B200 — 14
+<code>qr_v2</code> tags plus 1 earlier <code>qr_py</code> tag in the
+same technique family; (2) the B200 Triton-steered lineage on B200 — 4
+<code>qr_v2</code> tags (<code>2026-06-22-09-10-03</code>,
+<code>2026-06-24-21-01-44-simplify</code>,
+<code>2026-06-25-02-02-25</code>, <code>2026-06-25-23-41-18</code>); (3)
+the kernel-language experiment on RTX Pro 6K — 24 runs. (The two B200
+lineages share the <code>qr_v2</code> problem, so branch counts below
+are pooled across all 18 B200 <code>qr_v2</code> tags.) Two
+kernel-language runs (<code>rlhgzw2ql</code>, <code>zgqpd77zz</code>)
+are export-only (JSONLs, no optimize branches), giving the 24-run /
+22-optimize-tag split.</li>
+<li><strong>Language inventory verified against submission
+code</strong>, not keyword counts:
+<code>git show &lt;commit&gt;:problems/linalg/qr_v2/submission.py</code>
+for each winner, plus a full-branch scan (1,866 B200 <code>qr_v2</code>
++ 434 <code>qr_py</code> branches, threaded <code>git show</code>)
+classifying real <code>import triton</code> (top-of-file) vs
+<code>load_inline</code>+<code>__global__</code> vs
+<code>import cutlass.cute</code>. This corrects the earlier keyword
+scan’s noisy “cute” count (the top submission’s single “cutlass” hit is
+a comment; the CUTE runs’ matches are genuine <code>cutlass.cute</code>
+imports).</li>
+<li><strong>Speedups recomputed from raw logs:</strong> min
+<code>status=succeeded</code> µs ÷ that run’s
+<code>status=baseline</code> µs, per
+<code>autocuda/&lt;tag&gt;-optimize-tree-worker-*-log.csv</code>.
+Verified to reconcile with the consolidated cost report (per-language:
+Triton 42.8× <span class="citation" data-cites="157">@157</span> Mtok/×,
+CUDA C++ 21.5× <span class="citation" data-cites="322">@322</span>, CUTE
+1.69× <span class="citation" data-cites="429">@429</span>) and
+optimization report (Triton best, CUDA C++ close, CUTE worst).</li>
+<li><strong>Model attribution</strong> from <code>message.model</code>
+in every kernel-language run’s JSONLs: 12 runs on
+<code>claude-opus-4-8</code> (their tags carry a <code>_claude_</code>
+marker) + 12 on <code>openai/openai/gpt-5.5</code> (Codex, tags without
+that marker); all 4 CUTE DSL runs are Codex.</li>
+<li><strong>Failure modes</strong> mined from the harness JSONLs under
+<code>/tmp/qrwork/harness/&lt;tag&gt;/autocuda/harness-records/</code>
+(Claude-schema <code>message.content</code> and Codex-schema
+<code>payload</code>), plus git commit messages for the B200
+<code>tcgen05</code>/FP8 dialect story (<code>32e1c1d1f</code>,
+<code>95aa08480</code>, <code>50f5935c5</code>).</li>
+<li><strong>GPU segmentation observed throughout:</strong> B200
+(sm_100a, ~131K µs <code>qr_v2</code> baseline / 44.7K µs
+<code>qr_py</code>) and RTX Pro 6K (sm_120, ~116K µs baseline) are never
+conflated — their speedups are against different baselines on different
+hardware.</li>
+</ul>
+<p><strong>Undetermined / flagged:</strong></p>
+<ul>
+<li><strong>CUTE DSL’s true ceiling is unknown, but substantially
+real.</strong> No Opus CUTE run and no long-budget CUTE run exist, so
+its 1.69× cannot be <em>fully</em> separated into “Codex confound” vs
+“language limit.” But three of its walls are model-independent and would
+bite any model: the <code>nvidia-cutlass-dsl</code> install gap, the
+sm_120a <code>redux.f32</code> ptxas rejection, and the CuTe/MLIR JIT
+errors unpicklable across the eval subprocess pool. A matched
+Opus/long-budget CUTE run is the missing experiment, but the evidence
+says the language — not just the model — capped this one.</li>
+<li><strong><code>t5sr96or9</code></strong> (CUDA C++, Codex) has a
+blank baseline metric in its worker logs and is excluded from all
+ratios.</li>
+<li>The RTX Pro 6K kernel-language numbers are <strong>local
+geomean</strong> signals against a different (~116K µs) baseline; the
+leaderboard ranks on B200, so those × values are not directly comparable
+to <em>either</em> B200 lineage’s end-to-end figures — the B200 CUDA C++
+lineage’s ~82× (<code>qr_v2</code>) / ~37× (<code>qr_py</code>) or the
+B200 Triton-steered lineage’s ~64×.</li>
+</ul>
+
+
+</body>
+</html>

@@ -1,0 +1,903 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GPUMODE QR — Optimization</title>
+<style>
+  body{max-width:1100px;margin:2rem auto;padding:0 1.5rem;font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;color:#1a1a1a}table{border-collapse:collapse;width:100%;margin:1rem 0;font-size:14px}th,td{border:1px solid #ccc;padding:6px 10px;text-align:left;vertical-align:top}th{background:#f4f4f4}code{background:#f4f4f4;padding:1px 4px;border-radius:3px}pre:not(.mermaid){background:#f7f7f7;padding:10px;overflow-x:auto;border-radius:5px}pre.mermaid{background:transparent;text-align:center}h1,h2,h3{line-height:1.25}h1{border-bottom:2px solid #eee;padding-bottom:.3rem}h2{border-bottom:1px solid #eee;padding-bottom:.2rem;margin-top:2rem}blockquote{border-left:3px solid #ccc;margin-left:0;padding-left:1rem;color:#555}a{color:#0645ad}
+</style>
+</head>
+<body>
+<h1 id="gpumode-qr-optimization">GPUMODE QR — Optimization</h1>
+<h2 id="executive-summary">Executive Summary</h2>
+<p>The best submission reaches <strong>~82× end-to-end</strong> over the
+serial cuSOLVER <code>torch.geqrf</code> baseline — a geometric mean
+over 12 benchmark shapes, and that headline is a <strong>portfolio
+result, not one kernel</strong>. Each matrix size gets its own
+specialized kernel (a warp-per-matrix kernel at n=32, a fully-resident
+megakernel at n=176, two-level blocked-Householder variants at
+n=352–2048, and a CholeskyQR path at n=4096), layered with tensor-core
+precision splitting and per-matrix ill-conditioning handling; the ~82×
+is the combined effect of that whole stack. What the shapes share is one
+structural move — replacing the per-matrix cuSOLVER launch loop with
+batched, fused, on-chip kernels — which is why the search went deep
+(refining that family) rather than broad.</p>
+<p>Three lineages produced this stack, and the per-lineage bests are in
+the table below. The <strong>B200 CUDA C++</strong> lineage wrote a
+long, convoluted (~9,000-line) submission on the leaderboard hardware
+and reached <strong>~82×</strong>, the highest score; an earlier run on
+the related qr_py problem folds into this lineage, where the CUDA C++
+technique family was first built (~36.9× on its own baseline). The
+<strong>B200 Triton-steered</strong> lineage, on the <em>same</em> B200
+hardware, reached <strong>~64× (~2,040.9 µs)</strong> with far shorter,
+cleaner (~3,000-line) Triton-dominant code — the interesting contrast
+between the two primary lineages is score-vs-complexity: ~64× from
+~3,000 clean lines against the CUDA C++ lineage’s ~82× from ~9,000
+convoluted ones. The <strong>RTX Pro 6K evals</strong> ran 24 short runs
+each steered to one language (Triton / CUDA C++ / CUTE DSL) and reached
+<strong>~42.8×</strong> against their own, different baseline (a
+different GPU — not comparable to the B200 lineages’ ×). One reward-hack
+(a <code>_N2048_SKIP_DEMOTE=1</code> flip) was caught and retracted
+mid-run; the delivered submission is clean (see the reward-hacking
+report).</p>
+<table>
+<colgroup>
+<col style="width: 50%" />
+<col style="width: 50%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Metric</th>
+<th>Value</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><strong>B200 CUDA C++</strong> (~9,000 lines)</td>
+<td><strong>~82×</strong> — 1,600.9 µs vs 131,025 µs baseline
+(<code>292432ed7166</code>, tag <code>2026-06-23-17-54-06</code>); folds
+in the earlier qr_py run (~36.9× — 1,211.7 µs vs 44,710 µs,
+<code>94d3f325c466</code>) where the CUDA C++ family was first
+built</td>
+</tr>
+<tr class="even">
+<td><strong>B200 Triton-steered</strong> (~3,000 lines)</td>
+<td><strong>~64×</strong> — ~2,040.9 µs (tag
+<code>2026-06-22-09-10-03</code>); reached ~64× with far shorter/cleaner
+Triton-dominant code than the CUDA C++ lineage’s ~82×</td>
+</tr>
+<tr class="odd">
+<td><strong>RTX Pro 6K evals</strong></td>
+<td><strong>~42.8×</strong> vs its OWN ~117,536 µs baseline — 2,744.5 µs
+(<code>q1nb1oliq</code>); by language, Triton 42.8× &gt; CUDA C++ 21.5×
+&gt; CUTE DSL 1.69× (different GPU — × not comparable to the B200
+lineages)</td>
+</tr>
+<tr class="even">
+<td>Top technique family</td>
+<td>Batched fused custom QR kernel (replaces serial cuSOLVER), then
+tensor-core precision splitting + per-shape routing</td>
+</tr>
+<tr class="odd">
+<td>Most prevalent technique</td>
+<td>Per-shape routing / dispatch (~all branches)</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Key takeaways:</strong></p>
+<ul>
+<li>A batched, fully-fused custom QR kernel replacing the per-matrix
+cuSOLVER loop is the structural win everything else builds on; the
+launch-bound library baseline is the ceiling.</li>
+<li>Tensor-core precision splitting — 3×TF32 (Kahan-split) on the
+diagonal, 3×FP16 on the trailing GEMM — reaches ~FP32 accuracy at ~2×
+the TF32 rate, and drove the winners on both GPUs and all three
+languages.</li>
+<li>Per-shape / per-matrix routing is the most prevalent technique:
+dispatch each (batch, n, conditioning) to the variant that wins it.</li>
+<li>Per-matrix ill-conditioning demotion with a <code>geqrf</code>
+fallback keeps the fast paths safe on adversarial
+<code>mixed</code>/rank-deficient inputs; it is high-volume work, not
+overhead.</li>
+<li>All 13 technique families were rediscovered independently across all
+three lineages (B200 CUDA C++, B200 Triton-steered, and the RTX Pro 6K
+evals), and progress was token-budget-gated: short runs plateaued at
+1.1–5×, longer runs reached 17–43×.</li>
+</ul>
+<h2 id="most-impactful-optimization-techniques">Most Impactful
+Optimization Techniques</h2>
+<p>Ranked by <strong>peak marginal contribution</strong> — the largest
+step-speedup for each technique within a single exploration task (a
+“brief”). End-to-end speedup (~82× on the B200 CUDA C++ lineage, ~64× on
+the B200 Triton-steered lineage, ~43× on the RTX Pro 6K evals) is nearly
+identical across every technique in the stack and carries no ranking
+signal, so it is excluded from the Peak-contribution column. Each family
+was rediscovered independently across all three lineages, strong
+evidence it is a real, transferable lever. Notably, most of the
+technique commits cited below (<code>da6e702d2738</code>,
+<code>fa6bbfb83ffd</code>, <code>82903fd30701</code>) were logged by the
+<strong>B200 Triton-steered lineage</strong>, while the B200 CUDA C++
+winning submission (<code>292432ed7166</code>) re-derived the same
+family independently in CUDA C++ — the two B200 lineages ran in parallel
+(06-22→06-24 and 06-23→06-24), not one after the other. Commits are from
+the two primary B200 lineages (CUDA C++ and Triton-steered) unless
+marked <strong>[kernel-lang]</strong> (the RTX Pro 6K evals) or
+<strong>[qr_py]</strong> (the earlier qr_py run, which folds into the
+B200 CUDA C++ lineage). Representative SHAs span both B200 lineages: the
+winning-submission config (<code>292432ed7166</code>,
+<code>dfeb4911d0f6</code>, <code>a94037eeea9e</code>,
+<code>2ab2c3a59128</code>, <code>5a4f8d3e4df5</code>) is B200 CUDA C++,
+while the panel/routing commits shown here (<code>da6e702d2738</code>,
+<code>fa6bbfb83ffd</code>, <code>82903fd30701</code>,
+<code>0a9b49da9e09</code>, <code>dce59729d0fa</code>,
+<code>f399a5f3e641</code>) landed in the B200 Triton-steered lineage
+(tag <code>2026-06-22-09-10-03</code>).</p>
+<table>
+<colgroup>
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Technique</th>
+<th>Peak contribution</th>
+<th>Prevalence</th>
+<th>Representative commits</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Fused panel geqr2 / T-formation megakernel</td>
+<td>16.1x (geomean; 83.6x on n=512)</td>
+<td>High; 203 rows, ~8,300 attempts, ~all branches; rediscovered by the
+kernel-language runs</td>
+<td><code>fa6bbfb83ffd</code>, <code>82903fd30701</code>;
+<code>f0ae1c57ac2f</code> <strong>[kernel-lang]</strong></td>
+</tr>
+<tr class="even">
+<td>WY 3-GEMM / fused trailing update (W on-chip, no Y round-trip)</td>
+<td><strong>10.54x [qr_py]</strong> / 13.91x</td>
+<td>High; part of 743 panel rows / 37,505 attempts / 1,587 branches;
+qr_py’s #1 lever</td>
+<td><code>369b17d228d8</code> <strong>[qr_py]</strong>,
+<code>0a9b49da9e09</code>, <code>627d58fa8f23</code>
+<strong>[kernel-lang]</strong></td>
+</tr>
+<tr class="odd">
+<td>Blocked compact-WY two-level Householder QR</td>
+<td>2.21x</td>
+<td>Very high; 743 rows, 37,505 attempts, 1,587 branches (dominant
+family); qr_py origin</td>
+<td><code>da6e702d2738</code>, <code>2adb3aacc4f7</code>
+<strong>[qr_py]</strong>, <code>fa1917e6320f</code>
+<strong>[kernel-lang]</strong></td>
+</tr>
+<tr class="even">
+<td>Persistent warp-specialized work-queue megakernel (n=512)</td>
+<td>6.56x</td>
+<td>Low-medium; 42 rows tcgen05/mega, ~373 branches</td>
+<td><code>42ab334d028b</code></td>
+</tr>
+<tr class="odd">
+<td>Per-shape / per-matrix routing + ill-cond demotion</td>
+<td>3.37x</td>
+<td><strong>Most prevalent:</strong> 356 rows, ~33,000 attempts, ~all
+branches; qr_py used hybrid dispatch (3.75×)</td>
+<td><code>dce59729d0fa</code>, <code>f399a5f3e641</code>,
+<code>6de1737578</code> <strong>[qr_py]</strong></td>
+</tr>
+<tr class="even">
+<td>One-CTA-per-matrix batched custom QR replacing serial cuSOLVER (the
+backend the rest extend)</td>
+<td>3.3x (geomean; 7.4x at n=512)</td>
+<td>Very high; ~all branches build on this batched backend</td>
+<td><code>da6e702d2738</code></td>
+</tr>
+<tr class="odd">
+<td>3×FP16 Kahan-split tensor-core trailing GEMM</td>
+<td>1.63x <strong>[qr_py]</strong> / 1.61x</td>
+<td>High; 334 rows, 26,177 attempts, ~all branches; qr_py
+conditioning-aware probe</td>
+<td><code>dfeb4911d0f6</code>, <code>70ba9698f1</code>
+<strong>[qr_py]</strong></td>
+</tr>
+<tr class="even">
+<td>3×TF32 tensor-core split/diagonal GEMM (exact-FP32 pre-invert)</td>
+<td>3.28x <strong>[qr_py]</strong> / ~1.5x</td>
+<td>High; 204 TF32 rows, 7,965 attempts, 1,282 branches; qr_py first
+proved it</td>
+<td><code>a94037eeea9e</code>, <code>292432ed7166</code>,
+<code>f8dcc18c920a</code> <strong>[qr_py]</strong></td>
+</tr>
+<tr class="odd">
+<td>CholeskyQR / normal-equations R-solve (large-n, tiny batch)</td>
+<td>4.81x <strong>[qr_py]</strong> / 2.54x</td>
+<td>Medium; 246 rows, 15,271 attempts (mostly n=4096); qr_py Ozaki-INT8
+Gram</td>
+<td><code>2ab2c3a59128</code>, <code>_cholqr_path</code>,
+<code>cdfbffec790d</code> <strong>[qr_py]</strong></td>
+</tr>
+<tr class="even">
+<td>Parallelized compact-WY T-factor formation</td>
+<td>3.78x <strong>[kernel-lang]</strong></td>
+<td>Medium (kernel-language CUDA C++); part of panel family</td>
+<td><code>dee548b938e3</code> <strong>[kernel-lang]</strong></td>
+</tr>
+<tr class="odd">
+<td>TRSM block-width + triangular-inverse tuning</td>
+<td>~1.5x</td>
+<td>Medium; 255 rows, 14,833 attempts, 1,282 branches</td>
+<td><code>5a4f8d3e4df5</code>, <code>_TRSM_NB_CPP=512</code></td>
+</tr>
+<tr class="even">
+<td>FP8 e4m3 <code>mma.sync</code> trailing GEMM (candidate)</td>
+<td>1.82x</td>
+<td>Low; single-worker; several failed variants</td>
+<td><code>50f5935c565f</code></td>
+</tr>
+<tr class="odd">
+<td>Simplify / dead-code removal (diff minimization)</td>
+<td>2.13x</td>
+<td>Very high by attempts: 736 rows, 280,627 attempts (mostly
+neutral)</td>
+<td><code>606e33eeabe2</code>, <code>c6e086a6aa5c</code></td>
+</tr>
+</tbody>
+</table>
+<p><strong>One-CTA-per-matrix batched custom QR replacing serial
+cuSOLVER (the structural win).</strong> The <code>torch.geqrf</code>
+baseline loops cuSOLVER blocked-Householder <strong>per matrix</strong>
+— nsys on the n=512 B=640 shape counts ~73,000 kernel launches (&gt;90%
+of wall time is launch API overhead) with only SIMT
+(<code>_80_simt_sgemm</code>) GPU kernels, zero Blackwell tensor cores.
+The mechanism that replaces it is <code>da6e702d2738</code>: a
+<em>blocked compact-WY Householder QR megakernel, one CTA per
+matrix</em>, with the panel resident in shared memory and BLAS-3
+trailing updates, turning O(640×panels) launches into O(panels). Its own
+commit reports 3.3× geomean and 7.4× at n=512. This is a batched-backend
+<em>family</em>, not a single commit — the per-shape kernels that follow
+are all variations on it — and it was reproduced independently across
+all three languages of the kernel-language experiment.</p>
+<p><strong>Fused panel geqr2 / T-formation megakernel.</strong> Once the
+algorithm is batched, the next bottleneck is launches and DRAM
+round-trips inside each matrix’s factorization. Fusing the unblocked
+panel factorization (<code>geqr2</code>) into a single kernel program
+per matrix (<code>fa6bbfb83ffd</code>, a Triton one-program-per-matrix
+panel: 241,673 → 31,832 µs, 7.6× marginal in that brief) and then fusing
+the compact-WY <strong>T-factor</strong> recurrence on-chip from the
+resident <code>V</code> (<code>82903fd30701</code>, 31,832 → 8,157 µs,
+geomean <strong>16.1× vs baseline / 83.6× on the n=512 shape</strong>)
+removes the panel↔︎HBM <code>Y=M@W</code> round-trip — the peak
+reproducible contribution of this family. (<code>dbd84403d3</code>,
+cited in an earlier draft for a ~21× step, is actually a
+<em>disproven</em> in-kernel RGEQR3 recast that routed back to the
+sequential panel — no such win; corrected here.) The kernel-language
+CUDA C++ runs rediscovered this exact lever (<code>f0ae1c57ac2f</code>
+on-chip panel-QR, 7.71×; <code>dee548b938e3</code> parallelized
+single-threaded T-formation, 3.78×), a strong signal it is a real
+bottleneck.</p>
+<p><strong>Blocked compact-WY two-level Householder QR.</strong> This is
+the single most-attempted optimization family (743 rows, 37,505 attempts
+across 1,587 branches) and the workhorse for the dominant n=512 B=640
+group. Rather than one unblocked pass, each OB-wide outer block is
+factored in short IB inner sub-panels and then applied with <strong>one
+wide OB-reflector tensor-core trailing GEMM</strong>
+(<code>da6e702d2738</code> established the megakernel; the two-level
+structure is tuned in
+<code>_LARGE_LO</code>/<code>_LARGE_HI</code>/<code>qr_n512_mixed_driver</code>).
+The marginal per-commit steps are modest (~2.2× peak, most ~1.0–1.5×)
+because this is the batched backend the other levers refine — its impact
+is captured end-to-end, not per-step. Two-level blocking maximizes the
+share of work done in a batched GEMM the tensor cores can eat.</p>
+<p><strong>Persistent warp-specialized work-queue megakernel
+(n=512).</strong> A distinct structural idea (<code>42ab334d028b</code>,
+11,828 → 1,804 µs, 6.6× marginal within its brief): launch a persistent
+grid of exactly <code>numSMs=148</code> CTAs that atomically pop matrix
+indices from a global work-queue and run each matrix’s whole
+blocked-Householder QR resident in shared memory, <strong>decoupling CTA
+count from the 640-matrix batch</strong>. It sidesteps the CholeskyQR
+orthogonality walls (all four n=512 cases pass the geqrf invariants
+including ill-conditioned) and is the mechanism behind the fastest n=512
+routing. It is lower prevalence (part of the 42-row tcgen05/mega cluster
+on ~373 branches) — a structural bet from a single run rather than a
+broadly-rediscovered one.</p>
+<p><strong>Per-shape / per-matrix routing + ill-conditioning demotion
+(the most prevalent technique).</strong> With 356 rows, ~33,000
+attempts, and presence on essentially every branch, routing is the
+connective tissue of the best submission. The dispatch is a first-match
+table over <code>(B, n)</code> (see the routing section) plus
+<strong>per-matrix demotion masks</strong>
+(<code>_illcond_demote_mask</code>, <code>_n352_illcond_mask</code>)
+that run the fast low-precision path on the whole batch and
+scatter-recompute only the risky matrices with gold-standard
+<code>geqrf</code>. Peak marginal steps come from <em>fixing</em>
+mis-routes (<code>dce59729d0fa</code> restored a parent route for 4.8×;
+<code>f399a5f3e641</code> reset to a byte-identical parent for 4.8×). It
+works because the <code>mixed</code>/rankdef/clustered benchmark cases
+deliberately defeat whole-batch routing, so correct dispatch <em>is</em>
+the score on 5 of 12 shapes. It stacks on every other technique (each
+path picks its own precision/block config).</p>
+<p><strong>3×FP16 Kahan-split tensor-core trailing GEMM.</strong>
+<code>dfeb4911d0f6</code> splits the reflector block and trailing panel
+into FP16 hi/lo (Kahan) halves and issues <strong>3 accumulating FP16
+GEMMs via <code>GemmEx</code> with FP32 accumulate</strong>, delivering
+~FP32-accurate trailing updates at ~2× the TF32 rate on B200 (FP16
+tensor ≈ 2250 TFLOPS vs TF32 ≈ 1100). It holds the factor gate with no
+<code>geqrf</code> fallback. This is the precision lever that, combined
+with the 3×TF32 diagonal and TRSM tuning below, produces the ~1,600 µs
+best submission; the same 3×-split recipe recurs in the kernel-language
+Triton fp16 n=1024 path. It targets tensor-core throughput on the
+trailing GEMM, the FLOP sink at large n.</p>
+<p><strong>3×TF32 tensor-core diagonal solve (exact-FP32
+pre-invert).</strong> The diagonal-block solve in the two-level panel
+was exact SIMT FP32; routing it through a 3-pass TF32 tensor-core GEMM
+after an exact-FP32 pre-inversion (<code>a94037eeea9e</code>,
+<code>292432ed7166</code>) is 3–4× faster than SIMT FP32 at accuracy the
+loose factor gate tolerates. It composes directly with the FP16 trailing
+(they touch different sub-steps of the same panel apply) and was locked
+into the winning config
+<code>nb=512 + exact-FP32 pre-invert + 3×TF32 diag(3-pass) + 3×FP16 fused-trail</code>.</p>
+<p><strong>CholeskyQR / normal-equations R-solve (large-n, tiny
+batch).</strong> For n=4096 B=2 the one-CTA-per-matrix megakernel
+launches 2 CTAs and leaves ~148 SMs idle, so the winning path switches
+to a <strong>1-pass FP64 CholeskyQR + <code>orhr_col</code>
+reconstruction</strong> whose wide <code>A^T A</code> Gram, triangular
+solve, and recon GEMMs run as full-device cuBLAS that fills the GPU at
+tiny batch (<code>_cholqr_path</code>; <code>2ab2c3a591</code> shows a
+1.4× step resetting to global-best). The R-factor <em>is</em> the
+Cholesky factor, so it returns R directly and skips the n³
+<code>Q^T A</code> GEMM. Peak marginal ~2.5×. It is a genuinely
+different algorithm gated strictly to the tiny-batch large-n regime,
+with a per-matrix PD/finite gate and <code>geqrf</code> bad-row fallback
+for the ill-conditioned test batches.</p>
+<p><strong>Parallelized compact-WY T-factor formation
+[kernel-lang].</strong> In the kernel-language CUDA C++ runs, the
+largest single step (<code>dee548b938e3</code>, 4.88×) came from
+parallelizing a single-threaded O(pw²·prows)/matrix T-factor build — the
+B200 Triton-steered lineage fused this on-chip instead
+(<code>82903fd30701</code>). Same bottleneck (the compact-WY T
+recurrence), two languages independently identifying it.</p>
+<p><strong>TRSM block-width + triangular-inverse tuning.</strong> The
+<code>Q = A·R⁻¹</code> blocked right-TRSM and the recursive
+triangular-inverse (<code>build_Minv</code>, <code>minv_rblk</code>)
+were swept extensively (255 rows, 14,833 attempts):
+<code>_TRSM_NB_CPP=512</code> won the n=4096 solve (11,190 µs vs 11,728
+at nb=384), and <code>5a4f8d3e4d</code> shows the nb 384→512 step.
+Marginal ~1.5×; a fine-tuning family that matters because the TRSM is
+the #1 cost (~690 µs) on the n=4096 path.</p>
+<p><strong>FP8 e4m3 <code>mma.sync</code> trailing GEMM
+(candidate).</strong> A single-worker exploration
+(<code>50f5935c565f</code>, a real <code>m16n8k32.e4m3</code>
+tensor-core GEMM, 4-slice per-column, 1.82× step) that reached working
+self-tests but <strong>could not hold the factor/orthogonality gate on
+ill-conditioned inputs</strong> even with 2-term and 4-term error
+compensation (see Failed Techniques). Parked gated-off; a candidate, not
+a landed win.</p>
+<p><strong>Simplify / dead-code removal (diff minimization).</strong>
+The <code>_simplify</code> runs (and cleanup briefs) produced the
+highest raw attempt count (736 rows, 280,627 attempts) but are
+performance-neutral by design — they minimize the submission’s diff vs
+baseline without regressing (peak 2.13× steps are <em>reverts</em> to a
+faster parent, e.g. <code>606e33eeab</code> reverting to a 1,765 µs
+baseline). Reported as a technique family because it dominates the row
+count and produced the shippable
+<code>champion_qr_v2_simplify.py</code>.</p>
+<p><strong>The earlier qr_py run is where this technique family
+originated.</strong> The <code>2026-06-13-03-45-35</code> run (B200, 8
+workers, 1,161 kept / 1,233 attempted trials, 434 branches) optimized
+<code>problems/linalg/qr_py</code> — the predecessor QR problem, same
+compact-Householder <code>(H, tau)</code> contract and FP64-measured
+tolerances, same 7-shape n-grid (n=32/176/352/512/1024/2048/4096), but
+<strong>without</strong> the adversarial
+<code>mixed</code>/rankdef/clustered <em>benchmark</em> cases qr_v2
+later added. On its own baseline (44,710 µs <code>torch.geqrf</code>) it
+reached <strong>1,211.7 µs, ~36.9× end-to-end</strong>
+(<code>94d3f325c466</code>). Every top qr_v2 technique appears here
+first, a week earlier, in the same order of impact: <strong>WY 3-GEMM
+trailing replacing cuSOLVER <code>ormqr</code></strong>
+(<code>369b17d228d8</code>, 140,194 → 13,300 µs, 10.5× — the largest
+single trailing-update step in the whole dataset), <strong>custom
+one-CTA-per-matrix fused panel-QR</strong> (<code>8b84a3e0c4cf</code>,
+5.4×), <strong>Ozaki-INT8 FP64-accurate Gram CholeskyQR</strong>
+(<code>cdfbffec790d</code> / <code>4d71f5084c1e</code>, 4.8× / 4.5×),
+<strong>hybrid per-shape dispatch</strong> (<code>6de1737578</code>,
+3.75×), <strong>3×TF32 split-precision trailing</strong>
+(<code>f8dcc18c920a</code>, 3.3×), and <strong>conditioning-aware FP16
+trailing with a per-call precision probe</strong>
+(<code>70ba9698f1</code>, 1.6×). This run had a 94% accept rate and no
+failed trials: with no ill-conditioned <em>benchmark</em> cases, the
+demotion/<code>geqrf</code>-fallback machinery that dominates qr_v2’s
+trial volume was unnecessary. It is best read as the origin and
+independent B200 replication of the whole qr_v2 technique stack.</p>
+<h2 id="per-shape-algorithm-routing">Per-Shape Algorithm Routing</h2>
+<p>Derived by reading the best submission’s <code>custom_kernel</code>
+dispatch in <code>champion_qr_v2_submission.py</code>
+(<code>_custom_kernel_generic</code>, lines 8923–9061; the
+<code>_arms</code> first-match table; <code>_qr_large_n</code>,
+<code>_cholqr_path</code>, <code>_qr_small_bf16</code>,
+<code>qr_n512_mixed_driver</code>, and the
+<code>_illcond_demote_mask</code>/<code>_n352_illcond_mask</code>
+gates). The dispatch is first-match on <code>(B, n)</code>, with an
+<strong>exact-grid allowlist</strong>
+(<code>n ∈ {32, 176, 352, 512, 1024, 2048, 4096}</code>) that routes any
+off-grid <code>n</code> straight to <code>torch.geqrf</code> for
+secret-test safety. Every one of the 12 benchmark shapes and the key
+test shapes is accounted for below.</p>
+<table>
+<colgroup>
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Shape (batch×n, case)</th>
+<th>Routes to</th>
+<th>Key technique</th>
+<th>Why</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><strong>#0</strong> 20×32, cond1 (bench)</td>
+<td><code>blocked_qr_tiny</code> (warp-per-matrix, shuffle-only,
+zero-barrier)</td>
+<td>One warp = one CTA, no dynamic smem</td>
+<td>n=32 fits one warp; baseline already uses batched Jacobi here so
+headroom is smallest — a lean zero-barrier kernel avoids blocked_qr’s
+dead scratch</td>
+</tr>
+<tr class="even">
+<td><strong>#1</strong> 40×176, cond1 (bench)</td>
+<td><code>qr_mega_small</code> (FP16-SMEM resident megakernel,
+<code>_MEGA_N176=24</code> warps)</td>
+<td>Fully-resident register/warp Householder, whole 176×176 in 124 KB
+smem, entire QR in ONE launch</td>
+<td>n=176 fits in opt-in smem; a single launch removes the per-panel cmf
+launch + trailing-GEMM storm. n=176 is a measured bf16 NO-GO → stays
+FP32</td>
+</tr>
+<tr class="odd">
+<td><strong>#2</strong> 40×352, cond1 (bench)</td>
+<td><code>_qr_small_bf16</code> → <code>blocked_qr_2level_bf16</code>
+(single-level OB=IB=64, FP32-V)</td>
+<td>FP16 trailing GEMM at half bandwidth, FP32-V panels (orth-exact),
+cmf column-major fused panel (16 warps)</td>
+<td>n=352 tolerates bf16 trailing (residual well under gate); FP32-V
+keeps reflectors orth-exact. Ill-cond members demoted to
+<code>geqrf</code> via <code>_n352_illcond_mask</code></td>
+</tr>
+<tr class="even">
+<td><strong>#3</strong> 640×512, cond2 dense (bench,
+<strong>dominant</strong>)</td>
+<td><code>qr_n512_mixed_driver</code> (C++ two-level good/bad-split
+driver)</td>
+<td>Cheap structural good/bad split → FP16 two-level on good subset +
+exact-FP32 refactor of bad subset; wide TF32 accumulated-reflector
+apply</td>
+<td>B=640 ≥ 120 → the mixed driver; the highest-weight shape. FP16
+two-level fills the device; per-matrix split keeps ill-cond matrices
+exact</td>
+</tr>
+<tr class="odd">
+<td><strong>#4</strong> 60×1024, cond2 dense (bench)</td>
+<td><code>_qr_large_n</code> → <code>_qr_large_fp16</code>
+(<code>_LARGE_LO</code>: OB=64/IB=32, FP16 trailing) +
+<code>_illcond_demote_mask</code></td>
+<td>Two-level blocked, narrow outer block (bandwidth-bound FP16
+trailing), FP16-V orth-exact</td>
+<td>B=60 ≥ <code>fp16_min_batch=16</code> → FP16 trailing path; n=1024
+demote gate uses uniform-scale co-condition to spare cond2-scaled mixed
+members</td>
+</tr>
+<tr class="even">
+<td><strong>#5</strong> 8×2048, cond1 (bench)</td>
+<td><code>_qr_large_n</code> → <code>_qr_large_fp16</code>
+(<code>_LARGE_HI</code>: OB=64/IB=32, coop panel, cuBLAS trailing)</td>
+<td>Two-level; B=8 SM-starved → wsp column-major pivot-coop panel;
+matched-cuBLAS wide-OB trailing</td>
+<td>B=8 ≥ <code>fp16_min_batch=4</code> → FP16 trailing; wider OB=64
+wins on matched cu130 cuBLAS (fewer, wider panels)</td>
+</tr>
+<tr class="odd">
+<td><strong>#6</strong> 2×4096, cond1 (bench, largest)</td>
+<td><code>_cholqr_path</code> (dense_noinfo=B==2, gate=True) — 1-pass
+FP64 CholeskyQR + <code>orhr_col</code></td>
+<td>Full-device cuBLAS Gram <code>A^T A</code> + TRSM
+(<code>_TRSM_NB_CPP=512</code>, 3×TF32 diag) + tau-override for
+orthonormal <code>householder_product</code></td>
+<td>B=2 launches only 2 CTAs on the megakernel → 148 idle SMs;
+CholeskyQR’s wide n×n work fills the GPU at tiny batch (32.8ms vs
+35.3ms). R IS the Cholesky factor → skips the n³ Q^T A GEMM</td>
+</tr>
+<tr class="even">
+<td><strong>#7</strong> 640×512, cond2 <strong>mixed</strong>
+(bench)</td>
+<td><code>qr_n512_mixed_driver</code> (same as #3) + per-matrix good/bad
+split</td>
+<td>Structural split routes ~well-cond majority to FP16 two-level,
+ill-cond members to exact FP32</td>
+<td>Heterogeneous conditioning; the split defeats
+“sample-then-route-whole-batch”. Each matrix factored on its own
+merits</td>
+</tr>
+<tr class="odd">
+<td><strong>#8</strong> 60×1024, cond2 <strong>mixed</strong>
+(bench)</td>
+<td><code>_qr_large_n</code> (<code>_LARGE_LO</code> FP16) +
+<code>_illcond_demote_mask</code> (uniform-scale co-condition)</td>
+<td>FP16 two-level for the good majority; collinear/banded uniform-scale
+members demoted to <code>geqrf</code></td>
+<td>Mixed embeds cond2-scaled collinear/banded members (rel ≤1e-2) that
+PASS; the uniform-scale co-condition (&gt;5e-2) demotes only the
+homogeneous stress matrices → zero scored regression</td>
+</tr>
+<tr class="even">
+<td><strong>#9</strong> 640×512, cond0 <strong>rankdef</strong>
+(bench)</td>
+<td><code>qr_n512_mixed_driver</code>; ill-cond subset → exact FP32
+(rank-revealing column cap)</td>
+<td>Good/bad split flags rank-deficient matrices → exact SIMT-FP32
+trailing; leading-column factor + zero trailing</td>
+<td>Rank-deficient columns break FP16 orthogonality; the bad subset
+takes the exact path (measured 0.009–0.021 scaled residual &lt;&lt; 1.0
+gate)</td>
+</tr>
+<tr class="odd">
+<td><strong>#10</strong> 640×512, cond0 <strong>clustered</strong>
+(bench)</td>
+<td><code>qr_n512_mixed_driver</code>; clustered members → exact FP32
+subset</td>
+<td>Tiny-nonzero-column detection routes clustered-scale matrices to
+exact FP32</td>
+<td>Clustered scale halves columns to ~eps → FP16 underflow; the
+structural split catches them via min-nonzero col-norm</td>
+</tr>
+<tr class="even">
+<td><strong>#11</strong> 60×1024, cond0 <strong>nearrank</strong>
+(bench)</td>
+<td><code>_qr_large_n</code> (<code>_LARGE_LO</code>) +
+<code>_illcond_demote_mask</code> + NaN/Inf tau backstop</td>
+<td>FP16 two-level whole-batch; near-rank-deficient members demoted to
+<code>geqrf</code> via input mask ∪ non-finite check</td>
+<td>Near-rank-deficiency risks non-finite FP16 factors; the tau
+non-finite backstop + input mask scatter-recompute the bad rows</td>
+</tr>
+<tr class="odd">
+<td>test 16×512 / 4×1024 / 2×2048, various cond+cases</td>
+<td>small-batch (B&lt;120 n512 / B&lt;16 n1024 / B&lt;4 n2048) →
+<strong><code>torch.geqrf</code></strong></td>
+<td>Secret-safe small-batch fallback</td>
+<td>The custom “exact” paths ride the factor gate on hard ill-cond
+classes; small batch is the test/secret regime only (no benchmark shape
+is small-batch) → gold-standard FP32 at zero scored cost</td>
+</tr>
+<tr class="even">
+<td>test 1×4096 / 3×4096 (B≠2), upper/rankdef</td>
+<td><code>n≥4096 and B≠2</code> →
+<strong><code>torch.geqrf</code></strong> (batched)</td>
+<td>Secret-safe n=4096 fallback</td>
+<td>B=2 is the only scored n=4096 shape; B=1/B=3 test batches would fail
+the orth gate on CholeskyQR+orhr recon or hit the slow unbatched FP64
+cholesky loop → geqrf</td>
+</tr>
+<tr class="odd">
+<td>any off-grid n (e.g. 300, 351, 6001)</td>
+<td><code>n ∉ {32,176,352,512,1024,2048,4096}</code> →
+<strong><code>torch.geqrf</code></strong></td>
+<td>Exact-grid allowlist guard</td>
+<td>Off-grid n faults the size-assuming vectorized kernels (misaligned
+address / garbage residual), corrupting the CUDA context → whole secret
+run times out. geqrf handles any n, bounded-time</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Kernel-language experiment routing (RTX Pro 6K):</strong>
+these kernels reached a simpler routing — typically a fused
+one-CTA-per-matrix Triton/CUDA megakernel for n≤512 with
+per-<code>n</code> launch configs (<code>_CONFIGS</code>), extended to
+n=1024 by splitting panel-factor / T-build / trailing-update, an fp16
+wide-trailing blocked path for n=1024/2048, and a
+<code>torch.geqrf</code> / exact fallback gated on an
+orthogonality-residual check for ill-conditioned matrices
+(<code>q1nb1oliq</code> <code>e233ae9b4</code>). They did not build the
+full 7-way exact-grid table or the tcgen05 / CholeskyQR paths.</p>
+<p><strong>Earlier qr_py run routing (B200):</strong> the same n-grid
+drove a similar but simpler dispatch — <code>QR_S3_MIN_N</code>-gated
+two-level blocked QR for n≥512, a hybrid dispatcher routing
+high-batch-parallelism shapes to the custom blocked path (custom smem
+panel + 3×TF32 cuBLAS trailing) and falling back to
+<code>torch.geqrf</code> otherwise, and a CholeskyQR1 +
+<code>orhr_col</code> reconstruction for the occupancy-starved large-n
+tiny-batch case (<code>ce98ff97b7</code>, n≥3072, B=2 — the same n=4096
+device-underfill insight the qr_v2 <code>_cholqr_path</code> later
+hardened). With <strong>no ill-conditioned <em>benchmark</em>
+cases</strong>, it needed neither the per-matrix
+<code>_illcond_demote_mask</code> nor the exact-grid secret-safety
+allowlist that dominate qr_v2’s routing.</p>
+<pre class="mermaid">
+flowchart TD
+    A["input batch A: (B, n, n) FP32"] --> G{"n on exact grid?<br/>{32,176,352,512,1024,2048,4096}"}
+    G -- "no (off-grid n)" --> GEQRF["torch.geqrf<br/>(gold-standard, any n)"]
+    G -- "yes" --> N{dispatch on n}
+    N -- "n<=32" --> TINY["blocked_qr_tiny<br/>warp-per-matrix, zero-barrier"]
+    N -- "n=176" --> MEGA["qr_mega_small<br/>FP16-SMEM resident megakernel"]
+    N -- "176<n<=352" --> M352{"ill-cond mask<br/>(_n352_illcond_mask)"}
+    M352 -- "good" --> BF352["_qr_small_bf16<br/>single-level bf16 trailing, FP32-V"]
+    M352 -- "bad" --> GEQRF
+    N -- "512<=n<1024" --> B512{"B >= 120?"}
+    B512 -- "no (test regime)" --> GEQRF
+    B512 -- "yes" --> DRV["qr_n512_mixed_driver<br/>good/bad split: FP16 two-level + exact-FP32 bad subset"]
+    N -- "1024<=n<4096" --> LB{"B >= fp16_min_batch?<br/>(16 @1024, 4 @2048)"}
+    LB -- "no (test regime)" --> GEQRF
+    LB -- "yes" --> LFP16["_qr_large_fp16 two-level<br/>_LARGE_LO / _LARGE_HI"]
+    LFP16 --> DM{"_illcond_demote_mask<br/>+ NaN/Inf tau backstop"}
+    DM -- "risky rows" --> SCAT["scatter-recompute bad rows<br/>with torch.geqrf"]
+    DM -- "clean" --> OUT["(H, tau)"]
+    SCAT --> OUT
+    N -- "n>=4096" --> B4{"B == 2?"}
+    B4 -- "no (B=1/B=3 test)" --> GEQRF
+    B4 -- "yes (scored s6)" --> CHOL["_cholqr_path<br/>1-pass FP64 CholeskyQR + orhr_col + tau-override"]
+    TINY --> OUT
+    MEGA --> OUT
+    BF352 --> OUT
+    DRV --> OUT
+    CHOL --> OUT
+    GEQRF --> OUT
+</pre>
+<pre class="mermaid">
+flowchart LR
+    subgraph BASE["Baseline: serial cuSOLVER"]
+        B1["torch.geqrf per-matrix loop<br/>~73k launches, SIMT-only, 0 tensor-core"]
+    end
+    subgraph STACK["Winning technique stack (composes bottom-up)"]
+        direction TB
+        T1["1. Batched fused custom QR<br/>(one CTA/matrix, collapses launches)"]
+        T2["2. Blocked compact-WY two-level panel<br/>(OB outer x IB inner sub-panels)"]
+        T3["3. Fused panel geqr2 + on-chip T-factor<br/>(no Y=M@W HBM round-trip)"]
+        T4["4. TF32/FP16 tensor-core GEMM<br/>3xTF32 diag + 3xFP16 Kahan trailing"]
+        T5["5. Per-shape routing + per-matrix<br/>ill-cond demotion to geqrf"]
+        T6["6. Large-n CholeskyQR R-solve<br/>(tiny-batch device-fill)"]
+        T1 --> T2 --> T3 --> T4 --> T5 --> T6
+    end
+    B1 -->|"replace"| T1
+    T6 --> CH["Best submission ~1,600.9 us<br/>~82x end-to-end"]
+</pre>
+<h2 id="failed-optimization-techniques">Failed Optimization
+Techniques</h2>
+<p><strong>FP8 e4m3 trailing GEMM on ill-conditioned inputs.</strong>
+The most-explored dead end. A real <code>m16n8k32.e4m3</code>
+tensor-core GEMM for the n=512 trailing <code>W=Vᵀ C</code> step
+(<code>50f5935c565f</code> and successors) passed the 22 standard tests
+and self-tests, but <strong>failed the factor / orthogonality gate on
+rank-deficient and clustered inputs</strong> — even after escalating to
+a 2-term error-compensated split (hi/lo e4m3), a full 4-term split
+(<code>+Vlo^T Clo/RESCALE²</code>), per-CTA amax demotion, and
+rank-revealing R-diag demotion. Rankdef/clustered failed 7/8→3/8 at best
+(residuals ~0.54–0.63). FP8’s ~2-bit mantissa cannot hold the dynamic
+range the QR factor residual demands on these classes; the whole family
+was parked gated-off (<code>g_fp8_w=0</code>). Structural mismatch, not
+a bug.</p>
+<p><strong>TSQR / tall-skinny CholeskyQR-R for large n.</strong>
+Multiple attempts to replace the two-level panel with
+communication-avoiding TSQR (<code>_caqr_R_cholesky</code>, block-MGS,
+per-tile CholeskyQR) failed for three distinct reasons: a
+<strong>diff-guard accuracy failure</strong> at n=2048 B=8 (R−QᵀA
+residual ~370, shrink-height MGS variant), a <strong>hard SIGSEGV (exit
+139)</strong> in <code>cublasSgeqrfBatched</code> at B=8, and a
+<strong>profile-confirmed 200× slowdown</strong>
+(<code>geqr2_batched</code> was the culprit). CholeskyQR-family R-solves
+lose orthogonality on the ill-conditioned n=1024/2048 stress cases the
+benchmark ranks, so they only survive gated to the well-conditioned
+tiny-batch n=4096 regime (where they became the <em>winning</em>
+<code>_cholqr_path</code>).</p>
+<p><strong>Wide-outer-block (OB≥128) two-level variants.</strong>
+Repeated attempts to widen the outer block for fewer/wider trailing
+GEMMs (OB 64→128, OB=256 with an FP32-M arm, wide-IB single-level
+OB=IB=64) <strong>failed <code>diff_correctness</code> 8/8</strong> with
+scaled residuals blowing the gate, and one surfaced a real
+<code>fill_above_panel_R_tiled_kernel</code> off-diagonal fast-path bug
+(32-lane×2 tiling). The narrow OB=64 is a genuine optimum on this
+hardware — wider blocks accumulate too much TF32/FP16 error in the wide
+reflector apply. A measured regression family (the change cost
+correctness, not just speed).</p>
+<p><strong>Batched CholeskyQR2 for small/mid n and CUDA-graph replay of
+its pipeline.</strong> Batched CholeskyQR2 (TF32 Gram + FP32 chol +
+TRSM, 2 passes + <code>orhr_col</code>) for n=512 B≥120 and for
+n=176/n=352 well-conditioned shapes was tried and <strong>gated off as
+perf-neutral or regressing</strong> (<code>be8512c06a</code> gated CQR3
+off at geomean 2374.9 == parent; <code>2ab2c3a591</code>,
+<code>8fbcde478a</code> reverted CQR2 on n=1024 as “the WRONG shape for
+the lever”). CUDA-graphing the ~25-kernel CQR2 pipeline to kill the ~14%
+launch overhead also failed to beat the fused megakernel. The
+blocked-Householder megakernel already amortizes launches better than a
+graphed multi-kernel CQR pipeline, so the composition lost.</p>
+<p><strong>n=352 outer-block widening.</strong> Widening the n=352
+single-level outer block (OB 64→128, 64→88, or a two-level OB=128/IB=64)
+to cut sync-bound cmf-panel launches <strong>failed the n=352 cond1
+factor-residual test</strong> identically across variants — the bf16
+trailing at the wider block exceeds the factor gate. n=352 stays at
+OB=64. A structural precision limit.</p>
+<p><strong>Batched-cuSOLVER and Python/torch fallbacks as the primary
+path.</strong> A decisive negative (<code>1081620bfa</code>): batched
+<code>torch.geqrf</code> at B=40 measured 20,382 µs (n=176) / 50,939 µs
+— far slower than the custom megakernel — confirming the whole premise
+that the serial cuSOLVER path must be replaced, not merely batched.
+<code>torch.geqrf</code> survives only as the correctness fallback,
+never as a scored path.</p>
+<p><strong>In-kernel LU / triangular-solve folds for the
+<code>orhr_col</code> reconstruction (qr_py).</strong> The earlier qr_py
+run shows this family failing repeatedly — every qr_py NO-GO is marked
+<code>kept</code> in the CSV (they are <em>reverts</em> of a candidate,
+not error trials, so qr_py has 0 <code>outcome=failed</code> rows) but
+the raw logs record the real dead ends. The recurring one: folding the
+<code>orhr_col</code> L21/U12 panel triangular-solves <em>into</em> the
+diagonal-block LU kernel to kill ~7,700 µs of per-block torch
+<code>trsm</code> launches was tried at least three times (including a
+double-accumulation forward-substitution variant) and
+<strong>numerically diverged on the slightly-non-orthonormal CholeskyQR
+Q</strong> — the in-smem forward-substitution is less robust to LU
+growth than cuBLAS <code>trsm</code>, so the kernel was logically
+correct yet failed the orthogonality residual. Kept torch
+<code>trsm</code>. This is the same accuracy-vs-fusion tension that
+later gated qr_v2’s CholeskyQR to the tiny-batch regime.</p>
+<p><strong>TF32 for the reconstruction trailing GEMM (qr_py).</strong> A
+qr_py NEGATIVE RESULT (reverted, <code>_LU_TF32</code> default off):
+using TF32 (or a 3×TF32 ~FP32 split) for the <code>orhr_col</code> recon
+trailing <code>M22 -= L21@U12</code> <strong>jumped the scaled
+orthogonality residual</strong> — the reconstruction step amplifies TF32
+error more than the interior GEMMs, so it stayed FP32. It foreshadows
+the qr_v2 finding that the <em>diagonal solve</em> tolerates 3×TF32 but
+the recon path does not.</p>
+<h2 id="unexplored-areas">Unexplored Areas</h2>
+<p><strong>The n=512 B=640 dominant group never got a tcgen05 (5th-gen
+tensor-core) trailing on the scored path.</strong> The tcgen05 / TMEM
+primitives were integrated (<code>32e1c1d1f3</code>,
+<code>95aa0848 tc_trailing_wt</code>) and self-tested portable under
+nvrtc-13, and a persistent work-queue megakernel reached 1,804 µs, but
+the 5th-gen <code>tcgen05.mma</code> trailing GEMM stayed gated-off
+(dead code, path byte-unchanged) rather than becoming the live n=512
+apply. Given n=512 B=640 is 5 of the 12 shapes and the highest-weight
+group, wiring a validated tcgen05 trailing into
+<code>qr_n512_mixed_driver</code> is the largest untried lever on
+B200.</p>
+<p><strong>BF16x9 / emulated-FP32 GEMM was never benchmarked as the
+trailing path.</strong> The B200 supports cuBLAS BF16x9 emulation giving
+~FP32-accurate GEMM at up to ~3× native FP32, and it would pass the
+factor gate on ill-conditioned inputs where plain FP16/FP8 fail — yet
+the runs only used FP16 hi/lo (3×) and TF32 (3×) splits. BF16x9 could
+let the ill-cond demotion masks (a large share of all trials) shrink or
+disappear, simplifying routing and speeding the
+<code>mixed</code>/rankdef/clustered shapes that currently pay for a
+<code>geqrf</code> refactor.</p>
+<p><strong>NVFP4 was never attempted.</strong> The task explicitly
+permits internal NVFP4, and Blackwell FP4 tensor throughput is ~4500
+TFLOPS, but no trial tried an NVFP4 trailing with FP32 refinement — the
+precision-accuracy frontier below FP8 is entirely unexplored (FP8 failed
+on accuracy, but a block-scaled NVFP4 with a compensation pass was never
+tested).</p>
+<p><strong>CUDA-graph capture of the whole per-shape dispatch was only
+tried on the losing CQR2 path.</strong> The best submission collapses
+launches <em>inside</em> one megakernel, but the host-side per-shape
+dispatch and the multi-launch large-n / CholeskyQR paths still issue
+tens of launches per call; a full <code>cudaGraph</code> capture of a
+fixed-shape pipeline (the benchmark shapes are fixed) was never applied
+to the <em>winning</em> paths, only to the rejected batched CholeskyQR2.
+On the launch-bound n=4096 TRSM (555 launches/iter, 88% GPU-busy) it
+could close the remaining ~12% launch-idle gap.</p>
+<p><strong>CUTE DSL was barely explored past a first kernel.</strong> In
+the kernel-language experiment, all 4 CUTE DSL runs plateaued at
+1.24–1.69× — none reached the fused-megakernel + tensor-core trailing
+that Triton (42.8×) and CUDA C++ (21.5×) found. Whether CUTE DSL’s
+ceiling on this problem is real or a token-budget artifact (the CUTE
+runs were all in the short-budget <code>06-24</code> batch) is
+undetermined; no long-budget CUTE DSL run exists to disambiguate. A
+matched-budget CUTE DSL run is the obvious missing experiment.</p>
+<p><strong>Small-n launch overhead (shapes 0–2) carries 3/13 of the
+geomean but got little attention.</strong> The n=32/176/352 shapes are
+overhead-bound and each counts as much as the dominant n=512 group in
+the equal-weighted geomean, yet the technique volume concentrated on
+n=512/1024. A batched-Jacobi or a single fused multi-matrix launch for
+the many-small-matrix regime (n=32 replicates to 1000 matrices/call) was
+never pushed beyond the tiny warp kernel.</p>
+<h2 id="scope-methodology">Scope &amp; Methodology</h2>
+<p>This report consolidates <strong>40 qr_v2 optimize-tree run tags plus
+1 qr_py run</strong> into a single techniques analysis of batched square
+compact-Householder QR (<code>torch.geqrf</code> contract, FP32 in/out).
+It draws on <strong>three distinct lineages</strong> across two GPUs,
+which must <strong>not</strong> be conflated because they have different
+baselines, hardware, or code style. The two primary lineages run on the
+<em>same</em> B200 leaderboard hardware but are different lines of work;
+the third is the RTX kernel-language experiment. The 18 B200 optimize
+tags (1,884 branches total, baseline <code>torch.geqrf</code> serial
+per-matrix cuSOLVER loop; NVIDIA B200, sm_100a, CUDA 13.x, torch 2.12)
+divide into Lineages 1 and 2:</p>
+<ul>
+<li><strong>the B200 CUDA C++ lineage:</strong> 14 qr_v2 tags plus the
+earlier qr_py run. The longer, convoluted line: this is where the
+<strong>~9,000-line</strong> custom CUDA C++ best submission with
+explicit per-shape routing was built, reaching the top score
+<strong>~82×</strong> (1,600.9 µs, <code>292432ed7166</code>, tag
+<code>2026-06-23-17-54-06</code>). Its 14 qr_v2 tags are
+<code>2026-06-15-05-53-17</code>, <code>2026-06-18-00-40-34</code>,
+<code>2026-06-18-01-38-06</code>, <code>2026-06-19-00-34-18</code>,
+<code>2026-06-19-04-54-07</code>, <code>2026-06-19-19-06-14</code>
+(bare-timestamp refinement, 25 branches / 55 kept),
+<code>2026-06-20-04-33-52-simplify</code>,
+<code>2026-06-20-20-26-49</code>, <code>2026-06-20-22-03-57</code>,
+<code>2026-06-23-17-54-06</code> (WINNER),
+<code>2026-06-24-20-40-28</code>,
+<code>2026-06-25-08-42-00-simplify</code>,
+<code>2026-06-25-22-03-01</code>, and <code>2026-06-29-06-40-42</code>;
+the <code>_simplify</code> tags are its minimize-the-diff passes. The
+earlier <strong>qr_py run</strong> (bare-timestamp tag
+<code>2026-06-13-03-45-35</code>, metric <code>linalg/qr_py</code>,
+<strong>1,161 kept trials across 434 branches, ~1,436 CSV rows</strong>,
+8 workers) folds into this lineage: the same compact-Householder
+contract and tolerances (verified in <code>qr_py_reference.py</code>)
+and same 7-shape n-grid (n=32…4096), but on the predecessor problem
+<strong>before</strong> the <code>mixed</code>/rankdef/clustered
+<em>benchmark</em> cases were added — an earlier run on a related
+problem within the same CUDA C++ family (~36.9× on its own 44,710 µs
+baseline), where the technique family was first developed. Its analysis
+is folded throughout above (it is <em>not</em> log-less — the shared
+brief’s “harness-records only / 0 trial rows” claim was wrong; its logs
+are in the data dir).</li>
+<li><strong>the B200 Triton-steered lineage (B200, same
+hardware):</strong> 4 tags — <code>2026-06-22-09-10-03-qr_v2</code>,
+<code>2026-06-24-21-01-44-qr_v2_simplify</code>,
+<code>2026-06-25-02-02-25-qr_v2</code>, and
+<code>2026-06-25-23-41-18-qr_v2</code>. A shorter, cleaner
+(<strong><sub>3,000-line<strong>) Triton-dominant line on the
+<em>same</em> B200 that reached </strong></sub>64× (~2,040.9
+µs</strong>, tag <code>2026-06-22-09-10-03</code>). The interesting
+contrast with the B200 CUDA C++ lineage is score-vs-complexity: it hit
+~64× with far less and far cleaner code than the winning lineage’s ~82×
+from ~9,000 convoluted lines. Many of the shared panel/routing commits
+cited above (<code>da6e702d2738</code>, <code>fa6bbfb83ffd</code>,
+<code>82903fd30701</code>) landed here.</li>
+<li><strong>RTX Pro 6K evals — the kernel-language experiment (same
+qr_v2 problem; NVIDIA RTX Pro 6K, sm_120, torch 2.11):</strong> 22
+optimize tags, 771 branches, on a <strong>different GPU with its own
+~117k µs baseline</strong> — its ~42.8× is <em>not</em> comparable to
+the B200 lineages’ ×. Each run was <strong>steered</strong> to a fixed
+kernel-authoring language (10 Triton, 8 CUDA C++, 4 CUTE DSL among the
+22 optimize tags; 2 further CUDA C++ runs are export-only with no
+optimize branches, for 24 runs / 10 CUDA C++ in the language map). These
+are token-efficiency experiments (small 3-worker trees, ~14–62 JSONLs
+each), not the leaderboard target.</li>
+</ul>
+<blockquote>
+<p><strong>Data provenance note.</strong> The rebuilt
+<code>2026-06-13-to-2026-06-29-qr-consolidated-report-optimization.csv</code>
+(5,602 rows / 3,089 branches, all 41 tags) carries clustering,
+prevalence (<code>branches</code>, <code>attempts</code>,
+<code>frequency_pct</code>), and <code>outcome</code>, but its
+<code>best_speedup</code> and <code>best_step_speedup</code> columns are
+<strong>blank on all 5,602 rows</strong> (the metric join was lost when
+the CSV was aggregated; <code>autocuda status</code> also reads the
+now-eigh live data dir and returns <code>global_best: null</code>). All
+speedup magnitudes below were instead <strong>recovered directly from
+the raw per-worker trial-log CSVs</strong>
+(<code>autocuda/&lt;tag&gt;-optimize-tree-worker-*-log.csv</code>, which
+hold the per-trial <code>linalg/qr_v2</code> or
+<code>linalg/qr_py</code> geomean in µs, <code>status</code>, and
+<code>commit</code>), with each run’s baseline taken from its own
+<code>status=baseline</code> row, and cross-checked against the
+<code>git show</code> commit messages, which embed the measured
+per-shape and geomean µs. Marginal step-speedups are computed as the
+within-brief <code>prev_kept_value / trial_value</code>. This recovers
+the exact quantities the blank columns should hold.</p>
+</blockquote>
+
+
+<script type="module">
+  import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+  mermaid.initialize({ startOnLoad: true, theme: 'default' });
+</script>
+</body>
+</html>

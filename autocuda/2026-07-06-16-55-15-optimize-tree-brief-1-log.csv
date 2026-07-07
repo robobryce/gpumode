@@ -1,0 +1,7 @@
+timestamp,brief_id,trial,linalg/qr_v2,status,commit,description
+2026-07-06T17:11:24.634293,1,N/A,N/A,brief_start,N/A,"Build an n=512 CTA-cluster megakernel: one panel-owner CTA recursively factors 8+8+16 or 16+16 FP32 micro-panels and publishes V plus Gram-and-tau T-inverse data through DSM, while sibling CTAs tcgen05-tile far updates and synchronize once per blocked panel, preserving per-matrix conditioning routes and TF32x3 accuracy."
+2026-07-06T17:20:47.092361,1,0,N/A,build_error,fc4604626,4-CTA n512 DSM cluster megakernel with recursive 16+16 FP32 panels; lazy NVRTC compile failed because stdint.h is unavailable
+2026-07-06T17:23:23.069763,1,1,N/A,validation_error,4265a5327,"NVRTC-self-contained 4-CTA cluster kernel compiled and standard tests passed, but diff_correctness_guard hit cudaErrorIllegalAddress on benchmark n512 batch640"
+2026-07-06T17:35:53.879472,1,2,1800.168,succeeded,a56813d6b,Correct 4-CTA DSM cluster megakernel with 16+16 FP32 panel and Gram/tau block update; dense n512 measured 262515.289 us and full geomean 1800.168153 us
+2026-07-06T17:53:03.651216,1,3,1685.613,succeeded,1c4ba85f3,"Replicated owner V/Tinv from DSM once per panel into sibling shared memory; dense n512 improved 262515.289 to 117188.309 us, geomean 1800.168153 to 1685.613054 us"
+2026-07-06T18:05:40.014267,1,4,N/A,validation_error,c2507067b,"TF32x3 WMMA far-update tiles compiled, but in-place negated Tinv solve used the wrong recurrence sign; diff guard flagged all dense n512 inputs"

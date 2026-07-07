@@ -1,0 +1,249 @@
+<h1 id="autocuda-skill-audit-2026-07-06-18-24-02">Autocuda Skill Audit:
+2026-07-06-18-24-02</h1>
+<h2 id="executive-summary">Executive Summary</h2>
+<p>The audit found four actionable skill/tooling defects and one
+documentation ambiguity. All five scrubbed Codex session JSONLs were
+mapped exactly once under distinct run-segment labels, so there are no
+missing or unreadable harness records.</p>
+<ul>
+<li>The generated CSV contains six candidates, but none is a real skill
+defect: four are ordinary experimental kernel build/validation failures,
+and two are duplicate views of one sentence whose CUDA
+“instruction/layout” wording tripped the lexical skill-issue
+heuristic.</li>
+<li>The session skill catalog froze absolute paths into an ephemeral
+plugin-cache version. After the cache rotated, four long-lived sessions
+produced seven <code>No such file or directory</code> failures while
+re-reading <code>optimize-tree</code> or <code>explore-brief</code>;
+each agent had to rediscover the build-suffixed cache path.</li>
+<li>The run-start <code>explore-brief</code> contract permitted
+continuation after <code>brief_stop</code> but only documented
+<code>autocuda init brief</code>, which rejects a closed brief. Three
+continuations manually reopened the branch and appended
+<code>brief_start</code>. The later
+<code>0.4.0+codex.20260707013705</code> skill fixes this with
+<code>autocuda resume brief</code>, but the frozen catalog kept workers
+on the obsolete contract.</li>
+<li><code>optimize-tree</code> links to
+<code>references/profilers.md</code> as though it were inside the skill
+directory, while the packaged file is at the plugin root. The manager
+followed the required relative-path rule and immediately hit
+ENOENT.</li>
+<li>The <code>report-skill</code> scanner omitted 11 CLI rejection
+records stored as Codex <code>custom_tool_call_output</code>, missed
+explicit “resume path conflicts” / stale-path narration, overclassified
+four child-kernel tracebacks as critical autocuda exceptions, and
+emitted both Codex representations of one assistant message.</li>
+<li>No agent asked the operator for permission to continue. The
+remaining invalid CLI probes were self-corrected and, where the skill
+already showed the accepted syntax, are agent mistakes rather than skill
+defects.</li>
+</ul>
+<h2 id="skill-issue-candidates">Skill Issue Candidates</h2>
+<table style="width:100%;">
+<colgroup>
+<col style="width: 16%" />
+<col style="width: 16%" />
+<col style="width: 16%" />
+<col style="width: 16%" />
+<col style="width: 16%" />
+<col style="width: 16%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Branch</th>
+<th>Skill</th>
+<th>Severity</th>
+<th>Category</th>
+<th>Evidence</th>
+<th>Recommendation</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>manager and reused worker sessions</td>
+<td>plugin skill catalog</td>
+<td>high</td>
+<td>stale_skill_path</td>
+<td>The initial developer catalog names
+<code>/home/shadeform/.codex/plugins/cache/brycelelbach-autocuda/autocuda/0.4.0/...</code>.
+After cache rotation, seven reads failed: manager once, QR worker twice,
+Blackwell worker once, and the multi-brief worker three times. All
+recovered by searching for <code>0.4.0+codex.20260707013705</code>.</td>
+<td>Publish stable skill resource locators or preserve a stable version
+alias for the lifetime of every active session; refresh a session’s
+catalog when a plugin is reinstalled.</td>
+</tr>
+<tr class="even">
+<td>brief 0, brief 1, brief 2</td>
+<td>explore-brief</td>
+<td>high</td>
+<td>contradictory_resume_contract</td>
+<td>The run-start skill says a stopped brief may be continued and should
+receive a fresh <code>brief_start</code>, but directs every entry
+through <code>autocuda init brief</code>; the CLI rejected closed briefs
+at QR L2786, Blackwell L4389, and multi-brief L3119. Workers manually
+appended starts.</td>
+<td>Backport the current <code>autocuda resume brief</code> command and
+distinguish first launch, crash re-entry, and post-stop continuation in
+one lifecycle table.</td>
+</tr>
+<tr class="odd">
+<td>manager</td>
+<td>optimize-tree and shared profiler guidance</td>
+<td>medium</td>
+<td>broken_reference_path</td>
+<td>Manager L25–26 resolved <code>references/profilers.md</code>
+relative to <code>skills/optimize-tree/</code> and got ENOENT. The
+packaged file is
+<code>&lt;plugin-root&gt;/references/profilers.md</code>; the same
+unresolved relative reference appears in discover, optimize-simple,
+optimize-tree, and explore-brief.</td>
+<td>Change those links to <code>../../references/profilers.md</code> or
+package a per-skill <code>references/</code> asset; add a link-integrity
+test for every SKILL.md.</td>
+</tr>
+<tr class="even">
+<td>report generation</td>
+<td>report-skill</td>
+<td>high</td>
+<td>harness_parser_and_classifier</td>
+<td>CSV rows <code>bug_0000</code>–<code>bug_0005</code> contain no
+surviving issue, while direct review found 11 matching CLI rejections in
+omitted <code>custom_tool_call_output</code> records and all
+stale/resume incidents. Rows 0003/0004 duplicate one message; rows
+0000/0001/0002/0005 are child kernel failures.</td>
+<td>Parse <code>custom_tool_call_output</code>, broaden explicit defect
+wording, require an autocuda implementation frame for
+<code>autocuda_exception</code>, and deduplicate paired
+<code>agent_message</code>/assistant <code>message</code> records.</td>
+</tr>
+<tr class="odd">
+<td>manager</td>
+<td>optimize-tree</td>
+<td>low</td>
+<td>cli_discoverability</td>
+<td>The skill says only “Read <code>autocuda status</code>”; after
+compaction the manager tried
+<code>autocuda status optimize-tree --data-dir ... --tag ...</code>,
+which the CLI rejected at root L5365.</td>
+<td>Replace the shorthand with
+<code>autocuda status --data-dir "$DATA_DIR" --tag "$TAG"</code>
+everywhere it is prescribed.</td>
+</tr>
+</tbody>
+</table>
+<h2 id="root-causes">Root Causes</h2>
+<p><strong>Ephemeral cache paths were treated as durable session
+capabilities.</strong> The skill catalog embedded a concrete
+plugin-cache directory in each session’s initial developer message. The
+plugin was reinstalled during this long run under a cache-busted
+directory, removing the old path without refreshing existing
+conversations. This is why the same deterministic read failed repeatedly
+rather than a worker-specific setup problem. Recovery was safe but
+wasted turns and made the newly fixed skill text unavailable until each
+worker searched manually.</p>
+<p><strong>The old continuation prose and CLI lifecycle were out of
+sync.</strong> The <code>0.4.0</code>
+<code>explore-brief/SKILL.md</code> says the manager can push a worker
+back into a stopped brief and that the worker should log a fresh start,
+but its only entry command is <code>autocuda init brief</code>. The CLI
+deliberately rejects a branch with a matching <code>brief_stop</code>.
+The current build’s <code>autocuda resume brief</code> is the correct
+fix, confirming that the three manual-reopen incidents were contract
+defects rather than expected kernel experimentation.</p>
+<p><strong>Plugin-root references were written as skill-local
+references.</strong> <code>references/profilers.md</code> lives beside
+<code>skills/</code> at the plugin root, yet several skills name it
+without the required <code>../../</code> traversal. Under the
+skill-loading contract, relative resources resolve from the selected
+SKILL.md directory, so the manager’s failed
+<code>skills/optimize-tree/references/profilers.md</code> lookup was the
+specified behavior.</p>
+<p><strong>The report scanner does not cover the current Codex record
+shape.</strong> In <code>lib/_report.py</code>,
+<code>_iter_codex_payload_texts</code> accepts
+<code>function_call_output</code> and <code>tool_result</code> but not
+<code>custom_tool_call_output</code>; consequently 11 records containing
+<code>invalid choice</code>, <code>unrecognized arguments</code>, or
+missing required arguments never reached
+<code>_skill_issue_signals_from_text</code>.
+<code>_EXPLICIT_SKILL_ISSUE_RE</code> recognizes
+“bug/broken/wrong/incorrect/inconsistent/contradictory” but not the
+observed “conflicts”, “stale”, or “rotated”. Conversely,
+<code>_has_autocuda_context</code> treats any <code>/autocuda/</code>
+worktree path as proof that a traceback is from autocuda itself, so
+normal submission failures become critical CLI incidents. Deduplication
+includes the source line, preserving the paired event and response
+copies of the same assistant text.</p>
+<p>The six generated candidates were triaged as follows:
+<code>bug_0000</code> and <code>bug_0001</code> are NVRTC prototype
+build failures caused by unavailable <code>math.h</code>;
+<code>bug_0002</code> is an intentional transpose-descriptor mismatch
+diagnostic; <code>bug_0005</code> is an illegal GPU instruction from an
+experimental kernel during validation; and
+<code>bug_0003</code>/<code>bug_0004</code> are the same sentence
+duplicated across Codex record views, where “instruction/layout
+boundary” refers to GPU instructions rather than skill instructions.
+These are normal optimization outcomes, not skill defects.</p>
+<h2 id="fix-plan">Fix Plan</h2>
+<ol type="1">
+<li>Make plugin skill locators stable across cache-busting installs.
+Update the catalog/plugin-cache resolver to expose a stable resource
+identifier or atomic <code>current</code> alias, retain an old cache
+directory while any session references it, and refresh active catalogs
+after installation. Test by starting a session, reinstalling the plugin
+under a cache-busted version, and reading the original skill locator
+successfully.</li>
+<li>Backport the current continuation lifecycle to every distributed
+<code>explore-brief/SKILL.md</code>: <code>init brief</code> for
+fresh/open briefs, <code>resume brief</code> after
+<code>brief_stop</code>, and no manual <code>log ... start</code>
+workaround. Add CLI lifecycle tests for fresh, crash-resume,
+stopped-resume, and double-resume rejection.</li>
+<li>Fix profiler links in <code>skills/discover/SKILL.md</code>,
+<code>skills/optimize-simple/SKILL.md</code>,
+<code>skills/optimize-tree/SKILL.md</code>, and
+<code>skills/explore-brief/SKILL.md</code> to resolve the plugin-root
+<code>references/profilers.md</code>. Add a packaging test that resolves
+every referenced local file from its containing SKILL.md.</li>
+<li>In <code>lib/_report.py</code>, add
+<code>custom_tool_call_output</code> to
+<code>_iter_codex_payload_texts</code>; recursively unwrap its array and
+JSON-wrapped output forms. Expand explicit-issue matching to
+conflict/stale/missing-path language, narrow
+<code>autocuda_exception</code> to known CLI frames, and deduplicate
+paired Codex message views by timestamp/category/normalized text.
+Regression fixtures should reproduce all six false candidates, the 11
+missed CLI rejections, one stale path, and one resume conflict.</li>
+<li>Replace the <code>autocuda status</code> shorthand in
+<code>skills/optimize-tree/SKILL.md</code> with the complete accepted
+invocation and keep command examples synchronized with CLI
+<code>--help</code> in tests.</li>
+</ol>
+<h2 id="verification">Verification</h2>
+<ul>
+<li>Generated <code>autocuda/2026-07-06-18-24-02-report-skill.csv</code>
+from the five scrubbed run JSONLs exactly once each, using distinct
+labels for manager, baseline archaeology, QR research/reused worker,
+Blackwell research/reused worker, and the brief-0-through-17 worker
+segment.</li>
+<li><code>autocuda schema check report-skill-csv --output 2026-07-06-18-24-02</code>
+passed. The CSV has six candidate rows, zero
+<code>missing_harness</code> rows, and zero unreadable-record rows.</li>
+<li>Reviewed every generated row at its cited source line and directly
+searched all five JSONLs for skill paths, <code>SKILL.md</code>, CLI
+rejections, resume/continuation conflicts, stale/rotated paths, schema
+failures, and confirmation-gate language.</li>
+<li>Confirmed seven obsolete-cache path failures across four live
+sessions, three closed-brief continuation conflicts, one broken
+profiler-reference lookup, and 11 CLI rejection records omitted by the
+automated parser.</li>
+<li>Confirmed no operator-confirmation gate.
+GPU/compiler/build/validation failures were excluded unless they
+demonstrated a skill or CLI contract problem.</li>
+<li><code>autocuda schema check report-skill-markdown --output 2026-07-06-18-24-02</code>
+passed, and
+<code>autocuda report html autocuda/2026-07-06-18-24-02-report-skill.md</code>
+rendered the canonical HTML artifact.</li>
+</ul>

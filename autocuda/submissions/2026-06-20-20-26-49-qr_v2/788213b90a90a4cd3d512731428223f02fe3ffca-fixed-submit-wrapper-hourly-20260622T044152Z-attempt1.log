@@ -1,0 +1,225 @@
+Submitting to leaderboard: qr_v2
+GPU: B200
+Mode: leaderboard
+File: /home/shadeform/gpumode/autocuda/worktrees/submit-788213b90a90a4cd3d512731428223f02fe3ffca-20260622T044152Z/problems/linalg/qr_v2/submission.py
+
+Waiting for results...
+{"status": "processing", "elapsed_time": 0.0}
+{"status": "processing", "elapsed_time": 15.0}
+{"status": "processing", "elapsed_time": 30.0}
+{"status": "processing", "elapsed_time": 45.0}
+{"status": "processing", "elapsed_time": 60.0}
+{"status": "processing", "elapsed_time": 75.01}
+{"status": "processing", "elapsed_time": 90.01}
+{"status": "processing", "elapsed_time": 105.01}
+{"status": "processing", "elapsed_time": 120.01}
+{"status": "processing", "elapsed_time": 135.01}
+{"status": "processing", "elapsed_time": 150.01}
+{"status": "processing", "elapsed_time": 165.01}
+{"status": "processing", "elapsed_time": 180.01}
+{"status": "processing", "elapsed_time": 195.02}
+{"status": "processing", "elapsed_time": 210.02}
+{"status": "processing", "elapsed_time": 225.02}
+{"status": "processing", "elapsed_time": 240.02}
+{"status": "processing", "elapsed_time": 255.02}
+{"status": "processing", "elapsed_time": 270.02}
+{"status": "processing", "elapsed_time": 285.02}
+{"status": "processing", "elapsed_time": 300.02}
+{"status": "processing", "elapsed_time": 315.02}
+{"status": "processing", "elapsed_time": 330.02}
+{"status": "processing", "elapsed_time": 345.02}
+{"status": "processing", "elapsed_time": 360.03}
+{"status": "processing", "elapsed_time": 375.03}
+{"status": "processing", "elapsed_time": 390.03}
+
+"**B200 on Modal ✅ success**
+> ✅ Waiting for modal run to finish... Done
+> ✅ Testing successful
+> ✅ Benchmarking successful
+> ✅ Leaderboard run successful
+
+Running on:
+* GPU: `NVIDIA B200`
+* CPU: `AuthenticAMD`
+* Device count: `1`
+* Runtime: `CUDA`
+* Platform: `Linux-4.19.0-gvisor-x86_64-with-glibc2.39`
+* Torch: `2.12.0+cu130`
+* Hostname: `modal`
+
+
+## ✅ Passed 22/22 tests:
+```
+✅ n: 32; cond: 1; seed: 53124; batch: 20
+> factor_rtol=7.63e-05; orth_rtol=0.000381; scaled_factor_residual=0.122; scaled_reconstruction_residual=0.0532; scaled_triangular_residual=0.0981; scaled_orthogonality_residual=1.05; batch=20; n=32
+✅ n: 176; cond: 1; seed: 3321; batch: 40
+> factor_rtol=0.00042; orth_rtol=0.0021; scaled_factor_residual=0.0339; scaled_reconstruction_residual=0.0139; scaled_triangular_residual=0.0311; scaled_orthogonality_residual=0.583; batch=40; n=176
+✅ n: 352; cond: 1; seed: 1200; batch: 40
+> factor_rtol=0.000839; orth_rtol=0.0042; scaled_factor_residual=0.0171; scaled_reconstruction_residual=0.00846; scaled_triangular_residual=0.0163; scaled_orthogonality_residual=0.499; batch=40; n=352
+✅ n: 512; cond: 2; seed: 32523; batch: 16
+> factor_rtol=0.00122; orth_rtol=0.0061; scaled_factor_residual=0.00825; scaled_reconstruction_residual=0.00298; scaled_triangular_residual=0.0076; scaled_orthogonality_residual=0.407; batch=16; n=512
+✅ n: 1024; cond: 2; seed: 4327; batch: 4
+> factor_rtol=0.00244; orth_rtol=0.0122; scaled_factor_residual=0.00369; scaled_reconstruction_residual=0.00165; scaled_triangular_residual=0.00359; scaled_orthogonality_residual=0.252; batch=4; n=1024
+✅ n: 4096; cond: 1; seed: 75342; batch: 1
+> factor_rtol=0.00977; orth_rtol=0.0488; scaled_factor_residual=0.00229; scaled_reconstruction_residual=0.00174; scaled_triangular_residual=0.00216; scaled_orthogonality_residual=0.16; batch=1; n=4096
+✅ n: 512; case: dense; cond: 4; seed: 32524; batch: 16
+> factor_rtol=0.00122; orth_rtol=0.0061; scaled_factor_residual=0.00805; scaled_reconstruction_residual=0.0026; scaled_triangular_residual=0.00741; scaled_orthogonality_residual=0.404; batch=16; n=512
+✅ n: 512; case: rankdef; cond: 0; seed: 32525; batch: 16
+> factor_rtol=0.00122; orth_rtol=0.0061; scaled_factor_residual=0.0113; scaled_reconstruction_residual=0.0122; scaled_triangular_residual=0.00969; scaled_orthogonality_residual=0.306; batch=16; n=512
+✅ n: 512; case: clustered; cond: 0; seed: 32526; batch: 16
+> factor_rtol=0.00122; orth_rtol=0.0061; scaled_factor_residual=5.73; scaled_reconstruction_residual=5.43; scaled_triangular_residual=2.85; scaled_orthogonality_residual=0.245; batch=16; n=512
+✅ n: 512; case: band; cond: 0; seed: 32527; batch: 16
+> factor_rtol=0.00122; orth_rtol=0.0061; scaled_factor_residual=0.0173; scaled_reconstruction_residual=0.0201; scaled_triangular_residual=0.014; scaled_orthogonality_residual=0.606; batch=16; n=512
+✅ n: 512; case: rowscale; cond: 0; seed: 32528; batch: 16
+> factor_rtol=0.00122; orth_rtol=0.0061; scaled_factor_residual=0.0201; scaled_reconstruction_residual=0.0143; scaled_triangular_residual=0.0116; scaled_orthogonality_residual=0.42; batch=16; n=512
+✅ n: 512; case: nearcollinear; cond: 0; seed: 32529; batch: 16
+> factor_rtol=0.00122; orth_rtol=0.0061; scaled_factor_residual=0.00757; scaled_reconstruction_residual=0.00677; scaled_triangular_residual=0.00715; scaled_orthogonality_residual=0.406; batch=16; n=512
+✅ n: 1024; case: dense; cond: 4; seed: 4328; batch: 4
+> factor_rtol=0.00244; orth_rtol=0.0122; scaled_factor_residual=0.00354; scaled_reconstruction_residual=0.00123; scaled_triangular_residual=0.00336; scaled_orthogonality_residual=0.256; batch=4; n=1024
+✅ n: 1024; case: rankdef; cond: 0; seed: 4329; batch: 4
+> factor_rtol=0.00244; orth_rtol=0.0122; scaled_factor_residual=0.00551; scaled_reconstruction_residual=0.00609; scaled_triangular_residual=0.00378; scaled_orthogonality_residual=0.183; batch=4; n=1024
+✅ n: 1024; case: nearrank; cond: 0; seed: 4330; batch: 4
+> factor_rtol=0.00244; orth_rtol=0.0122; scaled_factor_residual=0.00557; scaled_reconstruction_residual=0.00626; scaled_triangular_residual=0.00409; scaled_orthogonality_residual=0.252; batch=4; n=1024
+✅ n: 1024; case: clustered; cond: 0; seed: 4331; batch: 4
+> factor_rtol=0.00244; orth_rtol=0.0122; scaled_factor_residual=0.00488; scaled_reconstruction_residual=0.0049; scaled_triangular_residual=0.00395; scaled_orthogonality_residual=0.254; batch=4; n=1024
+✅ n: 2048; case: dense; cond: 2; seed: 224466; batch: 2
+> factor_rtol=0.00488; orth_rtol=0.0244; scaled_factor_residual=0.00225; scaled_reconstruction_residual=0.00167; scaled_triangular_residual=0.00221; scaled_orthogonality_residual=0.178; batch=2; n=2048
+✅ n: 2048; case: rankdef; cond: 0; seed: 224467; batch: 2
+> factor_rtol=0.00488; orth_rtol=0.0244; scaled_factor_residual=0.00281; scaled_reconstruction_residual=0.00304; scaled_triangular_residual=0.00221; scaled_orthogonality_residual=0.115; batch=2; n=2048
+✅ n: 4096; case: upper; cond: 0; seed: 75343; batch: 1
+> factor_rtol=0.00977; orth_rtol=0.0488; scaled_factor_residual=0; scaled_reconstruction_residual=0; scaled_triangular_residual=0; scaled_orthogonality_residual=0; batch=1; n=4096
+✅ n: 512; case: mixed; cond: 2; seed: 32530; batch: 16
+> factor_rtol=0.00122; orth_rtol=0.0061; scaled_factor_residual=5.18; scaled_reconstruction_residual=5.28; scaled_triangular_residual=2.54; scaled_orthogonality_residual=0.42; batch=16; n=512
+✅ n: 1024; case: mixed; cond: 2; seed: 4332; batch: 4
+> factor_rtol=0.00244; orth_rtol=0.0122; scaled_factor_residual=0.00392; scaled_reconstruction_residual=0.00163; scaled_triangular_residual=0.00382; scaled_orthogonality_residual=0.256; batch=4; n=1024
+✅ n: 2048; case: mixed; cond: 2; seed: 224468; batch: 2
+> factor_rtol=0.00488; orth_rtol=0.0244; scaled_factor_residual=0.00206; scaled_reconstruction_residual=0.00169; scaled_triangular_residual=0.00203; scaled_orthogonality_residual=0.178; batch=2; n=2048```
+
+## Benchmarks:
+```
+n: 32; cond: 1; seed: 43214; batch: 20
+ ⏱ 145 ± 0.1 µs
+ ⚡ 145 µs 🐌 145 µs
+
+n: 176; cond: 1; seed: 423011; batch: 40
+ ⏱ 4.13 ± 0.000 ms
+ ⚡ 4.13 ms 🐌 4.13 ms
+
+n: 352; cond: 1; seed: 123456; batch: 40
+ ⏱ 45.6 ± 0.00 ms
+ ⚡ 45.6 ms 🐌 45.6 ms
+
+n: 512; cond: 2; seed: 1029; batch: 640
+ ⏱ 619 ± 0.1 ms
+ ⚡ 619 ms 🐌 620 ms
+
+n: 1024; cond: 2; seed: 75342; batch: 60
+ ⏱ 235 ± 0.2 ms
+ ⚡ 234 ms 🐌 235 ms
+
+n: 2048; cond: 1; seed: 224466; batch: 8
+ ⏱ 74.7 ± 0.01 ms
+ ⚡ 74.7 ms 🐌 74.7 ms
+
+n: 4096; cond: 1; seed: 32412; batch: 2
+ ⏱ 50.9 ± 0.01 ms
+ ⚡ 50.9 ms 🐌 51.0 ms
+
+n: 512; case: mixed; cond: 2; seed: 770001; batch: 640
+ ⏱ 567 ± 0.1 ms
+ ⚡ 567 ms 🐌 568 ms
+
+n: 1024; case: mixed; cond: 2; seed: 770002; batch: 60
+ ⏱ 230 ± 0.1 ms
+ ⚡ 230 ms 🐌 231 ms
+
+n: 512; case: rankdef; cond: 0; seed: 770003; batch: 640
+ ⏱ 391 ± 0.1 ms
+ ⚡ 391 ms 🐌 391 ms
+
+n: 512; case: clustered; cond: 0; seed: 770004; batch: 640
+ ⏱ 193 ± 0.0 ms
+ ⚡ 193 ms 🐌 193 ms
+
+n: 1024; case: nearrank; cond: 0; seed: 770005; batch: 60
+ ⏱ 189 ± 0.2 ms
+ ⚡ 188 ms 🐌 190 ms
+```
+
+## Ranked Benchmark:
+```
+n: 32; cond: 1; seed: 43214; batch: 20
+ ⏱ 145 ± 0.0 µs
+ ⚡ 145 µs 🐌 145 µs
+
+n: 176; cond: 1; seed: 423011; batch: 40
+ ⏱ 4.13 ± 0.001 ms
+ ⚡ 4.13 ms 🐌 4.14 ms
+
+n: 352; cond: 1; seed: 123456; batch: 40
+ ⏱ 45.6 ± 0.00 ms
+ ⚡ 45.6 ms 🐌 45.6 ms
+
+n: 512; cond: 2; seed: 1029; batch: 640
+ ⏱ 619 ± 0.1 ms
+ ⚡ 619 ms 🐌 619 ms
+
+n: 1024; cond: 2; seed: 75342; batch: 60
+ ⏱ 235 ± 0.2 ms
+ ⚡ 234 ms 🐌 235 ms
+
+n: 2048; cond: 1; seed: 224466; batch: 8
+ ⏱ 74.7 ± 0.01 ms
+ ⚡ 74.7 ms 🐌 74.7 ms
+
+n: 4096; cond: 1; seed: 32412; batch: 2
+ ⏱ 50.9 ± 0.01 ms
+ ⚡ 50.9 ms 🐌 50.9 ms
+
+n: 512; case: mixed; cond: 2; seed: 770001; batch: 640
+ ⏱ 568 ± 0.0 ms
+ ⚡ 567 ms 🐌 568 ms
+
+n: 1024; case: mixed; cond: 2; seed: 770002; batch: 60
+ ⏱ 231 ± 0.0 ms
+ ⚡ 231 ms 🐌 231 ms
+
+n: 512; case: rankdef; cond: 0; seed: 770003; batch: 640
+ ⏱ 390 ± 0.0 ms
+ ⚡ 390 ms 🐌 390 ms
+
+n: 512; case: clustered; cond: 0; seed: 770004; batch: 640
+ ⏱ 193 ± 0.0 ms
+ ⚡ 193 ms 🐌 193 ms
+
+n: 1024; case: nearrank; cond: 0; seed: 770005; batch: 60
+ ⏱ 189 ± 0.2 ms
+ ⚡ 188 ms 🐌 190 ms
+```","**B200 on Modal (secret) ✅ success**
+> ✅ Waiting for modal run to finish... Done
+> ✅ Testing successful
+> ✅ Benchmarking successful
+> ✅ Leaderboard run successful
+"
+===GPUMODE_SUBMIT_BEGIN===
+commit=788213b90a90a4cd3d512731428223f02fe3ffca
+leaderboard=qr_v2 gpu=B200 mode=leaderboard
+cli_exit=0
+verdict=ACCEPTED
+"**B200 on Modal ✅ success**
+> ✅ Testing successful
+> ✅ Benchmarking successful
+> ✅ Leaderboard run successful
+## ✅ Passed 22/22 tests:
+```","**B200 on Modal (secret) ✅ success**
+> ✅ Testing successful
+> ✅ Benchmarking successful
+> ✅ Leaderboard run successful
+submit_log=/tmp/popcorn-submit-9alV5Q.log
+===GPUMODE_SUBMIT_END===
+ID       Leaderboard          File                 Time                 GPU(s)       Status          Score
+---------------------------------------------------------------------------------------------------------
+826606   qr_v2                submission.py        2026-06-22T04:41...  B200,B20...  done                -
+826559   qr_v2                submission.py        2026-06-22T04:20...  B200,B20...  done                -
+826438   qr_v2                submission.py        2026-06-22T03:21...  B200,B20...  done                -
+826391   qr_v2                submission.py        2026-06-22T03:03...  B200,B20...  done                -

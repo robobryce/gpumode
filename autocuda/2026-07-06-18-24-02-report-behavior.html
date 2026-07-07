@@ -1,0 +1,324 @@
+<h1 id="behavior-report-2026-07-06-18-24-02">Behavior Report:
+2026-07-06-18-24-02</h1>
+<h2 id="executive-summary">Executive Summary</h2>
+<p>This single optimize-tree run produced 200 scored trials across 18
+briefs in 18.37 hours of elapsed time. Mean branch throughput was 3.39
+trials/hour (3.81 among the 16 briefs with scored trials); reliability
+was operationally good despite 155 gaps over ten minutes because the
+session evidence attributes most long intervals to the single-GPU
+scheduler, not agent silence.</p>
+<p>Cross-run variance is unavailable in single-experiment mode. Within
+the fleet, nonzero throughput stayed between 2.01 and 5.35 trials/hour
+around a 3.67 median, and there were no agent-initiated attempts to
+terminate the experiment early.</p>
+<p><strong>Key takeaways</strong></p>
+<ul>
+<li>Exact concurrency was three active briefs for 17.14 hours, or 93.3%
+of the run; the longest under-strength stretch was 42 minutes during a
+worker handoff.</li>
+<li>The scheduler recorded 28.29 aggregate agent-hours waiting for
+locks. That was 50.9% of the three worker sessions’ summed walltime;
+exclusive <code>gpu-0</code> waits contributed 22.87 hours.</li>
+<li><code>brief-1</code> absorbed the most contention at 8.05
+wait-hours, while the worst single lock wait was 460 seconds.</li>
+<li>No completed brief was more than 2× away from the fleet’s nonzero
+throughput median. <code>brief-16</code> and <code>brief-17</code> had
+no scored trials because the operator requested graceful
+termination.</li>
+<li>The final stop at 12:52 UTC was explicitly operator-directed; all
+workers reached safe checkpoints and left clean worktrees.</li>
+</ul>
+<p><strong>Run summary:</strong> 18 branches, 200 scored trials, 18.37
+hours elapsed (47.16 branch-hours), 3.39 mean trials/hour, 0.00
+worst-case trials/hour only on the two operator-stopped briefs; reliable
+overall, with GPU serialization as the dominant limiter.</p>
+<h2 id="fleet-behavior">Fleet Behavior</h2>
+<h3 id="concurrency-over-time">Concurrency Over Time</h3>
+<p>The requested fleet size was three workers. Across 221 five-minute
+windows, 202 windows touched three briefs, 10 touched four, eight
+touched two, and one touched one. The apparent four-brief peak (50
+window-minutes) is a bucketing artifact: a completed brief and its
+successor can both touch one five-minute window. An exact interval sweep
+never exceeded three simultaneous briefs and measured 17h08m23s at
+three, 1h04m54s at two, and 8m56s at one.</p>
+<p>Five-minute buckets were below the requested strength for 42m13s. The
+longest exact under-strength stretch was 42m03s, from
+<code>brief-4</code> stopping at 03:32:55 UTC until <code>brief-5</code>
+started at 04:14:58; it included the five-minute restart of
+<code>brief-1</code> and was the only material fleet refill delay.</p>
+<h3 id="brief-cycle-timing">Brief-Cycle Timing</h3>
+<p>Using the required manager-row to first non-lifecycle result
+definition, median handoff latency was 15m15s and p95 was 27m03s.
+Seventeen briefs exceeded five minutes; <code>brief-9</code> was worst
+at 35m30s. These values include implementation, compilation, and
+validation before the first logged result: manager-row to
+<code>brief_start</code> was only 42.6 seconds median, 69.2 seconds p95,
+and 83.7 seconds maximum, so dispatch itself was prompt.</p>
+<h3 id="lock-contention">Lock Contention</h3>
+<p>The five session records contain 668 lock acquisitions and 652
+completed releases. Builds completed 198 times and ran for 6m59s, while
+454 released <code>gpu-0</code> operations ran for 17h17m11s. Aggregate
+waiting was 28h17m32s: 5h25m14s for the shared build gate and 22h52m18s
+for exclusive <code>gpu-0</code>. Sixteen acquisitions lacked a release
+record, principally around interrupted or gracefully terminated work,
+and are excluded from run-duration totals but included in observed wait
+totals.</p>
+<p>The worst wait was 460.048 seconds in <code>brief-1</code>. Total
+wait by long-lived worker was balanced—9.25, 9.38, and 9.66 hours—but
+<code>brief-1</code> alone accumulated 8.05 hours because it spanned
+three continuations. Aggregate wait was 50.9% of the three workers’
+55.54 combined session-hours, making the one-GPU scheduler the run’s
+primary throughput constraint.</p>
+<h3 id="per-brief-reliability">Per-Brief Reliability</h3>
+<p>The median nonzero rate was 3.67 trials/hour. <code>brief-6</code>
+was fastest at 5.35, while <code>brief-14</code> was the slowest
+completed brief at 2.01; neither crossed the 2× outlier threshold.
+<code>brief-16</code> reached a validation error and
+<code>brief-17</code> reached full validation, but both were stopped
+before a scored benchmark, so their zero rates are termination artifacts
+rather than stalled workers.</p>
+<h2 id="throughput">Throughput</h2>
+<p>This is a single experiment, so no cross-run mean/stddev row is
+shown. Optimize-tree logs do not carry per-branch
+<code>pct_change</code>; the <code>+0.00</code> values are schema
+placeholders rather than claims of no targeted improvement.</p>
+<table>
+<thead>
+<tr class="header">
+<th>Branch</th>
+<th style="text-align: right;">Trials</th>
+<th style="text-align: right;">Duration</th>
+<th style="text-align: right;">Trials/hour</th>
+<th style="text-align: right;">Improvement %</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>brief-6</code></td>
+<td style="text-align: right;">10</td>
+<td style="text-align: right;">1h41m00s</td>
+<td style="text-align: right;">5.35</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="even">
+<td><code>brief-0</code></td>
+<td style="text-align: right;">22</td>
+<td style="text-align: right;">4h20m56s</td>
+<td style="text-align: right;">4.83</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="odd">
+<td><code>brief-2</code></td>
+<td style="text-align: right;">28</td>
+<td style="text-align: right;">5h56m34s</td>
+<td style="text-align: right;">4.54</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="even">
+<td><code>brief-15</code></td>
+<td style="text-align: right;">4</td>
+<td style="text-align: right;">39m48s</td>
+<td style="text-align: right;">4.52</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="odd">
+<td><code>brief-7</code></td>
+<td style="text-align: right;">11</td>
+<td style="text-align: right;">2h22m20s</td>
+<td style="text-align: right;">4.22</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="even">
+<td><code>brief-5</code></td>
+<td style="text-align: right;">13</td>
+<td style="text-align: right;">3h03m47s</td>
+<td style="text-align: right;">3.92</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="odd">
+<td><code>brief-8</code></td>
+<td style="text-align: right;">8</td>
+<td style="text-align: right;">1h48m05s</td>
+<td style="text-align: right;">3.89</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="even">
+<td><code>brief-3</code></td>
+<td style="text-align: right;">20</td>
+<td style="text-align: right;">5h10m33s</td>
+<td style="text-align: right;">3.67</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="odd">
+<td><code>brief-13</code></td>
+<td style="text-align: right;">4</td>
+<td style="text-align: right;">49m05s</td>
+<td style="text-align: right;">3.67</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="even">
+<td><code>brief-12</code></td>
+<td style="text-align: right;">4</td>
+<td style="text-align: right;">50m22s</td>
+<td style="text-align: right;">3.57</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="odd">
+<td><code>brief-1</code></td>
+<td style="text-align: right;">52</td>
+<td style="text-align: right;">14h36m44s</td>
+<td style="text-align: right;">3.49</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="even">
+<td><code>brief-4</code></td>
+<td style="text-align: right;">9</td>
+<td style="text-align: right;">2h18m45s</td>
+<td style="text-align: right;">3.46</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="odd">
+<td><code>brief-11</code></td>
+<td style="text-align: right;">5</td>
+<td style="text-align: right;">1h12m34s</td>
+<td style="text-align: right;">3.31</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="even">
+<td><code>brief-9</code></td>
+<td style="text-align: right;">6</td>
+<td style="text-align: right;">1h30m47s</td>
+<td style="text-align: right;">3.30</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="odd">
+<td><code>brief-10</code></td>
+<td style="text-align: right;">2</td>
+<td style="text-align: right;">18m29s</td>
+<td style="text-align: right;">3.25</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="even">
+<td><code>brief-14</code></td>
+<td style="text-align: right;">2</td>
+<td style="text-align: right;">29m54s</td>
+<td style="text-align: right;">2.01</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="odd">
+<td><code>brief-16</code></td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">0s</td>
+<td style="text-align: right;">0.00</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="even">
+<td><code>brief-17</code></td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">0s</td>
+<td style="text-align: right;">0.00</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+</tbody>
+</table>
+<h2 id="gaps-and-stalls">Gaps And Stalls</h2>
+<p>Every longest gap below was checked against the worker’s lock
+records. “Wait/run” gives the overlap with scheduler waiting and
+completed build, validation, benchmark, or profile work; the balance was
+editing, reasoning, or uninstrumented tool time.</p>
+<p><strong><code>brief-0</code>:</strong> 14 gaps; longest 23m17s
+between trials 16 and 17, including 13m06s waiting and 5m46s running
+under scheduler locks.</p>
+<p><strong><code>brief-1</code>:</strong> 47 gaps; longest 33m29s
+between trials 14 and 15, including 20m37s waiting and 6m03s running.
+This was the run’s largest gap and highest-contention brief.</p>
+<p><strong><code>brief-2</code>:</strong> 18 gaps; longest 25m06s
+between trials 17 and 18, including 14m59s waiting and 5m40s
+running.</p>
+<p><strong><code>brief-3</code>:</strong> 18 gaps; longest 23m26s
+between trials 10 and 11, including 14m49s waiting and 5m35s
+running.</p>
+<p><strong><code>brief-4</code>:</strong> eight gaps; longest 21m58s
+between trials 6 and 7, including 14m30s waiting and 5m48s running.</p>
+<p><strong><code>brief-5</code>:</strong> 12 gaps; longest 19m56s
+between trials 2 and 3, including 11m45s waiting and 5m47s running.</p>
+<p><strong><code>brief-6</code>:</strong> four gaps; longest 18m44s from
+validation-error trial 4 to successful trial 5, including 10m33s waiting
+and 6m30s running.</p>
+<p><strong><code>brief-7</code>:</strong> nine gaps; longest 21m27s from
+runtime-error trial 5 to successful trial 6, including 12m37s waiting
+and 5m38s running.</p>
+<p><strong><code>brief-8</code>:</strong> six gaps; longest 18m34s
+between trials 2 and 3, including 8m56s waiting and 5m38s running.</p>
+<p><strong><code>brief-9</code>:</strong> five gaps; longest 21m12s
+between trials 3 and 4. Overlapping build-gate and GPU records cover the
+full interval (15m45s wait and 5m51s run, with slight overlap).</p>
+<p><strong><code>brief-10</code>:</strong> one gap of 18m29s between its
+two trials, including 12m37s waiting and 5m24s running.</p>
+<p><strong><code>brief-11</code>:</strong> four gaps; longest 21m24s
+between trials 0 and 1, including 8m13s waiting and 7m11s running.</p>
+<p><strong><code>brief-12</code>:</strong> three gaps; longest 22m20s
+between trials 2 and 3, including 4m15s waiting and 7m50s running; the
+remaining 10m15s was live-range editing and analysis.</p>
+<p><strong><code>brief-13</code>:</strong> three gaps; longest 16m29s
+between trials 2 and 3, including 9m58s waiting and 5m35s running.</p>
+<p><strong><code>brief-14</code>:</strong> one gap of 29m54s between its
+two trials, including 13m58s waiting and 6m45s running; profiling
+analysis and the pair-loop rewrite account for the remaining 9m11s.</p>
+<p><strong><code>brief-15</code>:</strong> two gaps; longest 16m13s
+between trials 0 and 1, including 8m45s waiting and 5m43s running.</p>
+<p>No longest gap contained a context compaction. The gaps consistently
+align with queued or executing GPU work rather than unexplained agent
+disappearance.</p>
+<h2 id="early-termination-attempts">Early-Termination Attempts</h2>
+<p>No agent-initiated early-termination attempt was found. Workers
+described individual design lines as exhausted but immediately continued
+with their next measured hypothesis; the manager repeatedly stated that
+all three slots would remain active. The only run termination was the
+operator’s explicit “Gracefully terminate the run” message at 12:52:27
+UTC.</p>
+<h2 id="other-aberrant-behavior">Other Aberrant Behavior</h2>
+<ul>
+<li>Continuations for <code>brief-0</code>, <code>brief-1</code>, and
+<code>brief-2</code> required appending new lifecycle intervals because
+the installed CLI refused <code>init brief</code> after an existing
+<code>brief_stop</code>. The resulting logs still pass the optimize-tree
+schema.</li>
+<li><code>brief-15</code> contains a second <code>brief_stop</code> row
+correcting an incorrect long-form SHA suffix in the first stop note. The
+correction identifies the clean branch tip and does not alter
+measurements.</li>
+<li>Sixteen acquired lock operations lack matching release records. The
+imbalance is consistent with canceled work and the graceful shutdown; no
+completed metric was fabricated from those operations.</li>
+<li>All 20 run CSVs pass their schemas, timestamps are monotonic within
+each lifecycle interval, and all 18 worktrees were clean at audit
+time.</li>
+</ul>
+<h2 id="analysis">Analysis</h2>
+<p>The fleet was effective at keeping the GPU occupied: released
+exclusive operations account for 17.29 of 18.37 elapsed hours. Low
+per-branch trial rates therefore reflect expensive validation,
+benchmarking, and profiling plus serialized access, not idle agents. The
+155 log gaps are the visible consequence of that design: even a
+productive trial typically spent five to seven minutes executing and
+often longer queued behind two peers.</p>
+<p>Throughput variation is modest after excluding the two
+operator-stopped briefs. <code>brief-14</code> is slower because each of
+its two trials included profiling and a substantial rewrite;
+<code>brief-6</code> is faster because it logged more validation
+outcomes in a shorter search. <code>brief-1</code> is the main scale
+outlier in duration and contention, not in rate: it ran three
+continuations, produced 52 trials, and paid 8.05 aggregate
+wait-hours.</p>
+<p>The run also distinguished fleet dispatch from time-to-first-result.
+Workers acknowledged new briefs within about a minute, while the first
+logged trial took a median 15 minutes because logs are written after
+implementation and validation. Treating that entire interval as manager
+latency would incorrectly diagnose the orchestrator.</p>
+<p><strong>Recommendations:</strong> On this one-GPU host, use one
+benchmark/profile worker plus research or code-preparation workers that
+do not enter the GPU queue; batch validation and benchmark stages where
+correctness permits; and add native scheduler telemetry to the behavior
+CSV so future reports do not need transcript reconstruction. Preserve
+prompt dispatch and the clean safe-checkpoint shutdown behavior.</p>

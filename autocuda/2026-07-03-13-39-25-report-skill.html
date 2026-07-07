@@ -1,0 +1,289 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang xml:lang>
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>Autocuda Skill Audit: 2026-07-03-13-39-25</title>
+  <style>
+code{white-space: pre-wrap;}
+span.smallcaps{font-variant: small-caps;}
+div.columns{display: flex; gap: min(4vw, 1.5em);}
+div.column{flex: auto; overflow-x: auto;}
+div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
+
+ul.task-list[class]{list-style: none;}
+ul.task-list li input[type="checkbox"] {
+font-size: inherit;
+width: 0.8em;
+margin: 0 0.8em 0.2em -1.6em;
+vertical-align: middle;
+}
+.display.math{display: block; text-align: center; margin: 0.5rem auto;}
+</style>
+  <style type="text/css">body { max-width:1100px; margin:2rem auto; padding:0 1.5rem; font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif; color:#1a1a1a; }
+table { border-collapse:collapse; width:100%; margin:1rem 0; font-size:14px; }
+th,td { border:1px solid #ccc; padding:6px 10px; text-align:left; vertical-align:top; }
+th { background:#f4f4f4; }
+code { background:#f4f4f4; padding:1px 4px; border-radius:3px; }
+pre:not(.mermaid) { background:#f7f7f7; padding:10px; overflow-x:auto; border-radius:5px; }
+pre.mermaid { background:transparent; text-align:center; }
+h1,h2,h3 { line-height:1.25; }
+h1 { border-bottom:2px solid #eee; padding-bottom:.3rem; }
+h2 { border-bottom:1px solid #eee; padding-bottom:.2rem; margin-top:2rem; }
+blockquote { border-left:3px solid #ccc; margin-left:0; padding-left:1rem; color:#555; }
+a { color:#0645ad; }
+</style>
+</head>
+<body>
+<h1 id="autocuda-skill-audit-2026-07-03-13-39-25">Autocuda Skill Audit:
+2026-07-03-13-39-25</h1>
+<h2 id="executive-summary">Executive Summary</h2>
+<p>Four autocuda skill/CLI contract issues were confirmed: two in
+<code>report-optimization</code> and its shared
+<code>optimize-tree</code> data contract, one in
+<code>report-cost</code>, and one in <code>report-skill</code> candidate
+detection. Harness coverage is complete for all 95 brief branches plus
+the manager/report session, so the audit is trustworthy; the main
+qualification is that reused worker conversations can cover several
+brief IDs.</p>
+<ul>
+<li>A later run overwrote the untagged optimize schema, leaving all
+3,758 generated rows with blank speedup fields, including every
+metric-bearing logged trial, while schema validation still passed.</li>
+<li>The optimization report’s git fallback re-counts logged ancestor
+commits on descendant branches, inflating attempts and prevalence and
+duplicating techniques.</li>
+<li>The cost builder charged forked Codex rollouts for inherited
+cumulative parent usage, inflating this run from the corrected $6.89K
+and 12.08B post-fork tokens to $33.3K and 59.70B.</li>
+<li>The skill candidate extractor reported 438 critical autocuda
+exceptions from 76 unique ordinary kernel, build, or probe tool-result
+records.</li>
+<li>No confirmation gates, stale CLI syntax, unreadable records, or
+missing branch records were found.</li>
+</ul>
+<h3 id="root-cause-map">Root-Cause Map</h3>
+<pre class="mermaid">flowchart LR
+    S["Shared untagged optimize schema<br/>overwritten by linalg/qr_v2"] --> M["Historical eigh metrics blank<br/>global_best becomes null"]
+    M --> SF["Tag-scoped schema snapshots<br/>plus semantic metric checks"]
+    D["Per-branch git fallback<br/>deduplicates only locally"] --> P["Ancestor trial repeated<br/>across 92 descendants"]
+    P --> DF["Run-global logged-SHA deduplication"]
+    C["Forked Codex rollout keeps<br/>parent cumulative counters"] --> B["Inherited usage billed again<br/>USD 33.3K instead of 6.89K"]
+    B --> CF["Subtract pre-fork baseline<br/>for usage, tools, compactions"]
+    T["Broad autocuda-run<br/>traceback context"] --> F["438 false critical candidates<br/>from 76 unique tool-result records"]
+    F --> TF["Require a real autocuda CLI frame"]</pre>
+<h2 id="skill-issue-candidates">Skill Issue Candidates</h2>
+<table style="width:100%;">
+<colgroup>
+<col style="width: 16%" />
+<col style="width: 16%" />
+<col style="width: 16%" />
+<col style="width: 16%" />
+<col style="width: 16%" />
+<col style="width: 16%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Branch</th>
+<th>Skill</th>
+<th>Severity</th>
+<th>Category</th>
+<th>Evidence</th>
+<th>Recommendation</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>autocuda/optimize/2026-07-03-13-39-25/manager</code></td>
+<td><code>report-optimization</code>, <code>optimize-tree</code></td>
+<td>high</td>
+<td>schema contract</td>
+<td>At 2026-07-06T18:08:17Z the manager recorded 3,758 rows with both
+speedup columns blank and <code>global_best=null</code>; the active
+schema is now <code>linalg/qr_v2</code>, while this run logs
+<code>linalg/eigh_py</code>.</td>
+<td>Persist and load optimize schemas per tag; reject a report whose
+selected run metrics do not match the loaded schema.</td>
+</tr>
+<tr class="even">
+<td><code>autocuda/optimize/2026-07-03-13-39-25/brief-0</code></td>
+<td><code>report-optimization</code></td>
+<td>high</td>
+<td>ancestry duplication</td>
+<td>Commit <code>d05f2986</code> is logged once on brief 0, but
+git-history fallback emits it on 92 descendants as 92 attempts and also
+emits the logged observation separately.</td>
+<td>Suppress any globally logged SHA from git fallback on every selected
+branch and add linear/diamond ancestry tests.</td>
+</tr>
+<tr class="odd">
+<td><code>autocuda/optimize/2026-07-03-13-39-25/manager</code></td>
+<td><code>report-cost</code></td>
+<td>high</td>
+<td>cumulative fork accounting</td>
+<td><code>_summarize_harness_jsonl</code> takes each rollout’s final
+cumulative token snapshot and counts all compactions, even when a forked
+rollout embeds its parent’s prior counters.</td>
+<td>Detect each child-specific fork boundary and subtract the preceding
+cumulative baseline; count tools and compactions only after that
+boundary.</td>
+</tr>
+<tr class="even">
+<td><code>autocuda/optimize/2026-07-03-13-39-25/brief-83</code></td>
+<td><code>report-skill</code></td>
+<td>medium</td>
+<td>false autocuda exception</td>
+<td>Candidates <code>bug_0408</code> and <code>bug_0409</code> call a
+failed residual stress probe a critical autocuda exception only because
+it ran under <code>autocuda run</code>.</td>
+<td>Require an autocuda CLI traceback frame or explicit CLI failure;
+ignore child build, validation, benchmark, and probe tracebacks.</td>
+</tr>
+</tbody>
+</table>
+<p>The schema-contract failure is recorded in
+<code>/home/shadeform/.codex/sessions/2026/07/03/rollout-2026-07-03T13-37-30-019f2832-e134-7e31-9969-1d56b2f65234.jsonl:39172</code>
+at <code>2026-07-06T18:08:17.281Z</code>. Direct artifact review
+confirms <code>autocuda/log-schema-optimize.json</code> currently names
+<code>linalg/qr_v2</code>, whereas
+<code>2026-07-03-13-39-25-optimize-tree-reference-log.csv</code> and all
+selected brief logs carry <code>linalg/eigh_py</code>. There are 2,206
+succeeded rows with numeric <code>linalg/eigh_py</code> metrics, yet
+<code>2026-07-03-13-39-25-report-optimization.csv</code> has zero
+populated <code>best_speedup</code> or <code>best_step_speedup</code>
+cells and <code>autocuda status</code> returns an empty
+<code>top_best</code>.</p>
+<p>The ancestry defect is grounded in
+<code>/home/shadeform/.codex/sessions/2026/07/03/rollout-2026-07-03T13-47-52-019f283c-5cc8-70d3-ad2e-869469f03ceb.jsonl:4047</code>
+through line 4051 at <code>2026-07-03T17:17:53.775Z</code> through
+<code>17:17:57.716Z</code>: brief 0 commits and logs
+<code>d05f2986</code> once. The optimization CSV nevertheless contains
+one git-subject row with 92 attempts across 92 branches and a separate
+one-attempt row for the logged description;
+<code>git branch --contains</code> confirms those are inherited
+descendants, not 92 independent trials.</p>
+<p>The cost defect is explicit in
+<code>lib/_report.py::_summarize_harness_jsonl</code>: lines 1430-1436
+define Codex token counts as cumulative, lines 1531-1546 retain only the
+final snapshot, and lines 1507-1508 count every compaction in the file.
+Forked rollout files contain the parent’s earlier transcript and
+counters. Subtracting the last snapshot before each child-specific fork
+boundary reduces the run from 59.70B tokens, 794 compactions, and about
+$33.3K to 12.08B post-fork tokens, 134 compactions, and $6,886.96. For
+example, brief 75 costs $20.27 after subtracting its line-8395 baseline
+from its line-9386 final snapshot, not $548.92.</p>
+<p>The extractor defect is visible in
+<code>/home/shadeform/.codex/sessions/2026/07/05/rollout-2026-07-05T22-46-31-019f3476-39d6-7ee1-8ae1-8ae7ff060479.jsonl:10598</code>
+at <code>2026-07-05T23:18:46.740Z</code>. The traceback is an expected
+<code>A @ Q - Q @ diag(L)</code> residual failure from a worker stress
+probe. Across the CSV, 438 critical candidates collapse to 76 unique
+source-line/tool-result records: 69 kernel/harness failures, three ad
+hoc probe failures, and four other child failures; none contains an
+autocuda CLI implementation frame. The two remaining automated
+candidates describe a kernel’s Blackwell descriptor defect, not a skill
+defect.</p>
+<h2 id="root-causes">Root Causes</h2>
+<p><strong>Untagged mutable schema.</strong>
+<code>skills/optimize-tree/SKILL.md</code> tells every run to call
+<code>autocuda schema define optimize</code>, which writes the shared
+<code>autocuda/log-schema-optimize.json</code>.
+<code>skills/report-optimization/SKILL.md</code> later trusts
+<code>autocuda report data optimization</code>, while
+<code>lib/_report.py::_primary_benchmark</code> and
+<code>lib/_manager.py::_compute_top_best</code> load that current global
+schema rather than a schema associated with the requested tag.
+<code>report-optimization-csv</code> permits blank numeric cells, so the
+semantic loss is reported as schema-valid.</p>
+<p><strong>Branch-local rather than run-global deduplication.</strong>
+<code>lib/_report.py::cmd_report_build_optimization</code> compares each
+branch’s git history only with <code>log_shas</code> from that same
+brief log. An ancestor commit logged by an earlier brief is therefore
+treated as an unlogged commit on every descendant, despite
+<code>_metric_by_sha</code> already indexing logged SHAs across the full
+selected run.</p>
+<p><strong>Final cumulative snapshot without fork subtraction.</strong>
+<code>lib/_report.py::_summarize_harness_jsonl</code> correctly
+recognizes that Codex token snapshots are cumulative within a file, but
+assumes the file begins at zero usage. Forked agent rollouts embed a
+parent prefix and its cumulative counters, so taking the final snapshot
+independently for each selected child bills the inherited prefix
+repeatedly. Compactions and tool calls have the same boundary
+problem.</p>
+<p><strong>Over-broad traceback context.</strong>
+<code>lib/_report.py::_has_autocuda_context</code> treats
+<code>[autocuda run]</code> and any <code>/autocuda/</code> worktree
+path as proof that a traceback came from autocuda itself. This
+contradicts the normal-failure rule in
+<code>skills/report-skill/SKILL.md</code> and turns expected compiler,
+validation, and kernel failures into critical audit candidates.</p>
+<h2 id="fix-plan">Fix Plan</h2>
+<ol type="1">
+<li><p>Make optimize schemas tag-scoped or snapshot the active schema
+when a manager baseline is written. Update
+<code>optimize-tree/SKILL.md</code>,
+<code>report-optimization/SKILL.md</code>, <code>schema define</code>,
+<code>status</code>, and report-data loading together; fail with a
+metric/schema mismatch instead of emitting an all-blank valid report.
+Validate with a regression that creates run A, overwrites the active
+schema for run B, then runs <code>autocuda status --tag A</code> and
+<code>autocuda report data optimization --tag A</code> with non-empty
+speedups.</p></li>
+<li><p>Build a run-global set of logged commit SHAs before the
+per-branch git fallback and skip those SHAs on every branch. Keep
+fallback only for genuinely unlogged or newly cherry-picked commits.
+Validate with a linear ancestry and a diamond/merge fixture, asserting
+one attempt for one logged trial and no duplicate normalized technique
+row.</p></li>
+<li><p>Teach <code>report data cost</code> about Codex fork boundaries.
+For every selected rollout, identify the child-specific boundary,
+subtract the immediately preceding cumulative token snapshot, and count
+compactions and tools only after the boundary; retain one anchor for
+reused multi-brief worker conversations. Validate with a parent plus two
+forked children whose known deltas sum without any inherited
+usage.</p></li>
+<li><p>Narrow <code>autocuda_exception</code> detection to tracebacks
+containing <code>bin/autocuda</code>, <code>lib/autocuda_cli.py</code>,
+or another known CLI frame, and classify wrapper child failures
+separately or ignore them. Validate with a fixture whose
+<code>autocuda run</code> child raises a residual error and assert that
+<code>report data skill</code> emits no autocuda exception, while a real
+CLI traceback still emits one.</p></li>
+<li><p>Add a semantic report check: when selected logs contain numeric
+kept trials, reject an optimization CSV with no populated speedup
+fields. Validate with
+<code>autocuda schema check report-optimization-csv --output &lt;fixture&gt;</code>
+plus a new run-aware semantic check or integrate that invariant into
+data generation tests.</p></li>
+</ol>
+<h2 id="verification">Verification</h2>
+<ul>
+<li>Rebuilt <code>autocuda/2026-07-03-13-39-25-report-skill.csv</code>
+from 98 brief-to-session mappings plus the manager session. Briefs 87-89
+each have two session segments; reused long-lived sessions account for
+the other multi-brief mappings.</li>
+<li><code>autocuda schema check report-skill-csv --output 2026-07-03-13-39-25</code>
+passed.</li>
+<li>Reviewed all 440 generated candidate rows against their source
+JSONLs and collapsed 438 exception rows to 76 unique source records
+before triage.</li>
+<li>Searched assistant messages and tool results directly for
+<code>/autocuda:</code>, <code>autocuda:</code>, <code>SKILL.md</code>,
+CLI rejections, schema failures, contradictions, instruction defects,
+and confirmation gates.</li>
+<li>Reproduced the optimization failures: 0 of 3,758 rows have either
+speedup field, <code>autocuda status</code> returns
+<code>global_best=null</code>, and a once-logged commit is counted as 92
+inherited attempts.</li>
+<li>Recomputed all 93 selected cost anchors from post-fork deltas:
+12,083,223,851 disjoint tokens, 134 compactions, and $6,886.96, versus
+the stock cumulative-fork totals of 59.70B, 794, and about $33.3K.</li>
+<li>Harness coverage is 95 of 95 brief branches plus the manager/report
+session. No JSONL was missing or unreadable, so there are no
+coverage-gap rows.</li>
+<li><code>autocuda schema check report-skill-markdown --output 2026-07-03-13-39-25</code>
+passed; the schema-valid Markdown was then converted to HTML.</li>
+</ul>
+<script type="module">import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs'; mermaid.initialize({startOnLoad:true, theme:'default'});</script>
+</body>
+</html>
