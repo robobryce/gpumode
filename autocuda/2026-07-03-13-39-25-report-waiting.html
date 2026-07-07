@@ -1,0 +1,852 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang xml:lang>
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>Waiting and Timeout Report: 2026-07-03-13-39-25</title>
+  <style>
+code{white-space: pre-wrap;}
+span.smallcaps{font-variant: small-caps;}
+div.columns{display: flex; gap: min(4vw, 1.5em);}
+div.column{flex: auto; overflow-x: auto;}
+div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
+
+ul.task-list[class]{list-style: none;}
+ul.task-list li input[type="checkbox"] {
+font-size: inherit;
+width: 0.8em;
+margin: 0 0.8em 0.2em -1.6em;
+vertical-align: middle;
+}
+.display.math{display: block; text-align: center; margin: 0.5rem auto;}
+</style>
+  <style type="text/css">body { max-width:1100px; margin:2rem auto; padding:0 1.5rem; font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif; color:#1a1a1a; }
+table { border-collapse:collapse; width:100%; margin:1rem 0; font-size:14px; }
+th,td { border:1px solid #ccc; padding:6px 10px; text-align:left; vertical-align:top; }
+th { background:#f4f4f4; }
+code { background:#f4f4f4; padding:1px 4px; border-radius:3px; }
+pre:not(.mermaid) { background:#f7f7f7; padding:10px; overflow-x:auto; border-radius:5px; }
+pre.mermaid { background:transparent; text-align:center; }
+h1,h2,h3 { line-height:1.25; }
+h1 { border-bottom:2px solid #eee; padding-bottom:.3rem; }
+h2 { border-bottom:1px solid #eee; padding-bottom:.2rem; margin-top:2rem; }
+blockquote { border-left:3px solid #ccc; margin-left:0; padding-left:1rem; color:#555; }
+a { color:#0645ad; }
+</style>
+</head>
+<body>
+<h1 id="waiting-and-timeout-report-2026-07-03-13-39-25">Waiting and
+Timeout Report: 2026-07-03-13-39-25</h1>
+<h2 id="executive-summary">Executive Summary</h2>
+<p>This optimize-tree run used several mechanisms that all look like
+“waiting” in a trace but have different consequences. Manager
+<code>wait_agent</code> calls waited for mailbox activity and never
+stopped workers. Worker <code>functions.wait</code> and PTY polls
+yielded tool output while child commands continued. File-lock waits, by
+contrast, delayed admission to a shared build or the single B200.
+Process deadlines were a fourth and mostly missing mechanism: only the
+build wrapper enforced one.</p>
+<p><strong>Key findings</strong></p>
+<ul>
+<li>The manager made 3,769 <code>wait_agent</code> calls and spent 52.00
+of the 68.72 run hours inside them. This was the correct idle state
+while workers ran, but a post-compaction reset changed the intended
+30-minute health cadence into mostly 30-second calls. Those wait-call
+turns cost an estimated $353.08, 48.0% of manager inference spend,
+without improving notification latency.</li>
+<li>Workers made 14,040 outer <code>functions.wait</code> continuations,
+occupying 43.53 aggregate worker-hours. In 94.7% of calls the cell
+completed rather than yielding again. These were observation/yield
+intervals, not command deadlines; the underlying build, validation,
+benchmark, or profile continued.</li>
+<li>A conservative worker-only parse matched 2,636 shared-build and
+5,737 exclusive-GPU lifecycles. They accumulated 59h16m42s of lock queue
+time, equal to 29.8% of paired worker lifecycle-active time. GPU
+admission alone accounted for 50h10m32s, 1.56 times the measured
+execution time behind those GPU locks.</li>
+<li><code>autocuda run</code> had neither a lock deadline nor a
+child-command deadline. <code>harness/build.sh</code> enforced 1,800
+seconds plus a 30-second kill grace; validation, benchmark, profiling,
+and submission wrappers did not enforce the documented budgets.</li>
+<li>At least four commands exceeded their documented step budgets. Brief
+91’s benchmark ran for 571.460 seconds despite a 480-second stated limit
+and was logged as succeeded. Several hung kernels required manual
+interruption.</li>
+</ul>
+<p><strong>Run:</strong> first manager wait at 2026-07-03 13:48:04 UTC
+through graceful fleet stop at 2026-07-06 10:31:31 UTC, approximately
+68h43m. Worker totals cover 83 post-fork session segments mapped to 95
+briefs; concurrent worker-hours must not be added directly to elapsed
+run time.</p>
+<h3 id="waiting-layers">Waiting Layers</h3>
+<pre class="mermaid">flowchart TB
+    M["Manager supervision"] --> MA["wait_agent<br/>mailbox observation"]
+    MA -->|"notification"| MH["handle or continue worker"]
+    MA -->|"deadline"| HC["fleet health check"]
+    MA -.->|"never cancels"| W["Worker execution"]
+    W --> EX["exec_command<br/>child process continues"]
+    EX --> WY["functions.wait / write_stdin<br/>output-yield intervals"]
+    EX --> AR["autocuda run"]
+    AR --> LQ["build or GPU lock queue<br/>unbounded"]
+    LQ --> CMD["wrapped command"]
+    CMD --> BT["build: 1800s hard timeout"]
+    CMD --> UT["validate / benchmark / profile<br/>no standard hard timeout"]</pre>
+<h2 id="scope-and-method">Scope and Method</h2>
+<p>The manager analysis uses the preserved manager rollout through the
+last worker notification. Tool-call arguments were paired with their
+result timestamps; a rejected one-second request is counted as a call
+but contributes no wait duration. Inference estimates subtract
+cumulative pre-fork usage, separate cached from uncached input, and
+apply the same public list rates as the cost report.<a href="#fn1" class="footnote-ref" id="fnref1" role="doc-noteref"><sup>1</sup></a></p>
+<p>Worker tool waiting uses 80 long-lived worker rollouts plus three
+interrupted segments after their child-specific fork boundaries. Outer
+<code>functions.exec</code> calls were paired with yielded
+<code>functions.wait</code> cells; inner <code>exec_command</code> and
+<code>write_stdin</code> calls describe the child-process layer. A
+long-lived session’s label is its first brief anchor and can include
+later continuation briefs.</p>
+<p>Lock records were normalized from both scalar and list-shaped Codex
+tool outputs, deduplicated by exact marker, and paired FIFO within each
+source segment. This worker-local method matched 8,373 lifecycles and
+left 50 acquisitions and 166 releases unmatched, so its totals are
+conservative. The separate global run-window audit pairs across trace
+labels and is used only as a cross-check.</p>
+<p>The report keeps three denominators distinct:</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Quantity</th>
+<th>Meaning</th>
+<th>May overlap?</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>68.72 elapsed hours</td>
+<td>Wall-clock optimization window</td>
+<td>No</td>
+</tr>
+<tr class="even">
+<td>198h50m59.8s paired lifecycle-active time</td>
+<td>Sum across concurrently active worker segments</td>
+<td>Yes</td>
+</tr>
+<tr class="odd">
+<td>Aggregate wait hours</td>
+<td>Sum of time inside a mechanism across manager or workers</td>
+<td>Yes</td>
+</tr>
+</tbody>
+</table>
+<h2 id="mechanism-inventory">Mechanism Inventory</h2>
+<table>
+<colgroup>
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Layer</th>
+<th>Intended role</th>
+<th>Actual behavior in this run</th>
+<th>Deadline effect</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Manager <code>wait_agent</code></td>
+<td>Sleep until worker/user activity, with a 30-minute health-check
+ceiling</td>
+<td>Returned early on activity; timed out only as an observation
+deadline</td>
+<td>Does not cancel a worker</td>
+</tr>
+<tr class="even">
+<td>Outer <code>functions.exec</code> / <code>functions.wait</code></td>
+<td>Yield and resume a long tool cell</td>
+<td>The outer cell remained live and was resumed</td>
+<td>Does not cancel the child</td>
+</tr>
+<tr class="odd">
+<td>Inner <code>exec_command(yield_time_ms)</code></td>
+<td>Return output or a PTY session</td>
+<td>Returned a session ID when the process outlived the yield
+interval</td>
+<td>Does not cancel the process</td>
+</tr>
+<tr class="even">
+<td><code>write_stdin(yield_time_ms)</code></td>
+<td>Continue observing a PTY session</td>
+<td>Waited for more output or process exit</td>
+<td>Does not cancel the process</td>
+</tr>
+<tr class="odd">
+<td>Shared build lock</td>
+<td>Exclude builds from GPU measurements</td>
+<td>Blocking <code>flock</code>, no acquisition deadline</td>
+<td>Can queue forever</td>
+</tr>
+<tr class="even">
+<td>Exclusive GPU lock</td>
+<td>Serialize validation, benchmark, and profile on one B200</td>
+<td>Blocking scheduler lock plus a 250ms rescan loop, no acquisition
+deadline</td>
+<td>Can queue forever</td>
+</tr>
+<tr class="odd">
+<td>Build wrapper</td>
+<td>Bound CUDA-extension import/build</td>
+<td>Coreutils <code>timeout</code>: 1,800s, TERM, then 30s kill
+grace</td>
+<td>Enforced</td>
+</tr>
+<tr class="even">
+<td>Validate/benchmark/profile/submit</td>
+<td>Bound experiment execution</td>
+<td>Documented budgets were not passed into standard local wrappers</td>
+<td>Not enforced</td>
+</tr>
+</tbody>
+</table>
+<p>The manager contract explicitly says completion notification is the
+only actionable worker signal and permits one brief-count health check
+every 30 minutes (<a href="/home/shadeform/.codex/plugins/cache/brycelelbach-autocuda/autocuda/0.4.0/skills/optimize-tree/SKILL.md">optimize-tree
+waiting contract</a>). The worker contract requires synchronous
+<code>autocuda run</code> and forbids polling shells (<a href="/home/shadeform/.codex/plugins/cache/brycelelbach-autocuda/autocuda/0.4.0/skills/explore-brief/SKILL.md">explore-brief
+concurrency contract</a>). The worker agent definition contradicts that
+rule by requesting a shell <code>until ... sleep 5</code> loop for long
+background calls (<a href="/home/shadeform/.codex/plugins/cache/brycelelbach-autocuda/autocuda/0.4.0/agents/optimize-tree-worker.md">worker
+definition</a>). Actual workers usually used the native PTY continuation
+tools instead.</p>
+<h2 id="manager-waiting">Manager Waiting</h2>
+<h3 id="cadence-and-outcomes">Cadence and outcomes</h3>
+<table>
+<thead>
+<tr class="header">
+<th>Manager wait outcome</th>
+<th style="text-align: right;">Calls</th>
+<th style="text-align: right;">Share</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Timed out with no update</td>
+<td style="text-align: right;">3,540</td>
+<td style="text-align: right;">93.9%</td>
+</tr>
+<tr class="even">
+<td>Returned on worker/mailbox activity</td>
+<td style="text-align: right;">222</td>
+<td style="text-align: right;">5.9%</td>
+</tr>
+<tr class="odd">
+<td>Interrupted by new user input</td>
+<td style="text-align: right;">6</td>
+<td style="text-align: right;">0.2%</td>
+</tr>
+<tr class="even">
+<td>Rejected invalid one-second request</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">0.0%</td>
+</tr>
+<tr class="odd">
+<td><strong>Total</strong></td>
+<td style="text-align: right;"><strong>3,769</strong></td>
+<td style="text-align: right;"><strong>100.0%</strong></td>
+</tr>
+</tbody>
+</table>
+<p>The manager spent 52.00 hours inside these calls, 75.7% of the run
+window. That fraction is not evidence that workers were idle: waiting is
+the manager’s intended state while three workers execute. The defect is
+call frequency and the inference turn around each call, not the blocked
+wall time itself.</p>
+<p>Every completed wait was followed by its inter-agent record within a
+median 21ms, p95 43ms, and maximum 74ms. This directly confirms that the
+long observation ceiling did not delay notifications. Conversely, 3,323
+consecutive timeout-to-wait transitions added 3h48m20s of model/status
+overhead between calls, with a 3.269-second median and 8.681-second
+p95.</p>
+<p>Requested observation ceilings were dominated by 3,136 calls at 30
+seconds. There were also 433 at 60 seconds, 95 at 180 seconds, 48 at 30
+minutes, 12 at 20 minutes, and 45 at other durations. Of the 30-second
+calls, 3,031 ended by timeout rather than activity.</p>
+<h3 id="compaction-changed-the-policy">Compaction changed the
+policy</h3>
+<pre class="mermaid">flowchart LR
+    A["Before manager compaction<br/>91 waits"] --> B["30-minute cadence<br/>15.00h observed<br/>USD 8.87"]
+    B --> C["Context compaction<br/>2026-07-04 06:54 UTC"]
+    C --> D["Cadence reset<br/>30s, 60s, 120s, 180s"]
+    D --> E["After compaction<br/>3,678 waits<br/>37.00h observed<br/>about USD 344.21"]</pre>
+<p>Before the compaction boundary, 91 waits covered 15.00 hours: 67
+returned on activity, 23 timed out, and one returned on user input.
+Immediately after compaction, the manager resumed with short deadlines
+and eventually made 3,678 more calls. Since a 30-minute
+<code>wait_agent</code> already returns as soon as activity arrives,
+reducing the ceiling to 30 seconds did not improve notification
+responsiveness.</p>
+<p>The 3,769 wait-call turns processed approximately 664.7M
+cached-input, 2.76M uncached-input, and 227,750 output tokens, an
+estimated $353.08. Total manager inference through optimization
+completion was about $736.02, making wait-call turns 48.0% of manager
+spend. A counterfactual that retained early-return notifications and
+used 30-minute health ceilings would have needed roughly 233
+post-compaction calls rather than 3,678; applying the observed average
+cost per short-cadence call suggests about $322 avoidable spend. This is
+an estimate, not a replayed measurement.</p>
+<p>The permitted 30-minute health check was also not executed literally.
+Seventy-seven <code>list_agents</code> checks had a median interval of
+42.1 minutes, p95 of 161.7 minutes, and maximum gap of 3h41m43s; 58 of
+76 adjacent intervals exceeded 30 minutes. Short mailbox polling
+therefore increased turn count without preserving the intended
+health-check cadence.</p>
+<h3 id="dispatch-after-notification">Dispatch after notification</h3>
+<p>Direct notification/dispatch records are more reliable than
+<code>brief_start</code>/<code>brief_stop</code> rows for judging
+manager waiting:</p>
+<table>
+<colgroup>
+<col style="width: 15%" />
+<col style="width: 21%" />
+<col style="width: 21%" />
+<col style="width: 21%" />
+<col style="width: 21%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Dispatch phase</th>
+<th style="text-align: right;">Samples</th>
+<th style="text-align: right;">Median</th>
+<th style="text-align: right;">p95</th>
+<th style="text-align: right;">Maximum</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Manager brief row to <code>spawn_agent</code></td>
+<td style="text-align: right;">80</td>
+<td style="text-align: right;">6.202s</td>
+<td style="text-align: right;">20.448s</td>
+<td style="text-align: right;">52.421s</td>
+</tr>
+<tr class="even">
+<td><code>spawn_agent</code> to worker <code>brief_start</code> row</td>
+<td style="text-align: right;">80</td>
+<td style="text-align: right;">23.712s</td>
+<td style="text-align: right;">46.988s</td>
+<td style="text-align: right;">86.020s</td>
+</tr>
+<tr class="odd">
+<td>Manager brief row to worker <code>brief_start</code> row</td>
+<td style="text-align: right;">80</td>
+<td style="text-align: right;">32.525s</td>
+<td style="text-align: right;">56.666s</td>
+<td style="text-align: right;">94.690s</td>
+</tr>
+<tr class="even">
+<td>Final notification to <code>followup_task</code></td>
+<td style="text-align: right;">92</td>
+<td style="text-align: right;">31.948s</td>
+<td style="text-align: right;">325.819s</td>
+<td style="text-align: right;">3,915.915s</td>
+</tr>
+</tbody>
+</table>
+<p>The maximum follow-up delay was brief 4, but it did not leave a fleet
+slot empty: the manager spawned brief 7 into that slot 43.958 seconds
+after brief 4’s notification and resumed brief 4 when a later slot
+freed. Brief 89 exposes the opposite logging artifact. Its stop/start
+rows imply a 77-minute deficit, yet its worker trace contains 1,471
+records, 257 exec calls, and 78 waits throughout that interval; the
+manager sent continuation 20.909 seconds after notification, and the
+worker performed validation before writing its delayed
+<code>brief_start</code> row.</p>
+<p>Fifteen continuation briefs reused an existing long-lived task agent
+rather than receiving a dedicated spawn. As a result, mailbox identity,
+current brief ID, and CSV lifecycle rows are not interchangeable. The
+behavior report’s earlier occupancy/stall interpretation from CSV rows
+alone was invalid and has been corrected.</p>
+<h3 id="manager-shell-cell-waiting">Manager shell-cell waiting</h3>
+<p>Separate from worker notifications, the manager made 1,018 outer
+<code>functions.wait</code> calls for long shell cells. They occupied
+3.766 hours, with a 16.269-second median, 18.416-second p95, and
+18.831-second maximum. Of these, 948 completed their cell and 70 yielded
+while it was still running. These were output-yield waits, not process
+timeouts.</p>
+<h2 id="worker-waiting">Worker Waiting</h2>
+<h3 id="tool-continuation">Tool continuation</h3>
+<table>
+<thead>
+<tr class="header">
+<th>Worker tool observation</th>
+<th style="text-align: right;">Count or duration</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Outer <code>functions.exec</code> calls</td>
+<td style="text-align: right;">46,240</td>
+</tr>
+<tr class="even">
+<td>Nested <code>exec_command</code> starts</td>
+<td style="text-align: right;">23,306</td>
+</tr>
+<tr class="odd">
+<td>Nested <code>write_stdin</code> polls</td>
+<td style="text-align: right;">20,683</td>
+</tr>
+<tr class="even">
+<td>Outer exec cells that yielded</td>
+<td style="text-align: right;">13,186</td>
+</tr>
+<tr class="odd">
+<td>Paired outer <code>functions.wait</code> continuations</td>
+<td style="text-align: right;">14,040</td>
+</tr>
+<tr class="even">
+<td>Aggregate time inside outer waits</td>
+<td style="text-align: right;">43.525h</td>
+</tr>
+<tr class="odd">
+<td>Median / p95 / maximum observed wait</td>
+<td style="text-align: right;">13.401s / 18.307s / 48.315s</td>
+</tr>
+<tr class="even">
+<td>Completed cell / still running</td>
+<td style="text-align: right;">13,297 / 743</td>
+</tr>
+</tbody>
+</table>
+<p>Requested outer wait ceilings were 30 seconds for 10,162 calls, 10
+seconds for 2,128, and 20 seconds for 1,521; the remaining 229 used
+other values. Because 94.7% of continuations returned a completed cell,
+most tool-call turns existed only to collect a result that was already
+near completion. Longer supported yield intervals would reduce
+continuation turns without delaying results because these waits return
+early on completion.</p>
+<p>When a continuation still reported a running cell, the delay before
+the next wait call totaled 16.34 aggregate worker-hours with a
+3.19-second median. The child process continued during that
+control/model delay, so it is not all lost runtime; it is primarily
+orchestration overhead and delayed result collection.</p>
+<p>Wait-call turns processed approximately 2.501B cached-input, 11.87M
+uncached-input, and 459,566 output tokens, an estimated $1,323.48.
+Corrected worker inference was about $6,132.42, so these turns represent
+21.6% of worker spend. Exact savings from a different yield cadence
+cannot be reconstructed because completion times within each requested
+interval are unknown.</p>
+<p>The top long-lived session anchors by outer wait time were brief 39
+(2.472h), brief 63 (2.271h), brief 49 (2.047h), brief 91 (1.893h), brief
+92 (1.728h), and brief 89 (1.675h). These labels identify the session’s
+first mapped brief, not necessarily every later continuation whose work
+occurred in it.</p>
+<h3 id="what-workers-were-observing">What workers were observing</h3>
+<p>Origin classification is available only after an initial outer cell
+yielded, so it is not a complete command-time breakdown.</p>
+<table>
+<thead>
+<tr class="header">
+<th>Continuation origin</th>
+<th style="text-align: right;">Wait calls</th>
+<th style="text-align: right;">Aggregate observed time</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Generic process / unclassified</td>
+<td style="text-align: right;">11,523</td>
+<td style="text-align: right;">35.790h</td>
+</tr>
+<tr class="even">
+<td>Build</td>
+<td style="text-align: right;">719</td>
+<td style="text-align: right;">2.328h</td>
+</tr>
+<tr class="odd">
+<td>Benchmark</td>
+<td style="text-align: right;">703</td>
+<td style="text-align: right;">2.241h</td>
+</tr>
+<tr class="even">
+<td>Validate</td>
+<td style="text-align: right;">621</td>
+<td style="text-align: right;">1.728h</td>
+</tr>
+<tr class="odd">
+<td>Nsight Systems</td>
+<td style="text-align: right;">341</td>
+<td style="text-align: right;">1.042h</td>
+</tr>
+<tr class="even">
+<td>Other GPU work</td>
+<td style="text-align: right;">86</td>
+<td style="text-align: right;">0.237h</td>
+</tr>
+<tr class="odd">
+<td>Nsight Compute</td>
+<td style="text-align: right;">45</td>
+<td style="text-align: right;">0.152h</td>
+</tr>
+<tr class="even">
+<td>Combined build and validate</td>
+<td style="text-align: right;">2</td>
+<td style="text-align: right;">0.007h</td>
+</tr>
+</tbody>
+</table>
+<p>Only one worker-side <code>wait_agent</code> call was found, in brief
+5. It was an atypical 30-second sleep/poll while the worker inspected
+and interrupted an overlapping lock wait; it was not part of the normal
+worker protocol.</p>
+<h3 id="polling-and-result-collection-failures">Polling and result
+collection failures</h3>
+<p>Workers issued 20,683 nested <code>write_stdin</code> polls; 6,056
+requested one-second yields. For the 17,866 polls that reported wall
+time, observed blocking sums to 77.575 aggregate hours. This overlaps
+outer wait time, lock queueing, and useful command execution and
+therefore must not be added to any of them.</p>
+<p>Of 13,186 yielded outer execution cells, 13,176 were eventually
+collected and ten were not. One uncollected brief 63 benchmark result
+led the worker to poll a stale session and rerun the benchmark about 61
+seconds later; the other nine were interrupted-worker poll cells. Eleven
+stale polls failed with <code>Unknown process id</code>.</p>
+<p>Fifty-two worker commands used shell sleep/poll inspection despite
+the worker contract’s prohibition, totaling 16m52s of outer lifecycle
+time. Forty-seven occurred in the long-lived session while it handled
+the later brief 57 continuation; brief 63 used one
+<code>while pgrep ...; sleep 2</code> loop. The normal pattern was
+native session continuation, but the contradictory worker definition
+still produced avoidable shell polling.</p>
+<h2 id="resource-lock-waiting">Resource-Lock Waiting</h2>
+<h3 id="worker-local-conservative-totals">Worker-local conservative
+totals</h3>
+<table>
+<colgroup>
+<col style="width: 11%" />
+<col style="width: 14%" />
+<col style="width: 14%" />
+<col style="width: 14%" />
+<col style="width: 14%" />
+<col style="width: 14%" />
+<col style="width: 14%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Lock</th>
+<th style="text-align: right;">Matched calls</th>
+<th style="text-align: right;">Aggregate queue wait</th>
+<th style="text-align: right;">Aggregate execution</th>
+<th style="text-align: right;">Median wait</th>
+<th style="text-align: right;">p95 wait</th>
+<th style="text-align: right;">Maximum wait</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Shared build</td>
+<td style="text-align: right;">2,636</td>
+<td style="text-align: right;">9h06m11s</td>
+<td style="text-align: right;">34h11m04s</td>
+<td style="text-align: right;">0.000s</td>
+<td style="text-align: right;">54.915s</td>
+<td style="text-align: right;">559.744s</td>
+</tr>
+<tr class="even">
+<td>Exclusive GPU</td>
+<td style="text-align: right;">5,737</td>
+<td style="text-align: right;">50h10m32s</td>
+<td style="text-align: right;">32h15m53s</td>
+<td style="text-align: right;">16.062s</td>
+<td style="text-align: right;">107.435s</td>
+<td style="text-align: right;">646.809s</td>
+</tr>
+<tr class="odd">
+<td><strong>Total</strong></td>
+<td style="text-align: right;"><strong>8,373</strong></td>
+<td style="text-align: right;"><strong>59h16m42s</strong></td>
+<td style="text-align: right;"><strong>66h26m57s</strong></td>
+<td style="text-align: right;"></td>
+<td style="text-align: right;"></td>
+<td style="text-align: right;"></td>
+</tr>
+</tbody>
+</table>
+<p>The 59.28 aggregate wait hours equal 29.8% of the 198h50m59.8s paired
+worker lifecycle-active total. The GPU queue was the dominant source:
+its wait time was 5.51 times build queue time and 1.56 times the
+execution time behind exclusive GPU locks. On a one-GPU host with three
+active briefs, serialization is expected; the magnitude shows that
+admission latency was a major part of worker activity, not that the
+solver itself required concurrent callers.</p>
+<p>Brief 92’s long-lived session anchor accumulated the most
+worker-local lock wait at 3h31m22s. The global longest individual wait
+was brief 71: 646.809 seconds queued for a validation that then executed
+for 7.564 seconds. That trial correctly distinguished queue time from
+its explicit 240-second command envelope.</p>
+<p>The global run-window cross-check matched 2,696 build and 5,802 GPU
+lifecycles, with 60.35 aggregate hours waiting and 67.70 hours
+executing. It is slightly larger because it includes manager and
+boundary-adjacent records and can pair 112 lifecycles whose acquisition
+and release appear under different trace labels. It is the right
+run-wide total; the 59.28-hour figure is the conservative worker-only
+total used for per-worker analysis.</p>
+<p>Implementation evidence confirms that <code>autocuda run</code> is
+unbounded: <code>_run_logged</code> calls bare
+<code>subprocess.run</code>, the build path uses blocking
+<code>flock</code>, and exclusive selection holds a blocking scheduler
+lock while rescanning GPUs forever (<a href="/home/shadeform/.codex/plugins/cache/brycelelbach-autocuda/autocuda/0.4.0/lib/_run.py">lock
+implementation</a>).</p>
+<h2 id="timeout-enforcement">Timeout Enforcement</h2>
+<table style="width:100%;">
+<colgroup>
+<col style="width: 23%" />
+<col style="width: 30%" />
+<col style="width: 23%" />
+<col style="width: 23%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Step</th>
+<th style="text-align: right;">Documented budget</th>
+<th>Enforced by standard local path?</th>
+<th>Actual stop mechanism</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Build/import</td>
+<td style="text-align: right;">1,800s wrapper default</td>
+<td>Yes</td>
+<td>TERM at deadline, KILL after 30s</td>
+</tr>
+<tr class="even">
+<td>Validation</td>
+<td style="text-align: right;">240s</td>
+<td>No</td>
+<td>Process exit or manual interruption</td>
+</tr>
+<tr class="odd">
+<td>Benchmark</td>
+<td style="text-align: right;">480s</td>
+<td>No</td>
+<td>Process exit or manual interruption</td>
+</tr>
+<tr class="even">
+<td>Ranked evaluation</td>
+<td style="text-align: right;">900s</td>
+<td>Not in local wrapper</td>
+<td>Remote service behavior</td>
+</tr>
+<tr class="odd">
+<td>Nsys</td>
+<td style="text-align: right;">approximately 15-20s measured</td>
+<td>No common hard deadline</td>
+<td>Process exit or ad hoc shell timeout</td>
+</tr>
+<tr class="even">
+<td>Ncu</td>
+<td style="text-align: right;">at least 600s advised</td>
+<td>No common hard deadline</td>
+<td>Process exit or ad hoc shell timeout</td>
+</tr>
+<tr class="odd">
+<td>Leaderboard submission</td>
+<td style="text-align: right;">at least 600s, retry up to 3 times
+advised</td>
+<td>No standard enforced retry/deadline</td>
+<td>CLI/service behavior</td>
+</tr>
+<tr class="even">
+<td>Build/GPU lock acquisition</td>
+<td style="text-align: right;">None documented</td>
+<td>No</td>
+<td>Lock eventually acquired or caller interrupted</td>
+</tr>
+</tbody>
+</table>
+<p>The budgets appear in <a href="../problems/linalg/eigh_py/task.yml"><code>task.yml</code></a> and
+<a href="../autocuda/environment.md"><code>environment.md</code></a>,
+but <a href="../harness/validate.sh"><code>validate.sh</code></a> and <a href="../harness/benchmark.sh"><code>benchmark.sh</code></a> invoke
+<code>eval.py</code> directly. Of worker exec records that referenced
+these wrappers, only 40 of 2,554 validation records and 19 of 2,335
+benchmark records contained an explicit coreutils <code>timeout</code>;
+these counts are trace records, not unique process invocations.</p>
+<p>The evaluator’s 120-second per-shape break is soft. It is checked
+only after <code>custom_kernel</code> and
+<code>torch.cuda.synchronize()</code> return, and
+<code>multiprocessing.Pool.apply</code> blocks without a process timeout
+(<a href="../problems/linalg/eigh_py/eval.py">evaluator</a>). It
+therefore cannot terminate a hung GPU kernel or evaluator child.</p>
+<p>Workers issued 68 explicit shell <code>timeout</code> commands: 48
+correctly placed the timeout around the payload inside
+<code>autocuda run</code>, 19 incorrectly wrapped
+<code>autocuda run</code> itself, and one bounded a probe. Sixty-one
+exited zero, four exited one, and three reached exit 124. Two exit-124
+cases correctly stopped genuine validation hangs after 90 and 120
+seconds. The third, in brief 61, used
+<code>timeout 180s autocuda run exclusive ...</code> and expired without
+an acquired-lock marker: GPU queue time consumed its entire budget
+before the payload started.</p>
+<p>This distinction is load-bearing. Until <code>autocuda run</code>
+supports separate native limits,
+<code>autocuda run exclusive -- timeout 240s &lt;validate&gt;</code>
+bounds command execution after acquisition;
+<code>timeout 240s autocuda run exclusive -- &lt;validate&gt;</code>
+conflates queue and execution. Twenty-one Ctrl-C writes manually
+targeted 20 unique sessions during the run, showing that manual
+cancellation frequently substituted for a standard process deadline.</p>
+<h3 id="observed-overruns-and-hangs">Observed overruns and hangs</h3>
+<table>
+<colgroup>
+<col style="width: 17%" />
+<col style="width: 17%" />
+<col style="width: 23%" />
+<col style="width: 23%" />
+<col style="width: 17%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Brief / trial</th>
+<th>Operation</th>
+<th style="text-align: right;">Stated budget</th>
+<th style="text-align: right;">Observed behavior</th>
+<th>Outcome</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>49</td>
+<td>Validation</td>
+<td style="text-align: right;">240s</td>
+<td style="text-align: right;">285.791s execution</td>
+<td>Completed after budget</td>
+</tr>
+<tr class="even">
+<td>73 / 8</td>
+<td>Validation</td>
+<td style="text-align: right;">240s</td>
+<td style="text-align: right;">516.649s on GPU</td>
+<td>Manually interrupted</td>
+</tr>
+<tr class="odd">
+<td>91 / 59</td>
+<td>Validation</td>
+<td style="text-align: right;">240s</td>
+<td style="text-align: right;">318.836s execution</td>
+<td>Logged succeeded</td>
+</tr>
+<tr class="even">
+<td>91 / 59</td>
+<td>Benchmark</td>
+<td style="text-align: right;">480s</td>
+<td style="text-align: right;">571.460s execution after 49.876s
+queue</td>
+<td>Logged succeeded</td>
+</tr>
+<tr class="odd">
+<td>55 / 67</td>
+<td>Validation</td>
+<td style="text-align: right;">240s</td>
+<td style="text-align: right;">Three deadlocks stopped at 185s, 90s, and
+120s</td>
+<td>Ad hoc interruption</td>
+</tr>
+<tr class="even">
+<td>45 / 22</td>
+<td>Direct kernel run</td>
+<td style="text-align: right;">None</td>
+<td style="text-align: right;">Deadlocked for 254s</td>
+<td>Manually terminated</td>
+</tr>
+<tr class="odd">
+<td>63 / 38</td>
+<td>Validation</td>
+<td style="text-align: right;">240s</td>
+<td style="text-align: right;">Hung for 220s</td>
+<td>Manually terminated</td>
+</tr>
+</tbody>
+</table>
+<p>Brief 91 is the clearest contract failure. The worker described its
+benchmark as running under the 480-second limit, but the ordinary
+wrapper had no timeout. It made 18 PTY <code>write_stdin</code> polls
+and 18 outer <code>functions.wait</code> continuations while the command
+ran for 571.460 seconds, then recorded a successful metric (<a href="2026-07-03-13-39-25-optimize-tree-brief-91-log.csv">brief 91
+log</a>). Brief 55’s three manually bounded deadlocks likewise show why
+the wrapper needs a real deadline (<a href="2026-07-03-13-39-25-optimize-tree-brief-55-log.csv">brief 55
+log</a>).</p>
+<h2 id="benchmark-concurrency">Benchmark Concurrency</h2>
+<p>Nothing in the benchmark or leaderboard path establishes a
+requirement for simultaneous production calls into the solver.
+<code>eval.py</code> creates a one-process pool and invokes each test or
+benchmark through blocking <code>pool.apply</code>; cases are evaluated
+serially. The three-way concurrency in this run came from optimization
+workers competing for one B200, not from the target API contract. Worker
+effort spent making the solver safe for unrelated concurrent callers was
+therefore outside the demonstrated local and leaderboard
+requirements.</p>
+<h2 id="recommendations">Recommendations</h2>
+<ol type="1">
+<li>Preserve <code>wait_agent(timeout_ms=1800000)</code> as manager
+state across compaction. On timeout, perform one fleet-health and
+hourly-submission check; on notification, return immediately and handle
+that worker.</li>
+<li>Remove the shell-polling instruction from
+<code>optimize-tree-worker</code>. Specify output-yield intervals
+separately from hard process deadlines and use native session
+continuation only.</li>
+<li>Add <code>--lock-timeout</code> and <code>--command-timeout</code>
+to <code>autocuda run</code>. Start the command budget after lock
+acquisition so queue contention cannot consume validation or benchmark
+execution time.</li>
+<li>Enforce the 240-second validation and 480-second benchmark limits in
+their wrappers, plus explicit profile and submission deadlines.
+Implement the documented three-attempt submission retry.</li>
+<li>Emit a structured invocation ID with brief ID, command kind, queue
+duration, execution duration, configured deadline, exit reason, and
+timeout status. This would eliminate cross-trace pairing ambiguity.</li>
+<li>Report elapsed run time, aggregate worker-active time, output-yield
+time, and lock queue time as separate measures. Never add concurrent
+worker-hours directly to wall-clock duration.</li>
+<li>Keep solver validation aligned with the actual evaluator: serial
+calls and official local/leaderboard tests. Add concurrent-call work
+only if a test or explicit API requirement demonstrates it.</li>
+</ol>
+<h2 id="verification">Verification</h2>
+<ul>
+<li>Parsed 3,769 manager <code>wait_agent</code> calls and 1,018 manager
+shell-cell waits through graceful fleet stop.</li>
+<li>Parsed 46,240 worker outer exec calls, 23,306 nested command starts,
+20,683 PTY polls, and 14,040 paired outer continuations after worker
+fork boundaries.</li>
+<li>Re-ran lock extraction with normalized scalar/list tool outputs and
+source-local exact-marker deduplication; retained 8,373 conservative
+worker pairs and compared them with 8,498 global run-window pairs.</li>
+<li>Confirmed the timeout paths in <code>harness/build.sh</code>,
+<code>harness/validate.sh</code>, <code>harness/benchmark.sh</code>,
+<code>eval.py</code>, <code>task.yml</code>, and
+<code>autocuda run</code> source.</li>
+<li>Cross-checked documented overruns and deadlocks against brief logs
+and their underlying trace lock records.</li>
+</ul>
+<aside id="footnotes" class="footnotes footnotes-end-of-document" role="doc-endnotes">
+<hr />
+<ol>
+<li id="fn1"><p>Approximate list-rate estimate, not an invoice. The
+calculation uses $5/M uncached input, $30/M output, and $0.50/M cache
+reads from <a href="https://openai.com/index/previewing-gpt-5-6-sol/">OpenAI’s GPT-5.6
+Sol pricing</a>, matching the corrected cost report. Actual plan credits
+and terms may differ.<a href="#fnref1" class="footnote-back" role="doc-backlink">↩︎</a></p></li>
+</ol>
+</aside>
+<script type="module">import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs'; mermaid.initialize({startOnLoad:true, theme:'default'});</script>
+</body>
+</html>

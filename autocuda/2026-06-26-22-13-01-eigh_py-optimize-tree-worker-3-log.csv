@@ -1,0 +1,2 @@
+timestamp,agent_id,brief_id,iteration,linalg/eigh_py,status,commit,description
+2026-06-26T22:20:18.238090,3,,N/A,254872.371,baseline,f7b786a30a5199da50ce9cfdcfeab1b702c26dd4,baseline

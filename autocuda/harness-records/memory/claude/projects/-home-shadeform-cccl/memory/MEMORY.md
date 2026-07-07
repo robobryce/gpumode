@@ -1,0 +1,2 @@
+- [RANGE F64 low-bin root cause](reference_range_f64_lowbin_root_cause.md) — branch SmemPrivatized<256> vs main Sweep<256>; F64->full BinSelect @384/8 (matches main stall 0.27), I32->lean; residual ~0.96x at b16/b32-sat only.
+- [Lock GPU clocks for small-N benches](feedback_lock_gpu_clocks_for_small_n.md) — unlocked clocks corrupt 1M ratios 10-17%; sudo nvidia-smi -lgc 1800,1800 before A/B.

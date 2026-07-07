@@ -1,0 +1,1247 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang xml:lang>
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>Behavior Report: 2026-07-03-13-39-25</title>
+  <style>
+code{white-space: pre-wrap;}
+span.smallcaps{font-variant: small-caps;}
+div.columns{display: flex; gap: min(4vw, 1.5em);}
+div.column{flex: auto; overflow-x: auto;}
+div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
+
+ul.task-list[class]{list-style: none;}
+ul.task-list li input[type="checkbox"] {
+font-size: inherit;
+width: 0.8em;
+margin: 0 0.8em 0.2em -1.6em;
+vertical-align: middle;
+}
+.display.math{display: block; text-align: center; margin: 0.5rem auto;}
+</style>
+  <style type="text/css">body { max-width:1100px; margin:2rem auto; padding:0 1.5rem; font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif; color:#1a1a1a; }
+table { border-collapse:collapse; width:100%; margin:1rem 0; font-size:14px; }
+th,td { border:1px solid #ccc; padding:6px 10px; text-align:left; vertical-align:top; }
+th { background:#f4f4f4; }
+code { background:#f4f4f4; padding:1px 4px; border-radius:3px; }
+pre:not(.mermaid) { background:#f7f7f7; padding:10px; overflow-x:auto; border-radius:5px; }
+pre.mermaid { background:transparent; text-align:center; }
+h1,h2,h3 { line-height:1.25; }
+h1 { border-bottom:2px solid #eee; padding-bottom:.3rem; }
+h2 { border-bottom:1px solid #eee; padding-bottom:.2rem; margin-top:2rem; }
+blockquote { border-left:3px solid #ccc; margin-left:0; padding-left:1rem; color:#555; }
+a { color:#0645ad; }
+</style>
+</head>
+<body>
+<h1 id="behavior-report-2026-07-03-13-39-25">Behavior Report:
+2026-07-03-13-39-25</h1>
+<h2 id="executive-summary">Executive Summary</h2>
+<p>This single optimize-tree experiment was productive but operationally
+uneven: the CSV records 2,601 trials over 191.63 aggregate
+first-to-last-trial hours, with an arithmetic mean of 14.94 and a
+transition-consistent pooled rate of 13.09 trials/hour. Reliability was
+mixed: 40 branches contain 101 trial transitions over ten minutes, and
+39 branches emitted 77 completion outputs before their final cycle and
+later resumed; one experiment cannot establish cross-run stability.</p>
+<p><strong>Key takeaways</strong></p>
+<ul>
+<li>CSV <code>brief_start</code>/<code>brief_stop</code> intervals
+appear at width three for 62h21m26s of the 68h42m46s run (90.7%), but
+those rows do not measure workers in flight. Workers remain active after
+a stop row until their completion notification and can perform
+continuation setup before the next start row.</li>
+<li>Corrected records from 83 worker sessions show 59h16m42s of
+conservative aggregate lock wait, 29.8% of paired lifecycle-active time.
+Brief 92’s long-lived session anchor paid the most at 3h31m22s, and
+brief 71 had the worst single wait at 646.809s.</li>
+<li>The harness contains 172 completion outputs. Seventy-seven were
+followed by later activity on the same branch; there were no “should I
+keep going?” questions.</li>
+<li>Brief 4’s 71m22s branch gap was not a fleet stall: the manager
+placed brief 7 into that slot 43.958s after brief 4’s completion and
+resumed brief 4 when a later slot freed. Brief 89’s apparent 77-minute
+under-strength interval was also a lifecycle-logging artifact; its
+worker stayed active and the manager issued continuation 20.909s after
+notification.</li>
+<li>The report CSV understates the log by three trials because one-trial
+briefs 20, 21, and 94 are emitted as zero-duration rows; five trial rows
+also contain invalid manually expanded commit SHAs.</li>
+</ul>
+<p><strong>Run:</strong> 95 branches, 2,601 CSV-counted trials (2,604
+trial log rows), 191h37m59s aggregate first-to-last-trial span, and
+198h50m59.8s across paired lifecycle-active intervals; arithmetic mean
+14.94 trials/hour, pooled transition rate 13.09, and worst reported rate
+0.00 on three single-trial artifacts (6.24 worst meaningful rate on
+brief 89). Overall reliability: productive and actively managed, with
+repeated stop/resume cycles and log bookkeeping defects; start/stop rows
+alone cannot establish fleet-idle time.</p>
+<h3 id="run-flow">Run Flow</h3>
+<pre class="mermaid">flowchart LR
+    M["Manager<br/>95 briefs"] --> W["Three-worker fleet<br/>lifecycle rows are not occupancy"]
+    W --> T["2,604 logged trials"]
+    W --> B["Build lock<br/>2,636 matched calls"]
+    W --> G["GPU lock<br/>5,737 matched calls"]
+    B --> L["59h17m aggregate wait<br/>29.8% of lifecycle-active time"]
+    G --> L
+    T --> Q["101 gaps over 10 minutes"]
+    T --> R["77 pre-final completion outputs<br/>followed by later branch activity"]</pre>
+<h2 id="fleet-behavior">Fleet Behavior</h2>
+<h3 id="concurrency-over-time">Concurrency Over Time</h3>
+<p>Pairing 173 <code>brief_start</code>/<code>brief_stop</code> rows
+gives a peak of three logged brief intervals. Five-minute midpoint
+buckets were at width three in 749 of 825 windows; interval integration
+gives 224,485.7s at width three and 22,880.3s below it. This is
+branch-log coverage, not actual worker occupancy: the optimize-tree
+protocol keeps a worker in flight until its completion notification, and
+setup for a continuation can precede its next <code>brief_start</code>
+row. The apparent 4,621.5s deficit from 2026-07-06 02:37:04 to 03:54:06
+UTC is disproved by the brief 89 trace, which has 1,471 records, 257
+exec calls, and 78 waits throughout the stop/start interval with a
+maximum record gap of 73.594s. The manager issued its follow-up 20.909s
+after notification. True fleet occupancy must therefore be reconstructed
+from agent notifications and dispatches, not these CSV lifecycle
+rows.</p>
+<h3 id="brief-cycle-timing">Brief-Cycle Timing</h3>
+<p>Under the report contract’s manager-to-first-trial definition, median
+handoff latency was 344.1s (5m44s) and nearest-rank p95 was 663.5s
+(11m03s). Sixty-nine briefs exceeded five minutes: <code>2</code> 5.2m,
+<code>4</code> 6.9m, <code>5</code> 6.4m, <code>6</code> 6.3m,
+<code>8</code> 5.5m, <code>11</code> 6.7m, <code>12</code> 5.8m,
+<code>13</code> 5.1m, <code>15</code> 6.1m, <code>16</code> 6.1m,
+<code>18</code> 9.2m, <code>19</code> 7.6m, <code>21</code> 5.3m,
+<code>22</code> 5.4m, <code>23</code> 5.6m, <code>24</code> 5.0m,
+<code>25</code> 5.0m, <code>27</code> 5.1m, <code>29</code> 7.6m,
+<code>30</code> 5.0m, <code>31</code> 7.6m, <code>35</code> 7.7m,
+<code>36</code> 8.7m, <code>38</code> 5.4m, <code>39</code> 5.9m,
+<code>41</code> 6.4m, <code>42</code> 6.4m, <code>44</code> 5.1m,
+<code>45</code> 5.6m, <code>46</code> 5.8m, <code>47</code> 5.3m,
+<code>49</code> 6.5m, <code>50</code> 5.9m, <code>51</code> 9.9m,
+<code>52</code> 7.5m, <code>53</code> 6.8m, <code>54</code> 5.6m,
+<code>55</code> 5.7m, <code>56</code> 8.5m, <code>57</code> 10.9m,
+<code>58</code> 7.6m, <code>59</code> 8.1m, <code>60</code> 6.8m,
+<code>61</code> 5.3m, <code>62</code> 7.6m, <code>63</code> 7.5m,
+<code>64</code> 5.7m, <code>67</code> 5.9m, <code>70</code> 9.1m,
+<code>73</code> 6.7m, <code>74</code> 6.0m, <code>75</code> 5.5m,
+<code>76</code> 10.1m, <code>77</code> 12.5m, <code>78</code> 7.4m,
+<code>79</code> 8.4m, <code>80</code> 10.7m, <code>82</code> 8.2m,
+<code>83</code> 5.1m, <code>84</code> 9.5m, <code>86</code> 5.2m,
+<code>87</code> 7.6m, <code>88</code> 11.1m, <code>89</code> 7.8m,
+<code>90</code> 7.3m, <code>91</code> 5.7m, <code>92</code> 14.6m,
+<code>93</code> 11.9m, and <code>94</code> 18.7m. This metric includes
+setup, editing, build, validation, and benchmark work before trial 0 is
+logged, so it is not pure dispatch latency.</p>
+<h3 id="lock-contention">Lock Contention</h3>
+<p>After normalizing scalar and list-shaped tool outputs, exact-marker
+deduplication and source-local pairing across 83 current-run worker
+session segments yielded 2,636 matched shared-build calls and 5,737
+matched exclusive GPU calls. Shared <code>build</code> locks accumulated
+32,770.729s of wait and 123,063.852s of execution; <code>gpu-0</code>
+locks accumulated 180,631.578s of wait and 116,153.296s of execution.
+Total matched wait was 213,402.307s (59h16m42s), 29.8% of the
+198h50m59.8s paired lifecycle-active total. Brief 92’s long-lived
+session anchor paid the largest wait at 12,682.106s; brief 71 paid the
+worst single wait, 646.809s on <code>gpu-0</code>. Source-local pairing
+left 50 acquisitions and 166 releases unmatched; their cause is not
+established, so the totals are conservative. This worker-only scope
+excludes manager, pre-run, interrupted-launch, and post-run audit
+sessions. A separate global cross-trace pairing reports 60.35 aggregate
+wait hours.</p>
+<h3 id="per-brief-reliability">Per-Brief Reliability</h3>
+<p>The median branch rate is 13.69 trials/hour. Rates more than 2x from
+that median are briefs 43 (63.53), 39 (41.27), 59 (40.19), and 52
+(37.31) on the high side, and briefs 93 (6.64), 48 (6.53), 89 (6.24), 20
+(0.00), 21 (0.00), and 94 (0.00) on the low side. The high rates and
+brief 48 are short-run artifacts of two or three trials; briefs 20, 21,
+and 94 each logged one trial but have no inter-trial duration; and brief
+93’s caching trials were invalidated post-run. Brief 89 is the
+meaningful slow outlier: 47 trials over 7h22m22s with seven long
+transitions.</p>
+<h2 id="throughput">Throughput</h2>
+<p>Tree brief logs do not carry <code>pct_change</code>, so Improvement
+is <code>+0.00%</code> by construction. This is single-experiment mode,
+so no cross-run mean/stddev row is included.</p>
+<table>
+<thead>
+<tr class="header">
+<th>Branch</th>
+<th style="text-align: right;">Trials</th>
+<th style="text-align: right;">Duration</th>
+<th style="text-align: right;">Trials/hour</th>
+<th style="text-align: right;">Improvement %</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>brief-43</code></td>
+<td style="text-align: right;">3</td>
+<td style="text-align: right;">0:01:53</td>
+<td style="text-align: right;">63.53</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="even">
+<td><code>brief-39</code></td>
+<td style="text-align: right;">3</td>
+<td style="text-align: right;">0:02:54</td>
+<td style="text-align: right;">41.27</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="odd">
+<td><code>brief-59</code></td>
+<td style="text-align: right;">2</td>
+<td style="text-align: right;">0:01:30</td>
+<td style="text-align: right;">40.19</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="even">
+<td><code>brief-52</code></td>
+<td style="text-align: right;">2</td>
+<td style="text-align: right;">0:01:36</td>
+<td style="text-align: right;">37.31</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="odd">
+<td><code>brief-6</code></td>
+<td style="text-align: right;">25</td>
+<td style="text-align: right;">1:02:50</td>
+<td style="text-align: right;">22.92</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="even">
+<td><code>brief-38</code></td>
+<td style="text-align: right;">7</td>
+<td style="text-align: right;">0:15:46</td>
+<td style="text-align: right;">22.83</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="odd">
+<td><code>brief-47</code></td>
+<td style="text-align: right;">21</td>
+<td style="text-align: right;">0:55:17</td>
+<td style="text-align: right;">21.71</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="even">
+<td><code>brief-70</code></td>
+<td style="text-align: right;">30</td>
+<td style="text-align: right;">1:24:05</td>
+<td style="text-align: right;">20.69</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="odd">
+<td><code>brief-5</code></td>
+<td style="text-align: right;">59</td>
+<td style="text-align: right;">2:52:56</td>
+<td style="text-align: right;">20.12</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="even">
+<td><code>brief-87</code></td>
+<td style="text-align: right;">16</td>
+<td style="text-align: right;">0:45:42</td>
+<td style="text-align: right;">19.69</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="odd">
+<td><code>brief-66</code></td>
+<td style="text-align: right;">8</td>
+<td style="text-align: right;">0:21:24</td>
+<td style="text-align: right;">19.62</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="even">
+<td><code>brief-44</code></td>
+<td style="text-align: right;">7</td>
+<td style="text-align: right;">0:18:27</td>
+<td style="text-align: right;">19.52</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="odd">
+<td><code>brief-28</code></td>
+<td style="text-align: right;">3</td>
+<td style="text-align: right;">0:06:20</td>
+<td style="text-align: right;">18.95</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="even">
+<td><code>brief-65</code></td>
+<td style="text-align: right;">6</td>
+<td style="text-align: right;">0:16:15</td>
+<td style="text-align: right;">18.45</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="odd">
+<td><code>brief-77</code></td>
+<td style="text-align: right;">8</td>
+<td style="text-align: right;">0:23:35</td>
+<td style="text-align: right;">17.80</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="even">
+<td><code>brief-84</code></td>
+<td style="text-align: right;">10</td>
+<td style="text-align: right;">0:31:12</td>
+<td style="text-align: right;">17.30</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="odd">
+<td><code>brief-17</code></td>
+<td style="text-align: right;">17</td>
+<td style="text-align: right;">0:55:41</td>
+<td style="text-align: right;">17.24</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="even">
+<td><code>brief-31</code></td>
+<td style="text-align: right;">24</td>
+<td style="text-align: right;">1:20:14</td>
+<td style="text-align: right;">17.20</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="odd">
+<td><code>brief-19</code></td>
+<td style="text-align: right;">24</td>
+<td style="text-align: right;">1:20:16</td>
+<td style="text-align: right;">17.19</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="even">
+<td><code>brief-27</code></td>
+<td style="text-align: right;">11</td>
+<td style="text-align: right;">0:35:05</td>
+<td style="text-align: right;">17.10</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="odd">
+<td><code>brief-36</code></td>
+<td style="text-align: right;">16</td>
+<td style="text-align: right;">0:53:03</td>
+<td style="text-align: right;">16.97</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="even">
+<td><code>brief-46</code></td>
+<td style="text-align: right;">8</td>
+<td style="text-align: right;">0:24:46</td>
+<td style="text-align: right;">16.96</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="odd">
+<td><code>brief-56</code></td>
+<td style="text-align: right;">17</td>
+<td style="text-align: right;">0:56:48</td>
+<td style="text-align: right;">16.90</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="even">
+<td><code>brief-8</code></td>
+<td style="text-align: right;">48</td>
+<td style="text-align: right;">2:48:52</td>
+<td style="text-align: right;">16.70</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="odd">
+<td><code>brief-10</code></td>
+<td style="text-align: right;">32</td>
+<td style="text-align: right;">1:53:05</td>
+<td style="text-align: right;">16.45</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="even">
+<td><code>brief-23</code></td>
+<td style="text-align: right;">24</td>
+<td style="text-align: right;">1:23:56</td>
+<td style="text-align: right;">16.44</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="odd">
+<td><code>brief-53</code></td>
+<td style="text-align: right;">52</td>
+<td style="text-align: right;">3:08:08</td>
+<td style="text-align: right;">16.26</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="even">
+<td><code>brief-51</code></td>
+<td style="text-align: right;">23</td>
+<td style="text-align: right;">1:21:46</td>
+<td style="text-align: right;">16.14</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="odd">
+<td><code>brief-29</code></td>
+<td style="text-align: right;">26</td>
+<td style="text-align: right;">1:34:10</td>
+<td style="text-align: right;">15.93</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="even">
+<td><code>brief-88</code></td>
+<td style="text-align: right;">26</td>
+<td style="text-align: right;">1:34:45</td>
+<td style="text-align: right;">15.83</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="odd">
+<td><code>brief-50</code></td>
+<td style="text-align: right;">20</td>
+<td style="text-align: right;">1:12:17</td>
+<td style="text-align: right;">15.77</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="even">
+<td><code>brief-86</code></td>
+<td style="text-align: right;">11</td>
+<td style="text-align: right;">0:38:09</td>
+<td style="text-align: right;">15.73</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="odd">
+<td><code>brief-85</code></td>
+<td style="text-align: right;">11</td>
+<td style="text-align: right;">0:38:53</td>
+<td style="text-align: right;">15.43</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="even">
+<td><code>brief-41</code></td>
+<td style="text-align: right;">11</td>
+<td style="text-align: right;">0:38:56</td>
+<td style="text-align: right;">15.41</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="odd">
+<td><code>brief-33</code></td>
+<td style="text-align: right;">39</td>
+<td style="text-align: right;">2:31:48</td>
+<td style="text-align: right;">15.02</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="even">
+<td><code>brief-90</code></td>
+<td style="text-align: right;">37</td>
+<td style="text-align: right;">2:25:12</td>
+<td style="text-align: right;">14.88</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="odd">
+<td><code>brief-69</code></td>
+<td style="text-align: right;">36</td>
+<td style="text-align: right;">2:24:12</td>
+<td style="text-align: right;">14.56</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="even">
+<td><code>brief-12</code></td>
+<td style="text-align: right;">15</td>
+<td style="text-align: right;">0:58:20</td>
+<td style="text-align: right;">14.40</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="odd">
+<td><code>brief-13</code></td>
+<td style="text-align: right;">49</td>
+<td style="text-align: right;">3:21:13</td>
+<td style="text-align: right;">14.31</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="even">
+<td><code>brief-83</code></td>
+<td style="text-align: right;">18</td>
+<td style="text-align: right;">1:11:25</td>
+<td style="text-align: right;">14.28</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="odd">
+<td><code>brief-49</code></td>
+<td style="text-align: right;">51</td>
+<td style="text-align: right;">3:30:16</td>
+<td style="text-align: right;">14.27</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="even">
+<td><code>brief-15</code></td>
+<td style="text-align: right;">8</td>
+<td style="text-align: right;">0:29:30</td>
+<td style="text-align: right;">14.24</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="odd">
+<td><code>brief-75</code></td>
+<td style="text-align: right;">11</td>
+<td style="text-align: right;">0:42:12</td>
+<td style="text-align: right;">14.22</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="even">
+<td><code>brief-25</code></td>
+<td style="text-align: right;">46</td>
+<td style="text-align: right;">3:10:46</td>
+<td style="text-align: right;">14.15</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="odd">
+<td><code>brief-2</code></td>
+<td style="text-align: right;">79</td>
+<td style="text-align: right;">5:31:42</td>
+<td style="text-align: right;">14.11</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="even">
+<td><code>brief-68</code></td>
+<td style="text-align: right;">51</td>
+<td style="text-align: right;">3:37:05</td>
+<td style="text-align: right;">13.82</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="odd">
+<td><code>brief-55</code></td>
+<td style="text-align: right;">69</td>
+<td style="text-align: right;">4:57:02</td>
+<td style="text-align: right;">13.74</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="even">
+<td><code>brief-40</code></td>
+<td style="text-align: right;">28</td>
+<td style="text-align: right;">1:58:18</td>
+<td style="text-align: right;">13.69</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="odd">
+<td><code>brief-73</code></td>
+<td style="text-align: right;">34</td>
+<td style="text-align: right;">2:24:57</td>
+<td style="text-align: right;">13.66</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="even">
+<td><code>brief-11</code></td>
+<td style="text-align: right;">41</td>
+<td style="text-align: right;">2:56:05</td>
+<td style="text-align: right;">13.63</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="odd">
+<td><code>brief-78</code></td>
+<td style="text-align: right;">41</td>
+<td style="text-align: right;">2:59:59</td>
+<td style="text-align: right;">13.33</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="even">
+<td><code>brief-42</code></td>
+<td style="text-align: right;">12</td>
+<td style="text-align: right;">0:49:36</td>
+<td style="text-align: right;">13.30</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="odd">
+<td><code>brief-35</code></td>
+<td style="text-align: right;">16</td>
+<td style="text-align: right;">1:07:51</td>
+<td style="text-align: right;">13.26</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="even">
+<td><code>brief-81</code></td>
+<td style="text-align: right;">33</td>
+<td style="text-align: right;">2:25:03</td>
+<td style="text-align: right;">13.24</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="odd">
+<td><code>brief-63</code></td>
+<td style="text-align: right;">73</td>
+<td style="text-align: right;">5:30:30</td>
+<td style="text-align: right;">13.07</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="even">
+<td><code>brief-30</code></td>
+<td style="text-align: right;">48</td>
+<td style="text-align: right;">3:36:07</td>
+<td style="text-align: right;">13.05</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="odd">
+<td><code>brief-82</code></td>
+<td style="text-align: right;">43</td>
+<td style="text-align: right;">3:13:12</td>
+<td style="text-align: right;">13.04</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="even">
+<td><code>brief-9</code></td>
+<td style="text-align: right;">9</td>
+<td style="text-align: right;">0:37:02</td>
+<td style="text-align: right;">12.96</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="odd">
+<td><code>brief-7</code></td>
+<td style="text-align: right;">53</td>
+<td style="text-align: right;">4:00:57</td>
+<td style="text-align: right;">12.95</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="even">
+<td><code>brief-64</code></td>
+<td style="text-align: right;">54</td>
+<td style="text-align: right;">4:05:42</td>
+<td style="text-align: right;">12.94</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="odd">
+<td><code>brief-57</code></td>
+<td style="text-align: right;">67</td>
+<td style="text-align: right;">5:07:41</td>
+<td style="text-align: right;">12.87</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="even">
+<td><code>brief-37</code></td>
+<td style="text-align: right;">4</td>
+<td style="text-align: right;">0:14:01</td>
+<td style="text-align: right;">12.84</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="odd">
+<td><code>brief-3</code></td>
+<td style="text-align: right;">33</td>
+<td style="text-align: right;">2:31:51</td>
+<td style="text-align: right;">12.64</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="even">
+<td><code>brief-67</code></td>
+<td style="text-align: right;">67</td>
+<td style="text-align: right;">5:13:53</td>
+<td style="text-align: right;">12.62</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="odd">
+<td><code>brief-1</code></td>
+<td style="text-align: right;">47</td>
+<td style="text-align: right;">3:43:37</td>
+<td style="text-align: right;">12.34</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="even">
+<td><code>brief-16</code></td>
+<td style="text-align: right;">9</td>
+<td style="text-align: right;">0:38:59</td>
+<td style="text-align: right;">12.31</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="odd">
+<td><code>brief-80</code></td>
+<td style="text-align: right;">39</td>
+<td style="text-align: right;">3:05:10</td>
+<td style="text-align: right;">12.31</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="even">
+<td><code>brief-72</code></td>
+<td style="text-align: right;">37</td>
+<td style="text-align: right;">2:56:42</td>
+<td style="text-align: right;">12.22</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="odd">
+<td><code>brief-74</code></td>
+<td style="text-align: right;">9</td>
+<td style="text-align: right;">0:39:34</td>
+<td style="text-align: right;">12.13</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="even">
+<td><code>brief-71</code></td>
+<td style="text-align: right;">31</td>
+<td style="text-align: right;">2:29:26</td>
+<td style="text-align: right;">12.05</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="odd">
+<td><code>brief-79</code></td>
+<td style="text-align: right;">40</td>
+<td style="text-align: right;">3:18:29</td>
+<td style="text-align: right;">11.79</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="even">
+<td><code>brief-76</code></td>
+<td style="text-align: right;">24</td>
+<td style="text-align: right;">1:57:22</td>
+<td style="text-align: right;">11.76</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="odd">
+<td><code>brief-34</code></td>
+<td style="text-align: right;">13</td>
+<td style="text-align: right;">1:02:03</td>
+<td style="text-align: right;">11.60</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="even">
+<td><code>brief-32</code></td>
+<td style="text-align: right;">27</td>
+<td style="text-align: right;">2:15:13</td>
+<td style="text-align: right;">11.54</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="odd">
+<td><code>brief-54</code></td>
+<td style="text-align: right;">12</td>
+<td style="text-align: right;">0:57:23</td>
+<td style="text-align: right;">11.50</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="even">
+<td><code>brief-0</code></td>
+<td style="text-align: right;">40</td>
+<td style="text-align: right;">3:26:30</td>
+<td style="text-align: right;">11.33</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="odd">
+<td><code>brief-61</code></td>
+<td style="text-align: right;">82</td>
+<td style="text-align: right;">7:17:17</td>
+<td style="text-align: right;">11.11</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="even">
+<td><code>brief-4</code></td>
+<td style="text-align: right;">58</td>
+<td style="text-align: right;">5:08:42</td>
+<td style="text-align: right;">11.08</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="odd">
+<td><code>brief-14</code></td>
+<td style="text-align: right;">16</td>
+<td style="text-align: right;">1:21:42</td>
+<td style="text-align: right;">11.02</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="even">
+<td><code>brief-60</code></td>
+<td style="text-align: right;">24</td>
+<td style="text-align: right;">2:05:52</td>
+<td style="text-align: right;">10.96</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="odd">
+<td><code>brief-58</code></td>
+<td style="text-align: right;">12</td>
+<td style="text-align: right;">1:00:45</td>
+<td style="text-align: right;">10.86</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="even">
+<td><code>brief-62</code></td>
+<td style="text-align: right;">46</td>
+<td style="text-align: right;">4:10:39</td>
+<td style="text-align: right;">10.77</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="odd">
+<td><code>brief-91</code></td>
+<td style="text-align: right;">83</td>
+<td style="text-align: right;">7:37:20</td>
+<td style="text-align: right;">10.76</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="even">
+<td><code>brief-92</code></td>
+<td style="text-align: right;">56</td>
+<td style="text-align: right;">5:19:47</td>
+<td style="text-align: right;">10.32</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="odd">
+<td><code>brief-45</code></td>
+<td style="text-align: right;">49</td>
+<td style="text-align: right;">4:47:42</td>
+<td style="text-align: right;">10.01</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="even">
+<td><code>brief-26</code></td>
+<td style="text-align: right;">2</td>
+<td style="text-align: right;">0:06:21</td>
+<td style="text-align: right;">9.45</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="odd">
+<td><code>brief-24</code></td>
+<td style="text-align: right;">4</td>
+<td style="text-align: right;">0:20:24</td>
+<td style="text-align: right;">8.82</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="even">
+<td><code>brief-22</code></td>
+<td style="text-align: right;">2</td>
+<td style="text-align: right;">0:07:59</td>
+<td style="text-align: right;">7.52</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="odd">
+<td><code>brief-18</code></td>
+<td style="text-align: right;">2</td>
+<td style="text-align: right;">0:08:00</td>
+<td style="text-align: right;">7.50</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="even">
+<td><code>brief-93</code></td>
+<td style="text-align: right;">12</td>
+<td style="text-align: right;">1:39:27</td>
+<td style="text-align: right;">6.64</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="odd">
+<td><code>brief-48</code></td>
+<td style="text-align: right;">2</td>
+<td style="text-align: right;">0:09:12</td>
+<td style="text-align: right;">6.53</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="even">
+<td><code>brief-89</code></td>
+<td style="text-align: right;">47</td>
+<td style="text-align: right;">7:22:22</td>
+<td style="text-align: right;">6.24</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="odd">
+<td><code>brief-20</code></td>
+<td style="text-align: right;">0*</td>
+<td style="text-align: right;">0:00:00*</td>
+<td style="text-align: right;">0.00*</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="even">
+<td><code>brief-21</code></td>
+<td style="text-align: right;">0*</td>
+<td style="text-align: right;">0:00:00*</td>
+<td style="text-align: right;">0.00*</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+<tr class="odd">
+<td><code>brief-94</code></td>
+<td style="text-align: right;">0*</td>
+<td style="text-align: right;">0:00:00*</td>
+<td style="text-align: right;">0.00*</td>
+<td style="text-align: right;">+0.00</td>
+</tr>
+</tbody>
+</table>
+<p><code>*</code> Each marked branch contains one trial row. The data
+builder reports zero because it requires two timestamps to derive an
+inter-trial duration.</p>
+<h2 id="gaps-and-stalls">Gaps And Stalls</h2>
+<p><strong>Brief 0:</strong> Three gaps, longest 786s between trials 37
+and 38. The harness remained active with no silence over 14s, so this
+was an edit/build/measurement cycle rather than an agent stall.</p>
+<p><strong>Brief 1:</strong> Four gaps, longest 961s between trials 17
+and 18. It crosses a <code>brief_stop</code>/<code>brief_start</code>
+boundary and one compaction; the manager recovered the first completion
+and restarted the worker.</p>
+<p><strong>Brief 2:</strong> Three gaps, longest 657s between trials 45
+and 46. Harness activity continued at intervals under 18s while the
+worker implemented and measured the next variant.</p>
+<p><strong>Brief 3:</strong> One 794s gap between trials 19 and 20. It
+crosses a stop/restart and compaction, with a 259s replacement pause
+before work resumed.</p>
+<p><strong>Brief 4:</strong> One 4,282s gap between trials 34 and 35.
+This is a deliberate branch pause, not fleet idleness: 43.958s after
+brief 4 notified completion, the manager filled its slot with brief 7,
+then resumed brief 4 when a later slot became available.</p>
+<p><strong>Brief 5:</strong> One 737s gap between runtime-error trial 26
+and successful trial 27. Dense harness activity shows debugging,
+rebuild, and revalidation rather than silence.</p>
+<p><strong>Brief 6:</strong> One 720s gap between trials 18 and 19. The
+worker remained active throughout the compile/validation cycle; no
+paired lock call explains it.</p>
+<p><strong>Brief 7:</strong> Two gaps, longest 922s between trials 9 and
+10. A 440s exclusive GPU wait explains nearly half of the longest
+transition.</p>
+<p><strong>Brief 8:</strong> One 670s gap between trials 42 and 43.
+Matched lock records account for 78s waiting and 80s running; the
+remainder is active edit and validation work.</p>
+<p><strong>Brief 11:</strong> One 691s gap between trials 35 and 36.
+Harness activity continued at least every 38s through implementation and
+measurement.</p>
+<p><strong>Brief 14:</strong> Two gaps, longest 731s between trials 3
+and 4. Two matched calls account for 216s of queue wait and 50s of
+execution.</p>
+<p><strong>Brief 25:</strong> One 644s gap between trials 19 and 20. It
+crosses a completion and immediate manager continuation, adding setup
+and revalidation overhead.</p>
+<p><strong>Brief 30:</strong> One 614s gap between trials 14 and 15. It
+includes a compaction and a 119s lock wait, then continued
+measurement.</p>
+<p><strong>Brief 32:</strong> One 1,208s gap between trials 6 and 7. It
+crosses a stop/restart; harness silence peaks at 328s before the
+continuation becomes active.</p>
+<p><strong>Brief 35:</strong> One 627s gap between trials 0 and 1. The
+harness was active at intervals under 35s while building and validating
+the second variant.</p>
+<p><strong>Brief 45:</strong> Seven gaps, longest 1,577s between trials
+15 and 16. The trace remains active at intervals under 60s, indicating
+long implementation, build, and benchmark work rather than an idle
+worker.</p>
+<p><strong>Brief 49:</strong> Two gaps, longest 1,302s between trials 34
+and 35. It includes a compaction plus 144s of matched wait and 42s of
+resource execution.</p>
+<p><strong>Brief 54:</strong> One 608s gap between trials 4 and 5. The
+worker remained active, with no harness silence longer than 84s.</p>
+<p><strong>Brief 55:</strong> Two gaps, longest 803s between
+validation-error trials 66 and 67. Dense records show continued
+diagnosis and validation work.</p>
+<p><strong>Brief 57:</strong> Four gaps, longest 879s between trials 50
+and 51. It crosses a stop/restart, and matched calls add 150s of wait
+and 125s of execution.</p>
+<p><strong>Brief 58:</strong> Two gaps, longest 716s between trials 2
+and 3. The gap crosses a completion and manager continuation; the
+harness restarted promptly.</p>
+<p><strong>Brief 60:</strong> One 1,423s gap between trials 3 and 4. It
+crosses a stop/restart and includes a 510s replacement pause before
+active continuation work.</p>
+<p><strong>Brief 61:</strong> Seven gaps, longest 1,120s between trials
+74 and 75. Four matched calls contribute 218s of wait and 247s of
+execution, with active work filling the remainder.</p>
+<p><strong>Brief 62:</strong> Three gaps, longest 954s between trials 14
+and 15. It crosses a stop/restart and compaction; matched calls add 41s
+of wait and 88s of execution.</p>
+<p><strong>Brief 63:</strong> Three gaps, longest 1,036s between trials
+50 and 51. It crosses a completion, restart, and compaction, but the
+worker becomes active again within 54s.</p>
+<p><strong>Brief 64:</strong> One 981s gap between trials 6 and 7. It
+crosses a stop/restart and contains a 465s replacement pause.</p>
+<p><strong>Brief 67:</strong> Two gaps, longest 764s between trials 49
+and 50. It crosses a stop/restart; the matched GPU call waited 58s.</p>
+<p><strong>Brief 71:</strong> Three gaps, longest 1,081s between trials
+21 and 22. One compaction occurred, but harness activity continued at
+intervals under 35s through the experiment cycle.</p>
+<p><strong>Brief 72:</strong> One 699s gap between trials 11 and 12.
+Dense harness activity shows sustained implementation and measurement
+rather than unexplained silence.</p>
+<p><strong>Brief 73:</strong> One 751s gap between successful trial 7
+and runtime-error trial 8. The worker stayed active while executing the
+failing variant.</p>
+<p><strong>Brief 74:</strong> One 803s gap between trials 6 and 7. Nine
+matched calls account for 454s waiting and 190s running, explaining most
+of the transition.</p>
+<p><strong>Brief 76:</strong> One 941s gap between trials 18 and 19.
+Harness records remain dense, with no silence over 13s, so this was
+active tool and benchmark time.</p>
+<p><strong>Brief 79:</strong> One 643s gap between trials 32 and 33. The
+worker remained active at intervals under 33s throughout the cycle.</p>
+<p><strong>Brief 81:</strong> Three gaps, longest 804s between trials 13
+and 14. Dense harness activity indicates continued implementation and
+validation.</p>
+<p><strong>Brief 82:</strong> One 1,017s gap between trials 36 and 37.
+The harness stayed active at intervals under 43s while working through
+the native-kernel experiment.</p>
+<p><strong>Brief 89:</strong> Seven gaps, longest 9,307s between trials
+34 and 35. It includes a 71.2s stop/restart turnover; outside that
+boundary the trace remained dense, with no observed event gap over 65s
+during the long two-stage implementation and measurement cycle.</p>
+<p><strong>Brief 90:</strong> Two gaps, longest 755s between trials 19
+and 20. The harness remained active at intervals under 75s while
+diagnosing the validation error.</p>
+<p><strong>Brief 91:</strong> Eleven gaps, longest 1,813s between trials
+58 and 59. It crosses a stop/restart; four matched calls account for
+258s waiting and 701s running.</p>
+<p><strong>Brief 92:</strong> Seven gaps, longest 1,426s between trials
+22 and 23. The worker remained active at intervals under 51s through a
+long algorithm, build, and benchmark cycle.</p>
+<p><strong>Brief 93:</strong> Three gaps, longest 749s between
+validation-error trials 1 and 2. Harness activity continued at intervals
+under 35s; these cached-output trials were later invalidated for reward
+hacking.</p>
+<h2 id="early-termination-attempts">Early-Termination Attempts</h2>
+<p>The harness contains 172 completion outputs. Final completion for
+each of 95 branches is expected; the 77 pre-final outputs below are
+counted because each was followed by later activity on the same branch.
+This establishes repeated completion/resume cycles, not that every
+earlier completion judgment was necessarily incorrect. No worker asked
+whether it should keep going.</p>
+<table>
+<thead>
+<tr class="header">
+<th>Branch</th>
+<th style="text-align: right;">Attempts</th>
+<th>Trial numbers</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>brief-0</code></td>
+<td style="text-align: right;">2</td>
+<td>20, 35</td>
+</tr>
+<tr class="even">
+<td><code>brief-1</code></td>
+<td style="text-align: right;">2</td>
+<td>17, 26</td>
+</tr>
+<tr class="odd">
+<td><code>brief-2</code></td>
+<td style="text-align: right;">2</td>
+<td>22, 50</td>
+</tr>
+<tr class="even">
+<td><code>brief-3</code></td>
+<td style="text-align: right;">1</td>
+<td>19</td>
+</tr>
+<tr class="odd">
+<td><code>brief-4</code></td>
+<td style="text-align: right;">1</td>
+<td>34</td>
+</tr>
+<tr class="even">
+<td><code>brief-5</code></td>
+<td style="text-align: right;">1</td>
+<td>28</td>
+</tr>
+<tr class="odd">
+<td><code>brief-7</code></td>
+<td style="text-align: right;">1</td>
+<td>29</td>
+</tr>
+<tr class="even">
+<td><code>brief-13</code></td>
+<td style="text-align: right;">1</td>
+<td>39</td>
+</tr>
+<tr class="odd">
+<td><code>brief-25</code></td>
+<td style="text-align: right;">1</td>
+<td>19</td>
+</tr>
+<tr class="even">
+<td><code>brief-30</code></td>
+<td style="text-align: right;">1</td>
+<td>21</td>
+</tr>
+<tr class="odd">
+<td><code>brief-32</code></td>
+<td style="text-align: right;">3</td>
+<td>6, 13, 20</td>
+</tr>
+<tr class="even">
+<td><code>brief-33</code></td>
+<td style="text-align: right;">1</td>
+<td>7</td>
+</tr>
+<tr class="odd">
+<td><code>brief-34</code></td>
+<td style="text-align: right;">1</td>
+<td>5</td>
+</tr>
+<tr class="even">
+<td><code>brief-45</code></td>
+<td style="text-align: right;">3</td>
+<td>14, 30, 39</td>
+</tr>
+<tr class="odd">
+<td><code>brief-49</code></td>
+<td style="text-align: right;">4</td>
+<td>16, 24, 37, 44</td>
+</tr>
+<tr class="even">
+<td><code>brief-53</code></td>
+<td style="text-align: right;">2</td>
+<td>13, 24</td>
+</tr>
+<tr class="odd">
+<td><code>brief-55</code></td>
+<td style="text-align: right;">2</td>
+<td>39, 59</td>
+</tr>
+<tr class="even">
+<td><code>brief-57</code></td>
+<td style="text-align: right;">4</td>
+<td>13, 26, 50, 61</td>
+</tr>
+<tr class="odd">
+<td><code>brief-58</code></td>
+<td style="text-align: right;">2</td>
+<td>2, 6</td>
+</tr>
+<tr class="even">
+<td><code>brief-60</code></td>
+<td style="text-align: right;">2</td>
+<td>3, 9</td>
+</tr>
+<tr class="odd">
+<td><code>brief-61</code></td>
+<td style="text-align: right;">3</td>
+<td>27, 45, 67</td>
+</tr>
+<tr class="even">
+<td><code>brief-62</code></td>
+<td style="text-align: right;">2</td>
+<td>14, 31</td>
+</tr>
+<tr class="odd">
+<td><code>brief-63</code></td>
+<td style="text-align: right;">3</td>
+<td>19, 50, 60</td>
+</tr>
+<tr class="even">
+<td><code>brief-64</code></td>
+<td style="text-align: right;">4</td>
+<td>6, 16, 34, 49</td>
+</tr>
+<tr class="odd">
+<td><code>brief-67</code></td>
+<td style="text-align: right;">4</td>
+<td>17, 27, 34, 49</td>
+</tr>
+<tr class="even">
+<td><code>brief-68</code></td>
+<td style="text-align: right;">3</td>
+<td>7, 19, 28</td>
+</tr>
+<tr class="odd">
+<td><code>brief-69</code></td>
+<td style="text-align: right;">4</td>
+<td>6, 11, 18, 26</td>
+</tr>
+<tr class="even">
+<td><code>brief-70</code></td>
+<td style="text-align: right;">1</td>
+<td>12</td>
+</tr>
+<tr class="odd">
+<td><code>brief-71</code></td>
+<td style="text-align: right;">2</td>
+<td>10, 22</td>
+</tr>
+<tr class="even">
+<td><code>brief-72</code></td>
+<td style="text-align: right;">1</td>
+<td>14</td>
+</tr>
+<tr class="odd">
+<td><code>brief-73</code></td>
+<td style="text-align: right;">1</td>
+<td>26</td>
+</tr>
+<tr class="even">
+<td><code>brief-76</code></td>
+<td style="text-align: right;">1</td>
+<td>13</td>
+</tr>
+<tr class="odd">
+<td><code>brief-79</code></td>
+<td style="text-align: right;">1</td>
+<td>27</td>
+</tr>
+<tr class="even">
+<td><code>brief-81</code></td>
+<td style="text-align: right;">2</td>
+<td>8, 21</td>
+</tr>
+<tr class="odd">
+<td><code>brief-89</code></td>
+<td style="text-align: right;">2</td>
+<td>21, 34</td>
+</tr>
+<tr class="even">
+<td><code>brief-90</code></td>
+<td style="text-align: right;">1</td>
+<td>18</td>
+</tr>
+<tr class="odd">
+<td><code>brief-91</code></td>
+<td style="text-align: right;">3</td>
+<td>8, 36, 58</td>
+</tr>
+<tr class="even">
+<td><code>brief-92</code></td>
+<td style="text-align: right;">1</td>
+<td>21</td>
+</tr>
+<tr class="odd">
+<td><code>brief-93</code></td>
+<td style="text-align: right;">1</td>
+<td>5</td>
+</tr>
+</tbody>
+</table>
+<h2 id="other-aberrant-behavior">Other Aberrant Behavior</h2>
+<ul>
+<li>Briefs 20, 21, and 94 each contain one trial, but the behavior CSV
+reports zero trials and zero duration because the data builder requires
+at least two trial timestamps. The logs contain 2,604 trial rows versus
+the CSV’s 2,601.</li>
+<li>Five trial rows contain non-existent manually expanded full SHAs:
+brief 24 trial 0, brief 31 trial 16, brief 49 trial 46, brief 59 trial
+0, and brief 78 trial 0. Four are explicitly corrected in a later row or
+stop record; brief 31’s logged prefix <code>e2882498a</code> resolves to
+actual commit <code>e2882498af9eb8a580bd1e771d5e422fc51bb724</code>, not
+the recorded full string.</li>
+<li>Briefs 9 and 49 each contain one unmatched extra
+<code>brief_stop</code> lifecycle row. Trial numbering is otherwise
+contiguous and timestamps are monotonic.</li>
+<li>Briefs 82, 85, and 86 were interrupted together at about 00:56 UTC.
+All three turns resumed within 36s and no trial row was skipped.</li>
+<li>The current
+<code>autocuda schema check log --skill optimize-tree-brief</code>
+expects <code>linalg/qr_v2</code> from the present data-directory schema
+and therefore rejects all run logs’ consistent
+<code>linalg/eigh_py</code> header. The behavior CSV itself passes its
+required schema check.</li>
+<li>Briefs 93 and 94 are post-run invalidated for cached-output reward
+hacking. Their rows remain relevant to worker cadence but not to
+performance claims.</li>
+<li>The worker-only lock totals exclude 216 unmatched acquire/release
+markers and are conservative; no wait or run duration was invented to
+fill missing sides. The earlier parser missed list-shaped Codex tool
+outputs and materially undercounted both calls and wait time.</li>
+</ul>
+<h2 id="analysis">Analysis</h2>
+<p>The CSV lifecycle rows cover three simultaneous brief intervals for
+90.7% of elapsed time, but this must not be reported as fleet occupancy.
+Brief 89 proves that a worker can remain active throughout an apparent
+stop/start deficit, while brief 4 proves that a paused branch can be
+replaced promptly by a different brief. Seventy-seven pre-final
+completion outputs across 39 branches were followed by later work; the
+report does not quantify how much of that continuation work was
+avoidable overhead.</p>
+<p>Long trial gaps usually do not mean idle capacity. Harness records
+remain dense in most long branch gaps, and corrected lock calls explain
+material portions of many transitions. Brief 89’s 155-minute transition
+reflects active implementation, validation, and benchmark work. Brief
+4’s branch-local silence reflects reassignment of that fleet slot
+followed by a later resume, not a 3,916-second replacement failure.</p>
+<p>Single-GPU contention is substantial: the conservative worker-only
+matched wait total is 59.28 hours, 29.8% of paired lifecycle-active
+time. The remainder is not sufficiently categorized to rank continuation
+churn, inference, editing, build execution, and experiment runtime
+against one another. Cross-branch rate spread is also a weak stability
+proxy: the apparent 0.00-63.53 range is dominated by one- to three-trial
+branches, and one run provides no cross-run variance estimate.</p>
+<p><strong>Recommendations:</strong> require an explicit open-directions
+check before <code>task_complete</code>, and measure
+notification-to-dispatch latency directly rather than inferring
+occupancy from branch logs. Preserve three workers, but schedule long
+profiling calls so exclusive GPU work is staggered. Fix the behavior
+builder’s list-shaped tool-output parser and one-trial case, make log
+schema selection tag-local, and have the logger resolve commit SHAs
+itself instead of accepting manual full-hash expansion. See the
+dedicated waiting and timeout report for manager cadence, worker
+continuation, lock, and hard-deadline recommendations.</p>
+<script type="module">import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs'; mermaid.initialize({startOnLoad:true, theme:'default'});</script>
+</body>
+</html>

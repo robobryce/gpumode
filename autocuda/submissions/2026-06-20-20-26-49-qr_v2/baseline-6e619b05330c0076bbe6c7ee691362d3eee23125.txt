@@ -1,0 +1,243 @@
+leaderboard-submit: problem=linalg/qr_v2 leaderboard=qr_v2 gpu=B200 mode=leaderboard commit=6e619b05330c0076bbe6c7ee691362d3eee23125
+Submitting to leaderboard: qr_v2
+GPU: B200
+Mode: leaderboard
+File: /home/shadeform/gpumode/problems/linalg/qr_v2/submission.py
+
+Waiting for results...
+{"status": "processing", "elapsed_time": 0.0}
+{"status": "processing", "elapsed_time": 15.0}
+{"status": "processing", "elapsed_time": 30.0}
+{"status": "processing", "elapsed_time": 45.01}
+{"status": "processing", "elapsed_time": 60.01}
+{"status": "processing", "elapsed_time": 75.01}
+{"status": "processing", "elapsed_time": 90.01}
+{"status": "processing", "elapsed_time": 105.01}
+{"status": "processing", "elapsed_time": 120.01}
+{"status": "processing", "elapsed_time": 135.01}
+{"status": "processing", "elapsed_time": 150.01}
+{"status": "processing", "elapsed_time": 165.02}
+{"status": "processing", "elapsed_time": 180.02}
+
+"**B200 on Modal ✅ success**
+> ✅ Waiting for modal run to finish... Done
+> ✅ Testing successful
+> ✅ Benchmarking successful
+> ✅ Leaderboard run successful
+
+Running on:
+* GPU: `NVIDIA B200`
+* CPU: `GenuineIntel`
+* Device count: `1`
+* Runtime: `CUDA`
+* Platform: `Linux-4.19.0-gvisor-x86_64-with-glibc2.39`
+* Torch: `2.12.0+cu130`
+* Hostname: `modal`
+
+
+## ✅ Passed 22/22 tests:
+```
+✅ n: 32; cond: 1; seed: 53124; batch: 20
+> factor_rtol=7.63e-05; orth_rtol=0.000381; scaled_factor_residual=0.0977; scaled_reconstruction_residual=0.043; scaled_triangular_residual=0.0873; scaled_orthogonality_residual=1.11; batch=20; n=32
+✅ n: 176; cond: 1; seed: 3321; batch: 40
+> factor_rtol=0.00042; orth_rtol=0.0021; scaled_factor_residual=0.0332; scaled_reconstruction_residual=0.0132; scaled_triangular_residual=0.0306; scaled_orthogonality_residual=0.571; batch=40; n=176
+✅ n: 352; cond: 1; seed: 1200; batch: 40
+> factor_rtol=0.000839; orth_rtol=0.0042; scaled_factor_residual=0.0174; scaled_reconstruction_residual=0.00818; scaled_triangular_residual=0.016; scaled_orthogonality_residual=0.469; batch=40; n=352
+✅ n: 512; cond: 2; seed: 32523; batch: 16
+> factor_rtol=0.00122; orth_rtol=0.0061; scaled_factor_residual=0.00854; scaled_reconstruction_residual=0.00276; scaled_triangular_residual=0.0081; scaled_orthogonality_residual=0.403; batch=16; n=512
+✅ n: 1024; cond: 2; seed: 4327; batch: 4
+> factor_rtol=0.00244; orth_rtol=0.0122; scaled_factor_residual=0.00369; scaled_reconstruction_residual=0.00165; scaled_triangular_residual=0.00359; scaled_orthogonality_residual=0.252; batch=4; n=1024
+✅ n: 4096; cond: 1; seed: 75342; batch: 1
+> factor_rtol=0.00977; orth_rtol=0.0488; scaled_factor_residual=0.00229; scaled_reconstruction_residual=0.00174; scaled_triangular_residual=0.00216; scaled_orthogonality_residual=0.16; batch=1; n=4096
+✅ n: 512; case: dense; cond: 4; seed: 32524; batch: 16
+> factor_rtol=0.00122; orth_rtol=0.0061; scaled_factor_residual=0.00826; scaled_reconstruction_residual=0.00219; scaled_triangular_residual=0.00738; scaled_orthogonality_residual=0.397; batch=16; n=512
+✅ n: 512; case: rankdef; cond: 0; seed: 32525; batch: 16
+> factor_rtol=0.00122; orth_rtol=0.0061; scaled_factor_residual=0.0118; scaled_reconstruction_residual=0.0137; scaled_triangular_residual=0.00968; scaled_orthogonality_residual=0.292; batch=16; n=512
+✅ n: 512; case: clustered; cond: 0; seed: 32526; batch: 16
+> factor_rtol=0.00122; orth_rtol=0.0061; scaled_factor_residual=0.0109; scaled_reconstruction_residual=0.0104; scaled_triangular_residual=0.0093; scaled_orthogonality_residual=0.387; batch=16; n=512
+✅ n: 512; case: band; cond: 0; seed: 32527; batch: 16
+> factor_rtol=0.00122; orth_rtol=0.0061; scaled_factor_residual=0.0185; scaled_reconstruction_residual=0.018; scaled_triangular_residual=0.0145; scaled_orthogonality_residual=0.519; batch=16; n=512
+✅ n: 512; case: rowscale; cond: 0; seed: 32528; batch: 16
+> factor_rtol=0.00122; orth_rtol=0.0061; scaled_factor_residual=0.019; scaled_reconstruction_residual=0.0234; scaled_triangular_residual=0.0123; scaled_orthogonality_residual=0.419; batch=16; n=512
+✅ n: 512; case: nearcollinear; cond: 0; seed: 32529; batch: 16
+> factor_rtol=0.00122; orth_rtol=0.0061; scaled_factor_residual=0.0141; scaled_reconstruction_residual=0.0149; scaled_triangular_residual=0.00845; scaled_orthogonality_residual=0.398; batch=16; n=512
+✅ n: 1024; case: dense; cond: 4; seed: 4328; batch: 4
+> factor_rtol=0.00244; orth_rtol=0.0122; scaled_factor_residual=0.00354; scaled_reconstruction_residual=0.00123; scaled_triangular_residual=0.00336; scaled_orthogonality_residual=0.256; batch=4; n=1024
+✅ n: 1024; case: rankdef; cond: 0; seed: 4329; batch: 4
+> factor_rtol=0.00244; orth_rtol=0.0122; scaled_factor_residual=0.00551; scaled_reconstruction_residual=0.00609; scaled_triangular_residual=0.00378; scaled_orthogonality_residual=0.183; batch=4; n=1024
+✅ n: 1024; case: nearrank; cond: 0; seed: 4330; batch: 4
+> factor_rtol=0.00244; orth_rtol=0.0122; scaled_factor_residual=0.00557; scaled_reconstruction_residual=0.00626; scaled_triangular_residual=0.00409; scaled_orthogonality_residual=0.252; batch=4; n=1024
+✅ n: 1024; case: clustered; cond: 0; seed: 4331; batch: 4
+> factor_rtol=0.00244; orth_rtol=0.0122; scaled_factor_residual=0.00488; scaled_reconstruction_residual=0.0049; scaled_triangular_residual=0.00395; scaled_orthogonality_residual=0.254; batch=4; n=1024
+✅ n: 2048; case: dense; cond: 2; seed: 224466; batch: 2
+> factor_rtol=0.00488; orth_rtol=0.0244; scaled_factor_residual=0.00225; scaled_reconstruction_residual=0.00167; scaled_triangular_residual=0.00221; scaled_orthogonality_residual=0.178; batch=2; n=2048
+✅ n: 2048; case: rankdef; cond: 0; seed: 224467; batch: 2
+> factor_rtol=0.00488; orth_rtol=0.0244; scaled_factor_residual=0.00409; scaled_reconstruction_residual=0.00414; scaled_triangular_residual=0.0027; scaled_orthogonality_residual=0.116; batch=2; n=2048
+✅ n: 4096; case: upper; cond: 0; seed: 75343; batch: 1
+> factor_rtol=0.00977; orth_rtol=0.0488; scaled_factor_residual=0; scaled_reconstruction_residual=0; scaled_triangular_residual=0; scaled_orthogonality_residual=0; batch=1; n=4096
+✅ n: 512; case: mixed; cond: 2; seed: 32530; batch: 16
+> factor_rtol=0.00122; orth_rtol=0.0061; scaled_factor_residual=0.0185; scaled_reconstruction_residual=0.0105; scaled_triangular_residual=0.00913; scaled_orthogonality_residual=0.396; batch=16; n=512
+✅ n: 1024; case: mixed; cond: 2; seed: 4332; batch: 4
+> factor_rtol=0.00244; orth_rtol=0.0122; scaled_factor_residual=0.00392; scaled_reconstruction_residual=0.00163; scaled_triangular_residual=0.00382; scaled_orthogonality_residual=0.256; batch=4; n=1024
+✅ n: 2048; case: mixed; cond: 2; seed: 224468; batch: 2
+> factor_rtol=0.00488; orth_rtol=0.0244; scaled_factor_residual=0.00206; scaled_reconstruction_residual=0.00169; scaled_triangular_residual=0.00203; scaled_orthogonality_residual=0.178; batch=2; n=2048```
+
+## Benchmarks:
+```
+n: 32; cond: 1; seed: 43214; batch: 20
+ ⏱ 322 ± 0.0 µs
+ ⚡ 322 µs 🐌 322 µs
+
+n: 176; cond: 1; seed: 423011; batch: 40
+ ⏱ 21.7 ± 0.00 ms
+ ⚡ 21.7 ms 🐌 21.7 ms
+
+n: 352; cond: 1; seed: 123456; batch: 40
+ ⏱ 49.8 ± 0.03 ms
+ ⚡ 49.7 ms 🐌 49.8 ms
+
+n: 512; cond: 2; seed: 1029; batch: 640
+ ⏱ 1067 ± 0.0 ms
+ ⚡ 1067 ms 🐌 1067 ms
+
+n: 1024; cond: 2; seed: 75342; batch: 60
+ ⏱ 239 ± 0.0 ms
+ ⚡ 239 ms 🐌 239 ms
+
+n: 2048; cond: 1; seed: 224466; batch: 8
+ ⏱ 76.8 ± 0.06 ms
+ ⚡ 76.7 ms 🐌 77.0 ms
+
+n: 4096; cond: 1; seed: 32412; batch: 2
+ ⏱ 52.1 ± 0.01 ms
+ ⚡ 52.1 ms 🐌 52.1 ms
+
+n: 512; case: mixed; cond: 2; seed: 770001; batch: 640
+ ⏱ 1072 ± 0.0 ms
+ ⚡ 1072 ms 🐌 1072 ms
+
+n: 1024; case: mixed; cond: 2; seed: 770002; batch: 60
+ ⏱ 238 ± 0.0 ms
+ ⚡ 238 ms 🐌 238 ms
+
+n: 512; case: rankdef; cond: 0; seed: 770003; batch: 640
+ ⏱ 1064 ± 0.0 ms
+ ⚡ 1064 ms 🐌 1064 ms
+
+n: 512; case: clustered; cond: 0; seed: 770004; batch: 640
+ ⏱ 1067 ± 0.1 ms
+ ⚡ 1067 ms 🐌 1067 ms
+
+n: 1024; case: nearrank; cond: 0; seed: 770005; batch: 60
+ ⏱ 239 ± 0.0 ms
+ ⚡ 239 ms 🐌 239 ms
+```
+
+## Ranked Benchmark:
+```
+n: 32; cond: 1; seed: 43214; batch: 20
+ ⏱ 323 ± 0.0 µs
+ ⚡ 323 µs 🐌 323 µs
+
+n: 176; cond: 1; seed: 423011; batch: 40
+ ⏱ 21.7 ± 0.00 ms
+ ⚡ 21.7 ms 🐌 21.7 ms
+
+n: 352; cond: 1; seed: 123456; batch: 40
+ ⏱ 49.8 ± 0.01 ms
+ ⚡ 49.7 ms 🐌 49.8 ms
+
+n: 512; cond: 2; seed: 1029; batch: 640
+ ⏱ 1067 ± 0.1 ms
+ ⚡ 1067 ms 🐌 1067 ms
+
+n: 1024; cond: 2; seed: 75342; batch: 60
+ ⏱ 239 ± 0.0 ms
+ ⚡ 239 ms 🐌 239 ms
+
+n: 2048; cond: 1; seed: 224466; batch: 8
+ ⏱ 76.8 ± 0.05 ms
+ ⚡ 76.7 ms 🐌 76.9 ms
+
+n: 4096; cond: 1; seed: 32412; batch: 2
+ ⏱ 52.2 ± 0.01 ms
+ ⚡ 52.2 ms 🐌 52.2 ms
+
+n: 512; case: mixed; cond: 2; seed: 770001; batch: 640
+ ⏱ 1069 ± 0.0 ms
+ ⚡ 1069 ms 🐌 1069 ms
+
+n: 1024; case: mixed; cond: 2; seed: 770002; batch: 60
+ ⏱ 238 ± 0.0 ms
+ ⚡ 238 ms 🐌 239 ms
+
+n: 512; case: rankdef; cond: 0; seed: 770003; batch: 640
+ ⏱ 1054 ± 0.1 ms
+ ⚡ 1054 ms 🐌 1054 ms
+
+n: 512; case: clustered; cond: 0; seed: 770004; batch: 640
+ ⏱ 1074 ± 0.1 ms
+ ⚡ 1074 ms 🐌 1074 ms
+
+n: 1024; case: nearrank; cond: 0; seed: 770005; batch: 60
+ ⏱ 239 ± 0.0 ms
+ ⚡ 239 ms 🐌 239 ms
+```","**B200 on Modal (secret) ✅ success**
+> ✅ Waiting for modal run to finish... Done
+> ✅ Testing successful
+> ✅ Benchmarking successful
+> ✅ Leaderboard run successful
+"
+leaderboard-submit: submissions for qr_v2 after commit=6e619b05330c0076bbe6c7ee691362d3eee23125
+ID       Leaderboard          File                 Time                 GPU(s)       Status          Score
+---------------------------------------------------------------------------------------------------------
+823177   qr_v2                submission.py        2026-06-20T20:34...  B200,B20...  done                -
+823005   qr_v2                submission.py        2026-06-20T19:13...  B200,B20...  done                -
+822966   qr_v2                submission.py        2026-06-20T18:58...  B200,B20...  done                -
+822927   qr_v2                submission.py        2026-06-20T18:42...  B200,B20...  done                -
+822909   qr_v2                submission.py        2026-06-20T18:33...  -            done                -
+822078   qr_v2                submission.py        2026-06-20T11:34...  B200,B20...  done                -
+821997   qr_v2                submission.py        2026-06-20T10:54...  B200,B20...  done                -
+821988   qr_v2                submission.py        2026-06-20T10:50...  B200,B20...  done                -
+821907   qr_v2                submission.py        2026-06-20T10:11...  B200,B20...  done                -
+821809   qr_v2                submission.py        2026-06-20T09:23...  B200,B20...  done                -
+821797   qr_v2                submission.py        2026-06-20T09:13...  -            done                -
+821666   qr_v2                submission.py        2026-06-20T08:09...  B200,B20...  done                -
+821599   qr_v2                submission.py        2026-06-20T07:38...  B200,B20...  done                -
+821566   qr_v2                submission.py        2026-06-20T07:16...  B200,B20...  done                -
+821433   qr_v2                submission.py        2026-06-20T06:04...  B200,B20...  done                -
+821184   qr_v2                submission.py        2026-06-20T04:46...  B200,B20...  done                -
+821172   qr_v2                submission.py        2026-06-20T04:40...  -            done                -
+821116   qr_v2                submission.py        2026-06-20T04:13...  B200,B20...  done                -
+820511   qr_v2                submission.py        2026-06-19T22:43...  -            done                -
+820397   qr_v2                submission.py        2026-06-19T21:33...  -            done                -
+820181   qr_v2                submission.py        2026-06-19T19:21...  B200,B20...  done                -
+820173   qr_v2                submission.py        2026-06-19T19:17...  -            done                -
+820166   qr_v2                submission.py        2026-06-19T19:12...  -            done                -
+820078   qr_v2                submission.py        2026-06-19T18:14...  B200,B20...  done                -
+819956   qr_v2                submission.py        2026-06-19T16:55...  B200,B20...  done                -
+819955   qr_v2                submission.py        2026-06-19T16:54...  -            done                -
+819954   qr_v2                submission.py        2026-06-19T16:53...  -            done                -
+819944   qr_v2                submission.py        2026-06-19T16:48...  -            done                -
+819904   qr_v2                submission.py        2026-06-19T16:23...  -            pending             -
+819854   qr_v2                submission.py        2026-06-19T15:52...  -            done                -
+819844   qr_v2                submission.py        2026-06-19T15:45...  -            done                -
+819827   qr_v2                submission.py        2026-06-19T15:25...  -            done                -
+819816   qr_v2                submission.py        2026-06-19T15:22...  -            done                -
+819798   qr_v2                submission.py        2026-06-19T14:52...  -            done                -
+819785   qr_v2                submission.py        2026-06-19T14:26...  -            done                -
+819783   qr_v2                submission.py        2026-06-19T14:22...  -            done                -
+819768   qr_v2                submission.py        2026-06-19T13:52...  -            done                -
+819758   qr_v2                submission.py        2026-06-19T13:31...  -            done                -
+819754   qr_v2                submission.py        2026-06-19T13:22...  -            done                -
+819748   qr_v2                submission.py        2026-06-19T13:10...  -            done                -
+819738   qr_v2                submission.py        2026-06-19T12:52...  -            done                -
+819728   qr_v2                submission.py        2026-06-19T12:23...  -            done                -
+819489   qr_v2                submission.py        2026-06-19T11:52...  -            done                -
+819448   qr_v2                submission.py        2026-06-19T11:47...  -            done                -
+819208   qr_v2                submission.py        2026-06-19T11:22...  -            done                -
+818913   qr_v2                submission.py        2026-06-19T10:53...  -            done                -
+818619   qr_v2                submission.py        2026-06-19T10:24...  -            done                -
+818596   qr_v2                submission.py        2026-06-19T10:22...  -            done                -
+818312   qr_v2                submission.py        2026-06-19T09:54...  -            done                -
+817984   qr_v2                submission.py        2026-06-19T09:22...  -            done                -

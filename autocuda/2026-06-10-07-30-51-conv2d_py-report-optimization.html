@@ -1,0 +1,47 @@
+<h1 id="optimization-report-2026-06-10-07-30-51-conv2d_py">Optimization
+Report: <code>2026-06-10-07-30-51-conv2d_py</code></h1>
+<p>This run optimized <code>pmpp_v2/conv2d_py</code> on B200 with a
+4-worker optimize-tree loop. The final safe submitted source is commit
+<code>bc053cc626b666751c18871efc6d01674bcc6241</code>.</p>
+<h2 id="leaderboard-submissions">Leaderboard Submissions</h2>
+<ul>
+<li>Baseline <code>f47cc6c232bec176711608e8c66001de701a2aaa</code>:
+GPUMODE <code>conv2d_v2</code> / B200 submission <code>785293</code>,
+passed, ranked around 52.9 ms.</li>
+<li>Safe candidate
+<code>bc053cc626b666751c18871efc6d01674bcc6241</code>: submission
+<code>785294</code>, passed public/secret tests and ranked around 6.45
+ms.</li>
+<li>Cadence resubmission of the same safe source: submission
+<code>785314</code>, passed public + secret
+test/benchmark/leaderboard.</li>
+</ul>
+<h2 id="main-valid-optimization">Main Valid Optimization</h2>
+<p>The accepted B200-safe candidate combines:</p>
+<ul>
+<li>a k8 c64 CUDA graph path with cache keys including input
+shape/stride, kernel shape/stride, and
+<code>kernel.data_ptr()</code>;</li>
+<li>a c64/k16 <code>im2col</code> + expanded-weight
+<code>torch.bmm</code> path;</li>
+<li>cuDNN fallback for c128 shapes with TF32 disabled.</li>
+</ul>
+<h2 id="explored-and-rejected">Explored And Rejected</h2>
+<ul>
+<li>H100 FFT+sparse-correction champion
+(<code>robobryce/autocuda-gpumode</code> commit <code>6bf0aaa</code>)
+was investigated. Raw port built and public-validated but failed B200
+benchmark recheck; guarded/minimal ports were safe only by falling back
+to cuDNN and were slower.</li>
+<li>TF32 and split-matmul ideas for c128/k32 failed official
+tolerance.</li>
+<li>Direct CUDA c64/k16 was correct but far slower than
+<code>im2col+bmm</code>.</li>
+<li>c64/k16 column caching was proven unsafe under same-pointer input
+mutation.</li>
+<li>Multiple Python dispatch, import, graph-output, and cuDNN wrapper
+variants were either noisy, slower, or not reproducibly better.</li>
+</ul>
+<h2 id="csv">CSV</h2>
+<p>The companion CSV contains 585 optimization rows across worker
+branches.</p>

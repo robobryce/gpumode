@@ -1,0 +1,550 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GPUMODE QR — Megakernels</title>
+<style>
+  body{max-width:1100px;margin:2rem auto;padding:0 1.5rem;font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;color:#1a1a1a}table{border-collapse:collapse;width:100%;margin:1rem 0;font-size:14px}th,td{border:1px solid #ccc;padding:6px 10px;text-align:left;vertical-align:top}th{background:#f4f4f4}code{background:#f4f4f4;padding:1px 4px;border-radius:3px}pre{background:#f7f7f7;padding:10px;overflow-x:auto;border-radius:5px}h1,h2,h3{line-height:1.25}h1{border-bottom:2px solid #eee;padding-bottom:.3rem}h2{border-bottom:1px solid #eee;padding-bottom:.2rem;margin-top:2rem}blockquote{border-left:3px solid #ccc;margin-left:0;padding-left:1rem;color:#555}a{color:#0645ad}
+</style>
+</head>
+<body>
+<h1 id="gpumode-qr-megakernels">GPUMODE QR — Megakernels</h1>
+<h2 id="executive-summary">Executive summary</h2>
+<p>The task factors a large batch of matrices (a QR decomposition of
+each). The baseline, <code>torch.geqrf</code>, factors them one at a
+time, and for the batched shapes that means a storm of tiny GPU launches
+— about 73,000 of them on the n=512 batch, with <strong>over 90% of the
+wall-clock spent in launch overhead</strong> rather than arithmetic.</p>
+<p>A <strong>megakernel</strong> is the most aggressive possible answer:
+do the <em>entire</em> factorization of a matrix inside <strong>one GPU
+launch</strong>, start to finish, keeping every intermediate on-chip.
+This report uses that strict definition throughout — one kernel, whole
+algorithm. A kernel that factors only part of the matrix and hands the
+rest to another kernel or a library call is <em>not</em> a megakernel
+here, and those are called out where they matter, because they turn out
+to be the designs that actually won.</p>
+<p>The finding, stated plainly and then explained by the algorithm’s
+structure:</p>
+<blockquote>
+<p><strong>A true megakernel wins only for small matrices. For large
+matrices it is not just slower but structurally wrong, and every leading
+result abandoned it in favor of splitting the work back into separate
+kernels.</strong> No whole-matrix megakernel ever carried a large size
+in any winning submission across the whole project — the ~82× (CUDA C++)
+and ~64× (Triton) winners are both <em>de-fused</em> designs, as were
+the earliest winning submissions before them.</p>
+</blockquote>
+<p>Why that is true comes down to the three phases of the algorithm and
+what limits each one. The rest of this report builds that argument, then
+lists every true megakernel that was tried.</p>
+<h2 id="the-three-phases-and-what-limits-each">The three phases, and
+what limits each</h2>
+<p>Blocked Householder QR — the algorithm every kernel here uses —
+marches down the matrix in strips (“panels”). Each step has three
+phases:</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Phase</th>
+<th>What it computes</th>
+<th>What limits it (its bottleneck)</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><strong>Panel factorization</strong></td>
+<td>Turns one narrow strip of columns into Householder reflectors</td>
+<td><strong>Latency.</strong> Each reflector depends on the previous
+one, so it’s a serial chain with almost no arithmetic and almost no
+memory traffic. It is <em>inherently</em> slow-and-thin: measured panel
+time is essentially flat whether you give it 148 matrices or 640 (356 µs
+vs 404 µs), because the chain length, not the workload, sets the
+time.</td>
+</tr>
+<tr class="even">
+<td><strong>Compact-WY build</strong> <em>(optional)</em></td>
+<td>Assembles the panel’s reflectors into one small triangular factor so
+the next phase can be one big multiply</td>
+<td>A short serial step. Small kernels skip it entirely and apply
+reflectors one at a time (“unblocked”); it only earns its keep once the
+trailing update below is large.</td>
+</tr>
+<tr class="odd">
+<td><strong>Trailing update</strong></td>
+<td>Applies the finished panel to <em>all the remaining columns</em> of
+the matrix</td>
+<td><strong>Compute.</strong> This is an O(n³) matrix-multiply and the
+dominant cost at large sizes. It is embarrassingly parallel and wants to
+be spread across the <em>entire</em> GPU — all 148 processing units — to
+go fast.</td>
+</tr>
+</tbody>
+</table>
+<p>The two expensive phases therefore want <strong>opposite</strong>
+things from the hardware:</p>
+<ul>
+<li><strong>The panel</strong> wants to sit still in one place — one
+block, on-chip, minimal parallelism; spreading it out only adds
+communication to a latency-bound chain.</li>
+<li><strong>The trailing update</strong> wants maximum spread — every
+processing unit busy.</li>
+</ul>
+<p>To fuse both phases into one kernel, one block must be sized and
+shaped for both at once — and a block has a single warp count and a
+single shared-memory footprint for its whole life. The panel wants few
+warps and its V/T resident on-chip; the trailing GEMM wants many warps
+and many blocks resident per SM so it can hide the latency of streaming
+the trailing columns from global memory. There is no single shape that
+is good at both, so every way of building the megakernel sacrifices one
+phase to serve the other. <strong>That is the tension, and which phase
+gets sacrificed — and whether the sacrifice is affordable — depends
+entirely on the matrix size.</strong></p>
+<h3 id="the-three-ways-to-build-it">The three ways to build it</h3>
+<p>There are essentially three constructions for a whole-algorithm
+megakernel, and all three were built and measured:</p>
+<ol type="1">
+<li><strong>One matrix resident per block.</strong> Load the whole
+matrix into shared memory, one block per matrix, do everything on-chip.
+Ideal for the panel; works only while the matrix fits in shared
+memory.</li>
+<li><strong>One matrix spread across many blocks.</strong> Split the
+matrix’s rows across blocks so the trailing GEMM has parallelism, and
+coordinate the phases with a device-wide <code>grid.sync</code> each
+column.</li>
+<li><strong>One matrix per block, streaming (tiled) through it.</strong>
+Keep only a chunk resident, stream the rest of the matrix through global
+memory — so it fits at any size, one block per matrix.</li>
+</ol>
+<p>The next two sections trace what each construction does at small and
+large sizes.</p>
+<h2 id="why-fusing-wins-at-small-sizes">Why fusing wins at small
+sizes</h2>
+<p>When the matrix is small (n = 32, n = 176), all three phases are
+<em>cheap</em>, and the trailing update has too little arithmetic to
+benefit from the whole chip anyway. What dominates instead is the launch
+overhead — the thousands of tiny kernel starts. Here the megakernel’s
+one-launch design is exactly right: it deletes the overhead, and because
+the work is latency-bound rather than compute-bound, giving each matrix
+a single block costs nothing. The proof that it’s overhead and not
+arithmetic: the winning n=176 megakernel wins <em>while leaving most of
+the GPU idle</em>, and when someone added a separate matrix-multiply
+step back into that path, it got <strong>slower</strong>, not
+faster.</p>
+<p>At these sizes the megakernel also skips the compact-WY phase — with
+so few columns, applying reflectors one at a time (unblocked) is simpler
+and just as fast.</p>
+<h2 id="why-fusing-loses-at-large-sizes">Why fusing loses at large
+sizes</h2>
+<p>Each of the three constructions hits a different wall at large n —
+which is the real evidence that the problem is structural, not a tuning
+knob:</p>
+<ol type="1">
+<li><p><strong>One matrix resident per block — runs out of shared
+memory.</strong> The whole matrix must fit in the 228 KB scratchpad, and
+a full FP32 matrix fits only up to about <strong>n = 241</strong>. At n
+= 352 it needs 495 KB; at n = 512, a full megabyte. Past ~241 this
+construction simply cannot be built, and every attempt to force it was
+reverted.</p></li>
+<li><p><strong>One matrix spread across many blocks — pays a crippling
+synchronization cost.</strong> Splitting a matrix across blocks gives
+the trailing GEMM its parallelism, but the panel is a serial chain, so
+the blocks must now coordinate with a device-wide <code>grid.sync</code>
+every column. That barrier traffic dominated: the cooperative version
+was correct but ran <strong>~16× slower</strong> than a plain library
+panel. The latency-bound panel gets nothing from the extra blocks; it
+just pays to synchronize them.</p></li>
+<li><p><strong>One matrix per block, streaming — the in-kernel GEMM is
+simply worse than the library, and residency starves it.</strong> This
+is the interesting case, because at the large batch (640 matrices)
+one-block-per-matrix <em>does</em> fill the whole GPU — every SM is busy
+on its own matrices, so this is not about leaving hardware idle. It
+loses for two on-SM reasons instead. First, fusing forbids calling the
+vendor GEMM (cuBLAS) from inside the kernel, so the trailing multiply
+must be hand-written with tensor-core intrinsics — and the hand-written
+version measured about <strong>7× slower than cuBLAS</strong> on the
+same work. Second, the trailing columns (the bulk of the matrix) do not
+fit on-chip and are streamed from global memory; hiding that memory
+latency needs several blocks resident per SM to switch between, but the
+panel’s resident footprint (~210 KB) leaves room for only one block per
+SM, so the tensor cores stall on the stream with nothing to switch to.
+The tell that this is a genuine bind rather than a parameter: forcing a
+second block per SM was <strong>worse</strong> (98,000 µs vs 54,800 µs),
+because two matrices’ residency fight even harder for shared memory. End
+to end this construction ran <strong>8.6× slower at n = 512 and 31×
+slower at n = 1024</strong> than the library-based split.</p></li>
+</ol>
+<p>The escape from all three is the same: <strong>de-fuse.</strong>
+Write the panel’s V and T out to global memory, then apply the trailing
+update as a separate <strong>batched cuBLAS call</strong>. That one move
+fixes every wall at once — the matrix no longer needs to be resident (no
+capacity limit), the phases no longer need a grid barrier (no sync
+cost), and the trailing update is now the vendor’s GEMM at full
+throughput instead of a hand-rolled one throttled by low occupancy. The
+cost is the very thing fusion set out to avoid — an extra launch and a
+round-trip through global memory — but at large n the O(n³) trailing
+GEMM is so dominant that getting it done by cuBLAS dwarfs that overhead.
+This de-fused design is what every winning submission uses for its large
+sizes. The crossover sits around n = 176: the largest size where fusing
+still wins, and even there it is marginal (it won on one batch and
+regressed on another).</p>
+<h2 id="every-true-megakernel-that-was-tried">Every true megakernel that
+was tried</h2>
+<p>Only whole-algorithm kernels appear below (one launch, panel
+<em>and</em> trailing on-chip). The <strong>Construction</strong> column
+keys each kernel to the three designs above — <strong>(1)</strong> one
+matrix resident per block, <strong>(2)</strong> one matrix spread across
+blocks, <strong>(3)</strong> one matrix per block streaming through
+global memory. The de-fused panel kernels that actually won the large
+sizes are <strong>not</strong> megakernels and are omitted here by
+design — they are the winning alternative described above. Speedups are
+against the relevant <code>torch.geqrf</code> baseline (B200 ≈ 131,000
+µs; RTX Pro 6000 ≈ 117,000 µs) and are <strong>not comparable across
+GPUs</strong>. Commits point to the best/representative instance of each
+kernel; all touch <code>problems/linalg/qr_v2/submission.py</code>.</p>
+<h3
+id="b200-cuda-c-the-main-effort-82-the-winning-submission-is-de-fused">B200
+CUDA C++ — the main effort (~82×; the winning submission is
+de-fused)</h3>
+<table style="width:100%;">
+<colgroup>
+<col style="width: 14%" />
+<col style="width: 14%" />
+<col style="width: 14%" />
+<col style="width: 14%" />
+<col style="width: 14%" />
+<col style="width: 14%" />
+<col style="width: 14%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Megakernel</th>
+<th>Constr.</th>
+<th>n</th>
+<th>What it does &amp; how it’s implemented</th>
+<th>Correct?</th>
+<th>Outcome</th>
+<th>Commit</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>blocked_qr_tiny</code></td>
+<td>1</td>
+<td>32</td>
+<td>One warp per matrix does the whole 32×32 factorization in registers
+using warp shuffles — no shared memory, no barriers; it loops the
+columns, forming each reflector and applying it to the trailing columns
+in-register, one launch for the whole batch</td>
+<td>Yes</td>
+<td><strong>Kept</strong> — the small-<em>n</em> path of the winning
+submission. Fusing is unambiguously right here, but n=32 is a single
+panel with no real trailing update to fuse, so it is the easy case and
+adds little to the headline speedup</td>
+<td><code>4f9fb73d0</code></td>
+</tr>
+<tr class="even">
+<td><code>qr_mega_resident_kernel</code></td>
+<td>1</td>
+<td>176</td>
+<td>One block per matrix loads the whole 176×176 matrix into ~124 KB of
+shared memory and runs a right-looking <em>unblocked</em> Householder
+there — every reflector and every rank-1 trailing update on-chip — then
+writes the result back, one launch</td>
+<td>Yes</td>
+<td><strong>Kept, but marginal</strong> — the crossover size. This
+kernel is live in a winning submission, yet closely related whole-matrix
+variants (a blocked/compact-WY form and a plain unblocked form, holding
+the matrix in ~192 KB) <em>regressed</em> — 652 µs and 524 µs versus
+~305 µs for the de-fused split. The win for fusing is thin here and
+flips with batch size</td>
+<td><code>4f9fb73d0</code></td>
+</tr>
+<tr class="odd">
+<td><code>mega_qr_persistent_kernel</code></td>
+<td>1</td>
+<td>512</td>
+<td>One block factors an entire matrix resident in shared memory
+(reflectors applied to the trailing columns one at a time in plain SIMT,
+no library call); a fixed grid of 148 persistent blocks pulls matrices
+from a shared atomic queue so the resident design reaches n=512</td>
+<td>Yes (incl. ill-conditioned)</td>
+<td><strong>Abandoned</strong> — correct but ~935 ms/call (~260×
+slower); left disabled. One block per matrix starves the trailing
+update</td>
+<td><code>42ab334d0</code></td>
+</tr>
+<tr class="even">
+<td><code>hh_coop_panel_kernel</code></td>
+<td>2</td>
+<td>512</td>
+<td>One matrix’s rows split across all SMs via
+<code>cudaLaunchCooperativeKernel</code>, with a device-wide
+<code>grid.sync</code> every column to coordinate the phases; emits the
+flat <code>(V, τ)</code> directly</td>
+<td>Yes</td>
+<td><strong>Abandoned</strong> — correct but <strong>~16×
+slower</strong> (~898,000 µs vs 54,600 for a library panel); the
+per-column grid barriers and per-column block-reductions dominate</td>
+<td><code>c58ddfe45</code></td>
+</tr>
+<tr class="odd">
+<td><code>qr_mega_la_tc</code> (and <code>qr_mega_la</code>)</td>
+<td>3</td>
+<td>512, 1024</td>
+<td>One block per matrix runs the full right-looking blocked
+factorization — panel, compact-WY, and the trailing update — in a single
+launch, doing the trailing matrix-multiply in-kernel on tensor cores
+(TF32×3 WMMA) and streaming the trailing columns through global memory
+rather than holding them resident (<code>_la</code> = look-ahead,
+<code>_tc</code> = tensor-core trailing)</td>
+<td>Yes</td>
+<td><strong>Abandoned</strong> — 8.6× (n=512) to 31× (n=1024) slower
+than the batched-library split. The definitive large-<em>n</em>
+measurement: the hand-written in-kernel GEMM is ~7× slower than cuBLAS
+and residency caps the SM at one block, so it cannot hide the streamed
+trailing columns</td>
+<td><code>0dab5261</code></td>
+</tr>
+</tbody>
+</table>
+<p>This CUDA C++ effort spans the project’s full history — the technique
+and the first megakernels appeared in its earliest experiments — and
+even those first winning submissions were <strong>already
+de-fused</strong>: the trailing update went to a separate batched
+library GEMM, and every attempt to pull it on-chip lost. A whole-matrix
+megakernel never carried the large sizes, from the first submission to
+the last.</p>
+<h3
+id="rtx-pro-6000-controlled-language-experiments-24-short-experiments-separate-baseline">RTX
+Pro 6000 — controlled language experiments (24 short experiments;
+separate baseline)</h3>
+<table style="width:100%;">
+<colgroup>
+<col style="width: 14%" />
+<col style="width: 14%" />
+<col style="width: 14%" />
+<col style="width: 14%" />
+<col style="width: 14%" />
+<col style="width: 14%" />
+<col style="width: 14%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Megakernel</th>
+<th>Constr.</th>
+<th>n</th>
+<th>Language</th>
+<th>What it does &amp; how it’s implemented</th>
+<th>Correct?</th>
+<th>Outcome</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>_mega_kernel</code></td>
+<td>3</td>
+<td>512</td>
+<td>Triton</td>
+<td>One Triton program per matrix (<code>program_id</code> = matrix
+index) does the whole factorization on-chip — panel in registers,
+trailing applied as <code>(I − V·T·Vᵀ)</code> in the same kernel — with
+zero inter-kernel launches</td>
+<td>Yes</td>
+<td><strong>Ran and validated</strong> at ~9,500 µs — but still lost to
+that experiment’s de-fused panel+trailing design, so it was not the
+winning route</td>
+</tr>
+<tr class="even">
+<td><code>@cute.kernel</code> per-matrix QR (n=32/176)</td>
+<td>1</td>
+<td>32, 176</td>
+<td>CuTe DSL</td>
+<td>One <code>@cute.kernel</code> per matrix; the n=176 version loops
+all 176 columns forming and applying reflectors in-kernel (whole
+matrix), using block-index-per-matrix and warp-level reductions.
+<em>(The exact symbol names are not on a retained branch — the preserved
+CuTe branches keep only marker/no-op/probe kernels like
+<code>_cute_marker_kernel</code>.)</em></td>
+<td>Yes (small <em>n</em>)</td>
+<td><strong>Small-only</strong> — whole-matrix for n=32/176 (1.69×
+best); n≥512 fell back to the library</td>
+</tr>
+<tr class="odd">
+<td><code>_megakernel_qr</code></td>
+<td>1</td>
+<td>512</td>
+<td>Triton</td>
+<td>Attempt at one Triton program holding the full-height n=512 matrix
+resident and doing all phases; Triton materializes every live tile, so
+the footprint blew past the scratchpad</td>
+<td>—</td>
+<td><strong>Never ran</strong> — needs 388 KB of shared memory against a
+~99 KB limit on this GPU; <code>OutOfResources</code> at launch</td>
+</tr>
+</tbody>
+</table>
+<p>Across these experiments the <em>winning</em> designs were, again,
+de-fused: the best Triton result (42.8×) and the best CUDA result (~21×)
+both factor a panel in one kernel and apply the trailing update in a
+<em>separate</em> kernel or batched library GEMM — not megakernels.</p>
+<h2 id="takeaways">Takeaways</h2>
+<ul>
+<li><p><strong>The bottleneck flips with size, and that flip is the
+whole result.</strong> Small matrices are launch/latency-bound, which is
+exactly what one-launch fusion fixes; large matrices are dominated by
+the O(n³) trailing GEMM, which fusion is bad at — so the win crosses
+over from fused to de-fused as n grows.</p></li>
+<li><p><strong>A megakernel forces two phases with opposite hardware
+needs into one block shape.</strong> The panel wants few warps and its
+data resident; the trailing GEMM wants many resident blocks per SM to
+hide the memory latency of streaming the trailing columns. One block has
+a single shape, so it serves one phase and throttles the other. At large
+n the only fix is to split them — which is, by definition, not a
+megakernel.</p></li>
+<li><p><strong>The large-batch loss is not idle hardware — it is a worse
+GEMM.</strong> At 640 matrices, one block per matrix already fills every
+SM. The fused kernel still loses because fusion bars a cuBLAS call (its
+hand-written in-kernel GEMM measured ~7× slower) and the panel’s
+resident footprint caps the SM at one block, so it cannot hide the
+trailing columns streamed from memory. De-fusing restores the vendor
+GEMM at full occupancy.</p></li>
+<li><p><strong>No whole-matrix megakernel ever won a large size —
+anywhere in the project.</strong> Every leading submission (~82× CUDA
+C++, ~64× Triton, and the earliest winners before them) is de-fused.
+True megakernels earned their place only at n ≤ 176.</p></li>
+<li><p><strong>Three constructions, three different walls — so it is
+structural, not a tuning knob.</strong> Resident</p>
+<ol type="1">
+<li>runs out of shared memory past n ≈ 241; cooperative (2) pays ~16×
+for its grid barriers; streaming (3) is throttled by the hand-written
+GEMM and one-block occupancy (and forcing a second block per SM was
+<em>worse</em>, 98k vs 54.8k µs). No parameter closes any of the
+three.</li>
+</ol></li>
+<li><p><strong>“Correct” and “fast” were separate bars, and fast was the
+one that failed.</strong> The persistent work-queue megakernel was
+correct on every case including ill-conditioned inputs, yet ~260× too
+slow. At large n, making a megakernel <em>work</em> was rarely the
+obstacle; making it competitive was impossible.</p></li>
+</ul>
+<h2 id="what-the-model-struggled-with">What the model struggled
+with</h2>
+<p>All B200 work was one model (Opus 4.8). It could write a correct
+megakernel, but it repeatedly tripped on specific low-level details of
+the hardware and the tools. The concrete failure modes, by layer of the
+stack:</p>
+<p><strong>Tensor-core instructions: it defaulted to the older API and
+couldn’t drive the new one.</strong> Every working fused trailing update
+used the legacy <code>nvcuda::wmma</code> (HMMA) path. The model
+<em>tried</em> the Blackwell-native 5th-generation tensor-core
+instructions (<code>tcgen05</code>) many times, but they failed at the
+assembler —
+<code>ptxas ... error : Illegal modifier '.scale_vec::1X' for instruction 'tcgen05.mma'</code>
+— and it correctly diagnosed but never fixed the cause (“my instruction
+syntax was slightly off”). It also mis-estimated the payoff of new
+low-precision modes until it measured them: “legacy
+<code>mma.sync</code> FP8 = FP16 throughput on B200 (microbenchmarked
+0.96×, NOT 2–4×).”</p>
+<p><strong>Tensor-core memory layout: silent wrong answers from fragment
+alignment.</strong> The sharpest bug was not a crash but a silently
+corrupt result: “WMMA accumulator
+<code>load</code>/<code>store_matrix_sync</code> need an 8-aligned
+leading dim; the block’s odd <code>LDS = ob|1</code> (a bank-conflict
+pad) silently corrupted the in-place <code>C := C + VY</code> round-trip
+→ a deterministic, precision-INDEPENDENT orthogonality defect.” The
+model first chased this as a numerical-precision problem (trying
+1×/3×TF32) before realizing the constant error across every precision
+was the signature of a layout bug, not arithmetic.</p>
+<p><strong>Synchronization: races, wrong barrier scope, and
+cooperative-launch cost.</strong> A missing barrier produced NaNs
+(“Fixed missing <code>__syncthreads</code> after smem load”); a
+partial-warp shuffle under divergence silently zeroed data
+(“<code>__shfl_sync</code>-under-divergence bug was zeroing strict-lower
+V”); a hand-written cross-warp reduction via a named
+<code>bar.sync</code> was “unreliable on sm_100 EVEN WITH a memory
+clobber on the inline asm.” When it reached for cooperative-groups
+<code>grid.sync</code> to fuse across blocks, the synchronization cost
+dwarfed the work — a per-column grid barrier ran “~16× slower” — and a
+software grid barrier “DEADLOCKS non-deterministically.”</p>
+<p><strong>Registers and occupancy: the fused kernel spilled, and
+forcing occupancy made it worse.</strong> A one-CTA-per-matrix kernel
+hit “255 registers/thread (the max) + 39.4M local loads + 32.7M local
+stores” — i.e. massive spilling to local memory — and sat at “1
+block/SM, 12.5% occupancy.” Stacking tensor-core fragments overflowed
+the file outright: “32 warps × the 3×TF32 fragment set overflows the
+64K-reg/block budget (<code>cudaErrorLaunchOutOfResources</code>).” And
+the obvious lever backfired: capping registers with
+<code>__launch_bounds__</code> to force more blocks/SM “forces register
+SPILLS whose latency outweighs the extra occupancy.”</p>
+<p><strong>Correctness under fusion, and a benchmark that hid
+it.</strong> Packing every phase into one kernel meant many small ways
+to be wrong: an under-allocated shared-memory scratch from an odd stride
+gave a <code>cudaErrorIllegalAddress</code>; the low-precision path
+overflowed FP16’s range to NaN (“<code>M = T⁻¹</code> entries exceed
+FP16 max 65504 → NaN”). Worse, a quick benchmark once “gave a FALSE 24%
+signal by timing a NaN kernel” — a kernel that isn’t computing is fast —
+which is why the experiment later insisted on always correctness-gating
+a timing measurement.</p>
+<p><strong>Build cost: the template zoo hit the compile-time
+limit.</strong> The fused design fanned out into many template
+instantiations, and “the 7625-line file compiles near the remote 240 s
+limit, and ~1/3 of recent submits TIMED OUT,” with “pure DEAD ptxas
+instantiations sitting on the critical single-TU compile path” — a
+failure mode that has nothing to do with the kernel’s speed and
+everything to do with how it was generated.</p>
+<p><strong>Things it did <em>not</em> get wrong are as telling.</strong>
+It knew the dynamic-shared-memory opt-in and its size (“BLOCK with
+opt-in is ~227KB; the default cap is 48KB. 37KB &lt; 48KB so no opt-in
+needed”), tracked bank conflicts explicitly, and did build
+<code>cp.async</code> and double-buffered TMA pipelines — which then
+bought little, because the fused panel is barrier-bound, not
+memory-latency-bound (“the dominant stall is CTA-BARRIERS at 38.6% …
+<code>cp.async</code> C-prefetch has no memory latency to hide”). The
+gap was not ignorance of modern GPU APIs; it was getting the fiddly
+details (fragment alignment, barrier scope, register budget, the newest
+instruction encodings) right under the pressure of fusing everything
+into one kernel.</p>
+<p><strong>In the higher-level languages, the wall was expressiveness,
+not detail.</strong> Triton could not build a fully-resident megakernel
+because it “materializes every live tile in SMEM” with no way to free or
+alias scratch by hand (“388KB &gt;&gt; 99KB limit … needs raw CUDA
+<code>__shared__</code> with dynamic-SMEM opt-in”), it lacks the
+grid-wide barrier a cross-block fusion needs, and <code>tl.dot</code>
+refuses the narrow tiles a panel produces (“<code>tl.dot</code> requires
+K ≥ 16”). It also hid a data race behind a clean API — a loop-carried
+in-place dependency was “a silent race in Triton; a per-step
+<code>tl.debug_barrier()</code> fixes it at zero speed cost” — and had a
+compiler footgun where “<code>tl.range(num_stages=1)</code> compiles
+DIFFERENTLY from plain <code>range</code>.” (The CuTe-DSL experiments
+hit their own toolchain walls — <code>redux.f32</code> not supported on
+<code>sm_120a</code>, an IR-verifier internal error on values used
+outside an <code>scf.for</code> region — but those experiments used a
+weaker model, so they are not evidence about the language’s
+ceiling.)</p>
+<h2 id="scope-sources">Scope &amp; sources</h2>
+<p>A thematic slice through the QR project, restricted to true
+megakernels (one launch, whole algorithm). It draws on the two B200
+lines of work — a longer CUDA C++ effort (~82×), which spans the
+project’s whole history and is where the technique and the first
+megakernels appeared, and a shorter Triton-steered effort (~64×) — plus
+the RTX Pro 6000 language experiments (24 in all: 10 Triton, 10 CUDA
+C++, 4 CuTe DSL). All B200 work used one model, Opus 4.8.</p>
+<p>Every classification here was checked against the actual kernel
+source (does one launch do both panel and trailing?), and every speedup
+against the measured number in the commit that introduced it; speedups
+are stated against each line’s own baseline and never cross-compared
+between GPUs. Two cautions apply: the small-<em>n</em> CUDA speedups
+(about 4.5× at n=32 and 12–41× at n=176) come from a later rebuild of
+those kernels, not from the winning submission’s own history, so they
+are described qualitatively rather than pinned to the winner; and the
+large-<em>n</em> fused kernel, though written in CUDA/WMMA, was produced
+within the Triton-steered line of work.</p>
+
+</body>
+</html>

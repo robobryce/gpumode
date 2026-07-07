@@ -1,0 +1,803 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GPUMODE QR — Resource Usage</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { max-width: 1400px; margin: 2rem auto; padding: 0 1.25rem; font: 16px/1.55 system-ui, sans-serif; }
+  h1, h2 { line-height: 1.2; }
+  h2 { margin-top: 2rem; }
+  table { display: block; width: max-content; max-width: 100%; overflow-x: auto; border-collapse: collapse; margin: 1rem 0; }
+  th, td { border: 1px solid #8888; padding: .4rem .6rem; vertical-align: top; }
+  th { background: #8882; text-align: left; }
+  code { white-space: nowrap; }
+  @media print { body { max-width: none; } table { display: table; width: 100%; font-size: 9px; } }
+</style>
+</head>
+<body>
+<h1 id="gpumode-qr-resource-usage">GPUMODE QR — Resource Usage</h1>
+<h2 id="executive-summary">Executive Summary</h2>
+<p>The June QR work covers <strong>43 tagged attempts</strong>: 19 on
+B200 systems and 24 on RTX PRO 6000 systems. Available lock records
+measure <strong>at least 217.47 GPU-hours</strong>, plus <strong>49.36
+hours under the shared build lock</strong>. The GPU total comprises
+about <strong>45.2 benchmark GPU-hours</strong>, <strong>22.5 profile
+GPU-hours</strong>, and <strong>149.7 GPU-hours of validation, custom
+probes, submissions, and other exclusive work</strong>. Three early B200
+tags do not have enough lock evidence for an accurate compute breakdown,
+so the measured total is a lower bound.</p>
+<p>Inference used <strong>44.79B tokens</strong>. Cache reads account
+for <strong>95.2%</strong> of that volume, while output accounts for
+<strong>0.34%</strong>. Tool activity is now counted across both harness
+formats: <strong>185,184 Claude calls</strong> and <strong>36,097 Codex
+calls</strong>, or <strong>221,281 underlying calls</strong> before
+compound shell operations are split into their executed build,
+benchmark, profile, and edit entries.</p>
+<p><strong>Key takeaways</strong></p>
+<ul>
+<li><strong>Other exclusive GPU work is the largest measured
+category.</strong> Validation, custom probes, and submissions used about
+149.7 GPU-hours, versus 45.2 for benchmarking and 22.5 for
+profiling.</li>
+<li><strong>The 2×B200 runs are accounted per device.</strong> Durations
+from <code>gpu-0</code> and <code>gpu-1</code> are added, with no second
+multiplier.</li>
+<li><strong>Build, benchmark, and profile operations are no longer
+hidden inside Bash.</strong> Their counts appear as separate rows in the
+all-harness tool table.</li>
+<li><strong>Prompt context dominates inference volume.</strong> Cache
+reads are 42.65B of the 44.79B tokens.</li>
+<li><strong>The July QR activity on this node is outside the report
+scope.</strong></li>
+</ul>
+<h2 id="token-usage">Token Usage</h2>
+<table>
+<colgroup>
+<col style="width: 13%" />
+<col style="width: 17%" />
+<col style="width: 17%" />
+<col style="width: 17%" />
+<col style="width: 17%" />
+<col style="width: 17%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Harness</th>
+<th style="text-align: right;">Input</th>
+<th style="text-align: right;">Cached input</th>
+<th style="text-align: right;">Cache creation</th>
+<th style="text-align: right;">Output</th>
+<th style="text-align: right;">Total</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Claude</td>
+<td style="text-align: right;">20.15M</td>
+<td style="text-align: right;">38.55B</td>
+<td style="text-align: right;">1.87B</td>
+<td style="text-align: right;">143.94M</td>
+<td style="text-align: right;">40.58B</td>
+</tr>
+<tr class="even">
+<td>Codex</td>
+<td style="text-align: right;">101.24M</td>
+<td style="text-align: right;">4.10B</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">7.48M</td>
+<td style="text-align: right;">4.21B</td>
+</tr>
+<tr class="odd">
+<td><strong>Total</strong></td>
+<td style="text-align: right;"><strong>121.39M</strong></td>
+<td style="text-align: right;"><strong>42.65B</strong></td>
+<td style="text-align: right;"><strong>1.87B</strong></td>
+<td style="text-align: right;"><strong>151.42M</strong></td>
+<td style="text-align: right;"><strong>44.79B</strong></td>
+</tr>
+</tbody>
+</table>
+<table>
+<thead>
+<tr class="header">
+<th>Token type</th>
+<th style="text-align: right;">Tokens</th>
+<th style="text-align: right;">Share</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Input</td>
+<td style="text-align: right;">121,388,173</td>
+<td style="text-align: right;">0.27%</td>
+</tr>
+<tr class="even">
+<td>Cache creation</td>
+<td style="text-align: right;">1,868,563,110</td>
+<td style="text-align: right;">4.17%</td>
+</tr>
+<tr class="odd">
+<td>Cached input</td>
+<td style="text-align: right;">42,646,429,160</td>
+<td style="text-align: right;">95.22%</td>
+</tr>
+<tr class="even">
+<td>Output</td>
+<td style="text-align: right;">151,420,003</td>
+<td style="text-align: right;">0.34%</td>
+</tr>
+<tr class="odd">
+<td><strong>Total</strong></td>
+<td style="text-align: right;"><strong>44,787,800,446</strong></td>
+<td style="text-align: right;"><strong>100%</strong></td>
+</tr>
+</tbody>
+</table>
+<p>Cache hit rate is <strong>95.54%</strong>, calculated as cached input
+divided by input plus cache creation plus cached input. The dominant
+resource lever is therefore the amount of resident context re-read on
+each turn, not cache configuration.</p>
+<h2 id="walltime-by-experiment-tag">Walltime by Experiment Tag</h2>
+<p>There is one row per canonical experiment tag. <strong>Activity
+span</strong> is the first-to-last experiment-log timestamp and is not
+additive because experiments overlap. Build cells report shared
+build-lock calls and hours. Benchmark, profile, and other-exclusive
+cells report calls and per-device GPU-hours. On 2×B200 nodes,
+simultaneous <code>gpu-0</code> and <code>gpu-1</code> time contributes
+two GPU-seconds per wall-clock second.</p>
+<table style="width:100%;">
+<colgroup>
+<col style="width: 10%" />
+<col style="width: 13%" />
+<col style="width: 10%" />
+<col style="width: 13%" />
+<col style="width: 13%" />
+<col style="width: 13%" />
+<col style="width: 13%" />
+<col style="width: 13%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Experiment tag</th>
+<th style="text-align: right;">Activity span</th>
+<th>Hardware</th>
+<th style="text-align: right;">Build calls / h</th>
+<th style="text-align: right;">Benchmark calls / GPU-h</th>
+<th style="text-align: right;">Profile calls / GPU-h</th>
+<th style="text-align: right;">Other exclusive calls / GPU-h</th>
+<th style="text-align: right;">Total GPU-h</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>2026-06-13-03-45-35</code></td>
+<td style="text-align: right;">48.30 h</td>
+<td>2× B200</td>
+<td style="text-align: right;">1,787 / 10.79</td>
+<td style="text-align: right;">416 / 0.99</td>
+<td style="text-align: right;">1,192 / 1.73</td>
+<td style="text-align: right;">2,411 / 4.14</td>
+<td style="text-align: right;">6.86</td>
+</tr>
+<tr class="even">
+<td><code>2026-06-15-05-53-17-qr_v2</code></td>
+<td style="text-align: right;">35.26 h</td>
+<td>2× B200</td>
+<td style="text-align: right;">—†</td>
+<td style="text-align: right;">—†</td>
+<td style="text-align: right;">—†</td>
+<td style="text-align: right;">—†</td>
+<td style="text-align: right;">—†</td>
+</tr>
+<tr class="odd">
+<td><code>2026-06-18-00-40-34-qr_v2</code></td>
+<td style="text-align: right;">~0.78 h†</td>
+<td>2× B200</td>
+<td style="text-align: right;">—†</td>
+<td style="text-align: right;">—†</td>
+<td style="text-align: right;">—†</td>
+<td style="text-align: right;">—†</td>
+<td style="text-align: right;">—†</td>
+</tr>
+<tr class="even">
+<td><code>2026-06-18-01-38-06-qr_v2</code></td>
+<td style="text-align: right;">20.47 h</td>
+<td>2× B200</td>
+<td style="text-align: right;">—†</td>
+<td style="text-align: right;">—†</td>
+<td style="text-align: right;">—†</td>
+<td style="text-align: right;">—†</td>
+<td style="text-align: right;">—†</td>
+</tr>
+<tr class="odd">
+<td><code>2026-06-19-00-34-18-qr_v2</code></td>
+<td style="text-align: right;">2.61 h</td>
+<td>2× B200</td>
+<td style="text-align: right;">79 / 0.50</td>
+<td style="text-align: right;">21 / 0.34</td>
+<td style="text-align: right;">60 / 0.19</td>
+<td style="text-align: right;">89 / 1.19</td>
+<td style="text-align: right;">1.73</td>
+</tr>
+<tr class="even">
+<td><code>2026-06-19-04-54-07-qr_v2</code></td>
+<td style="text-align: right;">13.19 h</td>
+<td>2× B200</td>
+<td style="text-align: right;">334 / 2.58</td>
+<td style="text-align: right;">100 / 0.83</td>
+<td style="text-align: right;">159 / 1.02</td>
+<td style="text-align: right;">213 / 4.46</td>
+<td style="text-align: right;">6.31</td>
+</tr>
+<tr class="odd">
+<td><code>2026-06-19-19-06-14</code></td>
+<td style="text-align: right;">3.71 h</td>
+<td>2× B200</td>
+<td style="text-align: right;">134 / 0.84</td>
+<td style="text-align: right;">33 / 0.53</td>
+<td style="text-align: right;">82 / 0.11</td>
+<td style="text-align: right;">120 / 0.30</td>
+<td style="text-align: right;">0.94</td>
+</tr>
+<tr class="even">
+<td><code>2026-06-20-04-33-52-qr_v2_simplify</code></td>
+<td style="text-align: right;">16.46 h</td>
+<td>2× B200</td>
+<td style="text-align: right;">517 / 3.06</td>
+<td style="text-align: right;">195 / 2.07</td>
+<td style="text-align: right;">157 / 0.26</td>
+<td style="text-align: right;">427 / 8.93</td>
+<td style="text-align: right;">11.25</td>
+</tr>
+<tr class="odd">
+<td><code>2026-06-20-20-26-49-qr_v2</code></td>
+<td style="text-align: right;">33.46 h</td>
+<td>1× B200</td>
+<td style="text-align: right;">582 / 3.50</td>
+<td style="text-align: right;">544 / 5.19</td>
+<td style="text-align: right;">130 / 1.42</td>
+<td style="text-align: right;">596 / 22.51</td>
+<td style="text-align: right;">29.12</td>
+</tr>
+<tr class="even">
+<td><code>2026-06-20-22-03-57-qr_v2</code></td>
+<td style="text-align: right;">65.17 h</td>
+<td>2× B200</td>
+<td style="text-align: right;">1,372 / 11.58</td>
+<td style="text-align: right;">246 / 2.22</td>
+<td style="text-align: right;">766 / 3.36</td>
+<td style="text-align: right;">1,717 / 22.43</td>
+<td style="text-align: right;">28.01</td>
+</tr>
+<tr class="odd">
+<td><code>2026-06-22-09-10-03-qr_v2</code></td>
+<td style="text-align: right;">56.38 h</td>
+<td>1× B200</td>
+<td style="text-align: right;">684 / 0.63</td>
+<td style="text-align: right;">133 / 1.62</td>
+<td style="text-align: right;">208 / 3.35</td>
+<td style="text-align: right;">818 / 10.43</td>
+<td style="text-align: right;">15.41</td>
+</tr>
+<tr class="even">
+<td><code>2026-06-23-17-54-06-qr_v2</code></td>
+<td style="text-align: right;">22.22 h</td>
+<td>2× B200</td>
+<td style="text-align: right;">239 / 1.83</td>
+<td style="text-align: right;">74 / 0.86</td>
+<td style="text-align: right;">96 / 0.44</td>
+<td style="text-align: right;">409 / 6.31</td>
+<td style="text-align: right;">7.61</td>
+</tr>
+<tr class="odd">
+<td><code>2026-06-24-03-03-06-qrv2_kernel_languages_96364acw1</code></td>
+<td style="text-align: right;">5.18 h</td>
+<td>1× RTX PRO 6000</td>
+<td style="text-align: right;">80 / 0.35</td>
+<td style="text-align: right;">64 / 1.01</td>
+<td style="text-align: right;">16 / 0.12</td>
+<td style="text-align: right;">73 / 3.05</td>
+<td style="text-align: right;">4.17</td>
+</tr>
+<tr class="even">
+<td><code>2026-06-24-03-03-08-qrv2_kernel_languages_q651pl8jg</code></td>
+<td style="text-align: right;">5.19 h</td>
+<td>1× RTX PRO 6000</td>
+<td style="text-align: right;">84 / 0.02</td>
+<td style="text-align: right;">80 / 1.09</td>
+<td style="text-align: right;">15 / 0.12</td>
+<td style="text-align: right;">91 / 3.37</td>
+<td style="text-align: right;">4.58</td>
+</tr>
+<tr class="odd">
+<td><code>2026-06-24-03-03-44-qrv2_kernel_languages_vcp095s3n</code></td>
+<td style="text-align: right;">5.18 h</td>
+<td>1× RTX PRO 6000</td>
+<td style="text-align: right;">69 / 0.02</td>
+<td style="text-align: right;">51 / 0.72</td>
+<td style="text-align: right;">22 / 0.47</td>
+<td style="text-align: right;">75 / 3.35</td>
+<td style="text-align: right;">4.53</td>
+</tr>
+<tr class="even">
+<td><code>2026-06-24-03-04-02-qrv2_kernel_languages_yxiwb80jg</code></td>
+<td style="text-align: right;">5.19 h</td>
+<td>1× RTX PRO 6000</td>
+<td style="text-align: right;">76 / 0.36</td>
+<td style="text-align: right;">56 / 1.00</td>
+<td style="text-align: right;">19 / 0.08</td>
+<td style="text-align: right;">69 / 2.84</td>
+<td style="text-align: right;">3.93</td>
+</tr>
+<tr class="odd">
+<td><code>2026-06-24-03-43-38-qrv2_kernel_languages_ohzemi9pv</code></td>
+<td style="text-align: right;">4.52 h</td>
+<td>1× RTX PRO 6000</td>
+<td style="text-align: right;">82 / 0.03</td>
+<td style="text-align: right;">65 / 0.87</td>
+<td style="text-align: right;">35 / 0.53</td>
+<td style="text-align: right;">82 / 3.16</td>
+<td style="text-align: right;">4.56</td>
+</tr>
+<tr class="even">
+<td><code>2026-06-24-03-46-49-qrv2_kernel_languages_t5sr96or9</code></td>
+<td style="text-align: right;">4.51 h</td>
+<td>1× RTX PRO 6000</td>
+<td style="text-align: right;">112 / 0.00</td>
+<td style="text-align: right;">100 / 2.30</td>
+<td style="text-align: right;">27 / 0.88</td>
+<td style="text-align: right;">119 / 0.97</td>
+<td style="text-align: right;">4.15</td>
+</tr>
+<tr class="odd">
+<td><code>2026-06-24-09-37-38-qrv2_kernel_languages_5hrpmgplj</code></td>
+<td style="text-align: right;">7.99 h</td>
+<td>1× RTX PRO 6000</td>
+<td style="text-align: right;">122 / 0.63</td>
+<td style="text-align: right;">86 / 2.14</td>
+<td style="text-align: right;">40 / 0.97</td>
+<td style="text-align: right;">107 / 4.44</td>
+<td style="text-align: right;">7.54</td>
+</tr>
+<tr class="even">
+<td><code>2026-06-24-09-37-40-qrv2_kernel_languages_p9y2rr1gw</code></td>
+<td style="text-align: right;">8.13 h</td>
+<td>1× RTX PRO 6000</td>
+<td style="text-align: right;">140 / 0.04</td>
+<td style="text-align: right;">118 / 1.61</td>
+<td style="text-align: right;">56 / 0.89</td>
+<td style="text-align: right;">149 / 5.49</td>
+<td style="text-align: right;">7.99</td>
+</tr>
+<tr class="odd">
+<td><code>2026-06-24-09-37-42-qrv2_kernel_languages_pcevwrpue</code></td>
+<td style="text-align: right;">7.98 h</td>
+<td>1× RTX PRO 6000</td>
+<td style="text-align: right;">75 / 0.03</td>
+<td style="text-align: right;">55 / 1.69</td>
+<td style="text-align: right;">32 / 0.98</td>
+<td style="text-align: right;">84 / 5.13</td>
+<td style="text-align: right;">7.81</td>
+</tr>
+<tr class="even">
+<td><code>2026-06-24-09-38-11-qrv2_kernel_languages_ask3necgb</code></td>
+<td style="text-align: right;">8.08 h</td>
+<td>1× RTX PRO 6000</td>
+<td style="text-align: right;">110 / 0.44</td>
+<td style="text-align: right;">81 / 2.87</td>
+<td style="text-align: right;">27 / 0.31</td>
+<td style="text-align: right;">93 / 3.74</td>
+<td style="text-align: right;">6.92</td>
+</tr>
+<tr class="odd">
+<td><code>2026-06-24-09-38-12-qrv2_kernel_languages_ptv6z9eog</code></td>
+<td style="text-align: right;">8.04 h</td>
+<td>1× RTX PRO 6000</td>
+<td style="text-align: right;">145 / 0.82</td>
+<td style="text-align: right;">109 / 1.72</td>
+<td style="text-align: right;">28 / 0.13</td>
+<td style="text-align: right;">134 / 5.08</td>
+<td style="text-align: right;">6.94</td>
+</tr>
+<tr class="even">
+<td><code>2026-06-24-09-38-31-qrv2_kernel_languages_m7w1ravpo</code></td>
+<td style="text-align: right;">8.12 h</td>
+<td>1× RTX PRO 6000</td>
+<td style="text-align: right;">95 / 0.03</td>
+<td style="text-align: right;">69 / 1.18</td>
+<td style="text-align: right;">36 / 1.09</td>
+<td style="text-align: right;">95 / 5.27</td>
+<td style="text-align: right;">7.53</td>
+</tr>
+<tr class="odd">
+<td><code>2026-06-24-20-40-28-qr_v2</code></td>
+<td style="text-align: right;">10.44 h</td>
+<td>2× B200</td>
+<td style="text-align: right;">102 / 1.53</td>
+<td style="text-align: right;">66 / 1.10</td>
+<td style="text-align: right;">35 / 1.36</td>
+<td style="text-align: right;">53 / 1.83</td>
+<td style="text-align: right;">4.29</td>
+</tr>
+<tr class="even">
+<td><code>2026-06-24-21-01-44-qr_v2_simplify</code></td>
+<td style="text-align: right;">3.87 h</td>
+<td>2× B200</td>
+<td style="text-align: right;">25 / 0.01</td>
+<td style="text-align: right;">20 / 3.14</td>
+<td style="text-align: right;">21 / 0.15</td>
+<td style="text-align: right;">21 / 0.77</td>
+<td style="text-align: right;">4.06</td>
+</tr>
+<tr class="odd">
+<td><code>2026-06-25-00-41-50-qrv2_kernel_languages_claude_kurboui6f</code></td>
+<td style="text-align: right;">7.83 h</td>
+<td>1× RTX PRO 6000</td>
+<td style="text-align: right;">80 / 0.02</td>
+<td style="text-align: right;">5 / 0.31</td>
+<td style="text-align: right;">1 / 0.01</td>
+<td style="text-align: right;">107 / 0.82</td>
+<td style="text-align: right;">1.14</td>
+</tr>
+<tr class="even">
+<td><code>2026-06-25-00-44-08-qrv2_kernel_languages_claude_kj7cvsimx</code></td>
+<td style="text-align: right;">8.06 h</td>
+<td>1× RTX PRO 6000</td>
+<td style="text-align: right;">85 / 0.02</td>
+<td style="text-align: right;">14 / 0.31</td>
+<td style="text-align: right;">21 / 0.12</td>
+<td style="text-align: right;">74 / 1.36</td>
+<td style="text-align: right;">1.78</td>
+</tr>
+<tr class="odd">
+<td><code>2026-06-25-00-51-32-qrv2_kernel_languages_claude_q1nb1oliq</code></td>
+<td style="text-align: right;">7.72 h</td>
+<td>1× RTX PRO 6000</td>
+<td style="text-align: right;">95 / 0.03</td>
+<td style="text-align: right;">29 / 0.68</td>
+<td style="text-align: right;">2 / 0.00</td>
+<td style="text-align: right;">119 / 1.25</td>
+<td style="text-align: right;">1.93</td>
+</tr>
+<tr class="even">
+<td><code>2026-06-25-00-59-02-qrv2_kernel_languages_claude_ocix8g7hp</code></td>
+<td style="text-align: right;">7.67 h</td>
+<td>1× RTX PRO 6000</td>
+<td style="text-align: right;">121 / 1.50</td>
+<td style="text-align: right;">23 / 0.50</td>
+<td style="text-align: right;">5 / 0.01</td>
+<td style="text-align: right;">75 / 1.22</td>
+<td style="text-align: right;">1.73</td>
+</tr>
+<tr class="odd">
+<td><code>2026-06-25-01-02-17-qrv2_kernel_languages_claude_rlhgzw2ql</code></td>
+<td style="text-align: right;">7.77 h‡</td>
+<td>1× RTX PRO 6000</td>
+<td style="text-align: right;">104 / 0.70</td>
+<td style="text-align: right;">10 / 0.15</td>
+<td style="text-align: right;">8 / 0.11</td>
+<td style="text-align: right;">162 / 0.73</td>
+<td style="text-align: right;">0.99</td>
+</tr>
+<tr class="even">
+<td><code>2026-06-25-01-25-17-qrv2_kernel_languages_claude_3otwejh6b</code></td>
+<td style="text-align: right;">7.12 h</td>
+<td>1× RTX PRO 6000</td>
+<td style="text-align: right;">106 / 0.54</td>
+<td style="text-align: right;">22 / 0.39</td>
+<td style="text-align: right;">32 / 0.05</td>
+<td style="text-align: right;">133 / 0.86</td>
+<td style="text-align: right;">1.30</td>
+</tr>
+<tr class="odd">
+<td><code>2026-06-25-02-02-25-qr_v2</code></td>
+<td style="text-align: right;">7.23 h</td>
+<td>2× B200</td>
+<td style="text-align: right;">117 / 0.04</td>
+<td style="text-align: right;">7 / 0.61</td>
+<td style="text-align: right;">44 / 0.13</td>
+<td style="text-align: right;">228 / 1.91</td>
+<td style="text-align: right;">2.65</td>
+</tr>
+<tr class="even">
+<td><code>2026-06-25-08-42-00-qr_v2_simplify</code></td>
+<td style="text-align: right;">10.71 h</td>
+<td>2× B200</td>
+<td style="text-align: right;">151 / 1.09</td>
+<td style="text-align: right;">13 / 0.16</td>
+<td style="text-align: right;">37 / 0.70</td>
+<td style="text-align: right;">91 / 1.05</td>
+<td style="text-align: right;">1.90</td>
+</tr>
+<tr class="odd">
+<td><code>2026-06-25-11-58-38-qrv2_kernel_languages_claude_tszacp309</code></td>
+<td style="text-align: right;">7.85 h</td>
+<td>1× RTX PRO 6000</td>
+<td style="text-align: right;">81 / 0.10</td>
+<td style="text-align: right;">27 / 0.47</td>
+<td style="text-align: right;">7 / 0.02</td>
+<td style="text-align: right;">106 / 1.33</td>
+<td style="text-align: right;">1.81</td>
+</tr>
+<tr class="even">
+<td><code>2026-06-25-12-01-35-qrv2_kernel_languages_claude_w7jxbr46z</code></td>
+<td style="text-align: right;">7.83 h</td>
+<td>1× RTX PRO 6000</td>
+<td style="text-align: right;">106 / 0.62</td>
+<td style="text-align: right;">15 / 0.21</td>
+<td style="text-align: right;">6 / 0.02</td>
+<td style="text-align: right;">160 / 1.00</td>
+<td style="text-align: right;">1.22</td>
+</tr>
+<tr class="odd">
+<td><code>2026-06-25-12-03-48-qrv2_kernel_languages_claude_zgqpd77zz</code></td>
+<td style="text-align: right;">7.76 h‡</td>
+<td>1× RTX PRO 6000</td>
+<td style="text-align: right;">128 / 0.72</td>
+<td style="text-align: right;">39 / 1.08</td>
+<td style="text-align: right;">14 / 0.07</td>
+<td style="text-align: right;">145 / 1.69</td>
+<td style="text-align: right;">2.84</td>
+</tr>
+<tr class="even">
+<td><code>2026-06-25-12-08-24-qrv2_kernel_languages_claude_g7v577r9x</code></td>
+<td style="text-align: right;">7.81 h</td>
+<td>1× RTX PRO 6000</td>
+<td style="text-align: right;">54 / 0.02</td>
+<td style="text-align: right;">18 / 0.38</td>
+<td style="text-align: right;">19 / 0.09</td>
+<td style="text-align: right;">177 / 0.86</td>
+<td style="text-align: right;">1.34</td>
+</tr>
+<tr class="odd">
+<td><code>2026-06-25-12-21-21-qrv2_kernel_languages_claude_kpnikqu5d</code></td>
+<td style="text-align: right;">7.57 h</td>
+<td>1× RTX PRO 6000</td>
+<td style="text-align: right;">71 / 0.36</td>
+<td style="text-align: right;">10 / 0.64</td>
+<td style="text-align: right;">14 / 0.32</td>
+<td style="text-align: right;">72 / 0.70</td>
+<td style="text-align: right;">1.65</td>
+</tr>
+<tr class="even">
+<td><code>2026-06-25-12-48-50-qrv2_kernel_languages_claude_j057n57jl</code></td>
+<td style="text-align: right;">7.14 h</td>
+<td>1× RTX PRO 6000</td>
+<td style="text-align: right;">50 / 0.01</td>
+<td style="text-align: right;">20 / 0.66</td>
+<td style="text-align: right;">17 / 0.12</td>
+<td style="text-align: right;">162 / 1.77</td>
+<td style="text-align: right;">2.54</td>
+</tr>
+<tr class="odd">
+<td><code>2026-06-25-22-03-01-qr_v2</code></td>
+<td style="text-align: right;">23.45 h</td>
+<td>1× B200</td>
+<td style="text-align: right;">190 / 2.11</td>
+<td style="text-align: right;">9 / 0.12</td>
+<td style="text-align: right;">20 / 0.40</td>
+<td style="text-align: right;">54 / 1.20</td>
+<td style="text-align: right;">1.73</td>
+</tr>
+<tr class="even">
+<td><code>2026-06-25-23-41-18-qr_v2</code></td>
+<td style="text-align: right;">16.14 h</td>
+<td>2× B200</td>
+<td style="text-align: right;">153 / 0.05</td>
+<td style="text-align: right;">15 / 1.07</td>
+<td style="text-align: right;">18 / 0.29</td>
+<td style="text-align: right;">203 / 1.75</td>
+<td style="text-align: right;">3.10</td>
+</tr>
+<tr class="odd">
+<td><code>2026-06-29-06-40-42-qr_v2</code></td>
+<td style="text-align: right;">8.68 h</td>
+<td>2× B200</td>
+<td style="text-align: right;">249 / 1.81</td>
+<td style="text-align: right;">24 / 0.41</td>
+<td style="text-align: right;">18 / 0.11</td>
+<td style="text-align: right;">57 / 1.05</td>
+<td style="text-align: right;">1.57</td>
+</tr>
+<tr class="even">
+<td><strong>Measured total (40 tags)</strong></td>
+<td style="text-align: right;">—</td>
+<td>mixed</td>
+<td style="text-align: right;"><strong>8,986 / 49.36</strong></td>
+<td style="text-align: right;"><strong>3,082 / 45.22</strong></td>
+<td style="text-align: right;"><strong>3,542 / 22.52</strong></td>
+<td style="text-align: right;"><strong>10,170 / 149.75</strong></td>
+<td style="text-align: right;"><strong>217.47</strong></td>
+</tr>
+</tbody>
+</table>
+<p>† The activity span is available, but the harness corpus does not
+contain enough lock records for an accurate build or GPU breakdown. The
+<code>2026-06-18-00-40-34-qr_v2</code> span runs from tag creation to
+its last recorded commit.</p>
+<p>‡ These two RTX tags have session and lock records but no
+optimization log; their activity spans come from the harness
+timestamps.</p>
+<h2 id="tool-calls-across-claude-and-codex">Tool Calls Across Claude and
+Codex</h2>
+<p>Claude <code>tool_use</code> and Codex function-call records are
+normalized into the same categories. Build, benchmark, and profile
+operations are removed from generic shell activity and counted below as
+their own entries.</p>
+<table>
+<thead>
+<tr class="header">
+<th>Tool or operation</th>
+<th style="text-align: right;">Claude</th>
+<th style="text-align: right;">Codex</th>
+<th style="text-align: right;">Total</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Bash / shell, other</td>
+<td style="text-align: right;">96,292</td>
+<td style="text-align: right;">26,181</td>
+<td style="text-align: right;">122,473</td>
+</tr>
+<tr class="even">
+<td>Read</td>
+<td style="text-align: right;">34,931</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">34,931</td>
+</tr>
+<tr class="odd">
+<td>Edit</td>
+<td style="text-align: right;">19,866</td>
+<td style="text-align: right;">1,446</td>
+<td style="text-align: right;">21,312</td>
+</tr>
+<tr class="even">
+<td><strong>Build</strong></td>
+<td style="text-align: right;"><strong>9,188</strong></td>
+<td style="text-align: right;"><strong>1,797</strong></td>
+<td style="text-align: right;"><strong>10,985</strong></td>
+</tr>
+<tr class="odd">
+<td><strong>Benchmark</strong></td>
+<td style="text-align: right;"><strong>7,928</strong></td>
+<td style="text-align: right;"><strong>1,565</strong></td>
+<td style="text-align: right;"><strong>9,493</strong></td>
+</tr>
+<tr class="even">
+<td><strong>Profile</strong></td>
+<td style="text-align: right;"><strong>4,604</strong></td>
+<td style="text-align: right;"><strong>723</strong></td>
+<td style="text-align: right;"><strong>5,327</strong></td>
+</tr>
+<tr class="odd">
+<td>Task update</td>
+<td style="text-align: right;">508</td>
+<td style="text-align: right;">3,429</td>
+<td style="text-align: right;">3,937</td>
+</tr>
+<tr class="even">
+<td>Write</td>
+<td style="text-align: right;">2,627</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">2,627</td>
+</tr>
+<tr class="odd">
+<td>Web fetch</td>
+<td style="text-align: right;">2,362</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">2,362</td>
+</tr>
+<tr class="even">
+<td>Agent</td>
+<td style="text-align: right;">1,762</td>
+<td style="text-align: right;">449</td>
+<td style="text-align: right;">2,211</td>
+</tr>
+<tr class="odd">
+<td>Send message</td>
+<td style="text-align: right;">1,553</td>
+<td style="text-align: right;">326</td>
+<td style="text-align: right;">1,879</td>
+</tr>
+<tr class="even">
+<td>Monitor</td>
+<td style="text-align: right;">1,147</td>
+<td style="text-align: right;">711</td>
+<td style="text-align: right;">1,858</td>
+</tr>
+<tr class="odd">
+<td>Web search</td>
+<td style="text-align: right;">1,538</td>
+<td style="text-align: right;">9</td>
+<td style="text-align: right;">1,547</td>
+</tr>
+<tr class="even">
+<td>Task stop</td>
+<td style="text-align: right;">761</td>
+<td style="text-align: right;">211</td>
+<td style="text-align: right;">972</td>
+</tr>
+<tr class="odd">
+<td>Skill</td>
+<td style="text-align: right;">819</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">819</td>
+</tr>
+<tr class="even">
+<td>Remaining named tools</td>
+<td style="text-align: right;">926</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">927</td>
+</tr>
+<tr class="odd">
+<td><strong>Normalized entries</strong></td>
+<td style="text-align: right;"><strong>186,812</strong></td>
+<td style="text-align: right;"><strong>36,848</strong></td>
+<td style="text-align: right;"><strong>223,660</strong></td>
+</tr>
+</tbody>
+</table>
+<p>The remaining named tools are task output/create/list/get, structured
+output, cron create/delete/list, push notification, schedule wakeup,
+workflow, and leaderboard ranking.</p>
+<p>The normalized total is 2,379 above the 221,281 underlying harness
+calls because a compound shell call can execute more than one build,
+benchmark, or profile operation, and a resource command can also contain
+an edit. Each executed operation is represented in its corresponding
+row; it is not retained in the generic shell row.</p>
+<p>The tool table counts issued operations, while the walltime table
+counts completed lock releases that carry measured durations. Their
+build, benchmark, and profile call counts therefore answer different
+questions and are not expected to match.</p>
+<h2 id="resource-opportunities">Resource Opportunities</h2>
+<ul>
+<li><strong>Reduce repeated validation and exploratory GPU probes
+first.</strong> Other-exclusive work is about 69% of measured GPU time,
+substantially more than benchmarking or profiling.</li>
+<li><strong>Tighten benchmark budgets where confidence permits.</strong>
+Benchmarking still accounts for about 45.2 GPU-hours across 3,082
+measured calls.</li>
+<li><strong>Use profiling selectively.</strong> Profiling accounts for
+about 22.5 GPU-hours and 3,542 measured calls; profiles that do not
+change the next experiment can be avoided.</li>
+<li><strong>Reduce resident context size.</strong> With 42.65B
+cached-input tokens, smaller summaries or diff-focused context would
+target the dominant inference category directly.</li>
+<li><strong>Preserve build artifacts when safe.</strong> Shared
+build-lock activity totals 49.36 hours across 8,986 measured build
+calls.</li>
+</ul>
+<h2 id="scope-and-methodology">Scope and Methodology</h2>
+<p><strong>Scope.</strong> The report covers 43 June tags: 19 B200
+attempts and 24 RTX PRO 6000 attempts. Of the RTX attempts, 22 have
+optimization logs and two have session-only evidence. The recent July QR
+activity on this node is excluded.</p>
+<p><strong>GPU topology.</strong> Sixteen B200 tags ran on 2×B200 nodes,
+three ran on 1×B200 nodes, and all RTX PRO 6000 tags used one GPU.
+GPU-hours are the sum of unique per-device exclusive lock durations. A
+2× node therefore contributes up to two GPU-hours per wall-clock hour
+when both devices are active; the lock total is not multiplied
+again.</p>
+<p><strong>Walltime categories.</strong> Build time comes from shared
+build-lock releases. Benchmark and profile time come from exclusive lock
+releases classified using the originating command and result markers.
+Other exclusive time includes validation, custom GPU probes,
+submissions, and GPU work that is neither a benchmark nor a profile.
+Three early B200 tags have incomplete lock evidence and are excluded
+from measured compute totals rather than estimated.</p>
+<p><strong>Tool calls.</strong> Claude and Codex records are parsed in
+their native schemas and matched by stable call ID.
+<code>autocuda run slice/shared</code> operations are classified as
+builds; benchmark scripts and <code>eval.py benchmark</code> as
+benchmarks; profiler scripts, <code>nsys profile</code>, and
+capture-mode <code>ncu</code> as profiles. Remaining shell calls stay in
+the generic shell category.</p>
+<p><strong>Tokens.</strong> Claude usage uses the final values for each
+response ID. Codex usage uses the final per-session token snapshot, with
+cached input separated from the inclusive input field. The four token
+fields in this report are disjoint.</p>
+</body>
+</html>

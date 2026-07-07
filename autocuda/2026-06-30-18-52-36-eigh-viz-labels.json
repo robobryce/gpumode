@@ -1,0 +1,8 @@
+{
+  "0d3cd7b": "Dropped a slower large-matrix splitting scheme and banked the win from running the fast custom solver on the small and medium matrices.",
+  "12251fe": "Removed wrapper overhead — preallocated scratch, no gatekeeping, no sorting — so medium matrices run straight through the fast custom solver.",
+  "c0c9780": "Cut a redundant cleanup pass out of a setup step that a later step already repeats, faster with equal accuracy.",
+  "a79df8e": "Fixed a timing bug between GPU thread groups that corrupted a large-matrix fast path, making it reliable and roughly twice as fast.",
+  "3935720": "Switched the big-matrix multiplies to a faster reduced-precision tensor-core scheme, verified across random inputs to add speed with no new failures.",
+  "980c88b": "Grouped similar solves into shared batches to trim a few redundant GPU operations, locking in the run's best time."
+}

@@ -1,0 +1,289 @@
+COMMIT=39f6328df8f839d36ff01478ea71567efa0ccae4
+==PROF== Connected to process 1743339 (/home/shadeform/.local/share/uv/python/cpython-3.12.13-linux-x86_64-gnu/bin/python3.12)
+==PROF== Connected to process 1743377 (/home/shadeform/.local/share/uv/python/cpython-3.12.13-linux-x86_64-gnu/bin/python3.12)
+==WARNING== Unable to access the following 6 metrics: ctc__rx_bytes_data_user.sum, ctc__rx_bytes_data_user.sum.pct_of_peak_sustained_elapsed, ctc__rx_bytes_data_user.sum.per_second, ctc__tx_bytes_data_user.sum, ctc__tx_bytes_data_user.sum.pct_of_peak_sustained_elapsed, ctc__tx_bytes_data_user.sum.per_second.
+
+
+==PROF== Profiling "elementwise_kernel" - 0 (1/1): 0%....50%....100% - 41 passes
+==PROF== Disconnected from process 1743339
+[1743377] python3.12@127.0.0.1
+  void elementwise_kernel<128, 2, void gpu_kernel_impl_nocast<BinaryFunctor<float, float, float, MulFunctor<float>>>(TensorIteratorBase &, const T1 &)::[lambda(int) (instance 1)]>(int, T3) (80, 1, 1)x(128, 1, 1), Context 1, Stream 7, Device 0, CC 10.0
+    Section: GPU Speed Of Light Throughput
+    ----------------------- ----------- ------------
+    Metric Name             Metric Unit Metric Value
+    ----------------------- ----------- ------------
+    DRAM Frequency                  Ghz         3.96
+    SM Frequency                    Ghz         1.95
+    Elapsed Cycles                cycle         8736
+    Memory Throughput                 %         2.59
+    DRAM Throughput                   %         0.28
+    Duration                         us         4.48
+    L1/TEX Cache Throughput           %         1.23
+    L2 Cache Throughput               %         0.44
+    SM Active Cycles              cycle      1796.72
+    Compute (SM) Throughput           %         0.67
+    ----------------------- ----------- ------------
+
+    OPT   This kernel grid is too small to fill the available resources on this device, resulting in only 0.03 full     
+          waves across all SMs. Look at Launch Statistics for more details.                                             
+
+    Section: GPU Speed Of Light Roofline Chart (Overview)
+    INF   The ratio of peak float (FP32) to double (FP64) performance on this device is 2:1. The workload achieved      
+          close to 0% of this device's FP32 peak performance and 0% of its FP64 peak performance. See the Profiling     
+          Guide (https://docs.nvidia.com/nsight-compute/ProfilingGuide/index.html#roofline) for more details on         
+          roofline analysis.                                                                                            
+
+    Section: PM Sampling
+    ------------------------- ----------- ------------
+    Metric Name               Metric Unit Metric Value
+    ------------------------- ----------- ------------
+    Maximum Buffer Size             Mbyte        58.65
+    Maximum Sampling Interval          us            1
+    # Pass Groups                                    2
+    ------------------------- ----------- ------------
+
+    WRN   Sampling interval is larger than 10% of the workload duration, which likely results in very few collected     
+          samples.                                                                                                      
+
+    Section: Compute Workload Analysis
+    -------------------- ----------- ------------
+    Metric Name          Metric Unit Metric Value
+    -------------------- ----------- ------------
+    Executed Ipc Active   inst/cycle         0.13
+    Executed Ipc Elapsed  inst/cycle         0.03
+    Issue Slots Busy               %         0.67
+    Issued Ipc Active     inst/cycle         0.13
+    SM Busy                        %         0.67
+    -------------------- ----------- ------------
+
+    OPT   Est. Local Speedup: 99.51%                                                                                    
+          All compute pipelines are under-utilized. Either this workload is very small or it doesn't issue enough warps 
+          per scheduler. Check the Launch Statistics and Scheduler Statistics sections for further details.             
+
+    Section: Memory Workload Analysis
+    --------------------------------------- ----------- ------------
+    Metric Name                             Metric Unit Metric Value
+    --------------------------------------- ----------- ------------
+    Local Memory Spilling Requests                                 0
+    Local Memory Spilling Request Overhead            %            0
+    L2 Sector Promotion Misses                        %            0
+    Shared Memory Spilling Requests                                0
+    Shared Memory Spilling Request Overhead           %            0
+    Memory Throughput                           Gbyte/s        21.54
+    Mem Busy                                          %         2.14
+    Max Bandwidth                                     %         2.59
+    L1/TEX Hit Rate                                   %        29.17
+    L2 Persisting Size                            Mbyte        24.87
+    L2 Compression Success Rate                       %            0
+    L2 Compression Ratio                              %            0
+    L2 Compression Input Sectors                 sector         2655
+    L2 Hit Rate                                       %        24.56
+    Mem Pipes Busy                                    %         0.55
+    --------------------------------------- ----------- ------------
+
+    Section: Memory Workload Analysis Chart
+    OPT   Est. Speedup: 0.2331%                                                                                         
+          Out of the 84960.0 bytes sent to the L2 Compression unit only 0.00% were successfully compressed. To increase 
+          this success rate, consider marking only those memory regions as compressible that contain the most zero      
+          values and/or expose the most homogeneous values.                                                             
+
+    Section: Scheduler Statistics
+    ---------------------------- ----------- ------------
+    Metric Name                  Metric Unit Metric Value
+    ---------------------------- ----------- ------------
+    One or More Eligible                   %         3.16
+    Issued Warp Per Scheduler                        0.03
+    No Eligible                            %        96.84
+    Active Warps Per Scheduler          warp         0.92
+    Eligible Warps Per Scheduler        warp         0.03
+    ---------------------------- ----------- ------------
+
+    OPT   Est. Local Speedup: 96.84%                                                                                    
+          Every scheduler is capable of issuing one instruction per cycle, but for this workload each scheduler only    
+          issues an instruction every 31.6 cycles. This might leave hardware resources underutilized and may lead to    
+          less optimal performance. Out of the maximum of 16 warps per scheduler, this workload allocates an average    
+          of 0.92 active warps per scheduler, which already limits the scheduler to less than a warp per instruction.   
+
+    Section: Warp State Statistics
+    ---------------------------------------- ----------- ------------
+    Metric Name                              Metric Unit Metric Value
+    ---------------------------------------- ----------- ------------
+    Warp Cycles Per Issued Instruction             cycle        29.02
+    Warp Cycles Per Executed Instruction           cycle        29.02
+    Avg. Active Threads Per Warp                                   32
+    Avg. Not Predicated Off Threads Per Warp                    30.21
+    ---------------------------------------- ----------- ------------
+
+    OPT   Est. Speedup: 54.69%                                                                                          
+          On average, each warp of this workload spends 15.9 cycles being stalled waiting for a scoreboard dependency   
+          on a L1TEX (local, global, surface, texture) operation. Find the instruction producing the data being waited  
+          upon to identify the culprit. To reduce the number of cycles waiting on L1TEX data accesses verify the        
+          memory access patterns are optimal for the target architecture, attempt to increase cache hit rates by        
+          increasing data locality (coalescing), or by changing the cache configuration. Consider moving frequently     
+          used data to shared memory. This stall type represents about 54.7% of the total average of 29.0 cycles        
+          between issuing two instructions.                                                                             
+    ----- --------------------------------------------------------------------------------------------------------------
+    INF   Check the Warp Stall Sampling (All Samples) table for the top stall locations in your source based on         
+          sampling data. The Profiling Guide                                                                            
+          (https://docs.nvidia.com/nsight-compute/ProfilingGuide/index.html#metrics-reference) provides more details    
+          on each stall reason.                                                                                         
+
+    Section: Instruction Statistics
+    ---------------------------------------- ----------- ------------
+    Metric Name                              Metric Unit Metric Value
+    ---------------------------------------- ----------- ------------
+    Local Memory Spilling Requests                  byte            0
+    Shared Memory Spilling Requests                 byte            0
+    Avg. Executed Instructions Per Scheduler        inst        57.84
+    Executed Instructions                           inst        34240
+    Avg. Issued Instructions Per Scheduler          inst        57.84
+    Issued Instructions                             inst        34240
+    ---------------------------------------- ----------- ------------
+
+    OPT   Est. Speedup: 0.09345%                                                                                        
+          This workload executes 0 fused and 640 non-fused FP32 instructions. By converting pairs of non-fused          
+          instructions to their fused (https://docs.nvidia.com/cuda/floating-point/#cuda-and-floating-point),           
+          higher-throughput equivalent, the achieved FP32 performance could be increased by up to 50% (relative to its  
+          current performance).                                                                                         
+
+    Section: Launch Statistics
+    -------------------------------- --------------- ---------------
+    Metric Name                          Metric Unit    Metric Value
+    -------------------------------- --------------- ---------------
+    Block Size                                                   128
+    Cluster Scheduling Policy                           PolicySpread
+    Cluster Size                                                   0
+    Function Cache Configuration                     CachePreferNone
+    Grid Size                                                     80
+    Preferred Cluster Size                                         0
+    Registers Per Thread             register/thread              20
+    Shared Memory Configuration Size           Kbyte           32.77
+    Driver Shared Memory Per Block       Kbyte/block            1.02
+    Dynamic Shared Memory Per Block       byte/block               0
+    Static Shared Memory Per Block        byte/block               0
+    # SMs                                         SM             148
+    Stack Size                                                  1024
+    Threads                                   thread           10240
+    # TPCs                                                        74
+    Enabled TPC IDs                                              all
+    Uses Green Context                                             0
+    Waves Per SM                                                0.03
+    -------------------------------- --------------- ---------------
+
+    OPT   Est. Speedup: 45.95%                                                                                          
+          The grid for this launch is configured to execute only 80 blocks, which is less than the 148 multiprocessors  
+          used. This can underutilize some multiprocessors. If you do not intend to execute this kernel concurrently    
+          with other workloads, consider reducing the block size to have at least one block per multiprocessor or       
+          increase the size of the grid to fully utilize the available hardware resources. See the Hardware Model       
+          (https://docs.nvidia.com/nsight-compute/ProfilingGuide/index.html#metrics-hw-model) description for more      
+          details on launch configurations.                                                                             
+
+    Section: Occupancy
+    ------------------------------- ----------- ------------
+    Metric Name                     Metric Unit Metric Value
+    ------------------------------- ----------- ------------
+    Max Active Clusters                 cluster            0
+    Max Cluster Size                      block            8
+    Overall GPU Occupancy                     %            0
+    Cluster Occupancy                         %            0
+    Block Limit Barriers                  block           32
+    Block Limit SM                        block           32
+    Block Limit Registers                 block           21
+    Block Limit Shared Mem                block           32
+    Block Limit Warps                     block           16
+    Theoretical Active Warps per SM        warp           64
+    Theoretical Occupancy                     %          100
+    Achieved Occupancy                        %         6.10
+    Achieved Active Warps Per SM           warp         3.91
+    ------------------------------- ----------- ------------
+
+    OPT   Est. Speedup: 93.9%                                                                                           
+          The difference between calculated theoretical (100.0%) and measured achieved occupancy (6.1%) can be the      
+          result of warp scheduling overheads or workload imbalances during the kernel execution. Load imbalances can   
+          occur between warps within a block as well as across blocks of the same kernel. See the CUDA Best Practices   
+          Guide (https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#occupancy) for more details on     
+          optimizing occupancy.                                                                                         
+
+    Section: GPU and Memory Workload Distribution
+    -------------------------- ----------- ------------
+    Metric Name                Metric Unit Metric Value
+    -------------------------- ----------- ------------
+    Average DRAM Active Cycles       cycle        47.12
+    Total DRAM Elapsed Cycles        cycle      1136128
+    Average L1 Active Cycles         cycle      1796.72
+    Total L1 Elapsed Cycles          cycle      1284146
+    Average L2 Active Cycles         cycle      2603.18
+    Total L2 Elapsed Cycles          cycle      1604756
+    Average SM Active Cycles         cycle      1796.72
+    Total SM Elapsed Cycles          cycle      1284146
+    Average SMSP Active Cycles       cycle      1828.84
+    Total SMSP Elapsed Cycles        cycle      5136584
+    -------------------------- ----------- ------------
+
+    OPT   Est. Speedup: 11.2%                                                                                           
+          One or more SMs have a much lower number of active cycles than the average number of active cycles. Maximum   
+          instance value is 54.09% above the average, while the minimum instance value is 100.00% below the average.    
+    ----- --------------------------------------------------------------------------------------------------------------
+    OPT   Est. Speedup: 11.74%                                                                                          
+          One or more SMSPs have a much lower number of active cycles than the average number of active cycles. Maximum 
+          instance value is 55.69% above the average, while the minimum instance value is 100.00% below the average.    
+    ----- --------------------------------------------------------------------------------------------------------------
+    OPT   Est. Speedup: 11.2%                                                                                           
+          One or more L1 Slices have a much lower number of active cycles than the average number of active cycles.     
+          Maximum instance value is 54.09% above the average, while the minimum instance value is 100.00% below the     
+          average.                                                                                                      
+    ----- --------------------------------------------------------------------------------------------------------------
+    OPT   Est. Speedup: 10.3%                                                                                           
+          One or more L2 Slices have a much lower number of active cycles than the average number of active cycles.     
+          Maximum instance value is 34.49% above the average, while the minimum instance value is 74.99% below the      
+          average.                                                                                                      
+
+    Section: Source Counters
+    ------------------------- ----------- ------------
+    Metric Name               Metric Unit Metric Value
+    ------------------------- ----------- ------------
+    Branch Instructions Ratio           %         0.09
+    Branch Instructions              inst         3200
+    Branch Efficiency                   %          100
+    Avg. Divergent Branches      branches            0
+    ------------------------- ----------- ------------
+
+Collecting data...
+Generating '/tmp/nsys-report-e7bb.qdstrm'
+[1/8] [0%                          ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.nsys-rep[1/8] [0%                          ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.nsys-rep[1/8] [7%                          ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.nsys-rep[1/8] [=15%                        ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.nsys-rep[1/8] [=16%                        ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.nsys-rep[1/8] [=17%                        ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.nsys-rep[1/8] [==18%                       ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.nsys-rep[1/8] [==19%                       ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.nsys-rep[1/8] [==20%                       ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.nsys-rep[1/8] [==21%                       ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.nsys-rep[1/8] [===22%                      ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.nsys-rep[1/8] [===23%                      ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.nsys-rep[1/8] [===24%                      ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.nsys-rep[1/8] [====25%                     ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.nsys-rep[1/8] [====26%                     ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.nsys-rep[1/8] [====27%                     ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.nsys-rep[1/8] [====28%                     ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.nsys-rep[1/8] [=====29%                    ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.nsys-rep[1/8] [=====30%                    ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.nsys-rep[1/8] [=====31%                    ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.nsys-rep[1/8] [=====32%                    ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.nsys-rep[1/8] [======33%                   ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.nsys-rep[1/8] [======34%                   ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.nsys-rep[1/8] [======35%                   ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.nsys-rep[1/8] [=======36%                  ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.nsys-rep[1/8] [=======37%                  ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.nsys-rep[1/8] [=======38%                  ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.nsys-rep[1/8] [=======39%                  ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.nsys-rep[1/8] [========40%                 ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.nsys-rep[1/8] [========41%                 ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.nsys-rep[1/8] [========42%                 ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.nsys-rep[1/8] [=========43%                ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.nsys-rep[1/8] [=========44%                ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.nsys-rep[1/8] [=========45%                ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.nsys-rep[1/8] [=========46%                ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.nsys-rep[1/8] [==========47%               ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.nsys-rep[1/8] [==========48%               ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.nsys-rep[1/8] [==========49%               ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.nsys-rep[1/8] [===========50%              ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.nsys-rep[1/8] [===========51%              ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.nsys-rep[1/8] [===========52%              ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.nsys-rep[1/8] [===========53%              ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.nsys-rep[1/8] [============54%             ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.nsys-rep[1/8] [============55%             ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.nsys-rep[1/8] [============56%             ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.nsys-rep[1/8] [============57%             ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.nsys-rep[1/8] [=============58%            ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.nsys-rep[1/8] [=============59%            ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.nsys-rep[1/8] [=============60%            ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.nsys-rep[1/8] [==============61%           ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.nsys-rep[1/8] [==============62%           ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.nsys-rep[1/8] [==============63%           ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.nsys-rep[1/8] [==============64%           ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.nsys-rep[1/8] [===============65%          ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.nsys-rep[1/8] [===============66%          ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.nsys-rep[1/8] [===============67%          ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.nsys-rep[1/8] [================68%         ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.nsys-rep[1/8] [================69%         ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.nsys-rep[1/8] [================70%         ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.nsys-rep[1/8] [================71%         ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.nsys-rep[1/8] [=================72%        ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.nsys-rep[1/8] [=================73%        ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.nsys-rep[1/8] [=================74%        ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.nsys-rep[1/8] [==================75%       ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.nsys-rep[1/8] [==================76%       ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.nsys-rep[1/8] [==================77%       ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.nsys-rep[1/8] [==================78%       ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.nsys-rep[1/8] [===================79%      ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.nsys-rep[1/8] [===================80%      ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.nsys-rep[1/8] [===================81%      ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.nsys-rep[1/8] [===================82%      ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.nsys-rep[1/8] [====================83%     ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.nsys-rep[1/8] [====================84%     ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.nsys-rep[1/8] [====================85%     ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.nsys-rep[1/8] [=====================86%    ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.nsys-rep[1/8] [=====================87%    ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.nsys-rep[1/8] [=====================88%    ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.nsys-rep[1/8] [=====================89%    ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.nsys-rep[1/8] [======================90%   ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.nsys-rep[1/8] [=======================95%  ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.nsys-rep[1/8] [========================100%] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.nsys-rep[1/8] [========================100%] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.nsys-rep
+[2/8] [0%                          ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.sqlite[2/8] [1%                          ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.sqlite[2/8] [2%                          ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.sqlite[2/8] [3%                          ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.sqlite[2/8] [4%                          ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.sqlite[2/8] [5%                          ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.sqlite[2/8] [6%                          ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.sqlite[2/8] [7%                          ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.sqlite[2/8] [8%                          ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.sqlite[2/8] [9%                          ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.sqlite[2/8] [10%                         ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.sqlite[2/8] [11%                         ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.sqlite[2/8] [12%                         ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.sqlite[2/8] [13%                         ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.sqlite[2/8] [14%                         ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.sqlite[2/8] [=15%                        ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.sqlite[2/8] [=16%                        ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.sqlite[2/8] [=17%                        ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.sqlite[2/8] [==18%                       ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.sqlite[2/8] [==19%                       ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.sqlite[2/8] [==20%                       ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.sqlite[2/8] [==21%                       ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.sqlite[2/8] [===22%                      ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.sqlite[2/8] [===23%                      ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.sqlite[2/8] [===24%                      ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.sqlite[2/8] [====25%                     ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.sqlite[2/8] [====26%                     ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.sqlite[2/8] [====27%                     ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.sqlite[2/8] [====28%                     ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.sqlite[2/8] [=====29%                    ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.sqlite[2/8] [=====30%                    ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.sqlite[2/8] [=====31%                    ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.sqlite[2/8] [=====32%                    ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.sqlite[2/8] [======33%                   ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.sqlite[2/8] [======34%                   ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.sqlite[2/8] [======35%                   ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.sqlite[2/8] [=======36%                  ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.sqlite[2/8] [=======37%                  ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.sqlite[2/8] [=======38%                  ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.sqlite[2/8] [=======39%                  ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.sqlite[2/8] [========40%                 ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.sqlite[2/8] [========41%                 ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.sqlite[2/8] [========42%                 ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.sqlite[2/8] [=========43%                ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.sqlite[2/8] [=========44%                ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.sqlite[2/8] [=========45%                ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.sqlite[2/8] [=========46%                ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.sqlite[2/8] [==========47%               ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.sqlite[2/8] [==========48%               ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.sqlite[2/8] [==========49%               ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.sqlite[2/8] [===========50%              ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.sqlite[2/8] [===========51%              ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.sqlite[2/8] [===========52%              ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.sqlite[2/8] [===========53%              ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.sqlite[2/8] [============54%             ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.sqlite[2/8] [============55%             ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.sqlite[2/8] [============56%             ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.sqlite[2/8] [============57%             ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.sqlite[2/8] [=============58%            ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.sqlite[2/8] [=============59%            ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.sqlite[2/8] [=============60%            ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.sqlite[2/8] [==============61%           ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.sqlite[2/8] [==============62%           ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.sqlite[2/8] [==============63%           ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.sqlite[2/8] [==============64%           ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.sqlite[2/8] [===============65%          ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.sqlite[2/8] [===============66%          ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.sqlite[2/8] [===============67%          ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.sqlite[2/8] [================68%         ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.sqlite[2/8] [================69%         ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.sqlite[2/8] [================70%         ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.sqlite[2/8] [================71%         ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.sqlite[2/8] [=================72%        ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.sqlite[2/8] [=================73%        ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.sqlite[2/8] [=================74%        ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.sqlite[2/8] [==================75%       ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.sqlite[2/8] [==================76%       ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.sqlite[2/8] [==================77%       ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.sqlite[2/8] [==================78%       ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.sqlite[2/8] [===================79%      ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.sqlite[2/8] [===================80%      ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.sqlite[2/8] [===================81%      ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.sqlite[2/8] [===================82%      ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.sqlite[2/8] [====================83%     ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.sqlite[2/8] [====================84%     ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.sqlite[2/8] [====================85%     ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.sqlite[2/8] [=====================86%    ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.sqlite[2/8] [=====================87%    ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.sqlite[2/8] [=====================88%    ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.sqlite[2/8] [=====================89%    ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.sqlite[2/8] [======================90%   ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.sqlite[2/8] [======================91%   ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.sqlite[2/8] [======================92%   ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.sqlite[2/8] [=======================93%  ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.sqlite[2/8] [=======================94%  ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.sqlite[2/8] [=======================95%  ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.sqlite[2/8] [=======================96%  ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.sqlite[2/8] [========================97% ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.sqlite[2/8] [========================98% ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.sqlite[2/8] [========================99% ] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.sqlite[2/8] [========================100%] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.sqlite[2/8] [========================100%] worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.sqlite
+[3/8] Executing 'nvtx_sum' stats report
+[4/8] Executing 'osrt_sum' stats report
+
+ Time (%)  Total Time (ns)  Num Calls  Avg (ns)  Med (ns)  Min (ns)  Max (ns)  StdDev (ns)         Name        
+ --------  ---------------  ---------  --------  --------  --------  --------  -----------  -------------------
+     96.8         34528127        169  204308.4    3106.0      1009  33320291    2562566.4  read               
+      1.4           499207        183    2727.9    2069.0      1010     14687       1868.4  open64             
+      0.3           115724         15    7714.9    8589.0      2596     11123       2896.1  mmap64             
+      0.3           100597         21    4790.3    2305.0      1198     19448       6118.0  fopen64            
+      0.2            71985          3   23995.0   23947.0     22466     25572       1553.6  munmap             
+      0.2            63965         35    1827.6    1552.0      1022      5761        994.2  close              
+      0.1            52587          1   52587.0   52587.0     52587     52587          0.0  open               
+      0.1            43923          8    5490.4    5345.5      4964      6555        538.1  fflush             
+      0.1            37883          6    6313.8    6269.5      5476      7232        834.3  fwrite_unlocked    
+      0.1            36454         19    1918.6    1689.0      1001      3692        826.0  fclose             
+      0.1            24280          5    4856.0    1992.0      1360     16797       6685.5  sigaction          
+      0.1            22229          6    3704.8    3460.0      2115      6008       1730.5  fread              
+      0.1            20986          3    6995.3    6729.0      6673      7584        510.6  write              
+      0.1            19400          2    9700.0    9700.0      3456     15944       8830.3  pthread_cond_signal
+      0.0             6105          1    6105.0    6105.0      6105      6105          0.0  fstatat            
+      0.0             6093          1    6093.0    6093.0      6093      6093          0.0  fputs_unlocked     
+      0.0             4262          3    1420.7    1456.0      1223      1583        182.6  ioctl              
+      0.0             3742          1    3742.0    3742.0      3742      3742          0.0  stat               
+      0.0             2068          2    1034.0    1034.0      1007      1061         38.2  fcntl              
+      0.0             1963          1    1963.0    1963.0      1963      1963          0.0  fstat              
+      0.0             1000          1    1000.0    1000.0      1000      1000          0.0  fgets              
+
+[5/8] Executing 'cuda_api_sum' stats report
+[6/8] Executing 'cuda_gpu_kern_sum' stats report
+[7/8] Executing 'cuda_gpu_mem_time_sum' stats report
+[8/8] Executing 'cuda_gpu_mem_size_sum' stats report
+Generated:
+	/home/shadeform/gpumode/autocuda/profiles/2026-06-22-09-10-03-qr_v2/worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.nsys-rep
+	/home/shadeform/gpumode/autocuda/profiles/2026-06-22-09-10-03-qr_v2/worker-1-brief-11-iteration-1-39f6328df8f839d36ff01478ea71567efa0ccae4.sqlite
+=== nsys exit, top kernels by time ===
