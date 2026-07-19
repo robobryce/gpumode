@@ -12,16 +12,17 @@ Optimize a problem — pass its `<set>/<problem>` path as `benchmark=` (the one 
 /autocuda:optimize-tree workers=4 benchmark=<set>/<problem> tag-suffix=<problem>
 ```
 
-### ⚠️ MANDATORY: ALL COMMANDS MUST USE `autocuda run` WRAPPERS
+### ⚠️ MANDATORY OVERRIDE: MODAL TESTS AND BENCHMARKS USE `autocuda run slice`
 
-**Every build, validate, benchmark, and profile command MUST be wrapped with `autocuda run` — NO EXCEPTIONS.**
+**Explicit override of the autocuda skill's default guidance:** this project runs validation and benchmarking on Modal, not on a local GPU. Therefore **all tests and benchmarks MUST use `autocuda run slice`, never `autocuda run exclusive`.** The remote Modal GPU consumes no contended local GPU resource; `exclusive` would unnecessarily serialize workers and contradict this layout's project-specific execution contract.
 
 - **Build:** `autocuda run slice --data-dir "$DATA_DIR" -- <cmd>`
-- **Validate, Benchmark, Profile:** `autocuda run exclusive --data-dir "$DATA_DIR" -- <cmd>`
+- **Validate and Benchmark (remote Modal GPU):** `autocuda run slice --data-dir "$DATA_DIR" -- bash harness/modal.sh <validate|benchmark> <set>/<problem>`
+- **Profile (run-specific no-GPU exception):** no local GPU is available for this run, so local profiling is waived; do not invoke the local profiler wrappers or `autocuda run exclusive` for profiling. Hosted profiling through `popcorn-cli --profile-brev` is allowed, subject to the strict rate limit in [Profiling](#profiling).
 
-Direct invocations bypass the `.gpu.lock` flock in `$DATA_DIR` and produce corrupted/noisy measurements when multiple workers run concurrently. The single repo-root data dir means one lock serializes the whole fleet, even across different problems. `autocuda run` preserves the caller's working directory, and `harness/env.sh` resolves the target from the `<set>/<problem>` argument (not the cwd) to find the editable file, so a worker operates on the right `submission.py` from inside its worktree.
+`autocuda run slice` still provides each worker's local CPU/memory allocation while allowing independent Modal jobs to overlap. `harness/modal.sh` uploads the current worktree, so each worker evaluates its own edited `submission.py`. Its remote image mirrors the production `gpu-mode/kernelbot` Modal dependency definition at the pinned commit recorded in `harness/modal_runner.py`; do not add convenience packages to that image, because doing so can hide leaderboard import failures. Local-only kernelguard/portability checks run before Modal is launched. Set `MODAL_GPU` to the Modal NVIDIA GPU type required by the problem (default `B200`); authentication is the normal Modal CLI configuration. The supplied CUDA image supports NVIDIA/CUDA problem sets; AMD/ROCm and multi-GPU problems require a different remote image/runner and are not supported by this wrapper. `autocuda run` preserves the caller's working directory, and the harness resolves the target from the `<set>/<problem>` argument rather than the cwd.
 
-**Wrap each `harness/` script exactly once — never nest `autocuda run`.** Wrap the script *you* invoke; do not wrap a command that a wrapped script runs internally (a script may run several steps itself, inside the one lock it is already holding). Nesting deadlocks: `autocuda run exclusive` takes the fleet-wide scheduler lock and then waits for a free GPU before releasing it, so an inner `exclusive` call started by an outer one waits for a GPU the outer is holding — on a single-GPU host this is a permanent self-deadlock, and on any host it pins the scheduler lock so no other worker can claim a GPU, stalling the fleet. (The harness scripts therefore do their own work directly and never call `autocuda run` — keep it that way.)
+**Wrap each `harness/` script exactly once — never nest `autocuda run`.** Wrap the script *you* invoke; harness scripts do their own work directly and never call `autocuda run`. For remote validation/benchmarking, wrap `harness/modal.sh`; the local wrapper invokes Modal, and the remote function invokes `validate.sh` or `benchmark.sh` without another autocuda wrapper.
 
 ## Editable files
 
@@ -33,8 +34,8 @@ Frozen GPU MODE harness — DO NOT modify. These define correctness and timing e
 
 - **`eval.py`** — the official KernelBot eval harness. Modes `test` / `benchmark` / `leaderboard` / `profile`; reads a spec file, runs `custom_kernel` in a spawned subprocess, writes `key: value` results to the fd named by `POPCORN_FD`. Times with CUDA events, clears L2 between repeats, runs an obligatory correctness check before timing. **Its location varies by problem** — shared at the set root (`problems/<set>/eval.py`, e.g. `pmpp_v2`) or problem-local (`problems/<set>/<problem>/eval.py`, e.g. `linalg/qr_py`). The harness resolves the right one from `task.yml`'s `files:` manifest (`bin/gen_specs.py --file-source eval.py`), so never hardcode the set root.
 - **`utils.py`** — checkers (`verbose_allclose` / `verbose_allequal`), seeding, `clear_l2_cache`. Same dual location as `eval.py`, and may be borrowed from another set (`linalg/qr_py` → `problems/pmpp_v2/utils.py`); resolved the same way (`--file-source utils.py`).
-- **`problems/<set>/<problem>/reference.py`** — `generate_input(...)` and the `check_implementation` ground truth. **`task.py`** — input/output type schema. **`task.yml`** — the official problem spec: the canonical `tests:` / `benchmarks:` shapes + leaderboard timeouts **and** the `files:` manifest that maps each runtime file (`eval.py`, `utils.py`, …) to its `source` path. The `harness/` scripts render its shapes into eval.py spec files and resolve those file locations on the fly via `bin/gen_specs.py`.
-- **`harness/env.sh`, `build.sh`, `validate.sh`, `benchmark.sh`, `profile_ncu.sh`, `submit.sh`** and **`bin/gen_specs.py`** — the autocuda↔GPU-MODE bridge. `env.sh` resolves `eval.py` / `utils.py` per problem from the `files:` manifest (via `gen_specs.py --file-source`) and puts their dirs on `PYTHONPATH`, so the same scripts drive both the set-root and problem-local layouts unchanged. Treat as read-only infrastructure.
+- **`problems/<set>/<problem>/reference.py`** — `generate_input(...)` and the `check_implementation` ground truth. **`task.py`** — input/output type schema. **`task.yml`** — the official problem spec: the canonical `tests:` / `benchmarks:` shapes + leaderboard timeouts **and** the `files:` manifest that maps each runtime file (`eval.py`, `utils.py`, …) to its `source` path. The `harness/` scripts render its shapes into eval.py spec files and resolve those file locations on the fly via `bin/gen_specs.py`. Problem-specific `guards/*.sh` are also frozen validation infrastructure: QR v2 carries differential/invariance/off-grid guards, while Eigh and Cholesky carry bounded-time fresh-seed input-variation guards over published shapes and their ranked/official generator families.
+- **`harness/env.sh`, `build.sh`, `validate.sh`, `benchmark.sh`, `modal.sh`, `modal_runner.py`, `profile_ncu.sh`, `submit.sh`** and **`bin/gen_specs.py`** — the autocuda↔GPU-MODE bridge. `modal.sh` uploads the current worktree and invokes validation/benchmarking on Modal; `env.sh` then resolves `eval.py` / `utils.py` per problem from the `files:` manifest (via `gen_specs.py --file-source`) and puts their dirs on `PYTHONPATH`, so the same scripts drive both the set-root and problem-local layouts unchanged. Treat as read-only infrastructure.
 
 ## Build
 
@@ -52,22 +53,22 @@ autocuda run slice --data-dir "$DATA_DIR" -- \
 Runs the official harness in `test` mode over the problem's test shapes from `task.yml` (the same shapes the leaderboard's `--mode test` uses), so a local pass faithfully predicts a remote test pass.
 
 ```bash
-autocuda run exclusive --data-dir "$DATA_DIR" -- \
-  bash harness/validate.sh <set>/<problem>
+autocuda run slice --data-dir "$DATA_DIR" -- \
+  bash harness/modal.sh validate <set>/<problem>
 ```
 
-A passing run exits **0** and prints `validation: PASS` (`check: pass`). Any mismatch, crash, or compile error exits non-zero (eval.py returns `112` on a correctness mismatch) — treat as `validation_error`.
+A passing run exits **0** and prints `validation: PASS` (`check: pass`). Before GPU evaluation, every problem is scanned by local kernelguard plus the banned-stream gate. After official test shapes pass, `harness/validate.sh` runs every problem-local `guards/*.sh`; Eigh and Cholesky use these to catch naïve shape/call-order replay and public-test seed/profile overfitting with fresh inputs across their ranked/official generator families. Any mismatch, guard failure, crash, or compile error exits non-zero (eval.py returns `112` on a correctness mismatch) — treat as `validation_error`.
 
 ## Benchmarks
 
-The active benchmark is the problem named by the `<set>/<problem>` token; the autocuda metric name **is** that token. `harness/benchmark.sh` runs the problem's benchmark shapes from `task.yml`. Scope an `optimize-tree` run to it with `benchmark=<set>/<problem>` — the same token you pass to the script.
+The active benchmark is the problem named by the `<set>/<problem>` token; the autocuda metric name **is** that token. `harness/modal.sh benchmark` uploads the worktree and remotely runs `harness/benchmark.sh`, which uses the problem's benchmark shapes from `task.yml`. Scope an `optimize-tree` run to it with `benchmark=<set>/<problem>` — the same token you pass to the script.
 
 ```bash
-autocuda run exclusive --data-dir "$DATA_DIR" -- \
-  bash harness/benchmark.sh <set>/<problem>
+autocuda run slice --data-dir "$DATA_DIR" -- \
+  bash harness/modal.sh benchmark <set>/<problem>
 ```
 
-- **Command:** `autocuda run exclusive --data-dir "$DATA_DIR" -- bash harness/benchmark.sh <set>/<problem>`.
+- **Command:** `autocuda run slice --data-dir "$DATA_DIR" -- bash harness/modal.sh benchmark <set>/<problem>`.
 - **Metric:** the **geometric mean of the per-shape mean runtimes**, in microseconds.
 - **Unit:** µs. **Direction:** **min** (lower is better — it's latency). **Precision:** 3.
 - **Metric name:** the `<set>/<problem>` token — the same string you pass as `benchmark=` and to the script, so the emitted key matches the autocuda schema column with no lookup. (The GPU MODE *leaderboard* name from the set yaml is a separate identifier — distinct from the `<set>/<problem>` token — used only for `popcorn-cli submit --leaderboard`; `bin/gen_specs.py … --leaderboard` resolves it on demand.)
@@ -83,16 +84,18 @@ autocuda run exclusive --data-dir "$DATA_DIR" -- \
 
 ## Profiling
 
-Profile through the harness scripts — they exist so the capture is correct and reproducible, not improvised per run. `eval.py` wraps its timed `custom_kernel` launches in a `torch.cuda.profiler` range, and the scripts run `eval.py benchmark` on one shape under that range (`nsys --capture-range=cudaProfilerApi`, `ncu --profile-from-start off`), so the capture holds **only your kernels** — not the warmup, the L2 flush, or the cuSOLVER/cuBLAS reference checker `eval.py` runs between timed calls. The range is a no-op when no profiler is attached, so normal validate/benchmark runs are unaffected.
+### ⚠️ RUN-SPECIFIC EXCEPTION: NO LOCAL GPU
+
+No local GPU is available for this run. This is an explicit exception to any autocuda guidance that requires local profiling: **do not run `harness/profile_nsys.sh`, `harness/profile_ncu.sh`, or any local profiler command, and do not treat the absence of a local profile as a blocker or as an invalid baseline.**
+
+Models may instead use the hosted popcorn-cli profiling service for an occasional high-value capture:
 
 ```bash
-autocuda run exclusive --data-dir "$DATA_DIR" -- \
-  bash harness/profile_nsys.sh <set>/<problem> [<shape-spec>]                  # timeline
-autocuda run exclusive --data-dir "$DATA_DIR" -- \
-  bash harness/profile_ncu.sh  <set>/<problem> [<shape-spec>] [<kernel-regex>] # per-kernel (root)
+popcorn-cli submit --no-tui --leaderboard <name> --gpu <gpu> \
+  --mode profile --profile-brev --benchmark-index <index> submission.py
 ```
 
-`profile_nsys.sh` prints the per-kernel summary; `profile_ncu.sh` runs the full `ncu` section set (memory-vs-compute, occupancy, stalls — reach for it once you know which kernel to attack) and handles the `sudo`/`PYTHONPATH` it needs. Default to the first benchmark shape; pass a `<shape-spec>` (a `task.yml` benchmark line) to pick another. Redirect stdout to a SHA-named `.{nsys,ncu}-txt` under `profiles/<tag>/` (and set `NSYS_OUT=<...>.nsys-rep` to keep the nsys report) so `autocuda init brief` can hand it on.
+Limit hosted profiling to **at most 3 requests in any rolling hour across the entire run, not per worker**. Coordinate across workers and record each request's timestamp, commit SHA, and benchmark index in the run log. Reuse saved Nsight Compute artifacts; reserve requests for the baseline or a materially distinct promising candidate, rather than profiling every trial. Resolve `<name>` and `<gpu>` as described under [Leaderboard submission & standings (manager)](#leaderboard-submission--standings-manager).
 
 ## Cross-benchmark aggregation
 
@@ -100,14 +103,15 @@ One problem is optimized per run (one `optimize-tree` run, scoped with `benchmar
 
 ## Dependencies
 
-- **CUDA toolkit** with `nvcc` (the harness compiles `submission.py`'s CUDA via torch `load_inline` at import). Verified on CUDA 13.0.
+- **Modal CLI ≥ 1.1**, authenticated with `modal setup` or token environment variables. `harness/modal_runner.py` defaults to B200 and pins the production KernelBot image definition commit, including its CUDA/Python/PyTorch and package versions. Only `MODAL_GPU` is configurable; dependency overrides are intentionally unsupported so local results remain representative.
+- **CUDA toolkit** with `nvcc` for local builds/profiling (the harness compiles `submission.py`'s CUDA via torch `load_inline` at import). Verified on CUDA 13.0.
 - **PyTorch** matching the host GPU/CUDA (the workspace venv; `bin/install.sh` builds one and writes its path into `~/.config/gpumode/gpumode.env`), plus `pyyaml` (for `bin/gen_specs.py`) and `ninja`.
 - **popcorn-cli** — GPU MODE leaderboard submission client (authenticated via Discord; see the `popcorn-login` skill).
 - Custom CUDA in a submission must build against **stock CUB/Thrust** to be leaderboard-portable; compiling against a local CCCL checkout via `extra_include_paths` is diagnostic-only (the remote build has only stock headers).
 
 ## Log schema
 
-Materialise the optimize schema with the target problem's single benchmark before logging the baseline. The benchmark name is the `<set>/<problem>` token (the same one you pass as `benchmark=` and to `harness/benchmark.sh`):
+Materialise the optimize schema with the target problem's single benchmark before logging the baseline. The benchmark name is the `<set>/<problem>` token (the same one you pass as `benchmark=` and to `harness/modal.sh benchmark`):
 
 ```bash
 autocuda schema define optimize --data-dir "$DATA_DIR" \
@@ -124,7 +128,7 @@ Automatic submission is authorized for this workspace. Do not ask the operator b
 
 Submission can be flaky. A run that comes back **failed** is a real failure — treat it as one. A run that **times out** is not conclusive: retry it, up to 3 times. If all 3 time out, treat that as a real failure.
 
-- **At baseline setup:** after the baseline passes local validation, is benchmarked, profiled, and logged with `autocuda log optimize-tree baseline`, immediately submit that exact baseline `submission.py` with `popcorn-cli submit --no-tui --leaderboard <name> --gpu <gpu> --mode leaderboard submission.py`. If this submission is missing, the entire optimize run is invalid and workers must not be launched.
+- **At baseline setup:** after the baseline passes validation, is benchmarked, and is logged with `autocuda log optimize-tree baseline`, immediately submit that exact baseline `submission.py` with `popcorn-cli submit --no-tui --leaderboard <name> --gpu <gpu> --mode leaderboard submission.py`. Local profiling is waived for this run; hosted profiling is optional and subject to the run-wide rate limit above. If the baseline leaderboard submission is missing, the entire optimize run is invalid and workers must not be launched.
 - **As the run improves:** each time the best safe committed kernel meaningfully improves over the last submitted kernel, submit that exact committed `submission.py` with `--mode leaderboard` before treating the improvement as real. Do not compare local candidates as final apples-to-apples results without corresponding leaderboard submissions.
 - **Before final selection:** the chosen final candidate must have a successful leaderboard submission. If the fastest local candidate was never submitted, or was rejected remotely, it is not the final candidate.
 - **Submission metadata:** resolve `<name>` with `bin/gen_specs.py problems/<set>/<problem>/task.yml --leaderboard` and `<gpu>` with `bin/gen_specs.py problems/<set>/<problem>/task.yml --gpus` (choose the token matching the host GPU). The leaderboard name is **not** the autocuda metric token.

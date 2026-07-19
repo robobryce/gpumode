@@ -5,7 +5,8 @@
 # Idempotent. Provisions:
 #   1. popcorn-cli            (GPU MODE submission CLI) -> ~/.local/bin
 #   2. a Python venv + PyTorch (CUDA build) + numpy/pyyaml/ninja
-#   3. ~/.config/gpumode/gpumode.env  (toolchain paths the harness sources)
+#   3. Modal CLI for remote validation and benchmarking
+#   4. ~/.config/gpumode/gpumode.env  (toolchain paths the harness sources)
 #
 # Unlike a separate harness repo, this does NOT clone reference-kernels — this
 # repo IS it. After install, run /autocuda:discover once to write
@@ -53,13 +54,13 @@ else
     log "creating venv at $VENV from $GPUMODE_PY ..."
     if command -v uv >/dev/null 2>&1; then
         uv venv --python "$GPUMODE_PY" "$VENV"
-        VIRTUAL_ENV="$VENV" uv pip install --python "$PYBIN" numpy pyyaml ninja kernelguard
+        VIRTUAL_ENV="$VENV" uv pip install --python "$PYBIN" numpy pyyaml ninja kernelguard 'modal>=1.1'
         log "installing torch from $TORCH_INDEX_URL (large download) ..."
         VIRTUAL_ENV="$VENV" uv pip install --python "$PYBIN" torch --index-url "$TORCH_INDEX_URL"
     else
         "$GPUMODE_PY" -m venv "$VENV"
         "$PYBIN" -m pip install --upgrade pip
-        "$PYBIN" -m pip install numpy pyyaml ninja kernelguard
+        "$PYBIN" -m pip install numpy pyyaml ninja kernelguard 'modal>=1.1'
         log "installing torch from $TORCH_INDEX_URL (large download) ..."
         "$PYBIN" -m pip install torch --index-url "$TORCH_INDEX_URL"
     fi
@@ -80,7 +81,20 @@ else
     fi
 fi
 
-# --- 3. write machine config -------------------------------------------------
+# Modal CLI — validation/benchmark commands execute on remote Modal GPUs. Keep
+# this idempotent for venvs created before Modal support was added.
+if "$PYBIN" -c 'import importlib.metadata as m; assert tuple(map(int, m.version("modal").split(".")[:2])) >= (1, 1)' 2>/dev/null; then
+    log "Modal CLI already installed ($("$VENV/bin/modal" --version 2>/dev/null || echo present))"
+else
+    log "installing/upgrading Modal CLI ..."
+    if command -v uv >/dev/null 2>&1; then
+        VIRTUAL_ENV="$VENV" uv pip install --python "$PYBIN" 'modal>=1.1'
+    else
+        "$PYBIN" -m pip install 'modal>=1.1'
+    fi
+fi
+
+# --- 4. write machine config -------------------------------------------------
 cat > "$CFG" <<EOF
 # GPU MODE machine config — written by bin/install.sh. Sourced by harness/env.sh.
 GPUMODE_VENV_PYTHON="$PYBIN"
@@ -95,8 +109,9 @@ $(printf '\033[1;32m✓ install complete\033[0m')
 Next steps:
   1. Authenticate popcorn-cli (one-time) with the popcorn-login skill:
        bash .claude/skills/popcorn-login/scripts/login.sh
-  2. Set up this machine:   /autocuda:discover   (writes autocuda/environment.md)
-  3. Pick a problem and optimize it in place — its <set>/<problem> path is the
+  2. Authenticate Modal for remote tests/benchmarks:  "$VENV/bin/modal" setup
+  3. Set up this machine:   /autocuda:discover   (writes autocuda/environment.md)
+  4. Pick a problem and optimize it in place — its <set>/<problem> path is the
      one token (passed as benchmark=), e.g.:
        /autocuda:optimize-tree workers=4 benchmark=pmpp_v2/histogram_py tag-suffix=histogram_py
 EOF
