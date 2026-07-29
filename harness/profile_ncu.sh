@@ -14,9 +14,8 @@
 # (e.g. <set>/<problem> = pmpp_v2/histogram_py). Redirect to a SHA-named file so
 # `autocuda init brief` can hand it to the next brief.
 #
-# eval.py wraps the timed custom_kernel launches in a torch.cuda.profiler range,
-# so `--profile-from-start off` records only those launches — not the warmup,
-# the L2 flush, or the reference checker eval.py runs between them.
+# eval.py's profile mode wraps the target invocation in the NVTX range
+# `custom_kernel`, so ncu collects only kernels launched in that range.
 set -uo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/env.sh" "$@"
 
@@ -32,7 +31,7 @@ NCU="$(command -v ncu || echo "$CUDA_HOME/bin/ncu")"
 # --profile-from-start off honours eval.py's cudaProfiler range (so warmup and
 # reference-checker kernels are excluded). --launch-count caps collected
 # kernels; an optional --kernel-name focuses the dominant one (e.g. the GEMM).
-NCU_ARGS=(--profile-from-start off --set full --launch-count 6)
+NCU_ARGS=(--nvtx --nvtx-include 'custom_kernel/' --set full --launch-count 6)
 [ -n "$KERNEL_FILTER" ] && NCU_ARGS+=(--kernel-name "$KERNEL_FILTER")
 
 # ncu must run as root to read the GPU performance counters; without it the
@@ -54,7 +53,7 @@ run_ncu() {
     # "$@" is the privilege prefix (`sudo -n env VAR=val ...`); empty when root.
     "$@" "$NCU" "${NCU_ARGS[@]}" \
         bash -c 'exec 3>/dev/null; export POPCORN_FD=3; exec "$@"' profile_ncu \
-        "$PYTHON" "$EVAL_PY" benchmark "$SPECFILE" 3>/dev/null
+        "$PYTHON" "$EVAL_PY" profile "$SPECFILE" 3>/dev/null
 }
 
 if [ "$(id -u)" -eq 0 ]; then

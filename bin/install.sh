@@ -4,8 +4,7 @@
 #
 # Idempotent. Provisions:
 #   1. popcorn-cli            (GPU MODE submission CLI) -> ~/.local/bin
-#   2. a Python venv + PyTorch (CUDA build) + numpy/pyyaml/ninja
-#   3. Modal CLI for remote validation and benchmarking
+#   2. one Python venv with the production runtime plus local control tools
 #   4. ~/.config/gpumode/gpumode.env  (toolchain paths the harness sources)
 #
 # Unlike a separate harness repo, this does NOT clone reference-kernels — this
@@ -45,54 +44,26 @@ else
 fi
 
 # --- 2. venv + torch ---------------------------------------------------------
-VENV="$GPUMODE_ROOT/.venv"
+VENV="${GPUMODE_RUNTIME_VENV:-$GPUMODE_ROOT/.venv}"
 PYBIN="$VENV/bin/python"
-if [ -x "$PYBIN" ] && "$PYBIN" -c "import torch" 2>/dev/null; then
-    log "venv + torch already present at $VENV ($("$PYBIN" -c 'import torch;print(torch.__version__)'))"
-else
-    GPUMODE_PY="${GPUMODE_PY:-$(command -v python3.12 || command -v python3)}"
-    log "creating venv at $VENV from $GPUMODE_PY ..."
-    if command -v uv >/dev/null 2>&1; then
-        uv venv --python "$GPUMODE_PY" "$VENV"
-        VIRTUAL_ENV="$VENV" uv pip install --python "$PYBIN" numpy pyyaml ninja kernelguard 'modal>=1.1'
-        log "installing torch from $TORCH_INDEX_URL (large download) ..."
-        VIRTUAL_ENV="$VENV" uv pip install --python "$PYBIN" torch --index-url "$TORCH_INDEX_URL"
-    else
-        "$GPUMODE_PY" -m venv "$VENV"
-        "$PYBIN" -m pip install --upgrade pip
-        "$PYBIN" -m pip install numpy pyyaml ninja kernelguard 'modal>=1.1'
-        log "installing torch from $TORCH_INDEX_URL (large download) ..."
-        "$PYBIN" -m pip install torch --index-url "$TORCH_INDEX_URL"
-    fi
-fi
+GPUMODE_PY="${GPUMODE_PY:-$(command -v python3.13 || command -v python3)}"
+command -v uv >/dev/null 2>&1 || { echo "uv is required to reproduce the production dependency resolver"; exit 1; }
+
+log "recreating production-mirrored runtime at $VENV ..."
+uv venv --clear --python "$GPUMODE_PY" "$VENV"
+VIRTUAL_ENV="$VENV" uv pip install --python "$PYBIN" \
+    'ninja~=1.11' 'wheel~=0.45' 'requests~=2.32.4' 'packaging~=25.0' \
+    'numpy~=2.3' pytest PyYAML 'tinygrad~=0.10' helion \
+    'nvidia-cutlass-dsl==4.5.2' 'cuda-core[cu13]' \
+    'cuda-python[all]==13.0' 'cuda-tile==1.4.0' \
+    'nvmath-python[cu13-dx]==0.9.0' 'nvidia-libmathdx-cu13==0.3.2.6' \
+    'cuda-toolkit[cccl,nvrtc]==13.0.2'
+VIRTUAL_ENV="$VENV" uv pip install --python "$PYBIN" 'torch==2.12.0'
+VIRTUAL_ENV="$VENV" uv pip install --python "$PYBIN" kernelguard 'modal>=1.1'
+uv pip check --python "$PYBIN"
+"$PYBIN" -c 'import cuda.tile, nvmath, torch, kernelguard, modal'
 log "torch CUDA check: $("$PYBIN" -c 'import torch;print("avail",torch.cuda.is_available(),"dev",torch.cuda.get_device_name(0) if torch.cuda.is_available() else "-")')"
-
-# kernelguard — rule-based reward-hack detector for harness/validate.sh. Ensured
-# idempotently here too, since the venv+torch block above is skipped on re-runs
-# over an existing venv (which predates this dependency).
-if "$PYBIN" -c "import kernelguard" 2>/dev/null; then
-    log "kernelguard already installed ($("$PYBIN" -c 'import importlib.metadata as m; print(m.version("kernelguard"))' 2>/dev/null || echo present))"
-else
-    log "installing kernelguard (reward-hack detector) ..."
-    if command -v uv >/dev/null 2>&1; then
-        VIRTUAL_ENV="$VENV" uv pip install --python "$PYBIN" kernelguard
-    else
-        "$PYBIN" -m pip install kernelguard
-    fi
-fi
-
-# Modal CLI — validation/benchmark commands execute on remote Modal GPUs. Keep
-# this idempotent for venvs created before Modal support was added.
-if "$PYBIN" -c 'import importlib.metadata as m; assert tuple(map(int, m.version("modal").split(".")[:2])) >= (1, 1)' 2>/dev/null; then
-    log "Modal CLI already installed ($("$VENV/bin/modal" --version 2>/dev/null || echo present))"
-else
-    log "installing/upgrading Modal CLI ..."
-    if command -v uv >/dev/null 2>&1; then
-        VIRTUAL_ENV="$VENV" uv pip install --python "$PYBIN" 'modal>=1.1'
-    else
-        "$PYBIN" -m pip install 'modal>=1.1'
-    fi
-fi
+"$PYBIN" "$PWD/bin/kernelguard_gate.py" --self-test
 
 # --- 4. write machine config -------------------------------------------------
 cat > "$CFG" <<EOF

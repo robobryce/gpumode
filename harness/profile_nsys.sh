@@ -12,9 +12,8 @@
 # The .nsys-rep is written next to that path (-o without the extension); set
 # NSYS_OUT to keep it at a SHA-named path so `autocuda init brief` can hand it on.
 #
-# eval.py wraps the timed custom_kernel launches in a torch.cuda.profiler range,
-# so `--capture-range=cudaProfilerApi` records only those launches — not the
-# warmup, the L2 flush, or the reference checker eval.py runs between them.
+# eval.py's profile mode runs one target invocation and labels it with the NVTX
+# range `custom_kernel`.
 set -uo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/env.sh" "$@"
 
@@ -31,8 +30,9 @@ NSYS="$(command -v nsys || echo "$CUDA_HOME/bin/nsys")"
 
 cd "$PROBLEM_DIR" || exit 1
 POPCORN_FD=3 "$NSYS" profile --force-overwrite true -o "${REP%.nsys-rep}" \
-    --capture-range=cudaProfilerApi --capture-range-end=stop --trace=cuda,nvtx \
-    "$PYTHON" "$EVAL_PY" benchmark "$SPECFILE" 3>/dev/null >&2
+    --trace=cuda,nvtx "$PYTHON" "$EVAL_PY" profile "$SPECFILE" 3>/dev/null >&2
+
+[ -f "$REP" ] || { echo "profile_nsys: no report was generated" >&2; exit 1; }
 
 echo "===== nsys cuda_gpu_kern_sum ($SPEC) ====="
 "$NSYS" stats --report cuda_gpu_kern_sum --format table "$REP"
