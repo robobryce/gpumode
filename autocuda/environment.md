@@ -23,8 +23,7 @@ execution environment described below.
   source-backed Rust DSLs live under `/opt/cutile-rs` and `/opt/cuda-oxide`,
   and CUDA Oxide uses its pinned Rust nightly plus LLVM/Clang 21. Run
   `bin/verify_programming_models.sh` to compile and execute all seven smoke
-  kernels. The Rust DSLs and TileLang are local extensions and must not be
-  assumed available on the upstream leaderboard.
+  kernels.
 
 - **Host GPU:** 1× NVIDIA B200 (Blackwell, 183359 MiB HBM3e), compute capability
   **10.0 (sm_100)**. Single device — `torch.cuda.device_count() == 1`, no
@@ -69,12 +68,6 @@ execution environment described below.
   current clean local venv was rebuilt and audited against that manifest on 2026-07-30;
   `import cuda.tile, nvmath, cutlass.cute, torch` passes and Torch reports
   `2.12.0+cu130`.
-- **Submission runtime boundary:** submissions must use dependencies and
-  headers available in the selected evaluation backend. Modal CLI,
-  `kernelguard`, cuTile Rust, CUDA Oxide, and TileLang are local control or
-  exploration tools unless the upstream environment explicitly adds them.
-  Their local availability is not evidence that a submission importing them
-  is leaderboard-portable.
 - **Drift rule:** after changing either manifest or venv, rerun
   `bash bin/install.sh`; `bin/verify_environment.py` checks the imports,
   Python/Torch/CUDA versions, direct dependency constraints, and native header

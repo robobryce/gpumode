@@ -12,7 +12,7 @@ Run `bash bin/install.sh` from the repository root before discovery or optimizat
 
 Every local harness entry point sources `harness/env.sh`. That loader reads the generated machine config, exports the production include/toolchain paths, and runs `bin/verify_environment.py` before touching problem code. Do not bypass it with a manually activated venv or a naked `python`/`nvcc` invocation. Optional `popcorn-cli` and Modal authentication happen after setup and remain conditional as described below.
 
-The local optimization environment supports CUDA C++, CuTe DSL, cuTile Python, Triton, cuTile Rust, CUDA Oxide, and TileLang. `bin/install.sh` runs `bin/verify_programming_models.sh`, which compiles and executes a GPU smoke kernel in every model. CuTile Rust, CUDA Oxide, and TileLang are local optimization tools and are not guaranteed to exist in the upstream leaderboard image. A leaderboard submission must still restrict its runtime imports, libraries, and headers to the official problem environment; use local-only models for exploration, code generation, or for submissions only when the target environment explicitly supports them.
+The optimization environment supports CUDA C++, CuTe DSL, cuTile Python, Triton, cuTile Rust, CUDA Oxide, and TileLang. `bin/install.sh` runs `bin/verify_programming_models.sh`, which compiles and executes a GPU smoke kernel in every model.
 
 Optimize a problem — pass its `<set>/<problem>` path as `benchmark=` (the one token that selects the target; nothing to export, nothing to `cd` into):
 
