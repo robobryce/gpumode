@@ -22,7 +22,7 @@ REPO_DIR="$(cd "$HARNESS_DIR/.." && pwd)"
 
 # --- 1. machine-level config -------------------------------------------------
 # Written by bin/install.sh to ~/.config/gpumode/gpumode.env. Defines
-# GPUMODE_VENV_PYTHON, CUDA_HOME, CUTLASS_PATH, and MATHDX_HOME.
+# GPUMODE_VENV_PYTHON, CUDA_HOME, SDK paths, and Rust DSL paths.
 for cfg in "${GPUMODE_ENV:-}" "$HOME/.config/gpumode/gpumode.env"; do
     if [ -n "$cfg" ] && [ -f "$cfg" ]; then source "$cfg"; break; fi
 done
@@ -46,10 +46,14 @@ PYTHON="${GPUMODE_VENV_PYTHON:-$REPO_DIR/.venv/bin/python}"
 export CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"
 export CUTLASS_PATH="${CUTLASS_PATH:-/opt/cutlass}"
 export MATHDX_HOME="${MATHDX_HOME:-/opt/mathdx}"
+export CUTILE_RS_PATH="${CUTILE_RS_PATH:-/opt/cutile-rs}"
+export CUDA_OXIDE_PATH="${CUDA_OXIDE_PATH:-/opt/cuda-oxide}"
+export CUDA_TOOLKIT_PATH="${CUDA_TOOLKIT_PATH:-$CUDA_HOME}"
+export CUDA_OXIDE_LLC="${CUDA_OXIDE_LLC:-/usr/bin/llc-21}"
 [ -x "$PYTHON" ] || {
     echo "GPU MODE venv not found at $PYTHON; run $REPO_DIR/bin/install.sh" >&2; exit 1; }
 PYTHON_BIN_DIR="$(dirname "$PYTHON")"
-export PATH="$PYTHON_BIN_DIR:$CUDA_HOME/bin:$PATH"
+export PATH="$PYTHON_BIN_DIR:$HOME/.cargo/bin:/usr/lib/llvm-21/bin:$CUDA_HOME/bin:$PATH"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 export CPLUS_INCLUDE_PATH="$MATHDX_HOME/include:$MATHDX_HOME/external/cutlass/include:$CUTLASS_PATH/include:$CUTLASS_PATH/tools/util/include${CPLUS_INCLUDE_PATH:+:$CPLUS_INCLUDE_PATH}"
 

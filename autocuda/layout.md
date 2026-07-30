@@ -8,9 +8,11 @@ Pick the target problem by passing its `<set>/<problem>` path — this is the si
 
 ## Required host setup
 
-Run `bash bin/install.sh` from the repository root before discovery or optimization. It is the single supported setup path: it installs/selects the leaderboard-matched CUDA 13.3.0 toolkit with `nvcc` 13.3.33 without replacing the host driver, recreates the repository-local `.venv` with Python 3.13 and the production KernelBot dependency order, installs the matching CUTLASS and MathDx headers, and writes `~/.config/gpumode/gpumode.env`. Rerun it after changing the dependency manifest, moving the checkout, or detecting environment drift.
+Run `bash bin/install.sh` from the repository root before discovery or optimization. It is the single supported setup path: it installs/selects the leaderboard-matched CUDA 13.3.0 toolkit with `nvcc` 13.3.33 without replacing the host driver, recreates the repository-local `.venv` with Python 3.13, installs the matching SDK/header trees and supported programming models, and writes `~/.config/gpumode/gpumode.env`. Rerun it after changing the dependency manifest, moving the checkout, or detecting environment drift.
 
 Every local harness entry point sources `harness/env.sh`. That loader reads the generated machine config, exports the production include/toolchain paths, and runs `bin/verify_environment.py` before touching problem code. Do not bypass it with a manually activated venv or a naked `python`/`nvcc` invocation. Optional `popcorn-cli` and Modal authentication happen after setup and remain conditional as described below.
+
+The local optimization environment supports CUDA C++, CuTe DSL, cuTile Python, Triton, cuTile Rust, CUDA Oxide, and TileLang. `bin/install.sh` runs `bin/verify_programming_models.sh`, which compiles and executes a GPU smoke kernel in every model. CuTile Rust, CUDA Oxide, and TileLang are local optimization tools and are not guaranteed to exist in the upstream leaderboard image. A leaderboard submission must still restrict its runtime imports, libraries, and headers to the official problem environment; use local-only models for exploration, code generation, or for submissions only when the target environment explicitly supports them.
 
 Optimize a problem — pass its `<set>/<problem>` path as `benchmark=` (the one token that selects the target; nothing to export, nothing to `cd` into):
 
@@ -44,7 +46,7 @@ Record the backend and the concrete fallback reason in `autocuda/environment.md`
 
 The fallback uses `run slice` because remote GPU work needs the run's CPU/memory build slice rather than exclusive ownership of a local GPU. Do not silently switch after a local failure, and return to `run exclusive` only after the local GPU is again uncontended.
 
-**Runtime parity is mandatory.** The clean local venv and the Modal image must use the same execution-facing setup: Python 3.13, the CUDA 13.3 toolchain with Torch's CUDA 13.0 runtime, Torch 2.12 installed last, and the same direct dependency groups and version constraints for NumPy, PyYAML, Ninja, CUDA Python/Tile/Core, nvMath, CUTLASS DSL, MathDx, Tinygrad, and Helion. `harness/modal_runner.py` is the canonical manifest and records the production KernelBot commit it mirrors. Modal CLI and local static-analysis tools are control-plane dependencies, not part of the measured runtime. If either environment drifts from that manifest, rebuild it before mixing local and Modal results.
+**Runtime parity is mandatory for dependencies used by a submission.** The clean local venv and the Modal image share the leaderboard-facing setup: Python 3.13, the CUDA 13.3 toolchain with Torch's CUDA 13.0 runtime, Torch 2.12 installed last, and the same direct dependency groups and version constraints for NumPy, PyYAML, Ninja, CUDA Python/Tile/Core, nvMath, CUTLASS DSL, MathDx, Tinygrad, and Helion. `harness/modal_runner.py` is the canonical leaderboard-facing manifest and records the production KernelBot commit it mirrors. Additional local programming models are intentionally allowed but do not become leaderboard dependencies merely because they are installed locally. If a submission-facing dependency drifts from the manifest, rebuild it before mixing local and Modal results.
 
 ## Editable files
 

@@ -28,8 +28,9 @@ REQUIRED_PACKAGES = {
     "nvmath-python": "==0.9.0",
     "nvidia-libmathdx-cu13": "==0.3.2.6",
     "cuda-toolkit": "==13.0.2",
+    "tilelang": "==0.1.12",
 }
-REQUIRED_IMPORTS = ("torch", "cuda.tile", "nvmath", "cutlass.cute")
+REQUIRED_IMPORTS = ("torch", "cuda.tile", "nvmath", "cutlass.cute", "triton", "tilelang")
 
 
 def fail(message: str) -> None:
@@ -96,6 +97,16 @@ mathdx_marker = mathdx / (
 )
 if not mathdx_marker.is_file():
     fail(f"verified MathDx 26.06.0 install required under {mathdx}; rerun bin/install.sh")
+
+cutile_rs = Path(os.environ.get("CUTILE_RS_PATH", "/opt/cutile-rs"))
+cuda_oxide = Path(os.environ.get("CUDA_OXIDE_PATH", "/opt/cuda-oxide"))
+if not (cutile_rs / ".gpumode-cutile-rs-0.2.0-d89788bca7de8a9cbeabc5ded63740520a96c223").is_file():
+    fail(f"cuTile Rust v0.2.0 missing under {cutile_rs}; rerun bin/install.sh")
+if not (cuda_oxide / ".gpumode-cuda-oxide-0.2.1-4514af2ca8a21a9f8feb187567f61fe67090f881").is_file():
+    fail(f"CUDA Oxide v0.2.1 missing under {cuda_oxide}; rerun bin/install.sh")
+for executable in (Path.home() / ".cargo/bin/cargo", Path.home() / ".cargo/bin/cargo-oxide", Path("/usr/bin/llc-21")):
+    if not executable.is_file():
+        fail(f"required programming-model tool missing: {executable}; rerun bin/install.sh")
 
 print(
     f"GPU MODE environment OK: Python {sys.version.split()[0]}, "

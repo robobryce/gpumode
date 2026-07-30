@@ -17,6 +17,14 @@ execution environment described below.
   `~/.config/gpumode/gpumode.env`, and executes `bin/verify_environment.py`.
   `harness/env.sh` repeats that verification for every local harness command;
   do not bypass the generated config or substitute a manually assembled venv.
+- **Programming models:** the installer provides and smoke-tests CUDA C++,
+  CuTe DSL 4.5.2, cuTile Python 1.4.0, Triton 3.7.0, cuTile Rust 0.2.0,
+  CUDA Oxide 0.2.1, and TileLang 0.1.12. Rust lives under `~/.cargo`, the
+  source-backed Rust DSLs live under `/opt/cutile-rs` and `/opt/cuda-oxide`,
+  and CUDA Oxide uses its pinned Rust nightly plus LLVM/Clang 21. Run
+  `bin/verify_programming_models.sh` to compile and execute all seven smoke
+  kernels. The Rust DSLs and TileLang are local extensions and must not be
+  assumed available on the upstream leaderboard.
 
 - **Host GPU:** 1× NVIDIA B200 (Blackwell, 183359 MiB HBM3e), compute capability
   **10.0 (sm_100)**. Single device — `torch.cuda.device_count() == 1`, no
@@ -61,10 +69,12 @@ execution environment described below.
   current clean local venv was rebuilt and audited against that manifest on 2026-07-30;
   `import cuda.tile, nvmath, cutlass.cute, torch` passes and Torch reports
   `2.12.0+cu130`.
-- **Common runtime only:** submissions must use dependencies and headers
-  available in both environments. Modal CLI and local `kernelguard` are
-  controller/static-check tools and intentionally stay outside the clean
-  execution runtime. Do not add a convenience package to only one backend.
+- **Submission runtime boundary:** submissions must use dependencies and
+  headers available in the selected evaluation backend. Modal CLI,
+  `kernelguard`, cuTile Rust, CUDA Oxide, and TileLang are local control or
+  exploration tools unless the upstream environment explicitly adds them.
+  Their local availability is not evidence that a submission importing them
+  is leaderboard-portable.
 - **Drift rule:** after changing either manifest or venv, rerun
   `bash bin/install.sh`; `bin/verify_environment.py` checks the imports,
   Python/Torch/CUDA versions, direct dependency constraints, and native header

@@ -21,6 +21,14 @@ CFG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/gpumode"
 CFG="$CFG_DIR/gpumode.env"
 CUTLASS_VERSION="4.5.2"
 CUTLASS_PATH="${CUTLASS_PATH:-/opt/cutlass}"
+CUTILE_RS_VERSION="0.2.0"
+CUTILE_RS_COMMIT="d89788bca7de8a9cbeabc5ded63740520a96c223"
+CUTILE_RS_PATH="${CUTILE_RS_PATH:-/opt/cutile-rs}"
+CUDA_OXIDE_VERSION="0.2.1"
+CUDA_OXIDE_COMMIT="4514af2ca8a21a9f8feb187567f61fe67090f881"
+CUDA_OXIDE_PATH="${CUDA_OXIDE_PATH:-/opt/cuda-oxide}"
+CUDA_OXIDE_TOOLCHAIN="nightly-2026-04-03"
+TILELANG_VERSION="0.1.12"
 MATHDX_VERSION="26.06.0"
 MATHDX_HOME="${MATHDX_HOME:-/opt/mathdx}"
 MATHDX_ARCHIVE="nvidia-mathdx-${MATHDX_VERSION}-cuda13.tar.gz"
@@ -52,7 +60,8 @@ install_host_tools() {
     log "installing host build tools"
     "${SUDO[@]}" apt-get update
     DEBIAN_FRONTEND=noninteractive "${SUDO[@]}" apt-get install -y --no-install-recommends \
-        ca-certificates curl git build-essential gcc-13 g++-13 clang-18 pkg-config
+        ca-certificates curl git build-essential gcc-13 g++-13 clang-18 pkg-config \
+        cmake libedit-dev libxml2-dev zlib1g-dev lsb-release wget gnupg software-properties-common
 }
 
 install_cuda() {
@@ -108,6 +117,36 @@ install_uv() {
     command -v uv >/dev/null 2>&1 || die "uv installation failed"
 }
 
+install_llvm21() {
+    if command -v llc-21 >/dev/null 2>&1 && command -v clang-21 >/dev/null 2>&1; then
+        return
+    fi
+    command -v apt-get >/dev/null 2>&1 || die "LLVM/Clang 21 installation requires apt-get"
+    log "installing LLVM and Clang 21 for CUDA Oxide"
+    llvm_script="$(mktemp)"
+    trap 'rm -f "${keyring:-}" "${mathdx_tmp:-}" "${llvm_script:-}"' EXIT
+    curl -fsSL https://apt.llvm.org/llvm.sh -o "$llvm_script"
+    "${SUDO[@]}" bash "$llvm_script" 21
+    DEBIAN_FRONTEND=noninteractive "${SUDO[@]}" apt-get install -y --no-install-recommends \
+        llvm-21 llvm-21-dev clang-21 libclang-21-dev
+    "${SUDO[@]}" update-alternatives --install /usr/bin/clang clang /usr/bin/clang-21 210
+    "${SUDO[@]}" update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-21 210
+}
+
+install_rust() {
+    if ! command -v rustup >/dev/null 2>&1; then
+        log "installing rustup"
+        rustup_script="$(mktemp)"
+        trap 'rm -f "${keyring:-}" "${mathdx_tmp:-}" "${llvm_script:-}" "${rustup_script:-}"' EXIT
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o "$rustup_script"
+        sh "$rustup_script" -y --profile minimal
+    fi
+    export PATH="$HOME/.cargo/bin:$PATH"
+    rustup toolchain install stable --profile minimal
+    rustup toolchain install "$CUDA_OXIDE_TOOLCHAIN" --profile minimal \
+        --component rust-src --component rustc-dev --component llvm-tools
+}
+
 install_sdk_headers() {
     if [ ! -f "$CUTLASS_PATH/include/cutlass/cutlass.h" ]; then
         log "installing CUTLASS v$CUTLASS_VERSION headers at $CUTLASS_PATH"
@@ -137,6 +176,29 @@ install_sdk_headers() {
     "${SUDO[@]}" rm -f /tmp/gpumode-cublasdx-smoke.o
 }
 
+install_rust_dsls() {
+    if [ ! -f "$CUTILE_RS_PATH/.gpumode-cutile-rs-$CUTILE_RS_VERSION-$CUTILE_RS_COMMIT" ]; then
+        log "installing cuTile Rust v$CUTILE_RS_VERSION at $CUTILE_RS_PATH"
+        "${SUDO[@]}" rm -rf "$CUTILE_RS_PATH"
+        "${SUDO[@]}" git clone --depth 1 --branch "v$CUTILE_RS_VERSION" \
+            https://github.com/NVlabs/cutile-rs.git "$CUTILE_RS_PATH"
+        "${SUDO[@]}" touch "$CUTILE_RS_PATH/.gpumode-cutile-rs-$CUTILE_RS_VERSION-$CUTILE_RS_COMMIT"
+    fi
+    "${SUDO[@]}" chown -R "$(id -u):$(id -g)" "$CUTILE_RS_PATH"
+    if [ ! -f "$CUDA_OXIDE_PATH/.gpumode-cuda-oxide-$CUDA_OXIDE_VERSION-$CUDA_OXIDE_COMMIT" ]; then
+        log "installing CUDA Oxide v$CUDA_OXIDE_VERSION at $CUDA_OXIDE_PATH"
+        "${SUDO[@]}" rm -rf "$CUDA_OXIDE_PATH"
+        "${SUDO[@]}" git clone --depth 1 --branch "v$CUDA_OXIDE_VERSION" \
+            https://github.com/NVlabs/cuda-oxide.git "$CUDA_OXIDE_PATH"
+        "${SUDO[@]}" touch "$CUDA_OXIDE_PATH/.gpumode-cuda-oxide-$CUDA_OXIDE_VERSION-$CUDA_OXIDE_COMMIT"
+    fi
+    "${SUDO[@]}" chown -R "$(id -u):$(id -g)" "$CUDA_OXIDE_PATH"
+    log "installing cargo-oxide v$CUDA_OXIDE_VERSION"
+    CARGO_TARGET_DIR="$HOME/.cache/gpumode/cargo-oxide-install" \
+        cargo "+$CUDA_OXIDE_TOOLCHAIN" install --locked --force \
+        --path "$CUDA_OXIDE_PATH/crates/cargo-oxide"
+}
+
 install_runtime() {
     log "recreating production-matched Python 3.13 runtime at $VENV"
     uv venv --clear --python 3.13 "$VENV"
@@ -151,6 +213,7 @@ install_runtime() {
     VIRTUAL_ENV="$VENV" uv pip install --python "$PYBIN" 'torch==2.12.0'
     # Local control-plane tools are intentionally absent from the remote image.
     VIRTUAL_ENV="$VENV" uv pip install --python "$PYBIN" kernelguard 'modal>=1.1'
+    VIRTUAL_ENV="$VENV" uv pip install --python "$PYBIN" "tilelang==$TILELANG_VERSION"
     uv pip check --python "$PYBIN"
 }
 
@@ -163,6 +226,10 @@ write_config() {
         printf 'CUDA_HOME=%q\n' "$CUDA_HOME"
         printf 'CUTLASS_PATH=%q\n' "$CUTLASS_PATH"
         printf 'MATHDX_HOME=%q\n' "$MATHDX_HOME"
+        printf 'CUTILE_RS_PATH=%q\n' "$CUTILE_RS_PATH"
+        printf 'CUDA_OXIDE_PATH=%q\n' "$CUDA_OXIDE_PATH"
+        printf 'CUDA_TOOLKIT_PATH=%q\n' "$CUDA_HOME"
+        printf 'CUDA_OXIDE_LLC=%q\n' /usr/bin/llc-21
     } > "$CFG"
     log "wrote $CFG"
 }
@@ -170,14 +237,21 @@ write_config() {
 install_host_tools
 install_cuda
 install_uv
+install_llvm21
+install_rust
 install_sdk_headers
+install_rust_dsls
 install_runtime
 write_config
 
 export GPUMODE_VENV_PYTHON="$PYBIN" CUDA_HOME CUTLASS_PATH MATHDX_HOME
+export CUTILE_RS_PATH CUDA_OXIDE_PATH CUDA_TOOLKIT_PATH="$CUDA_HOME"
+export CUDA_OXIDE_LLC=/usr/bin/llc-21
+export PATH="$HOME/.cargo/bin:/usr/lib/llvm-21/bin:$PATH"
 export CPLUS_INCLUDE_PATH="$MATHDX_HOME/include:$MATHDX_HOME/external/cutlass/include:$CUTLASS_PATH/include:$CUTLASS_PATH/tools/util/include"
 "$PYBIN" "$REPO_DIR/bin/verify_environment.py"
 "$PYBIN" "$REPO_DIR/bin/kernelguard_gate.py" --self-test
+"$REPO_DIR/bin/verify_programming_models.sh"
 
 if [ "${GPUMODE_INSTALL_POPCORN:-1}" = 1 ]; then
     if command -v popcorn-cli >/dev/null 2>&1 || [ -x "$HOME/.local/bin/popcorn-cli" ]; then

@@ -77,6 +77,10 @@ else
         CUTLASS_PATH="$CUTLASS_PATH"
         MATHDX_HOME="$MATHDX_HOME"
         CPLUS_INCLUDE_PATH="$CPLUS_INCLUDE_PATH"
+        CUTILE_RS_PATH="$CUTILE_RS_PATH"
+        CUDA_OXIDE_PATH="$CUDA_OXIDE_PATH"
+        CUDA_TOOLKIT_PATH="$CUDA_TOOLKIT_PATH"
+        CUDA_OXIDE_LLC="$CUDA_OXIDE_LLC"
     )
     [ -n "${LD_LIBRARY_PATH:-}" ] && KEEP+=(LD_LIBRARY_PATH="$LD_LIBRARY_PATH")
     # `sudo -n`: fail fast rather than hang on a password prompt under the
