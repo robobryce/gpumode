@@ -1,0 +1,26 @@
+[
+  {
+    "harness": "codex",
+    "relative_path": "sessions/2026/07/19/rollout-2026-07-19T01-42-43-019f780a-39d5-7013-94e3-36648902f851.jsonl",
+    "session_id": "019f780a-39d5-7013-94e3-36648902f851",
+    "started_at": "2026-07-19T01:44:06.000000Z"
+  },
+  {
+    "harness": "codex",
+    "relative_path": "sessions/2026/07/29/rollout-2026-07-29T17-45-34-019faefb-5252-71e2-a6db-c410456875b0.jsonl",
+    "session_id": "019faefb-5252-71e2-a6db-c410456875b0",
+    "started_at": "2026-07-29T17:48:04.200507Z"
+  },
+  {
+    "harness": "codex",
+    "relative_path": "sessions/2026/07/29/rollout-2026-07-29T20-32-51-019faf94-7cc4-7fa1-8a65-9f2ed71c3c5a.jsonl",
+    "session_id": "019faf94-7cc4-7fa1-8a65-9f2ed71c3c5a",
+    "started_at": "2026-07-29T20:37:47.060709Z"
+  },
+  {
+    "harness": "codex",
+    "relative_path": "sessions/2026/07/29/rollout-2026-07-29T22-57-24-019fb018-d19c-73c2-b3c2-602b53776c83.jsonl",
+    "session_id": "019fb018-d19c-73c2-b3c2-602b53776c83",
+    "started_at": "2026-07-29T22:59:03.874973Z"
+  }
+]

@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "benchmarks": [
+    {
+      "name": "linalg/cholesky_py",
+      "unit": "us",
+      "direction": "min",
+      "precision": 3
+    }
+  ]
+}

@@ -1,0 +1,144 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 740" role="img" aria-labelledby="title desc">
+  <title id="title">Blocked Cholesky phase shapes and dependencies</title>
+  <desc id="desc">Three partitioned matrix views show diagonal POTRF on a b by b tile, dependent TRSM on an m by b panel, and a rank-k update of the m by m trailing matrix. Arrows show that the diagonal factor feeds TRSM, the solved panel and old trailing matrix feed the update, and the updated trailing matrix becomes the input to the next panel iteration.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#334155"/>
+    </marker>
+    <marker id="loop-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#64748b"/>
+    </marker>
+    <pattern id="inactive" width="10" height="10" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
+      <rect width="10" height="10" fill="#f1f5f9"/>
+      <line x1="0" y1="0" x2="0" y2="10" stroke="#cbd5e1" stroke-width="3"/>
+    </pattern>
+    <style>
+      .title { font: 700 26px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #0f172a; }
+      .subtitle { font: 15px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #475569; }
+      .card { fill: #ffffff; stroke: #cbd5e1; stroke-width: 1.5; rx: 14; }
+      .phase { font: 700 18px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #0f172a; }
+      .phase-number { font: 700 14px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #ffffff; }
+      .matrix-outline { fill: none; stroke: #475569; stroke-width: 2; }
+      .cell { stroke: #ffffff; stroke-width: 3; }
+      .cell-label { font: 700 15px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #0f172a; text-anchor: middle; }
+      .cell-shape { font: 13px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #334155; text-anchor: middle; }
+      .formula { font: 600 16px ui-monospace, SFMono-Regular, Menlo, monospace; fill: #0f172a; text-anchor: middle; }
+      .note { font: 13px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #475569; text-anchor: middle; }
+      .arrow { fill: none; stroke: #334155; stroke-width: 2.5; marker-end: url(#arrow); }
+      .dependency { fill: none; stroke: #334155; stroke-width: 2; marker-end: url(#arrow); }
+      .loop { fill: none; stroke: #64748b; stroke-width: 2.25; stroke-dasharray: 7 6; marker-end: url(#loop-arrow); }
+      .arrow-label { font: 600 13px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #334155; text-anchor: middle; }
+      .legend { font: 13px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #334155; }
+      .dep-box { fill: #ffffff; stroke: #94a3b8; stroke-width: 1.5; rx: 8; }
+      .dep-op { fill: #e2e8f0; stroke: #64748b; stroke-width: 1.5; rx: 8; }
+      .dep-text { font: 600 13px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #0f172a; text-anchor: middle; }
+    </style>
+  </defs>
+
+  <rect width="1200" height="740" fill="#ffffff"/>
+  <text x="32" y="42" class="title">Blocked Cholesky: one panel iteration</text>
+  <text x="32" y="68" class="subtitle">At step k, partition the remaining matrix into a diagonal tile, a block column, and a trailing matrix (m = n − (k + 1)b).</text>
+
+  <g transform="translate(590 76)">
+    <rect x="0" y="0" width="16" height="16" rx="3" fill="#f59e0b"/><text x="23" y="13" class="legend">POTRF tile</text>
+    <rect x="126" y="0" width="16" height="16" rx="3" fill="#8b5cf6"/><text x="149" y="13" class="legend">panel input</text>
+    <rect x="258" y="0" width="16" height="16" rx="3" fill="#14b8a6"/><text x="281" y="13" class="legend">solved panel</text>
+    <rect x="395" y="0" width="16" height="16" rx="3" fill="#84cc16"/><text x="418" y="13" class="legend">updated trailing matrix</text>
+  </g>
+
+  <!-- Phase 1: POTRF -->
+  <rect x="24" y="96" width="360" height="430" class="card"/>
+  <circle cx="50" cy="126" r="15" fill="#f59e0b"/>
+  <text x="50" y="131" class="phase-number" text-anchor="middle">1</text>
+  <text x="76" y="132" class="phase">POTRF — factor diagonal tile</text>
+
+  <rect x="70" y="170" width="72" height="72" fill="#f59e0b" class="cell"/>
+  <rect x="142" y="170" width="196" height="72" fill="url(#inactive)" class="cell"/>
+  <rect x="70" y="242" width="72" height="210" fill="#c4b5fd" class="cell"/>
+  <rect x="142" y="242" width="196" height="210" fill="#e2e8f0" class="cell"/>
+  <rect x="70" y="170" width="268" height="282" class="matrix-outline"/>
+  <text x="106" y="202" class="cell-label">A<tspan baseline-shift="sub" font-size="11">kk</tspan></text>
+  <text x="106" y="222" class="cell-shape">b × b</text>
+  <text x="106" y="332" class="cell-label">A<tspan baseline-shift="sub" font-size="11">ik</tspan></text>
+  <text x="106" y="352" class="cell-shape">m × b</text>
+  <text x="240" y="334" class="cell-label">A<tspan baseline-shift="sub" font-size="11">ii</tspan></text>
+  <text x="240" y="354" class="cell-shape">m × m</text>
+  <text x="240" y="200" class="cell-shape">symmetric upper region</text>
+  <text x="204" y="480" class="formula">Lkk = chol(Akk)</text>
+  <text x="204" y="505" class="note">Sequential on the panel; parallel within the b × b tile.</text>
+
+  <!-- Phase 2: TRSM -->
+  <rect x="420" y="96" width="360" height="430" class="card"/>
+  <circle cx="446" cy="126" r="15" fill="#0ea5e9"/>
+  <text x="446" y="131" class="phase-number" text-anchor="middle">2</text>
+  <text x="472" y="132" class="phase">TRSM — solve block column</text>
+
+  <rect x="466" y="170" width="72" height="72" fill="#38bdf8" class="cell"/>
+  <rect x="538" y="170" width="196" height="72" fill="url(#inactive)" class="cell"/>
+  <rect x="466" y="242" width="72" height="210" fill="#14b8a6" class="cell"/>
+  <rect x="538" y="242" width="196" height="210" fill="#e2e8f0" class="cell"/>
+  <rect x="466" y="170" width="268" height="282" class="matrix-outline"/>
+  <text x="502" y="202" class="cell-label">L<tspan baseline-shift="sub" font-size="11">kk</tspan></text>
+  <text x="502" y="222" class="cell-shape">b × b</text>
+  <text x="502" y="332" class="cell-label">L<tspan baseline-shift="sub" font-size="11">ik</tspan></text>
+  <text x="502" y="352" class="cell-shape">m × b</text>
+  <text x="636" y="334" class="cell-label">A<tspan baseline-shift="sub" font-size="11">ii</tspan></text>
+  <text x="636" y="354" class="cell-shape">m × m</text>
+  <path d="M 502 230 L 502 274" class="dependency"/>
+  <text x="600" y="480" class="formula">Lik = Aik Lkk^-T</text>
+  <text x="600" y="505" class="note">Depends on Lkk; rows and batch members are parallel.</text>
+
+  <!-- Phase 3: trailing update -->
+  <rect x="816" y="96" width="360" height="430" class="card"/>
+  <circle cx="842" cy="126" r="15" fill="#65a30d"/>
+  <text x="842" y="131" class="phase-number" text-anchor="middle">3</text>
+  <text x="868" y="132" class="phase">Rank-k — update trailing matrix</text>
+
+  <rect x="862" y="170" width="72" height="72" fill="#38bdf8" class="cell"/>
+  <rect x="934" y="170" width="196" height="72" fill="url(#inactive)" class="cell"/>
+  <rect x="862" y="242" width="72" height="210" fill="#14b8a6" class="cell"/>
+  <rect x="934" y="242" width="196" height="210" fill="#bef264" class="cell"/>
+  <path d="M 999 242 V 452 M 1064 242 V 452 M 934 312 H 1130 M 934 382 H 1130" stroke="#ffffff" stroke-width="2" opacity="0.85"/>
+  <path d="M 934 242 L 1130 452" stroke="#65a30d" stroke-width="2" opacity="0.7"/>
+  <rect x="862" y="170" width="268" height="282" class="matrix-outline"/>
+  <text x="898" y="202" class="cell-label">L<tspan baseline-shift="sub" font-size="11">kk</tspan></text>
+  <text x="898" y="222" class="cell-shape">b × b</text>
+  <text x="898" y="332" class="cell-label">L<tspan baseline-shift="sub" font-size="11">ik</tspan></text>
+  <text x="898" y="352" class="cell-shape">m × b</text>
+  <text x="1032" y="334" class="cell-label">A′<tspan baseline-shift="sub" font-size="11">ii</tspan></text>
+  <text x="1032" y="354" class="cell-shape">m × m</text>
+  <path d="M 923 342 C 950 342 953 318 976 318" class="dependency"/>
+  <text x="996" y="480" class="formula">Aii' = Aii − Lik Lik^T</text>
+  <text x="996" y="505" class="note">(m × b)(b × m) updates the m × m region in parallel tiles.</text>
+
+  <!-- Cross-phase dependencies -->
+  <path d="M 338 206 C 372 206 386 206 420 206" class="arrow"/>
+  <text x="379" y="192" class="arrow-label">Lkk</text>
+  <path d="M 734 347 C 770 347 780 347 816 347" class="arrow"/>
+  <text x="776" y="333" class="arrow-label">Lik</text>
+
+  <!-- Dependency strip -->
+  <text x="32" y="568" class="phase">Data-dependency chain</text>
+  <rect x="32" y="590" width="112" height="42" class="dep-box"/><text x="88" y="616" class="dep-text">Akk · b × b</text>
+  <rect x="178" y="590" width="92" height="42" class="dep-op"/><text x="224" y="616" class="dep-text">POTRF</text>
+  <rect x="304" y="590" width="112" height="42" class="dep-box"/><text x="360" y="616" class="dep-text">Lkk · b × b</text>
+  <rect x="450" y="590" width="92" height="42" class="dep-op"/><text x="496" y="616" class="dep-text">TRSM</text>
+  <rect x="576" y="590" width="112" height="42" class="dep-box"/><text x="632" y="616" class="dep-text">Lik · m × b</text>
+  <rect x="722" y="590" width="126" height="42" class="dep-op"/><text x="785" y="616" class="dep-text">Rank-k update</text>
+  <rect x="882" y="590" width="124" height="42" class="dep-box"/><text x="944" y="616" class="dep-text">A′ii · m × m</text>
+  <path d="M 144 611 H 178" class="dependency"/>
+  <path d="M 270 611 H 304" class="dependency"/>
+  <path d="M 416 611 H 450" class="dependency"/>
+  <path d="M 542 611 H 576" class="dependency"/>
+  <path d="M 688 611 H 722" class="dependency"/>
+  <path d="M 848 611 H 882" class="dependency"/>
+
+  <rect x="323" y="662" width="112" height="42" class="dep-box"/><text x="379" y="688" class="dep-text">Aik · m × b</text>
+  <path d="M 435 683 C 472 683 496 670 496 632" class="dependency"/>
+  <rect x="703" y="662" width="112" height="42" class="dep-box"/><text x="759" y="688" class="dep-text">Aii · m × m</text>
+  <path d="M 815 683 C 842 683 785 668 785 632" class="dependency"/>
+
+  <path d="M 1006 611 H 1120 C 1150 611 1150 704 1090 704 H 104 C 64 704 64 662 88 632" class="loop"/>
+  <rect x="868" y="678" width="240" height="28" rx="8" fill="#ffffff"/>
+  <text x="988" y="697" class="arrow-label">next panel: A(k+1) ← A′ii, m ← m − b</text>
+</svg>

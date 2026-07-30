@@ -1,0 +1,1 @@
+*/15 * * * * /usr/bin/flock -n /tmp/autocuda-cholesky-submit.lock /home/shadeform/.local/share/autocuda/gpumode/2026-07-19-01-44-06-cholesky-resumed-local/cadence-submit.sh # AUTOCUDA_CHOLESKY_SUBMIT_15M

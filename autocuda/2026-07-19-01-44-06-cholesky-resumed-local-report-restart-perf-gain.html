@@ -1,0 +1,311 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang xml:lang>
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>Why Reallocating the Whole Fleet Broke the Performance Plateau</title>
+  <style>
+    code{white-space: pre-wrap;}
+    span.smallcaps{font-variant: small-caps;}
+    span.underline{text-decoration: underline;}
+    div.column{display: inline-block; vertical-align: top; width: 50%;}
+    div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
+    ul.task-list{list-style: none;}
+    pre > code.sourceCode { white-space: pre; position: relative; }
+    pre > code.sourceCode > span { display: inline-block; line-height: 1.25; }
+    pre > code.sourceCode > span:empty { height: 1.2em; }
+    code.sourceCode > span { color: inherit; text-decoration: inherit; }
+    div.sourceCode { margin: 1em 0; }
+    pre.sourceCode { margin: 0; }
+    @media screen {
+    div.sourceCode { overflow: auto; }
+    }
+    @media print {
+    pre > code.sourceCode { white-space: pre-wrap; }
+    pre > code.sourceCode > span { text-indent: -5em; padding-left: 5em; }
+    }
+    pre.numberSource code
+      { counter-reset: source-line 0; }
+    pre.numberSource code > span
+      { position: relative; left: -4em; counter-increment: source-line; }
+    pre.numberSource code > span > a:first-child::before
+      { content: counter(source-line);
+        position: relative; left: -1em; text-align: right; vertical-align: baseline;
+        border: none; display: inline-block;
+        -webkit-touch-callout: none; -webkit-user-select: none;
+        -khtml-user-select: none; -moz-user-select: none;
+        -ms-user-select: none; user-select: none;
+        padding: 0 4px; width: 4em;
+        color: #aaaaaa;
+      }
+    pre.numberSource { margin-left: 3em; border-left: 1px solid #aaaaaa;  padding-left: 4px; }
+    div.sourceCode
+      {   }
+    @media screen {
+    pre > code.sourceCode > span > a:first-child::before { text-decoration: underline; }
+    }
+    code span.al { color: #ff0000; font-weight: bold; } /* Alert */
+    code span.an { color: #60a0b0; font-weight: bold; font-style: italic; } /* Annotation */
+    code span.at { color: #7d9029; } /* Attribute */
+    code span.bn { color: #40a070; } /* BaseN */
+    code span.bu { } /* BuiltIn */
+    code span.cf { color: #007020; font-weight: bold; } /* ControlFlow */
+    code span.ch { color: #4070a0; } /* Char */
+    code span.cn { color: #880000; } /* Constant */
+    code span.co { color: #60a0b0; font-style: italic; } /* Comment */
+    code span.cv { color: #60a0b0; font-weight: bold; font-style: italic; } /* CommentVar */
+    code span.do { color: #ba2121; font-style: italic; } /* Documentation */
+    code span.dt { color: #902000; } /* DataType */
+    code span.dv { color: #40a070; } /* DecVal */
+    code span.er { color: #ff0000; font-weight: bold; } /* Error */
+    code span.ex { } /* Extension */
+    code span.fl { color: #40a070; } /* Float */
+    code span.fu { color: #06287e; } /* Function */
+    code span.im { } /* Import */
+    code span.in { color: #60a0b0; font-weight: bold; font-style: italic; } /* Information */
+    code span.kw { color: #007020; font-weight: bold; } /* Keyword */
+    code span.op { color: #666666; } /* Operator */
+    code span.ot { color: #007020; } /* Other */
+    code span.pp { color: #bc7a00; } /* Preprocessor */
+    code span.sc { color: #4070a0; } /* SpecialChar */
+    code span.ss { color: #bb6688; } /* SpecialString */
+    code span.st { color: #4070a0; } /* String */
+    code span.va { color: #19177c; } /* Variable */
+    code span.vs { color: #4070a0; } /* VerbatimString */
+    code span.wa { color: #60a0b0; font-weight: bold; font-style: italic; } /* Warning */
+  </style>
+  <style type="text/css">body { max-width:1100px; margin:2rem auto; padding:0 1.5rem; font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif; color:#1a1a1a; }
+table { border-collapse:collapse; width:100%; margin:1rem 0; font-size:14px; }
+th,td { border:1px solid #ccc; padding:6px 10px; text-align:left; vertical-align:top; }
+th { background:#f4f4f4; }
+code { background:#f4f4f4; padding:1px 4px; border-radius:3px; }
+pre:not(.mermaid) { background:#f7f7f7; padding:10px; overflow-x:auto; border-radius:5px; }
+pre.mermaid { background:transparent; text-align:center; }
+h1,h2,h3 { line-height:1.25; }
+h1 { border-bottom:2px solid #eee; padding-bottom:.3rem; }
+h2 { border-bottom:1px solid #eee; padding-bottom:.2rem; margin-top:2rem; }
+blockquote { border-left:3px solid #ccc; margin-left:0; padding-left:1rem; color:#555; }
+a { color:#0645ad; }
+</style>
+</head>
+<body>
+<h1 id="why-reallocating-the-whole-fleet-broke-the-performance-plateau">Why Reallocating the Whole Fleet Broke the Performance Plateau</h1>
+<p><strong>Benchmark:</strong> <code>linalg/cholesky_py</code><br />
+<strong>Report tag:</strong> <code>2026-07-19-01-44-06-cholesky-resumed-local-unmerged</code><br />
+<strong>Runs studied:</strong> the original run, <code>cholesky_r2</code>, and <code>cholesky_r3</code></p>
+<h2 id="short-answer">Short Answer</h2>
+<p>The original run made excellent early progress, but eventually spent hundreds of trials refining and merging the same family of solutions. The two follow-on runs kept the best code and replaced all five active assignments with fresh ones. That directed work toward opportunities the original run had missed.</p>
+<p>The workers did not run trials faster. Their new assignments simply produced better ideas.</p>
+<p>Autocuda should reproduce that result only when the search has genuinely stalled:</p>
+<pre class="text"><code>SEARCH NORMALLY
+       ↓
+DETECT A REAL STALL
+       ↓
+STOP THE WHOLE FLEET AFTER ITS CURRENT TRIALS
+       ↓
+START A FRESH NON-COMBINE FLEET
+       ↓
+SEARCH NORMALLY</code></pre>
+<p>A four-hour cooldown prevents repeated reallocations when the search remains difficult.</p>
+<h2 id="what-the-numbers-show">What the Numbers Show</h2>
+<table>
+<thead>
+<tr class="header">
+<th>Run</th>
+<th style="text-align: right;">Time</th>
+<th style="text-align: right;">Trials</th>
+<th style="text-align: right;">Successful trials</th>
+<th style="text-align: right;">Best local time</th>
+<th style="text-align: right;">Best public time</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Original run</td>
+<td style="text-align: right;">45:14</td>
+<td style="text-align: right;">1,638</td>
+<td style="text-align: right;">1,454</td>
+<td style="text-align: right;">743.614 µs</td>
+<td style="text-align: right;">735.196 µs</td>
+</tr>
+<tr class="even">
+<td>r2</td>
+<td style="text-align: right;">5:32</td>
+<td style="text-align: right;">156</td>
+<td style="text-align: right;">130</td>
+<td style="text-align: right;">715.900 µs</td>
+<td style="text-align: right;">711.991 µs</td>
+</tr>
+<tr class="odd">
+<td>r3</td>
+<td style="text-align: right;">3:19</td>
+<td style="text-align: right;">70</td>
+<td style="text-align: right;">55</td>
+<td style="text-align: right;">670.920 µs</td>
+<td style="text-align: right;">656.445 µs</td>
+</tr>
+</tbody>
+</table>
+<p>The two follow-on runs improved the retained public result from <code>735.196</code> to <code>656.445 µs</code>, a <code>10.712%</code> reduction, in 226 trials.</p>
+<p>The original run’s productivity fell sharply:</p>
+<table>
+<thead>
+<tr class="header">
+<th>Part of the search</th>
+<th style="text-align: right;">Trials</th>
+<th style="text-align: right;">Improvement per 100 trials</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>First 30 hours</td>
+<td style="text-align: right;">1,175</td>
+<td style="text-align: right;">118.184 µs</td>
+</tr>
+<tr class="even">
+<td>Final 15.24 hours</td>
+<td style="text-align: right;">463</td>
+<td style="text-align: right;">4.626 µs</td>
+</tr>
+</tbody>
+</table>
+<p>The final part was about 25.5 times less productive per trial. After its last local record, the run performed another 120 trials for almost four hours without improving it.</p>
+<p>The follow-on runs had roughly the same trials per hour and lower success rates. Their advantage was better trial selection, not more trial throughput.</p>
+<p>Timing varies between runs, so small score differences are not strong evidence by themselves. The clearest evidence comes from large improvements on specific benchmark cases and the close final public and secret scores.</p>
+<h2 id="why-a-full-reallocation-helped">Why a Full Reallocation Helped</h2>
+<h3 id="the-long-run-remained-active-but-its-returns-had-collapsed">The long run remained active but its returns had collapsed</h3>
+<p>The original run began with very different approaches. Over time, more work concentrated on the current leading code:</p>
+<ul>
+<li>58 of 98 assignments were about merging earlier work;</li>
+<li>72 of 93 assignments after the initial batch started from the current best version;</li>
+<li>many later assignments had to preserve most of the existing design.</li>
+</ul>
+<p>The manager still chose every brief’s starting commit explicitly, and the skill already required diversity. The missing action was not another diversity rule. It was a moment when <strong>all five assignments were reconsidered together</strong> after measured progress had stopped.</p>
+<h3 id="fresh-assignments-exposed-neglected-work">Fresh assignments exposed neglected work</h3>
+<p>The clearest example was <code>batch16/n512</code>. The original run spent substantial effort on <code>batch640/n512</code> but never gave the low-batch n512 case its own clear assignment. A fresh r3 worker built a different method and cut:</p>
+<p><code>508.062 → 175.995 µs</code></p>
+<p>That benchmark case became <code>65.36%</code> faster and explains a large part of the final result.</p>
+<h3 id="fresh-assignments-reused-successful-code-more-broadly">Fresh assignments reused successful code more broadly</h3>
+<p>In r2, a change of only 38 lines routed existing fast code to four additional matrix shapes. In r3, a method written for <code>batch2/n4096</code> was adapted to <code>batch8/n2048</code>, cutting:</p>
+<p><code>1797.576 → 977.081 µs</code></p>
+<p>This suggests one useful question whenever the fleet is reallocated:</p>
+<blockquote>
+<p>Which successful methods have not yet been tried on other compatible benchmark cases?</p>
+</blockquote>
+<h3 id="starting-without-combines-restored-exploration">Starting without combines restored exploration</h3>
+<p>The initial assignments in the follow-on runs were not combine briefs. Workers first established separate improvements. r3’s final merge then worked because those improvements mostly affected different benchmark cases.</p>
+<p>The final merges in the original run and r2 did not improve their best results. The lesson is not to combine more; it is to combine only after fresh exploration has produced clear, compatible wins.</p>
+<h2 id="plan">Plan</h2>
+<h3 id="replace-the-current-stall-calculation-with-a-meaningful-one">1. Replace the current stall calculation with a meaningful one</h3>
+<p>A trial counts as meaningful progress when it does either of the following:</p>
+<ul>
+<li>improves the trusted global best by more than normal timing variation; or</li>
+<li>makes a similarly clear improvement within its own brief, showing that the worker is still advancing a potentially useful branch.</li>
+</ul>
+<p>Important gains should be remeasured before they reset the stall window.</p>
+<p>Declare a stall only when:</p>
+<ol type="1">
+<li>enough trials have run since the last fleet allocation;</li>
+<li>no worker has produced meaningful global or branch progress over the trailing trial window;</li>
+<li>the same conclusion appears in two consecutive checks;</li>
+<li>the four-hour reallocation cooldown has expired.</li>
+</ol>
+<p>This avoids both errors: reallocating a productive fleet too early and allowing noise-sized wins to keep a weak search alive indefinitely.</p>
+<h3 id="keep-autocuda-status-simple">2. Keep <code>autocuda status</code> simple</h3>
+<p>Status needs only three progress fields:</p>
+<div class="sourceCode" id="cb2"><pre class="sourceCode json"><code class="sourceCode json"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true"></a><span class="fu">{</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true"></a>  <span class="dt">&quot;stalled&quot;</span><span class="fu">:</span> <span class="kw">true</span><span class="fu">,</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true"></a>  <span class="dt">&quot;trials_since_improvement&quot;</span><span class="fu">:</span> <span class="dv">37</span><span class="fu">,</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true"></a>  <span class="dt">&quot;reallocate&quot;</span><span class="fu">:</span> <span class="kw">false</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true"></a><span class="fu">}</span></span></code></pre></div>
+<ul>
+<li><code>stalled</code> says whether recent trials show meaningful progress.</li>
+<li><code>trials_since_improvement</code> explains the decision.</li>
+<li><code>reallocate</code> is the action signal. It is true only when the fleet is stalled and the cooldown has expired.</li>
+</ul>
+<p>Noise estimates, timestamps, and cooldown bookkeeping should remain internal. The existing best-trial and per-brief status output already provides the rest of the useful detail.</p>
+<h3 id="stop-every-active-worker-at-a-safe-boundary">3. Stop every active worker at a safe boundary</h3>
+<p>When <code>reallocate</code> becomes true, tell every worker:</p>
+<ol type="1">
+<li>finish the current build, validation, benchmark, and trial log;</li>
+<li>commit the measured code;</li>
+<li>write <code>brief_stop</code>;</li>
+<li>do not start another trial;</li>
+<li>return the best result and remaining ideas.</li>
+</ol>
+<p>Do not interrupt a trial halfway through. Start no replacement worker until the old fleet has returned, so no brief has two writers.</p>
+<h3 id="start-a-fresh-fleet-using-round-zero-rules">4. Start a fresh fleet using round-zero rules</h3>
+<p>Create all replacement assignments together.</p>
+<ul>
+<li>Create exactly the configured number of briefs.</li>
+<li>Use no <code>combine</code> briefs.</li>
+<li>Require exactly one brief to start from the original baseline.</li>
+<li>Select the other parents through the existing parent-selection rules.</li>
+<li>Apply the existing diversity rules to the fresh fleet as a whole.</li>
+<li>Give every brief a fresh worker.</li>
+</ul>
+<p>The baseline brief is intentionally expensive insurance. It gives one worker a clean path away from assumptions embedded in the current best code. Its assignment should try a substantially different approach, not recreate known work.</p>
+<p>After this initial fresh batch is launched, normal brief selection resumes as workers finish.</p>
+<h3 id="enforce-a-four-hour-cooldown">5. Enforce a four-hour cooldown</h3>
+<p>Record the time of each fleet allocation internally. Another full reallocation is forbidden for four hours.</p>
+<p>During the cooldown:</p>
+<ul>
+<li>status may report <code>stalled: true</code>;</li>
+<li>status must report <code>reallocate: false</code>;</li>
+<li>the manager continues normal per-worker steering and replacement.</li>
+</ul>
+<p>Progress calculations for the new fleet must ignore trials from before the allocation. Otherwise the old stall could immediately trigger another reallocation.</p>
+<p>A meaningful improvement resets <code>trials_since_improvement</code>, but the four-hour cooldown remains anchored to the last allocation.</p>
+<h2 id="minimal-implementation-changes">Minimal Implementation Changes</h2>
+<ol type="1">
+<li>Add an internal fleet-allocation number to manager and brief rows.</li>
+<li>Track the last meaningful improvement within that allocation.</li>
+<li>Teach workers to honor a “finish this trial and stop” request.</li>
+<li>Add one manager action that stops the fleet and writes a new non-combine batch.</li>
+<li>Keep the last allocation time internally to enforce the four-hour cooldown.</li>
+</ol>
+<p>No new diversity system is required. Reallocation should reuse the diversity and parent-selection rules that already exist.</p>
+<h2 id="tests">Tests</h2>
+<p>The change should include these regression tests:</p>
+<ol type="1">
+<li>The original run’s 120-trial flat tail triggers <code>reallocate</code>.</li>
+<li>r3’s early productive search does not trigger a false stall.</li>
+<li>A worker making meaningful branch progress prevents a fleet-wide stall.</li>
+<li>Same-version timing variation does not count as meaningful progress.</li>
+<li>Old trials cannot immediately retrigger a stall after reallocation.</li>
+<li>Two reallocations cannot happen within four hours.</li>
+<li>Every active worker stops before replacement workers start.</li>
+<li>Every replacement brief is non-combine.</li>
+<li>Exactly one replacement brief starts from the baseline.</li>
+<li>Normal parent selection and diversity checks apply to the other briefs.</li>
+</ol>
+<h2 id="performance-evaluation">Performance Evaluation</h2>
+<p>Compare the current skill and the reallocation design with equal GPU time, inference budget, and trial count across many benchmarks.</p>
+<p>Measure:</p>
+<ul>
+<li>improvement per 100 trials;</li>
+<li>time and trials needed to reach the best trusted result;</li>
+<li>number of reallocations;</li>
+<li>useful improvements found after reallocation;</li>
+<li>consistency across repeated runs.</li>
+</ul>
+<p>The main question is simple:</p>
+<blockquote>
+<p>When progress genuinely stops, does replacing the whole fleet find better results than continuing to replace workers one at a time?</p>
+</blockquote>
+<h2 id="scope-and-limits">Scope and Limits</h2>
+<p>This report studies 112 assignments and 1,864 trials across the three runs. The follow-on runs reused code and knowledge from earlier work, so this was not a controlled experiment. Timing also varies between runs.</p>
+<p>Even with those limits, the result strongly supports one targeted change: continue the current search while meaningful progress exists, then perform a cooldown-limited, round-zero-style fleet reallocation when robust stall tracking says progress has stopped.</p>
+<h2 id="evidence-files">Evidence Files</h2>
+<ul>
+<li><a href="./2026-07-19-01-44-06-cholesky-resumed-local-unmerged-report-optimization.md">Original optimization report</a></li>
+<li><a href="./2026-07-19-01-44-06-cholesky-resumed-local-unmerged-optimize-tree-manager-log.csv">Original manager log</a></li>
+<li><a href="./2026-07-20-23-00-46-cholesky-unmerged-optimize-tree-manager-log.csv">r2 manager log</a></li>
+<li><a href="./2026-07-21-04-34-16-cholesky-unmerged-optimize-tree-manager-log.csv">r3 manager log</a></li>
+<li><a href="./2026-07-19-01-44-06-cholesky-resumed-local-unmerged-leaderboard-submissions.md">Original public submissions</a></li>
+<li><a href="./2026-07-20-23-00-46-cholesky-unmerged-leaderboard-submissions.md">r2 public submissions</a></li>
+<li><a href="./2026-07-21-04-34-16-cholesky-unmerged-leaderboard-submissions.md">r3 public submissions</a></li>
+</ul>
+</body>
+</html>

@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang xml:lang>
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>Optimize-Tree Worker Compaction Confusion Incident</title>
+  <style>
+    code{white-space: pre-wrap;}
+    span.smallcaps{font-variant: small-caps;}
+    span.underline{text-decoration: underline;}
+    div.column{display: inline-block; vertical-align: top; width: 50%;}
+    div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
+    ul.task-list{list-style: none;}
+  </style>
+  <style type="text/css">body { max-width:1100px; margin:2rem auto; padding:0 1.5rem; font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif; color:#1a1a1a; }
+table { border-collapse:collapse; width:100%; margin:1rem 0; font-size:14px; }
+th,td { border:1px solid #ccc; padding:6px 10px; text-align:left; vertical-align:top; }
+th { background:#f4f4f4; }
+code { background:#f4f4f4; padding:1px 4px; border-radius:3px; }
+pre:not(.mermaid) { background:#f7f7f7; padding:10px; overflow-x:auto; border-radius:5px; }
+pre.mermaid { background:transparent; text-align:center; }
+h1,h2,h3 { line-height:1.25; }
+h1 { border-bottom:2px solid #eee; padding-bottom:.3rem; }
+h2 { border-bottom:1px solid #eee; padding-bottom:.2rem; margin-top:2rem; }
+blockquote { border-left:3px solid #ccc; margin-left:0; padding-left:1rem; color:#555; }
+a { color:#0645ad; }
+</style>
+</head>
+<body>
+<h1 id="optimize-tree-worker-compaction-confusion-incident">Optimize-Tree Worker Compaction Confusion Incident</h1>
+<h2 id="executive-summary">Executive Summary</h2>
+<p>One high-severity worker-role contract defect affected two <code>autocuda:explore-brief</code> workers in run <code>2026-07-19-01-44-06-cholesky-resumed-local-unmerged</code>, and one medium-severity manager health-check gap delayed detection. Both workers adopted the manager role after context compaction and entered its indefinite wait loop instead of continuing their assigned briefs; direct harness evidence is complete for the two affected branches.</p>
+<p><strong>Key takeaways</strong></p>
+<ul>
+<li>Briefs 58 and 63 stopped producing trials because compaction recovery did not preserve their worker identity.</li>
+<li>Neither incident was caused by a tool, API, GPU, or remote infrastructure failure.</li>
+<li>Brief 63 abandoned a validated in-flight Trial 5 benchmark session; Brief 58 stopped after a successful Trial 26.</li>
+<li>A task-list-only health check reported both sessions as running and could not detect zero trial throughput.</li>
+<li>The fix makes worker identity permanent and adds a rate-limited <code>autocuda status</code> health audit every 30 minutes.</li>
+</ul>
+<h2 id="skill-issue-candidates">Skill Issue Candidates</h2>
+<table style="width:100%;">
+<colgroup>
+<col style="width: 16%"></col>
+<col style="width: 16%"></col>
+<col style="width: 16%"></col>
+<col style="width: 16%"></col>
+<col style="width: 16%"></col>
+<col style="width: 16%"></col>
+</colgroup>
+<thead>
+<tr class="header">
+<th>Branch</th>
+<th>Skill</th>
+<th>Severity</th>
+<th>Category</th>
+<th>Evidence</th>
+<th>Recommendation</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>brief-58</code></td>
+<td><code>autocuda:explore-brief</code></td>
+<td>High</td>
+<td>role_recovery</td>
+<td>At 06:31 UTC the worker reported that, after compaction, it misidentified itself as manager and waited for worker completions instead of resuming after Trial 26.</td>
+<td>Make worker role and <code>brief-id</code> permanent across compaction; resume only the assigned brief and return if identity is unavailable.</td>
+</tr>
+<tr class="even">
+<td><code>brief-63</code></td>
+<td><code>autocuda:explore-brief</code></td>
+<td>High</td>
+<td>role_recovery</td>
+<td>At 06:31 UTC the worker reported that it entered the manager wait loop and ignored the handoff to collect benchmark session <code>42908</code> for validated Trial 5.</td>
+<td>Apply the same permanent-role guard in the worker skill and every host-specific worker definition.</td>
+</tr>
+<tr class="odd">
+<td>Manager</td>
+<td><code>autocuda:optimize-tree</code></td>
+<td>Medium</td>
+<td>health_check</td>
+<td>The 30-minute check counted live tasks only; Briefs 58 and 63 remained marked running for 290 and 338 minutes without new trial rows.</td>
+<td>Audit <code>autocuda status</code> at most once per 30 minutes, inspect per-brief activity, and checkpoint or replace unresponsive workers.</td>
+</tr>
+<tr class="even">
+<td>Briefs 0–57, 59–62, 64–78</td>
+<td><code>autocuda:optimize-tree</code></td>
+<td>Info</td>
+<td>coverage_gap</td>
+<td>The targeted data build mapped only the two affected worker JSONLs; 77 other brief branches have missing-harness rows in the companion CSV.</td>
+<td>Treat this report as an incident audit, not a complete run-wide skill audit.</td>
+</tr>
+</tbody>
+</table>
+<p>The Brief 58 harness record at <code>/home/ubuntu/.codex/sessions/2026/07/19/rollout-2026-07-19T22-42-00-019f7c8b-1f8f-7d30-ae2a-2b40049a0eb4.jsonl:4084</code> contains the worker’s direct postmortem. Its last trial row was successful at <code>2026-07-20T01:39:18.623972</code>, after which no additional Brief 58 state was written.</p>
+<p>The Brief 63 harness record at <code>/home/ubuntu/.codex/sessions/2026/07/19/rollout-2026-07-19T23-11-58-019f7ca6-8f68-7a02-8844-040b14cb1d0f.jsonl:3614</code> contains the second direct postmortem. Its last logged row was Trial 4 at <code>2026-07-20T00:50:56.378366</code>; the worker later confirmed that Trial 5 had built and validated but was never collected, committed, or logged.</p>
+<h2 id="root-causes">Root Causes</h2>
+<ul>
+<li><code>plugins/autocuda/skills/explore-brief/SKILL.md</code> defined the worker loop but did not state that worker identity and assignment survive compaction. Inherited manager conversation therefore became an ambiguous recovery signal.</li>
+<li>The Claude Code, Codex, and Pi <code>optimize-tree-worker</code> definitions did not contain a role-recovery invariant or a safe return path when launch arguments are missing.</li>
+<li><code>plugins/autocuda/skills/optimize-tree/SKILL.md</code> told the manager to confirm only the live brief count every 30 minutes and otherwise treat an unnotified quiet worker as alive indefinitely. That detects missing tasks but not a running worker with zero trial progress.</li>
+</ul>
+<h2 id="fix-plan">Fix Plan</h2>
+<ol type="1">
+<li>Add a concise worker-identity section to <code>explore-brief</code>: recover <code>brief-id</code>, <code>tag</code>, and <code>data-dir</code>, re-enter the same brief after compaction, never enter the manager loop, and return if the assignment is unavailable. Validate with <code>pytest plugins/autocuda/tests/test_autocuda_cli.py::test_optimize_tree_worker_agent_is_a_thin_wrapper_over_explore_brief</code>.</li>
+<li>Mirror the invariant in all three host definitions: <code>agents/optimize-tree-worker.md</code>, <code>agents/optimize-tree-worker.toml</code>, and <code>agents/pi/optimize-tree-worker.md</code>. Keep a regression assertion over every format.</li>
+<li>Require every manager launch and continuation prompt to reassert permanent worker role and brief assignment.</li>
+<li>Replace the count-only timed check with a rate-limited health audit: run <code>autocuda status</code> no more than once every 30 minutes, inspect activity/trial/status fields, and checkpoint a running worker with no progress before interrupting it.</li>
+<li>Run the full plugin test suite and repository hooks, then upstream the complete fix in one pull request.</li>
+</ol>
+<h2 id="verification">Verification</h2>
+<ul>
+<li><code>autocuda report data skill</code> generated the companion CSV from the two affected worker harness records and the selected run tag.</li>
+<li><code>autocuda schema check report-skill-csv --output 2026-07-19-01-44-06-cholesky-resumed-local-unmerged-worker-compaction</code> passed.</li>
+<li>Direct harness review confirmed both role-recovery failures and excluded tool/API failures.</li>
+<li>The focused worker-role regression tests passed; the full autocuda suite passed with 665 tests and 10 skips.</li>
+<li>All repository pre-commit hooks passed: whitespace, EOF, line endings, YAML/JSON, conflict markers, large files, Ruff, ShellCheck, and shfmt.</li>
+<li>Upstream fix: <a href="https://github.com/brycelelbach-private/autocuda/pull/381">autocuda PR #381</a>.</li>
+<li>Harness coverage outside Briefs 58 and 63 was not mapped for this targeted incident report.</li>
+</ul>
+<h2 id="scope-methodology">Scope &amp; Methodology</h2>
+<p>The report covers optimize-tree run <code>2026-07-19-01-44-06-cholesky-resumed-local-unmerged</code>, specifically branches <code>autocuda/optimize/2026-07-19-01-44-06-cholesky-resumed-local-unmerged/brief-58</code> and <code>brief-63</code>. Evidence combines the tagged skill-report CSV, both per-brief trial logs, the 06:29 UTC <code>autocuda status</code> health audit, and direct Codex harness records including each worker’s read-only postmortem. Candidate extraction did not classify the self-reported role failures automatically, so they were added through the report skill’s required direct harness review. The other 77 brief branches remain coverage gaps in this focused report.</p>
+</body>
+</html>

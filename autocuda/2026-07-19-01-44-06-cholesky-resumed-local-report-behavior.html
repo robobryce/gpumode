@@ -1,0 +1,829 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang xml:lang>
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>Behavior Report: autocuda optimize-tree 2026-07-19-01-44-06-cholesky-resumed-local-unmerged</title>
+  <style>
+    code{white-space: pre-wrap;}
+    span.smallcaps{font-variant: small-caps;}
+    span.underline{text-decoration: underline;}
+    div.column{display: inline-block; vertical-align: top; width: 50%;}
+    div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
+    ul.task-list{list-style: none;}
+  </style>
+  <style type="text/css">body { max-width:1100px; margin:2rem auto; padding:0 1.5rem; font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif; color:#1a1a1a; }
+table { border-collapse:collapse; width:100%; margin:1rem 0; font-size:14px; }
+th,td { border:1px solid #ccc; padding:6px 10px; text-align:left; vertical-align:top; }
+th { background:#f4f4f4; }
+code { background:#f4f4f4; padding:1px 4px; border-radius:3px; }
+pre:not(.mermaid) { background:#f7f7f7; padding:10px; overflow-x:auto; border-radius:5px; }
+pre.mermaid { background:transparent; text-align:center; }
+h1,h2,h3 { line-height:1.25; }
+h1 { border-bottom:2px solid #eee; padding-bottom:.3rem; }
+h2 { border-bottom:1px solid #eee; padding-bottom:.2rem; margin-top:2rem; }
+blockquote { border-left:3px solid #ccc; margin-left:0; padding-left:1rem; color:#555; }
+a { color:#0645ad; }
+</style>
+</head>
+<body>
+<h1 id="behavior-report-autocuda-optimize-tree-2026-07-19-01-44-06-cholesky-resumed-local-unmerged">Behavior Report: autocuda optimize-tree 2026-07-19-01-44-06-cholesky-resumed-local-unmerged</h1>
+<h2 id="executive-summary">Executive Summary</h2>
+<p>At the 2026-07-20 21:01:15 UTC snapshot, 93 branches had produced 1,581 structured trials at 8.43 trials per summed branch-active hour (36.77 trials per fleet wall-clock hour). The run was productive but behavior was uneven: 88.8% of trials succeeded, while 134 inter-trial gaps exceeded ten minutes and branch rates ranged from 0.00 to 23.62 trials/hour. This is one still-running experiment, so branch spread is descriptive and cannot establish cross-run variance.</p>
+<p><strong>Key takeaways</strong></p>
+<ul>
+<li>Five briefs occupied 466/517 five-minute windows (90.1%); 36 windows were under-strength, while two stale open briefs made 15 windows appear to have seven workers.</li>
+<li>Context-role drift was the top issue: briefs 58 and 63 stopped optimizing after compaction, and briefs 71 and 81 temporarily entered manager-style wait loops.</li>
+<li>No unauthorized early-termination request or convergence claim was found; normal completion messages followed logged stops or were explicit compaction checkpoints.</li>
+<li>All 4,697 paired lock calls were shared <code>build</code> calls with 0.000 seconds of wait; no exclusive per-GPU event was recorded, so GPU contention is not measurable from this run.</li>
+</ul>
+<p><strong>Snapshot totals:</strong> 93 branches (92 with trials), 1,581 trials, 43.00 fleet hours, 187.50 summed measured branch hours, 8.43 aggregate trials/hour, 0.00 worst reported branch rate, and a mixed reliability verdict driven by compaction-role failures rather than lock contention.</p>
+<h2 id="fleet-behavior-optimize-tree-runs-only">Fleet Behavior (Optimize-Tree Runs Only)</h2>
+<h3 id="concurrency-over-time">Concurrency Over Time</h3>
+<p>The configured target was five workers. At five-minute midpoints across 517 windows, exactly five briefs were open in 466 windows (38h45m, 90.1%), fewer than five in 36 windows (3h00m, 7.0%), and the logged peak of seven in 15 windows (1h15m, 2.9%). The longest under-strength run covered two buckets (10 minutes); exact lifecycle edges place it at 11m32s, from 2026-07-20 10:22:48 to 10:34:20 UTC.</p>
+<p>The seven-brief peak was not seven productive workers. Briefs 58 and 63 remained lifecycle-open after losing their worker role, overlapping their replacements until both were administratively stopped at 07:45:37 UTC. Exact interval integration gives 91.4% at five, 5.8% below five, and 2.8% above five; therefore the desired five productive briefs were not in flight continuously, even though the open-interval average was 5.00.</p>
+<h3 id="brief-cycle-timing">Brief-Cycle Timing</h3>
+<p>For 92 briefs with a non-lifecycle result, the manager-row-to-first-result median was 9m23s and nearest-rank p95 was 16m25s. Brief 92 had only a start row at the cutoff. Eighty-seven handoffs exceeded five minutes; the only completed briefs at or below five minutes were 1 (3.4m), 2 (5.0m), 6 (4.7m), 14 (4.4m), and 16 (4.4m), so every other completed brief individually exceeded the threshold.</p>
+<p>The largest delays were brief 58 (69m24s), brief 62 (32m30s), brief 11 (25m32s), brief 71 (19m52s), and brief 70 (16m25s). This definition intentionally includes the first edit/build/validation/benchmark cycle before a result row; it is not a pure process-spawn latency.</p>
+<h3 id="lock-contention">Lock Contention</h3>
+<table>
+<colgroup>
+<col style="width: 13%"></col>
+<col style="width: 18%"></col>
+<col style="width: 18%"></col>
+<col style="width: 18%"></col>
+<col style="width: 18%"></col>
+<col style="width: 13%"></col>
+</colgroup>
+<thead>
+<tr class="header">
+<th>Lock / mode</th>
+<th style="text-align: right;">Paired calls</th>
+<th style="text-align: right;">Total wait</th>
+<th style="text-align: right;">Total run time</th>
+<th style="text-align: right;">Worst wait</th>
+<th>Highest-wait brief</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>build</code> / shared</td>
+<td style="text-align: right;">4,697</td>
+<td style="text-align: right;">0.000s</td>
+<td style="text-align: right;">144h26m24s</td>
+<td style="text-align: right;">0.000s</td>
+<td>Tie: every brief paid 0.000s</td>
+</tr>
+<tr class="even">
+<td><code>gpu-*</code> / exclusive</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">Not observed</td>
+<td style="text-align: right;">Not observed</td>
+<td style="text-align: right;">Not observed</td>
+<td>Not observable</td>
+</tr>
+</tbody>
+</table>
+<p>The 184 mapped worker/helper JSONLs contained 4,755 in-snapshot acquisitions. Time-order pairing by source, lock, and mode yielded 4,697 complete calls and 58 unmatched acquisitions from interrupted or killed commands; no unmatched release was found. Aggregate measured lock wait was 0% of both the 43.00-hour fleet window and the 187.50 summed measured branch hours. Because every recorded call used shared <code>build</code> locking and none emitted <code>gpu-*</code> exclusive events, this proves there was no shared-lock queueing but does not measure remote Modal GPU contention or per-GPU load.</p>
+<h3 id="per-brief-reliability">Per-Brief Reliability</h3>
+<p>The fleet median was 8.26 trials/hour. More than 2x above it were briefs 3 (23.62), 6 (19.45), 2 (19.34), 1 (18.98), and 13 (18.00). Below half the median were briefs 58 (2.76), 63 (2.70), and 73 (2.64), plus one-trial briefs 35, 37, 70, and 75 whose zero-duration rows mechanically report 0.00; open brief 92 had no trial and is excluded as a reliability outlier. Briefs 58 and 63 are genuine low-throughput outliers tied to role loss, while the one- and three-trial cases are small-denominator artifacts.</p>
+<h2 id="throughput">Throughput</h2>
+<table>
+<thead>
+<tr class="header">
+<th>Branch</th>
+<th style="text-align: right;">Trials</th>
+<th style="text-align: right;">Duration</th>
+<th style="text-align: right;">Trials/hour</th>
+<th style="text-align: right;">Improvement %</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>brief-3</td>
+<td style="text-align: right;">27</td>
+<td style="text-align: right;">1:06:03</td>
+<td style="text-align: right;">23.62</td>
+<td style="text-align: right;">+30.73%</td>
+</tr>
+<tr class="even">
+<td>brief-6</td>
+<td style="text-align: right;">9</td>
+<td style="text-align: right;">0:24:41</td>
+<td style="text-align: right;">19.45</td>
+<td style="text-align: right;">+50.71%</td>
+</tr>
+<tr class="odd">
+<td>brief-2</td>
+<td style="text-align: right;">22</td>
+<td style="text-align: right;">1:05:09</td>
+<td style="text-align: right;">19.34</td>
+<td style="text-align: right;">+34.81%</td>
+</tr>
+<tr class="even">
+<td>brief-1</td>
+<td style="text-align: right;">30</td>
+<td style="text-align: right;">1:31:42</td>
+<td style="text-align: right;">18.98</td>
+<td style="text-align: right;">+5.59%</td>
+</tr>
+<tr class="odd">
+<td>brief-13</td>
+<td style="text-align: right;">5</td>
+<td style="text-align: right;">0:13:20</td>
+<td style="text-align: right;">18.00</td>
+<td style="text-align: right;">+84.15%</td>
+</tr>
+<tr class="even">
+<td>brief-12</td>
+<td style="text-align: right;">14</td>
+<td style="text-align: right;">0:48:07</td>
+<td style="text-align: right;">16.21</td>
+<td style="text-align: right;">+66.74%</td>
+</tr>
+<tr class="odd">
+<td>brief-7</td>
+<td style="text-align: right;">11</td>
+<td style="text-align: right;">0:39:03</td>
+<td style="text-align: right;">15.37</td>
+<td style="text-align: right;">+44.97%</td>
+</tr>
+<tr class="even">
+<td>brief-8</td>
+<td style="text-align: right;">60</td>
+<td style="text-align: right;">3:52:13</td>
+<td style="text-align: right;">15.24</td>
+<td style="text-align: right;">+67.06%</td>
+</tr>
+<tr class="odd">
+<td>brief-11</td>
+<td style="text-align: right;">31</td>
+<td style="text-align: right;">2:03:51</td>
+<td style="text-align: right;">14.53</td>
+<td style="text-align: right;">+66.94%</td>
+</tr>
+<tr class="even">
+<td>brief-14</td>
+<td style="text-align: right;">14</td>
+<td style="text-align: right;">0:55:01</td>
+<td style="text-align: right;">14.18</td>
+<td style="text-align: right;">+90.76%</td>
+</tr>
+<tr class="odd">
+<td>brief-19</td>
+<td style="text-align: right;">9</td>
+<td style="text-align: right;">0:35:33</td>
+<td style="text-align: right;">13.50</td>
+<td style="text-align: right;">+109.63%</td>
+</tr>
+<tr class="even">
+<td>brief-46</td>
+<td style="text-align: right;">8</td>
+<td style="text-align: right;">0:31:18</td>
+<td style="text-align: right;">13.42</td>
+<td style="text-align: right;">+134.67%</td>
+</tr>
+<tr class="odd">
+<td>brief-10</td>
+<td style="text-align: right;">56</td>
+<td style="text-align: right;">4:10:42</td>
+<td style="text-align: right;">13.16</td>
+<td style="text-align: right;">+103.17%</td>
+</tr>
+<tr class="even">
+<td>brief-4</td>
+<td style="text-align: right;">29</td>
+<td style="text-align: right;">2:15:30</td>
+<td style="text-align: right;">12.40</td>
+<td style="text-align: right;">+18.57%</td>
+</tr>
+<tr class="odd">
+<td>brief-27</td>
+<td style="text-align: right;">6</td>
+<td style="text-align: right;">0:25:34</td>
+<td style="text-align: right;">11.73</td>
+<td style="text-align: right;">+124.19%</td>
+</tr>
+<tr class="even">
+<td>brief-0</td>
+<td style="text-align: right;">14</td>
+<td style="text-align: right;">1:06:41</td>
+<td style="text-align: right;">11.70</td>
+<td style="text-align: right;">+11.74%</td>
+</tr>
+<tr class="odd">
+<td>brief-30</td>
+<td style="text-align: right;">10</td>
+<td style="text-align: right;">0:46:34</td>
+<td style="text-align: right;">11.60</td>
+<td style="text-align: right;">+130.79%</td>
+</tr>
+<tr class="even">
+<td>brief-26</td>
+<td style="text-align: right;">11</td>
+<td style="text-align: right;">0:51:45</td>
+<td style="text-align: right;">11.59</td>
+<td style="text-align: right;">+117.33%</td>
+</tr>
+<tr class="odd">
+<td>brief-48</td>
+<td style="text-align: right;">6</td>
+<td style="text-align: right;">0:26:17</td>
+<td style="text-align: right;">11.41</td>
+<td style="text-align: right;">+136.07%</td>
+</tr>
+<tr class="even">
+<td>brief-17</td>
+<td style="text-align: right;">13</td>
+<td style="text-align: right;">1:03:42</td>
+<td style="text-align: right;">11.30</td>
+<td style="text-align: right;">+109.24%</td>
+</tr>
+<tr class="odd">
+<td>brief-9</td>
+<td style="text-align: right;">43</td>
+<td style="text-align: right;">3:46:27</td>
+<td style="text-align: right;">11.13</td>
+<td style="text-align: right;">+98.23%</td>
+</tr>
+<tr class="even">
+<td>brief-20</td>
+<td style="text-align: right;">5</td>
+<td style="text-align: right;">0:21:45</td>
+<td style="text-align: right;">11.03</td>
+<td style="text-align: right;">+115.26%</td>
+</tr>
+<tr class="odd">
+<td>brief-41</td>
+<td style="text-align: right;">8</td>
+<td style="text-align: right;">0:38:08</td>
+<td style="text-align: right;">11.02</td>
+<td style="text-align: right;">+133.33%</td>
+</tr>
+<tr class="even">
+<td>brief-18</td>
+<td style="text-align: right;">12</td>
+<td style="text-align: right;">1:00:09</td>
+<td style="text-align: right;">10.97</td>
+<td style="text-align: right;">+104.88%</td>
+</tr>
+<tr class="odd">
+<td>brief-16</td>
+<td style="text-align: right;">17</td>
+<td style="text-align: right;">1:28:18</td>
+<td style="text-align: right;">10.87</td>
+<td style="text-align: right;">+103.64%</td>
+</tr>
+<tr class="even">
+<td>brief-42</td>
+<td style="text-align: right;">7</td>
+<td style="text-align: right;">0:33:30</td>
+<td style="text-align: right;">10.74</td>
+<td style="text-align: right;">+134.82%</td>
+</tr>
+<tr class="odd">
+<td>brief-5</td>
+<td style="text-align: right;">5</td>
+<td style="text-align: right;">0:22:23</td>
+<td style="text-align: right;">10.72</td>
+<td style="text-align: right;">+47.81%</td>
+</tr>
+<tr class="even">
+<td>brief-33</td>
+<td style="text-align: right;">11</td>
+<td style="text-align: right;">0:56:00</td>
+<td style="text-align: right;">10.71</td>
+<td style="text-align: right;">+131.69%</td>
+</tr>
+<tr class="odd">
+<td>brief-47</td>
+<td style="text-align: right;">6</td>
+<td style="text-align: right;">0:28:43</td>
+<td style="text-align: right;">10.44</td>
+<td style="text-align: right;">+134.90%</td>
+</tr>
+<tr class="even">
+<td>brief-23</td>
+<td style="text-align: right;">15</td>
+<td style="text-align: right;">1:22:04</td>
+<td style="text-align: right;">10.24</td>
+<td style="text-align: right;">+112.55%</td>
+</tr>
+<tr class="odd">
+<td>brief-22</td>
+<td style="text-align: right;">30</td>
+<td style="text-align: right;">2:50:02</td>
+<td style="text-align: right;">10.23</td>
+<td style="text-align: right;">+127.69%</td>
+</tr>
+<tr class="even">
+<td>brief-28</td>
+<td style="text-align: right;">15</td>
+<td style="text-align: right;">1:22:12</td>
+<td style="text-align: right;">10.22</td>
+<td style="text-align: right;">+125.98%</td>
+</tr>
+<tr class="odd">
+<td>brief-38</td>
+<td style="text-align: right;">10</td>
+<td style="text-align: right;">0:53:30</td>
+<td style="text-align: right;">10.09</td>
+<td style="text-align: right;">+133.27%</td>
+</tr>
+<tr class="even">
+<td>brief-15</td>
+<td style="text-align: right;">11</td>
+<td style="text-align: right;">0:59:57</td>
+<td style="text-align: right;">10.01</td>
+<td style="text-align: right;">+103.38%</td>
+</tr>
+<tr class="odd">
+<td>brief-24</td>
+<td style="text-align: right;">30</td>
+<td style="text-align: right;">2:56:11</td>
+<td style="text-align: right;">9.88</td>
+<td style="text-align: right;">+117.62%</td>
+</tr>
+<tr class="even">
+<td>brief-79</td>
+<td style="text-align: right;">8</td>
+<td style="text-align: right;">0:42:56</td>
+<td style="text-align: right;">9.78</td>
+<td style="text-align: right;">+180.56%</td>
+</tr>
+<tr class="odd">
+<td>brief-39</td>
+<td style="text-align: right;">10</td>
+<td style="text-align: right;">0:56:47</td>
+<td style="text-align: right;">9.51</td>
+<td style="text-align: right;">+133.13%</td>
+</tr>
+<tr class="even">
+<td>brief-51</td>
+<td style="text-align: right;">6</td>
+<td style="text-align: right;">0:31:39</td>
+<td style="text-align: right;">9.48</td>
+<td style="text-align: right;">+136.78%</td>
+</tr>
+<tr class="odd">
+<td>brief-34</td>
+<td style="text-align: right;">7</td>
+<td style="text-align: right;">0:38:15</td>
+<td style="text-align: right;">9.41</td>
+<td style="text-align: right;">+133.00%</td>
+</tr>
+<tr class="even">
+<td>brief-25</td>
+<td style="text-align: right;">48</td>
+<td style="text-align: right;">5:01:51</td>
+<td style="text-align: right;">9.34</td>
+<td style="text-align: right;">+116.40%</td>
+</tr>
+<tr class="odd">
+<td>brief-56</td>
+<td style="text-align: right;">18</td>
+<td style="text-align: right;">1:57:01</td>
+<td style="text-align: right;">8.72</td>
+<td style="text-align: right;">+144.73%</td>
+</tr>
+<tr class="even">
+<td>brief-43</td>
+<td style="text-align: right;">36</td>
+<td style="text-align: right;">4:07:33</td>
+<td style="text-align: right;">8.48</td>
+<td style="text-align: right;">+135.36%</td>
+</tr>
+<tr class="odd">
+<td>brief-21</td>
+<td style="text-align: right;">2</td>
+<td style="text-align: right;">0:07:10</td>
+<td style="text-align: right;">8.38</td>
+<td style="text-align: right;">+115.59%</td>
+</tr>
+<tr class="even">
+<td>brief-40</td>
+<td style="text-align: right;">5</td>
+<td style="text-align: right;">0:28:42</td>
+<td style="text-align: right;">8.36</td>
+<td style="text-align: right;">+131.90%</td>
+</tr>
+<tr class="odd">
+<td>brief-54</td>
+<td style="text-align: right;">9</td>
+<td style="text-align: right;">0:57:36</td>
+<td style="text-align: right;">8.33</td>
+<td style="text-align: right;">+143.28%</td>
+</tr>
+<tr class="even">
+<td>brief-76</td>
+<td style="text-align: right;">12</td>
+<td style="text-align: right;">1:19:26</td>
+<td style="text-align: right;">8.31</td>
+<td style="text-align: right;">+176.79%</td>
+</tr>
+<tr class="odd">
+<td>brief-68</td>
+<td style="text-align: right;">13</td>
+<td style="text-align: right;">1:27:12</td>
+<td style="text-align: right;">8.26</td>
+<td style="text-align: right;">+172.86%</td>
+</tr>
+<tr class="even">
+<td>brief-91</td>
+<td style="text-align: right;">6</td>
+<td style="text-align: right;">0:36:36</td>
+<td style="text-align: right;">8.20</td>
+<td style="text-align: right;">+181.12%</td>
+</tr>
+<tr class="odd">
+<td>brief-57</td>
+<td style="text-align: right;">9</td>
+<td style="text-align: right;">0:58:44</td>
+<td style="text-align: right;">8.17</td>
+<td style="text-align: right;">+153.89%</td>
+</tr>
+<tr class="even">
+<td>brief-32</td>
+<td style="text-align: right;">11</td>
+<td style="text-align: right;">1:13:53</td>
+<td style="text-align: right;">8.12</td>
+<td style="text-align: right;">+128.46%</td>
+</tr>
+<tr class="odd">
+<td>brief-69</td>
+<td style="text-align: right;">10</td>
+<td style="text-align: right;">1:07:49</td>
+<td style="text-align: right;">7.96</td>
+<td style="text-align: right;">+171.88%</td>
+</tr>
+<tr class="even">
+<td>brief-67</td>
+<td style="text-align: right;">5</td>
+<td style="text-align: right;">0:30:35</td>
+<td style="text-align: right;">7.85</td>
+<td style="text-align: right;">+172.99%</td>
+</tr>
+<tr class="odd">
+<td>brief-64</td>
+<td style="text-align: right;">17</td>
+<td style="text-align: right;">2:02:23</td>
+<td style="text-align: right;">7.84</td>
+<td style="text-align: right;">+170.93%</td>
+</tr>
+<tr class="even">
+<td>brief-61</td>
+<td style="text-align: right;">17</td>
+<td style="text-align: right;">2:04:09</td>
+<td style="text-align: right;">7.73</td>
+<td style="text-align: right;">+162.18%</td>
+</tr>
+<tr class="odd">
+<td>brief-36</td>
+<td style="text-align: right;">13</td>
+<td style="text-align: right;">1:33:33</td>
+<td style="text-align: right;">7.70</td>
+<td style="text-align: right;">+132.32%</td>
+</tr>
+<tr class="even">
+<td>brief-29</td>
+<td style="text-align: right;">27</td>
+<td style="text-align: right;">3:22:52</td>
+<td style="text-align: right;">7.69</td>
+<td style="text-align: right;">+129.55%</td>
+</tr>
+<tr class="odd">
+<td>brief-55</td>
+<td style="text-align: right;">25</td>
+<td style="text-align: right;">3:09:26</td>
+<td style="text-align: right;">7.60</td>
+<td style="text-align: right;">+146.79%</td>
+</tr>
+<tr class="even">
+<td>brief-72</td>
+<td style="text-align: right;">11</td>
+<td style="text-align: right;">1:19:19</td>
+<td style="text-align: right;">7.57</td>
+<td style="text-align: right;">+171.64%</td>
+</tr>
+<tr class="odd">
+<td>brief-52</td>
+<td style="text-align: right;">13</td>
+<td style="text-align: right;">1:36:52</td>
+<td style="text-align: right;">7.43</td>
+<td style="text-align: right;">+139.78%</td>
+</tr>
+<tr class="even">
+<td>brief-77</td>
+<td style="text-align: right;">37</td>
+<td style="text-align: right;">4:52:00</td>
+<td style="text-align: right;">7.40</td>
+<td style="text-align: right;">+179.00%</td>
+</tr>
+<tr class="odd">
+<td>brief-87</td>
+<td style="text-align: right;">17</td>
+<td style="text-align: right;">2:10:19</td>
+<td style="text-align: right;">7.37</td>
+<td style="text-align: right;">+184.42%</td>
+</tr>
+<tr class="even">
+<td>brief-45</td>
+<td style="text-align: right;">8</td>
+<td style="text-align: right;">0:58:31</td>
+<td style="text-align: right;">7.18</td>
+<td style="text-align: right;">+132.87%</td>
+</tr>
+<tr class="odd">
+<td>brief-74</td>
+<td style="text-align: right;">19</td>
+<td style="text-align: right;">2:31:22</td>
+<td style="text-align: right;">7.13</td>
+<td style="text-align: right;">+177.19%</td>
+</tr>
+<tr class="even">
+<td>brief-59</td>
+<td style="text-align: right;">8</td>
+<td style="text-align: right;">1:00:16</td>
+<td style="text-align: right;">6.97</td>
+<td style="text-align: right;">+154.74%</td>
+</tr>
+<tr class="odd">
+<td>brief-78</td>
+<td style="text-align: right;">97</td>
+<td style="text-align: right;">13:47:27</td>
+<td style="text-align: right;">6.96</td>
+<td style="text-align: right;">+177.00%</td>
+</tr>
+<tr class="even">
+<td>brief-88</td>
+<td style="text-align: right;">32</td>
+<td style="text-align: right;">4:30:28</td>
+<td style="text-align: right;">6.88</td>
+<td style="text-align: right;">+189.62%</td>
+</tr>
+<tr class="odd">
+<td>brief-86</td>
+<td style="text-align: right;">22</td>
+<td style="text-align: right;">3:04:22</td>
+<td style="text-align: right;">6.83</td>
+<td style="text-align: right;">+184.50%</td>
+</tr>
+<tr class="even">
+<td>brief-60</td>
+<td style="text-align: right;">10</td>
+<td style="text-align: right;">1:19:37</td>
+<td style="text-align: right;">6.78</td>
+<td style="text-align: right;">+155.12%</td>
+</tr>
+<tr class="odd">
+<td>brief-90</td>
+<td style="text-align: right;">14</td>
+<td style="text-align: right;">1:56:04</td>
+<td style="text-align: right;">6.72</td>
+<td style="text-align: right;">+187.54%</td>
+</tr>
+<tr class="even">
+<td>brief-66</td>
+<td style="text-align: right;">5</td>
+<td style="text-align: right;">0:35:55</td>
+<td style="text-align: right;">6.68</td>
+<td style="text-align: right;">+170.04%</td>
+</tr>
+<tr class="odd">
+<td>brief-31</td>
+<td style="text-align: right;">7</td>
+<td style="text-align: right;">0:54:03</td>
+<td style="text-align: right;">6.66</td>
+<td style="text-align: right;">+127.97%</td>
+</tr>
+<tr class="even">
+<td>brief-81</td>
+<td style="text-align: right;">82</td>
+<td style="text-align: right;">12:30:56</td>
+<td style="text-align: right;">6.47</td>
+<td style="text-align: right;">+184.23%</td>
+</tr>
+<tr class="odd">
+<td>brief-62</td>
+<td style="text-align: right;">12</td>
+<td style="text-align: right;">1:42:59</td>
+<td style="text-align: right;">6.41</td>
+<td style="text-align: right;">+148.18%</td>
+</tr>
+<tr class="even">
+<td>brief-85</td>
+<td style="text-align: right;">28</td>
+<td style="text-align: right;">4:15:28</td>
+<td style="text-align: right;">6.34</td>
+<td style="text-align: right;">+182.37%</td>
+</tr>
+<tr class="odd">
+<td>brief-80</td>
+<td style="text-align: right;">2</td>
+<td style="text-align: right;">0:09:35</td>
+<td style="text-align: right;">6.26</td>
+<td style="text-align: right;">+183.12%</td>
+</tr>
+<tr class="even">
+<td>brief-83</td>
+<td style="text-align: right;">24</td>
+<td style="text-align: right;">3:55:33</td>
+<td style="text-align: right;">5.86</td>
+<td style="text-align: right;">+184.23%</td>
+</tr>
+<tr class="odd">
+<td>brief-89</td>
+<td style="text-align: right;">23</td>
+<td style="text-align: right;">3:47:40</td>
+<td style="text-align: right;">5.80</td>
+<td style="text-align: right;">+185.08%</td>
+</tr>
+<tr class="even">
+<td>brief-65</td>
+<td style="text-align: right;">6</td>
+<td style="text-align: right;">0:52:09</td>
+<td style="text-align: right;">5.75</td>
+<td style="text-align: right;">+170.27%</td>
+</tr>
+<tr class="odd">
+<td>brief-84</td>
+<td style="text-align: right;">18</td>
+<td style="text-align: right;">2:57:59</td>
+<td style="text-align: right;">5.73</td>
+<td style="text-align: right;">+178.65%</td>
+</tr>
+<tr class="even">
+<td>brief-44</td>
+<td style="text-align: right;">7</td>
+<td style="text-align: right;">1:03:13</td>
+<td style="text-align: right;">5.69</td>
+<td style="text-align: right;">+135.26%</td>
+</tr>
+<tr class="odd">
+<td>brief-53</td>
+<td style="text-align: right;">21</td>
+<td style="text-align: right;">3:50:16</td>
+<td style="text-align: right;">5.21</td>
+<td style="text-align: right;">+138.48%</td>
+</tr>
+<tr class="even">
+<td>brief-50</td>
+<td style="text-align: right;">17</td>
+<td style="text-align: right;">3:17:09</td>
+<td style="text-align: right;">4.87</td>
+<td style="text-align: right;">+144.10%</td>
+</tr>
+<tr class="odd">
+<td>brief-49</td>
+<td style="text-align: right;">32</td>
+<td style="text-align: right;">6:45:54</td>
+<td style="text-align: right;">4.58</td>
+<td style="text-align: right;">+144.26%</td>
+</tr>
+<tr class="even">
+<td>brief-82</td>
+<td style="text-align: right;">8</td>
+<td style="text-align: right;">1:34:22</td>
+<td style="text-align: right;">4.45</td>
+<td style="text-align: right;">+183.59%</td>
+</tr>
+<tr class="odd">
+<td>brief-71</td>
+<td style="text-align: right;">37</td>
+<td style="text-align: right;">8:20:27</td>
+<td style="text-align: right;">4.32</td>
+<td style="text-align: right;">+181.52%</td>
+</tr>
+<tr class="even">
+<td>brief-58</td>
+<td style="text-align: right;">28</td>
+<td style="text-align: right;">9:47:20</td>
+<td style="text-align: right;">2.76</td>
+<td style="text-align: right;">+154.24%</td>
+</tr>
+<tr class="odd">
+<td>brief-63</td>
+<td style="text-align: right;">5</td>
+<td style="text-align: right;">1:28:50</td>
+<td style="text-align: right;">2.70</td>
+<td style="text-align: right;">+158.52%</td>
+</tr>
+<tr class="even">
+<td>brief-73</td>
+<td style="text-align: right;">3</td>
+<td style="text-align: right;">0:45:25</td>
+<td style="text-align: right;">2.64</td>
+<td style="text-align: right;">+169.23%</td>
+</tr>
+<tr class="odd">
+<td>brief-35</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">0:00:00</td>
+<td style="text-align: right;">0.00</td>
+<td style="text-align: right;">+131.57%</td>
+</tr>
+<tr class="even">
+<td>brief-37</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">0:00:00</td>
+<td style="text-align: right;">0.00</td>
+<td style="text-align: right;">+130.41%</td>
+</tr>
+<tr class="odd">
+<td>brief-70</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">0:00:00</td>
+<td style="text-align: right;">0.00</td>
+<td style="text-align: right;">+168.15%</td>
+</tr>
+<tr class="even">
+<td>brief-75</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">0:00:00</td>
+<td style="text-align: right;">0.00</td>
+<td style="text-align: right;">+169.64%</td>
+</tr>
+<tr class="odd">
+<td>brief-92</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">0:00:00</td>
+<td style="text-align: right;">0.00</td>
+<td style="text-align: right;">+0.00%</td>
+</tr>
+</tbody>
+</table>
+<p>Durations are first-to-last trial spans, not lifecycle-open time. Their sum is 187.50 hours because workers overlap. Single-experiment policy omits a mean/stddev row; the unweighted productive-branch rate is 8.96 trials/hour (median 8.29, sample CV 0.47), but that is branch heterogeneity rather than replicate-run variance.</p>
+<h2 id="gaps-and-stalls">Gaps And Stalls</h2>
+<p>The 134 gaps total 52.74 overlapping branch-hours; most contain builds, validation, full-grid benchmarks, or hosted-profile work rather than agent silence. Every gap-bearing branch is accounted for below.</p>
+<ul>
+<li><strong>brief-8:</strong> 2 gaps, longest 32m17s; both were explicit remote no-progress failures, one in a 640-thread benchmark and one in literal-unroll JIT compilation.</li>
+<li><strong>brief-9:</strong> 1 gap, 13m01s; hosted validation stopped progressing after extension startup and was terminated.</li>
+<li><strong>brief-16:</strong> 1 gap, 15m05s; wrapped Modal validation emitted no output well beyond the configured allowance.</li>
+<li><strong>brief-22:</strong> 1 gap, 17m50s; a 256-thread persistent candidate exceeded the benchmark timeout before the runtime-error row.</li>
+<li><strong>brief-24:</strong> 2 gaps, longest 10m28s; both were successful full build/validation/benchmark sweeps of large factor-output variants.</li>
+<li><strong>brief-29:</strong> 1 gap, 13m48s; the successful CuTe rank-k integration required a complete validation and benchmark cycle.</li>
+<li><strong>brief-31:</strong> 2 gaps, longest 11m11s; one benchmark hung after initialization and the next interval restored and revalidated the safe path.</li>
+<li><strong>brief-36:</strong> 1 gap, 24m08s; remote compilation/validation failed after the local extension build.</li>
+<li><strong>brief-43:</strong> 5 gaps, longest 18m12s; profile-directed n=2048 variants repeatedly ran full validation and grid measurements, with no long harness silence.</li>
+<li><strong>brief-44:</strong> 1 gap, 31m03s; the packed-sidecar benchmark made no progress and was logged as a runtime failure.</li>
+<li><strong>brief-45:</strong> 1 gap, 26m49s; Modal validation exceeded its timeout after a cleanup-fusion edit.</li>
+<li><strong>brief-49:</strong> 5 gaps, longest 1h35m35s; hosted Nsight scheduling/artifact work, manager-style waits, and long full-grid cycles dominated, with one later validation failure.</li>
+<li><strong>brief-50:</strong> 3 gaps, longest 1h06m33s; no-output Modal runs and manager-style wait calls surrounded two runtime failures and a recovery trial.</li>
+<li><strong>brief-52:</strong> 2 gaps, longest 13m53s; profile inspection plus compile/full-grid measurements explain both successful transitions.</li>
+<li><strong>brief-53:</strong> 4 gaps, longest 1h04m16s; hosted-profile coordination, full-grid work, and a 1,542-second remote compilation timeout account for the pauses.</li>
+<li><strong>brief-54:</strong> 1 gap, 12m29s; the worker consumed and analyzed its authorized hosted profile before the successful trial.</li>
+<li><strong>brief-55:</strong> 4 gaps, longest 23m24s; two software-barrier benchmark failures and two complete profile-guided trials account for the intervals.</li>
+<li><strong>brief-56:</strong> 1 gap, 14m42s; exact hosted-profile analysis led to a full validation that exposed NaN/Inf.</li>
+<li><strong>brief-57:</strong> 1 gap, 13m20s; the higher-thread residency benchmark reached a runtime failure after validation.</li>
+<li><strong>brief-58:</strong> 4 gaps, longest 6h06m19s; three were long remote runs/failures, while the largest was role loss after Trial 26 followed by manager-loop waits until administrative recovery logged Trial 27.</li>
+<li><strong>brief-59:</strong> 1 gap, 22m50s; hosted-profile work and a byte-identical restore/remeasurement filled the interval.</li>
+<li><strong>brief-60:</strong> 2 gaps, longest 20m56s; a heterogeneous software-barrier run timed out, followed by interrupted-state cleanup and a successful recovery.</li>
+<li><strong>brief-61:</strong> 1 gap, 21m46s; the worker analyzed an exact hosted profile and ran a complete successful candidate.</li>
+<li><strong>brief-62:</strong> 2 gaps, longest 15m31s; hosted profiling preceded one successful trial, then the next storage rewrite failed validation.</li>
+<li><strong>brief-63:</strong> 3 gaps, longest 53m28s; direct swizzle experiments caused validation failures and a 2,907-second benchmark hang. The later role-loss interval after Trial 4 is not counted because Trial 5 was never logged.</li>
+<li><strong>brief-64:</strong> 1 gap, 33m52s; the worker recovered from an illegal-address first trial and completed hosted-profile-backed validation.</li>
+<li><strong>brief-65:</strong> 2 gaps, longest 17m42s; one contains hosted profile work, the other a Modal validation timeout on a restored source.</li>
+<li><strong>brief-66:</strong> 1 gap, 10m16s; exact hosted-profile analysis and the following successful full-grid run account for it.</li>
+<li><strong>brief-68:</strong> 1 gap, 16m43s; the authorized hosted profile drove a successful register-cap experiment.</li>
+<li><strong>brief-71:</strong> 6 gaps, longest 2h40m46s; after Trial 29 the worker entered manager-style waits, including a one-hour wait, before resuming; later profile-guided validation/runtime failures add the smaller gaps.</li>
+<li><strong>brief-72:</strong> 1 gap, 19m24s; hosted-profile work and noisy full-grid sampling preceded the successful trial.</li>
+<li><strong>brief-73:</strong> 2 gaps, longest 23m22s; both contain hosted-profile capture/artifact analysis and successful remeasurement.</li>
+<li><strong>brief-74:</strong> 1 gap, 34m34s; an all-thread staging benchmark hung until termination.</li>
+<li><strong>brief-76:</strong> 1 gap, 12m02s; authorized hosted profiling and artifact canonicalization account for the successful transition.</li>
+<li><strong>brief-77:</strong> 5 gaps, longest 33m37s; hosted-profile analysis and long, successful full-grid graph experiments dominate; no lock wait was present.</li>
+<li><strong>brief-78:</strong> 9 gaps, longest 1h12m41s; the largest includes a 61m37s task-complete-to-restart interruption after Trial 17, while smaller gaps map to remote failures, profiling, and long full-grid runs.</li>
+<li><strong>brief-81:</strong> 13 gaps, longest 1h15m19s; the largest contains dashboard/fleet inspection and a one-hour manager-style wait after Trial 36; other gaps are profile work and a 1,567-second benchmark timeout.</li>
+<li><strong>brief-82:</strong> 2 gaps, longest 38m52s; hosted-profile analysis drove one successful transition and one later Modal runtime failure.</li>
+<li><strong>brief-83:</strong> 6 gaps, longest 52m50s; a compaction/resumption and multiple complete benchmark iterations occurred between rows, without measurable lock wait.</li>
+<li><strong>brief-84:</strong> 2 gaps, longest 47m52s; exact hosted-profile work and a later runtime timeout explain them.</li>
+<li><strong>brief-85:</strong> 5 gaps, longest 28m03s; profile analysis, a validation failure, and long full-grid iterations account for the delays.</li>
+<li><strong>brief-86:</strong> 4 gaps, longest 11m40s; all four were near-threshold successful build/validation/full-grid cycles for packed small-matrix variants.</li>
+<li><strong>brief-87:</strong> 2 gaps, longest 27m30s; hosted-profile analysis and complete successful measurements account for both.</li>
+<li><strong>brief-88:</strong> 6 gaps, longest 29m04s; profile-guided large-shape trials and one runtime timeout dominated.</li>
+<li><strong>brief-89:</strong> 7 gaps, longest 29m16s; the authorized profile and long/outlier-heavy Modal full-grid trials explain the intervals.</li>
+<li><strong>brief-90:</strong> 4 gaps, longest 18m47s; profile-guided pipeline variants repeatedly ran noisy full grids, including a globally slow repeat.</li>
+<li><strong>brief-91:</strong> 1 gap, 10m53s; the 14-stage full-grid benchmark remained live past its nominal allowance and eventually returned a successful result.</li>
+</ul>
+<h2 id="early-termination-attempts">Early-Termination Attempts</h2>
+<p>No unauthorized early-termination attempt was found across the mapped harness records. No worker asked whether it should continue or declared the experiment converged. Normal <code>complete</code>, <code>stopped</code>, or <code>exhausted</code> language followed a <code>brief_stop</code>; active-brief final-answer records on briefs 55, 58, 85, 89, and 90 were explicit compaction handoffs/checkpoints and those workers were continued, not operator-confirmation gates.</p>
+<h2 id="other-aberrant-behavior">Other Aberrant Behavior</h2>
+<ul>
+<li><strong>brief-58 after Trial 26:</strong> compaction erased the worker role; the session spent about 4h42m in manager-style <code>wait_agent</code> calls and produced no optimization state until recovery logged Trial 27 and stopped the brief.</li>
+<li><strong>brief-63 after Trial 4:</strong> the same role error abandoned a built and validated Trial 5 benchmark session; no Trial 5 row, commit, or metric was recovered before the administrative stop.</li>
+<li><strong>brief-71 after Trial 29 and brief-81 after Trial 36:</strong> both temporarily performed manager/dashboard duties and issued one-hour waits. They recovered and resumed, but caused the run’s 2h40m46s and 1h15m19s branch gaps.</li>
+<li><strong>brief-19 after Trial 8:</strong> the worker invoked <code>autocuda log optimize-tree stop</code> twice to correct a commit SHA, creating one orphan duplicate <code>brief_stop</code>. Trial numbering is otherwise contiguous and all timestamps are monotonic.</li>
+<li><strong>Lock coverage:</strong> 58 acquisitions lack release lines because their commands were killed or interrupted, and the run emitted no exclusive <code>gpu-*</code> records. Neither condition fabricated a trial row, but both limit contention attribution.</li>
+</ul>
+<h2 id="analysis">Analysis</h2>
+<p>The fleet delivered useful optimization work, but trial throughput slowed as the search moved from early library/dispatch changes into graph-captured and profile-driven kernels. That complexity explains much of the decline from the 18–24 trials/hour early outliers to the 4–8 trials/hour later branches: builds, remote compilation, full 15-cell grids, and hosted profiles became longer. The one-run branch-rate CV of 0.47 is therefore primarily workload mix and branch age, not evidence of unstable repeated experiments.</p>
+<p>The 134 gaps are not 52.74 hours of fleet idleness because workers overlap and most gaps contain external work. The bottleneck worth fixing is the distinct harness failure: context compaction caused workers to adopt manager behavior. Briefs 58 and 63 permanently lost productive time, while briefs 71 and 81 recovered after long waits. Shared build locking contributed no delay, and the absence of exclusive lock events means the report cannot blame or clear remote GPU contention.</p>
+<p>Logging was otherwise reliable: all 1,581 trial numbers are contiguous within their branches, timestamps are ordered, and 88.8% of rows succeeded. The lone lifecycle defect is brief 19’s corrective duplicate stop. No operator-confirmation gate or convergence claim interrupted the autonomous loop.</p>
+<p><strong>Recommendations:</strong> make worker identity and brief ID immutable across compaction and have the 30-minute health audit check trial progress, not merely live task count; record a distinct worker-start/first-command timestamp so handoff latency is not conflated with the first benchmark; and route validation/benchmark/profile work through instrumented exclusive locking (or emit equivalent remote-GPU events) while enforcing bounded no-output timeouts.</p>
+<h2 id="scope-methodology">Scope &amp; Methodology</h2>
+<p>This is a live single-experiment snapshot of tag <code>2026-07-19-01-44-06-cholesky-resumed-local-unmerged</code> through 2026-07-20 21:01:15 UTC. It covers manager rows and brief logs 0–92; briefs 78, 81, 89, 91, and 92 were lifecycle-open at the cutoff, and brief 92 had not produced a trial. Later rows from the ongoing run are intentionally excluded. The behavior CSV was regenerated with <code>autocuda report data behavior --tag 2026-07-19-01-44-06-cholesky-resumed-local-unmerged --output 2026-07-19-01-44-06-cholesky-resumed-local-unmerged</code> and schema-checked before analysis.</p>
+<p>Concurrency pairs every <code>brief_start</code> with the next <code>brief_stop</code>, ignores brief 19’s orphan second stop, caps open intervals at the cutoff, and samples active sets at five-minute window midpoints; exact edge integration is reported separately. Handoff latency follows the report contract: manager assignment to the first later non-lifecycle row. Throughput and gap counts come from the generated CSV; gap causes were correlated with per-trial descriptions and harness timelines.</p>
+<p>First-line agent-path mapping found 184 Codex worker/helper JSONLs covering all 93 briefs after excluding two read-only status helpers and correcting the nested brief-58 and brief-49 ownership exceptions. A session began strictly inside the log span for 24 briefs; for the other 69, the associated top-level worker session began 9–107 seconds before its first <code>brief_start</code>, so the nearest preceding session was used rather than claiming missing coverage. All mapped sessions were read for lock and aberration evidence. Lock events were admitted only when their embedded timestamp followed that source’s first timestamp and preceded the cutoff, removing fork-replayed parent history; acquisitions/releases were paired by source, lock, mode, and time order.</p>
+<p>The run records only shared <code>build</code> locks, even for commands that performed remote validation/benchmarking, so exclusive per-GPU utilization and remote queueing are coverage gaps. Branch-rate spread is descriptive only: with one experiment tag there is no cross-run mean/stddev row and no basis for a replicated stability estimate.</p>
+</body>
+</html>

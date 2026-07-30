@@ -1,0 +1,364 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang xml:lang>
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>Optimization Report: linalg/cholesky_py</title>
+  <style>
+    code{white-space: pre-wrap;}
+    span.smallcaps{font-variant: small-caps;}
+    span.underline{text-decoration: underline;}
+    div.column{display: inline-block; vertical-align: top; width: 50%;}
+    div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
+    ul.task-list{list-style: none;}
+  </style>
+  <style type="text/css">body { max-width:1100px; margin:2rem auto; padding:0 1.5rem; font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif; color:#1a1a1a; }
+table { border-collapse:collapse; width:100%; margin:1rem 0; font-size:14px; }
+th,td { border:1px solid #ccc; padding:6px 10px; text-align:left; vertical-align:top; }
+th { background:#f4f4f4; }
+code { background:#f4f4f4; padding:1px 4px; border-radius:3px; }
+pre:not(.mermaid) { background:#f7f7f7; padding:10px; overflow-x:auto; border-radius:5px; }
+pre.mermaid { background:transparent; text-align:center; }
+h1,h2,h3 { line-height:1.25; }
+h1 { border-bottom:2px solid #eee; padding-bottom:.3rem; }
+h2 { border-bottom:1px solid #eee; padding-bottom:.2rem; margin-top:2rem; }
+blockquote { border-left:3px solid #ccc; margin-left:0; padding-left:1rem; color:#555; }
+a { color:#0645ad; }
+</style>
+</head>
+<body>
+<h1 id="optimization-report-linalgcholesky_py">Optimization Report: linalg/cholesky_py</h1>
+<h2 id="executive-summary">Executive Summary</h2>
+<p>At the 2026-07-19 09:06:31 UTC snapshot, the five-worker tree had reduced the B200 benchmark geomean from 2153.690 µs to 972.969 µs, a 2.2135× speedup and 54.82% latency reduction. The search found several large structural wins rather than one universal kernel: small matrices, high-batch cells, middle-sized matrices, and very large matrices each favored a different implementation. Six technique families were retained and composed through explicit shape dispatch; the run was still active, and the 972.969 µs local leader had not yet received independent leaderboard validation.</p>
+<table>
+<colgroup>
+<col style="width: 50%"></col>
+<col style="width: 50%"></col>
+</colgroup>
+<thead>
+<tr class="header">
+<th>Metric</th>
+<th>Value</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Baseline geomean</td>
+<td>2153.690 µs</td>
+</tr>
+<tr class="even">
+<td>Best local geomean</td>
+<td>972.969 µs</td>
+</tr>
+<tr class="odd">
+<td>Overall best speedup</td>
+<td>2.2135×</td>
+</tr>
+<tr class="even">
+<td>Latency reduction</td>
+<td>54.82%</td>
+</tr>
+<tr class="odd">
+<td>Distinct retained technique families</td>
+<td>6</td>
+</tr>
+<tr class="even">
+<td>Accepted / attempted structured trials</td>
+<td>422 / 463 (91.1% accepted)</td>
+</tr>
+<tr class="odd">
+<td>Failed structured trials</td>
+<td>41 (14 validation, 9 build, 18 runtime)</td>
+</tr>
+<tr class="even">
+<td>Workers / experiment branches</td>
+<td>5 / 27</td>
+</tr>
+<tr class="odd">
+<td>Most prevalent family</td>
+<td>Mixed-precision blocked Cholesky, observed in 13 of 27 branches</td>
+</tr>
+<tr class="even">
+<td>Latest independently submitted candidate</td>
+<td>1000.488 µs local / 1006.765 µs public at <code>9d7af0d6</code></td>
+</tr>
+<tr class="odd">
+<td>Snapshot cutoff</td>
+<td>2026-07-19 09:06:31 UTC; run still active</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Key takeaways</strong></p>
+<ul>
+<li>Custom register/shared-memory kernels supplied the largest recorded marginal step, up to 1.8716×, by removing library overhead from n=32/64/128.</li>
+<li>The 2.2135× final result came from shape-specific composition, not from applying one algorithm across all 15 benchmark entries.</li>
+<li>Persistent MathDx reduced the batch-64 n=256 cell from 300.985 to 168.125 µs after tile tuning, while a separate persistent path served batch-640 n=512.</li>
+<li>Large-matrix mixed-precision work was the most widely explored family (13 of 27 branches), making it the strongest independently repeated direction in this run.</li>
+</ul>
+<h2 id="computational-description">Computational Description</h2>
+<h3 id="problem-overview">Problem Overview</h3>
+<p>The kernel factors a batch of independent dense FP32 symmetric positive-definite matrices. For input <code>A</code> with shape <code>batch × n × n</code>, it must return a lower-triangular FP32 matrix <code>L</code> with a positive diagonal such that <code>A ≈ L Lᵀ</code>; validation checks the reconstruction, triangular structure, finiteness, dtype, and device rather than requiring bitwise agreement with one library. A Cholesky factorization performs approximately <code>n³/3</code> floating-point operations per matrix and stores <code>O(n²)</code> values, so a batch costs approximately <code>batch × n³/3</code> FLOPs.</p>
+<p>The B200 benchmark contains 15 inputs spanning n=32 through n=32768. Its first six entries, from <code>(batch=4096, n=32)</code> through <code>(batch=4, n=1024)</code>, each contain <code>2²²</code> FP32 input elements, which holds the 16 MiB input footprint constant while increasing the work per element. Additional high-batch n=512/1024/2048/4096 entries test throughput and occupancy separately, while the single-matrix n=8192/16384/32768 entries expose large-factorization efficiency. The score is the geometric mean of all 15 runtimes, so improving one regime cannot compensate efficiently for regressing another.</p>
+<h3 id="computational-phases">Computational Phases</h3>
+<p>For a blocked right-looking Cholesky with panel width <code>b</code> and remaining trailing order <code>m</code>, the computation repeats the following dependency chain. The small persistent kernels fuse these phases inside one CTA, while the library and CuTe paths express them as separate operations.</p>
+<figure>
+<img src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAxMjAwIDc0MCIgcm9sZT0iaW1nIiBhcmlhLWxhYmVsbGVkYnk9InRpdGxlIGRlc2MiPgogIDx0aXRsZSBpZD0idGl0bGUiPkJsb2NrZWQgQ2hvbGVza3kgcGhhc2Ugc2hhcGVzIGFuZCBkZXBlbmRlbmNpZXM8L3RpdGxlPgogIDxkZXNjIGlkPSJkZXNjIj5UaHJlZSBwYXJ0aXRpb25lZCBtYXRyaXggdmlld3Mgc2hvdyBkaWFnb25hbCBQT1RSRiBvbiBhIGIgYnkgYiB0aWxlLCBkZXBlbmRlbnQgVFJTTSBvbiBhbiBtIGJ5IGIgcGFuZWwsIGFuZCBhIHJhbmstayB1cGRhdGUgb2YgdGhlIG0gYnkgbSB0cmFpbGluZyBtYXRyaXguIEFycm93cyBzaG93IHRoYXQgdGhlIGRpYWdvbmFsIGZhY3RvciBmZWVkcyBUUlNNLCB0aGUgc29sdmVkIHBhbmVsIGFuZCBvbGQgdHJhaWxpbmcgbWF0cml4IGZlZWQgdGhlIHVwZGF0ZSwgYW5kIHRoZSB1cGRhdGVkIHRyYWlsaW5nIG1hdHJpeCBiZWNvbWVzIHRoZSBpbnB1dCB0byB0aGUgbmV4dCBwYW5lbCBpdGVyYXRpb24uPC9kZXNjPgogIDxkZWZzPgogICAgPG1hcmtlciBpZD0iYXJyb3ciIHZpZXdCb3g9IjAgMCAxMCAxMCIgcmVmWD0iOSIgcmVmWT0iNSIgbWFya2VyV2lkdGg9IjgiIG1hcmtlckhlaWdodD0iOCIgb3JpZW50PSJhdXRvLXN0YXJ0LXJldmVyc2UiPgogICAgICA8cGF0aCBkPSJNIDAgMCBMIDEwIDUgTCAwIDEwIHoiIGZpbGw9IiMzMzQxNTUiLz4KICAgIDwvbWFya2VyPgogICAgPG1hcmtlciBpZD0ibG9vcC1hcnJvdyIgdmlld0JveD0iMCAwIDEwIDEwIiByZWZYPSI5IiByZWZZPSI1IiBtYXJrZXJXaWR0aD0iOCIgbWFya2VySGVpZ2h0PSI4IiBvcmllbnQ9ImF1dG8tc3RhcnQtcmV2ZXJzZSI+CiAgICAgIDxwYXRoIGQ9Ik0gMCAwIEwgMTAgNSBMIDAgMTAgeiIgZmlsbD0iIzY0NzQ4YiIvPgogICAgPC9tYXJrZXI+CiAgICA8cGF0dGVybiBpZD0iaW5hY3RpdmUiIHdpZHRoPSIxMCIgaGVpZ2h0PSIxMCIgcGF0dGVyblVuaXRzPSJ1c2VyU3BhY2VPblVzZSIgcGF0dGVyblRyYW5zZm9ybT0icm90YXRlKDQ1KSI+CiAgICAgIDxyZWN0IHdpZHRoPSIxMCIgaGVpZ2h0PSIxMCIgZmlsbD0iI2YxZjVmOSIvPgogICAgICA8bGluZSB4MT0iMCIgeTE9IjAiIHgyPSIwIiB5Mj0iMTAiIHN0cm9rZT0iI2NiZDVlMSIgc3Ryb2tlLXdpZHRoPSIzIi8+CiAgICA8L3BhdHRlcm4+CiAgICA8c3R5bGU+CiAgICAgIC50aXRsZSB7IGZvbnQ6IDcwMCAyNnB4IC1hcHBsZS1zeXN0ZW0sIEJsaW5rTWFjU3lzdGVtRm9udCwgIlNlZ29lIFVJIiwgc2Fucy1zZXJpZjsgZmlsbDogIzBmMTcyYTsgfQogICAgICAuc3VidGl0bGUgeyBmb250OiAxNXB4IC1hcHBsZS1zeXN0ZW0sIEJsaW5rTWFjU3lzdGVtRm9udCwgIlNlZ29lIFVJIiwgc2Fucy1zZXJpZjsgZmlsbDogIzQ3NTU2OTsgfQogICAgICAuY2FyZCB7IGZpbGw6ICNmZmZmZmY7IHN0cm9rZTogI2NiZDVlMTsgc3Ryb2tlLXdpZHRoOiAxLjU7IHJ4OiAxNDsgfQogICAgICAucGhhc2UgeyBmb250OiA3MDAgMThweCAtYXBwbGUtc3lzdGVtLCBCbGlua01hY1N5c3RlbUZvbnQsICJTZWdvZSBVSSIsIHNhbnMtc2VyaWY7IGZpbGw6ICMwZjE3MmE7IH0KICAgICAgLnBoYXNlLW51bWJlciB7IGZvbnQ6IDcwMCAxNHB4IC1hcHBsZS1zeXN0ZW0sIEJsaW5rTWFjU3lzdGVtRm9udCwgIlNlZ29lIFVJIiwgc2Fucy1zZXJpZjsgZmlsbDogI2ZmZmZmZjsgfQogICAgICAubWF0cml4LW91dGxpbmUgeyBmaWxsOiBub25lOyBzdHJva2U6ICM0NzU1Njk7IHN0cm9rZS13aWR0aDogMjsgfQogICAgICAuY2VsbCB7IHN0cm9rZTogI2ZmZmZmZjsgc3Ryb2tlLXdpZHRoOiAzOyB9CiAgICAgIC5jZWxsLWxhYmVsIHsgZm9udDogNzAwIDE1cHggLWFwcGxlLXN5c3RlbSwgQmxpbmtNYWNTeXN0ZW1Gb250LCAiU2Vnb2UgVUkiLCBzYW5zLXNlcmlmOyBmaWxsOiAjMGYxNzJhOyB0ZXh0LWFuY2hvcjogbWlkZGxlOyB9CiAgICAgIC5jZWxsLXNoYXBlIHsgZm9udDogMTNweCAtYXBwbGUtc3lzdGVtLCBCbGlua01hY1N5c3RlbUZvbnQsICJTZWdvZSBVSSIsIHNhbnMtc2VyaWY7IGZpbGw6ICMzMzQxNTU7IHRleHQtYW5jaG9yOiBtaWRkbGU7IH0KICAgICAgLmZvcm11bGEgeyBmb250OiA2MDAgMTZweCB1aS1tb25vc3BhY2UsIFNGTW9uby1SZWd1bGFyLCBNZW5sbywgbW9ub3NwYWNlOyBmaWxsOiAjMGYxNzJhOyB0ZXh0LWFuY2hvcjogbWlkZGxlOyB9CiAgICAgIC5ub3RlIHsgZm9udDogMTNweCAtYXBwbGUtc3lzdGVtLCBCbGlua01hY1N5c3RlbUZvbnQsICJTZWdvZSBVSSIsIHNhbnMtc2VyaWY7IGZpbGw6ICM0NzU1Njk7IHRleHQtYW5jaG9yOiBtaWRkbGU7IH0KICAgICAgLmFycm93IHsgZmlsbDogbm9uZTsgc3Ryb2tlOiAjMzM0MTU1OyBzdHJva2Utd2lkdGg6IDIuNTsgbWFya2VyLWVuZDogdXJsKCNhcnJvdyk7IH0KICAgICAgLmRlcGVuZGVuY3kgeyBmaWxsOiBub25lOyBzdHJva2U6ICMzMzQxNTU7IHN0cm9rZS13aWR0aDogMjsgbWFya2VyLWVuZDogdXJsKCNhcnJvdyk7IH0KICAgICAgLmxvb3AgeyBmaWxsOiBub25lOyBzdHJva2U6ICM2NDc0OGI7IHN0cm9rZS13aWR0aDogMi4yNTsgc3Ryb2tlLWRhc2hhcnJheTogNyA2OyBtYXJrZXItZW5kOiB1cmwoI2xvb3AtYXJyb3cpOyB9CiAgICAgIC5hcnJvdy1sYWJlbCB7IGZvbnQ6IDYwMCAxM3B4IC1hcHBsZS1zeXN0ZW0sIEJsaW5rTWFjU3lzdGVtRm9udCwgIlNlZ29lIFVJIiwgc2Fucy1zZXJpZjsgZmlsbDogIzMzNDE1NTsgdGV4dC1hbmNob3I6IG1pZGRsZTsgfQogICAgICAubGVnZW5kIHsgZm9udDogMTNweCAtYXBwbGUtc3lzdGVtLCBCbGlua01hY1N5c3RlbUZvbnQsICJTZWdvZSBVSSIsIHNhbnMtc2VyaWY7IGZpbGw6ICMzMzQxNTU7IH0KICAgICAgLmRlcC1ib3ggeyBmaWxsOiAjZmZmZmZmOyBzdHJva2U6ICM5NGEzYjg7IHN0cm9rZS13aWR0aDogMS41OyByeDogODsgfQogICAgICAuZGVwLW9wIHsgZmlsbDogI2UyZThmMDsgc3Ryb2tlOiAjNjQ3NDhiOyBzdHJva2Utd2lkdGg6IDEuNTsgcng6IDg7IH0KICAgICAgLmRlcC10ZXh0IHsgZm9udDogNjAwIDEzcHggLWFwcGxlLXN5c3RlbSwgQmxpbmtNYWNTeXN0ZW1Gb250LCAiU2Vnb2UgVUkiLCBzYW5zLXNlcmlmOyBmaWxsOiAjMGYxNzJhOyB0ZXh0LWFuY2hvcjogbWlkZGxlOyB9CiAgICA8L3N0eWxlPgogIDwvZGVmcz4KCiAgPHJlY3Qgd2lkdGg9IjEyMDAiIGhlaWdodD0iNzQwIiBmaWxsPSIjZmZmZmZmIi8+CiAgPHRleHQgeD0iMzIiIHk9IjQyIiBjbGFzcz0idGl0bGUiPkJsb2NrZWQgQ2hvbGVza3k6IG9uZSBwYW5lbCBpdGVyYXRpb248L3RleHQ+CiAgPHRleHQgeD0iMzIiIHk9IjY4IiBjbGFzcz0ic3VidGl0bGUiPkF0IHN0ZXAgaywgcGFydGl0aW9uIHRoZSByZW1haW5pbmcgbWF0cml4IGludG8gYSBkaWFnb25hbCB0aWxlLCBhIGJsb2NrIGNvbHVtbiwgYW5kIGEgdHJhaWxpbmcgbWF0cml4IChtID0gbiDiiJIgKGsgKyAxKWIpLjwvdGV4dD4KCiAgPGcgdHJhbnNmb3JtPSJ0cmFuc2xhdGUoNTkwIDc2KSI+CiAgICA8cmVjdCB4PSIwIiB5PSIwIiB3aWR0aD0iMTYiIGhlaWdodD0iMTYiIHJ4PSIzIiBmaWxsPSIjZjU5ZTBiIi8+PHRleHQgeD0iMjMiIHk9IjEzIiBjbGFzcz0ibGVnZW5kIj5QT1RSRiB0aWxlPC90ZXh0PgogICAgPHJlY3QgeD0iMTI2IiB5PSIwIiB3aWR0aD0iMTYiIGhlaWdodD0iMTYiIHJ4PSIzIiBmaWxsPSIjOGI1Y2Y2Ii8+PHRleHQgeD0iMTQ5IiB5PSIxMyIgY2xhc3M9ImxlZ2VuZCI+cGFuZWwgaW5wdXQ8L3RleHQ+CiAgICA8cmVjdCB4PSIyNTgiIHk9IjAiIHdpZHRoPSIxNiIgaGVpZ2h0PSIxNiIgcng9IjMiIGZpbGw9IiMxNGI4YTYiLz48dGV4dCB4PSIyODEiIHk9IjEzIiBjbGFzcz0ibGVnZW5kIj5zb2x2ZWQgcGFuZWw8L3RleHQ+CiAgICA8cmVjdCB4PSIzOTUiIHk9IjAiIHdpZHRoPSIxNiIgaGVpZ2h0PSIxNiIgcng9IjMiIGZpbGw9IiM4NGNjMTYiLz48dGV4dCB4PSI0MTgiIHk9IjEzIiBjbGFzcz0ibGVnZW5kIj51cGRhdGVkIHRyYWlsaW5nIG1hdHJpeDwvdGV4dD4KICA8L2c+CgogIDwhLS0gUGhhc2UgMTogUE9UUkYgLS0+CiAgPHJlY3QgeD0iMjQiIHk9Ijk2IiB3aWR0aD0iMzYwIiBoZWlnaHQ9IjQzMCIgY2xhc3M9ImNhcmQiLz4KICA8Y2lyY2xlIGN4PSI1MCIgY3k9IjEyNiIgcj0iMTUiIGZpbGw9IiNmNTllMGIiLz4KICA8dGV4dCB4PSI1MCIgeT0iMTMxIiBjbGFzcz0icGhhc2UtbnVtYmVyIiB0ZXh0LWFuY2hvcj0ibWlkZGxlIj4xPC90ZXh0PgogIDx0ZXh0IHg9Ijc2IiB5PSIxMzIiIGNsYXNzPSJwaGFzZSI+UE9UUkYg4oCUIGZhY3RvciBkaWFnb25hbCB0aWxlPC90ZXh0PgoKICA8cmVjdCB4PSI3MCIgeT0iMTcwIiB3aWR0aD0iNzIiIGhlaWdodD0iNzIiIGZpbGw9IiNmNTllMGIiIGNsYXNzPSJjZWxsIi8+CiAgPHJlY3QgeD0iMTQyIiB5PSIxNzAiIHdpZHRoPSIxOTYiIGhlaWdodD0iNzIiIGZpbGw9InVybCgjaW5hY3RpdmUpIiBjbGFzcz0iY2VsbCIvPgogIDxyZWN0IHg9IjcwIiB5PSIyNDIiIHdpZHRoPSI3MiIgaGVpZ2h0PSIyMTAiIGZpbGw9IiNjNGI1ZmQiIGNsYXNzPSJjZWxsIi8+CiAgPHJlY3QgeD0iMTQyIiB5PSIyNDIiIHdpZHRoPSIxOTYiIGhlaWdodD0iMjEwIiBmaWxsPSIjZTJlOGYwIiBjbGFzcz0iY2VsbCIvPgogIDxyZWN0IHg9IjcwIiB5PSIxNzAiIHdpZHRoPSIyNjgiIGhlaWdodD0iMjgyIiBjbGFzcz0ibWF0cml4LW91dGxpbmUiLz4KICA8dGV4dCB4PSIxMDYiIHk9IjIwMiIgY2xhc3M9ImNlbGwtbGFiZWwiPkE8dHNwYW4gYmFzZWxpbmUtc2hpZnQ9InN1YiIgZm9udC1zaXplPSIxMSI+a2s8L3RzcGFuPjwvdGV4dD4KICA8dGV4dCB4PSIxMDYiIHk9IjIyMiIgY2xhc3M9ImNlbGwtc2hhcGUiPmIgw5cgYjwvdGV4dD4KICA8dGV4dCB4PSIxMDYiIHk9IjMzMiIgY2xhc3M9ImNlbGwtbGFiZWwiPkE8dHNwYW4gYmFzZWxpbmUtc2hpZnQ9InN1YiIgZm9udC1zaXplPSIxMSI+aWs8L3RzcGFuPjwvdGV4dD4KICA8dGV4dCB4PSIxMDYiIHk9IjM1MiIgY2xhc3M9ImNlbGwtc2hhcGUiPm0gw5cgYjwvdGV4dD4KICA8dGV4dCB4PSIyNDAiIHk9IjMzNCIgY2xhc3M9ImNlbGwtbGFiZWwiPkE8dHNwYW4gYmFzZWxpbmUtc2hpZnQ9InN1YiIgZm9udC1zaXplPSIxMSI+aWk8L3RzcGFuPjwvdGV4dD4KICA8dGV4dCB4PSIyNDAiIHk9IjM1NCIgY2xhc3M9ImNlbGwtc2hhcGUiPm0gw5cgbTwvdGV4dD4KICA8dGV4dCB4PSIyNDAiIHk9IjIwMCIgY2xhc3M9ImNlbGwtc2hhcGUiPnN5bW1ldHJpYyB1cHBlciByZWdpb248L3RleHQ+CiAgPHRleHQgeD0iMjA0IiB5PSI0ODAiIGNsYXNzPSJmb3JtdWxhIj5Ma2sgPSBjaG9sKEFrayk8L3RleHQ+CiAgPHRleHQgeD0iMjA0IiB5PSI1MDUiIGNsYXNzPSJub3RlIj5TZXF1ZW50aWFsIG9uIHRoZSBwYW5lbDsgcGFyYWxsZWwgd2l0aGluIHRoZSBiIMOXIGIgdGlsZS48L3RleHQ+CgogIDwhLS0gUGhhc2UgMjogVFJTTSAtLT4KICA8cmVjdCB4PSI0MjAiIHk9Ijk2IiB3aWR0aD0iMzYwIiBoZWlnaHQ9IjQzMCIgY2xhc3M9ImNhcmQiLz4KICA8Y2lyY2xlIGN4PSI0NDYiIGN5PSIxMjYiIHI9IjE1IiBmaWxsPSIjMGVhNWU5Ii8+CiAgPHRleHQgeD0iNDQ2IiB5PSIxMzEiIGNsYXNzPSJwaGFzZS1udW1iZXIiIHRleHQtYW5jaG9yPSJtaWRkbGUiPjI8L3RleHQ+CiAgPHRleHQgeD0iNDcyIiB5PSIxMzIiIGNsYXNzPSJwaGFzZSI+VFJTTSDigJQgc29sdmUgYmxvY2sgY29sdW1uPC90ZXh0PgoKICA8cmVjdCB4PSI0NjYiIHk9IjE3MCIgd2lkdGg9IjcyIiBoZWlnaHQ9IjcyIiBmaWxsPSIjMzhiZGY4IiBjbGFzcz0iY2VsbCIvPgogIDxyZWN0IHg9IjUzOCIgeT0iMTcwIiB3aWR0aD0iMTk2IiBoZWlnaHQ9IjcyIiBmaWxsPSJ1cmwoI2luYWN0aXZlKSIgY2xhc3M9ImNlbGwiLz4KICA8cmVjdCB4PSI0NjYiIHk9IjI0MiIgd2lkdGg9IjcyIiBoZWlnaHQ9IjIxMCIgZmlsbD0iIzE0YjhhNiIgY2xhc3M9ImNlbGwiLz4KICA8cmVjdCB4PSI1MzgiIHk9IjI0MiIgd2lkdGg9IjE5NiIgaGVpZ2h0PSIyMTAiIGZpbGw9IiNlMmU4ZjAiIGNsYXNzPSJjZWxsIi8+CiAgPHJlY3QgeD0iNDY2IiB5PSIxNzAiIHdpZHRoPSIyNjgiIGhlaWdodD0iMjgyIiBjbGFzcz0ibWF0cml4LW91dGxpbmUiLz4KICA8dGV4dCB4PSI1MDIiIHk9IjIwMiIgY2xhc3M9ImNlbGwtbGFiZWwiPkw8dHNwYW4gYmFzZWxpbmUtc2hpZnQ9InN1YiIgZm9udC1zaXplPSIxMSI+a2s8L3RzcGFuPjwvdGV4dD4KICA8dGV4dCB4PSI1MDIiIHk9IjIyMiIgY2xhc3M9ImNlbGwtc2hhcGUiPmIgw5cgYjwvdGV4dD4KICA8dGV4dCB4PSI1MDIiIHk9IjMzMiIgY2xhc3M9ImNlbGwtbGFiZWwiPkw8dHNwYW4gYmFzZWxpbmUtc2hpZnQ9InN1YiIgZm9udC1zaXplPSIxMSI+aWs8L3RzcGFuPjwvdGV4dD4KICA8dGV4dCB4PSI1MDIiIHk9IjM1MiIgY2xhc3M9ImNlbGwtc2hhcGUiPm0gw5cgYjwvdGV4dD4KICA8dGV4dCB4PSI2MzYiIHk9IjMzNCIgY2xhc3M9ImNlbGwtbGFiZWwiPkE8dHNwYW4gYmFzZWxpbmUtc2hpZnQ9InN1YiIgZm9udC1zaXplPSIxMSI+aWk8L3RzcGFuPjwvdGV4dD4KICA8dGV4dCB4PSI2MzYiIHk9IjM1NCIgY2xhc3M9ImNlbGwtc2hhcGUiPm0gw5cgbTwvdGV4dD4KICA8cGF0aCBkPSJNIDUwMiAyMzAgTCA1MDIgMjc0IiBjbGFzcz0iZGVwZW5kZW5jeSIvPgogIDx0ZXh0IHg9IjYwMCIgeT0iNDgwIiBjbGFzcz0iZm9ybXVsYSI+TGlrID0gQWlrIExra14tVDwvdGV4dD4KICA8dGV4dCB4PSI2MDAiIHk9IjUwNSIgY2xhc3M9Im5vdGUiPkRlcGVuZHMgb24gTGtrOyByb3dzIGFuZCBiYXRjaCBtZW1iZXJzIGFyZSBwYXJhbGxlbC48L3RleHQ+CgogIDwhLS0gUGhhc2UgMzogdHJhaWxpbmcgdXBkYXRlIC0tPgogIDxyZWN0IHg9IjgxNiIgeT0iOTYiIHdpZHRoPSIzNjAiIGhlaWdodD0iNDMwIiBjbGFzcz0iY2FyZCIvPgogIDxjaXJjbGUgY3g9Ijg0MiIgY3k9IjEyNiIgcj0iMTUiIGZpbGw9IiM2NWEzMGQiLz4KICA8dGV4dCB4PSI4NDIiIHk9IjEzMSIgY2xhc3M9InBoYXNlLW51bWJlciIgdGV4dC1hbmNob3I9Im1pZGRsZSI+MzwvdGV4dD4KICA8dGV4dCB4PSI4NjgiIHk9IjEzMiIgY2xhc3M9InBoYXNlIj5SYW5rLWsg4oCUIHVwZGF0ZSB0cmFpbGluZyBtYXRyaXg8L3RleHQ+CgogIDxyZWN0IHg9Ijg2MiIgeT0iMTcwIiB3aWR0aD0iNzIiIGhlaWdodD0iNzIiIGZpbGw9IiMzOGJkZjgiIGNsYXNzPSJjZWxsIi8+CiAgPHJlY3QgeD0iOTM0IiB5PSIxNzAiIHdpZHRoPSIxOTYiIGhlaWdodD0iNzIiIGZpbGw9InVybCgjaW5hY3RpdmUpIiBjbGFzcz0iY2VsbCIvPgogIDxyZWN0IHg9Ijg2MiIgeT0iMjQyIiB3aWR0aD0iNzIiIGhlaWdodD0iMjEwIiBmaWxsPSIjMTRiOGE2IiBjbGFzcz0iY2VsbCIvPgogIDxyZWN0IHg9IjkzNCIgeT0iMjQyIiB3aWR0aD0iMTk2IiBoZWlnaHQ9IjIxMCIgZmlsbD0iI2JlZjI2NCIgY2xhc3M9ImNlbGwiLz4KICA8cGF0aCBkPSJNIDk5OSAyNDIgViA0NTIgTSAxMDY0IDI0MiBWIDQ1MiBNIDkzNCAzMTIgSCAxMTMwIE0gOTM0IDM4MiBIIDExMzAiIHN0cm9rZT0iI2ZmZmZmZiIgc3Ryb2tlLXdpZHRoPSIyIiBvcGFjaXR5PSIwLjg1Ii8+CiAgPHBhdGggZD0iTSA5MzQgMjQyIEwgMTEzMCA0NTIiIHN0cm9rZT0iIzY1YTMwZCIgc3Ryb2tlLXdpZHRoPSIyIiBvcGFjaXR5PSIwLjciLz4KICA8cmVjdCB4PSI4NjIiIHk9IjE3MCIgd2lkdGg9IjI2OCIgaGVpZ2h0PSIyODIiIGNsYXNzPSJtYXRyaXgtb3V0bGluZSIvPgogIDx0ZXh0IHg9Ijg5OCIgeT0iMjAyIiBjbGFzcz0iY2VsbC1sYWJlbCI+TDx0c3BhbiBiYXNlbGluZS1zaGlmdD0ic3ViIiBmb250LXNpemU9IjExIj5razwvdHNwYW4+PC90ZXh0PgogIDx0ZXh0IHg9Ijg5OCIgeT0iMjIyIiBjbGFzcz0iY2VsbC1zaGFwZSI+YiDDlyBiPC90ZXh0PgogIDx0ZXh0IHg9Ijg5OCIgeT0iMzMyIiBjbGFzcz0iY2VsbC1sYWJlbCI+TDx0c3BhbiBiYXNlbGluZS1zaGlmdD0ic3ViIiBmb250LXNpemU9IjExIj5pazwvdHNwYW4+PC90ZXh0PgogIDx0ZXh0IHg9Ijg5OCIgeT0iMzUyIiBjbGFzcz0iY2VsbC1zaGFwZSI+bSDDlyBiPC90ZXh0PgogIDx0ZXh0IHg9IjEwMzIiIHk9IjMzNCIgY2xhc3M9ImNlbGwtbGFiZWwiPkHigLI8dHNwYW4gYmFzZWxpbmUtc2hpZnQ9InN1YiIgZm9udC1zaXplPSIxMSI+aWk8L3RzcGFuPjwvdGV4dD4KICA8dGV4dCB4PSIxMDMyIiB5PSIzNTQiIGNsYXNzPSJjZWxsLXNoYXBlIj5tIMOXIG08L3RleHQ+CiAgPHBhdGggZD0iTSA5MjMgMzQyIEMgOTUwIDM0MiA5NTMgMzE4IDk3NiAzMTgiIGNsYXNzPSJkZXBlbmRlbmN5Ii8+CiAgPHRleHQgeD0iOTk2IiB5PSI0ODAiIGNsYXNzPSJmb3JtdWxhIj5BaWknID0gQWlpIOKIkiBMaWsgTGlrXlQ8L3RleHQ+CiAgPHRleHQgeD0iOTk2IiB5PSI1MDUiIGNsYXNzPSJub3RlIj4obSDDlyBiKShiIMOXIG0pIHVwZGF0ZXMgdGhlIG0gw5cgbSByZWdpb24gaW4gcGFyYWxsZWwgdGlsZXMuPC90ZXh0PgoKICA8IS0tIENyb3NzLXBoYXNlIGRlcGVuZGVuY2llcyAtLT4KICA8cGF0aCBkPSJNIDMzOCAyMDYgQyAzNzIgMjA2IDM4NiAyMDYgNDIwIDIwNiIgY2xhc3M9ImFycm93Ii8+CiAgPHRleHQgeD0iMzc5IiB5PSIxOTIiIGNsYXNzPSJhcnJvdy1sYWJlbCI+TGtrPC90ZXh0PgogIDxwYXRoIGQ9Ik0gNzM0IDM0NyBDIDc3MCAzNDcgNzgwIDM0NyA4MTYgMzQ3IiBjbGFzcz0iYXJyb3ciLz4KICA8dGV4dCB4PSI3NzYiIHk9IjMzMyIgY2xhc3M9ImFycm93LWxhYmVsIj5MaWs8L3RleHQ+CgogIDwhLS0gRGVwZW5kZW5jeSBzdHJpcCAtLT4KICA8dGV4dCB4PSIzMiIgeT0iNTY4IiBjbGFzcz0icGhhc2UiPkRhdGEtZGVwZW5kZW5jeSBjaGFpbjwvdGV4dD4KICA8cmVjdCB4PSIzMiIgeT0iNTkwIiB3aWR0aD0iMTEyIiBoZWlnaHQ9IjQyIiBjbGFzcz0iZGVwLWJveCIvPjx0ZXh0IHg9Ijg4IiB5PSI2MTYiIGNsYXNzPSJkZXAtdGV4dCI+QWtrIMK3IGIgw5cgYjwvdGV4dD4KICA8cmVjdCB4PSIxNzgiIHk9IjU5MCIgd2lkdGg9IjkyIiBoZWlnaHQ9IjQyIiBjbGFzcz0iZGVwLW9wIi8+PHRleHQgeD0iMjI0IiB5PSI2MTYiIGNsYXNzPSJkZXAtdGV4dCI+UE9UUkY8L3RleHQ+CiAgPHJlY3QgeD0iMzA0IiB5PSI1OTAiIHdpZHRoPSIxMTIiIGhlaWdodD0iNDIiIGNsYXNzPSJkZXAtYm94Ii8+PHRleHQgeD0iMzYwIiB5PSI2MTYiIGNsYXNzPSJkZXAtdGV4dCI+TGtrIMK3IGIgw5cgYjwvdGV4dD4KICA8cmVjdCB4PSI0NTAiIHk9IjU5MCIgd2lkdGg9IjkyIiBoZWlnaHQ9IjQyIiBjbGFzcz0iZGVwLW9wIi8+PHRleHQgeD0iNDk2IiB5PSI2MTYiIGNsYXNzPSJkZXAtdGV4dCI+VFJTTTwvdGV4dD4KICA8cmVjdCB4PSI1NzYiIHk9IjU5MCIgd2lkdGg9IjExMiIgaGVpZ2h0PSI0MiIgY2xhc3M9ImRlcC1ib3giLz48dGV4dCB4PSI2MzIiIHk9IjYxNiIgY2xhc3M9ImRlcC10ZXh0Ij5MaWsgwrcgbSDDlyBiPC90ZXh0PgogIDxyZWN0IHg9IjcyMiIgeT0iNTkwIiB3aWR0aD0iMTI2IiBoZWlnaHQ9IjQyIiBjbGFzcz0iZGVwLW9wIi8+PHRleHQgeD0iNzg1IiB5PSI2MTYiIGNsYXNzPSJkZXAtdGV4dCI+UmFuay1rIHVwZGF0ZTwvdGV4dD4KICA8cmVjdCB4PSI4ODIiIHk9IjU5MCIgd2lkdGg9IjEyNCIgaGVpZ2h0PSI0MiIgY2xhc3M9ImRlcC1ib3giLz48dGV4dCB4PSI5NDQiIHk9IjYxNiIgY2xhc3M9ImRlcC10ZXh0Ij5B4oCyaWkgwrcgbSDDlyBtPC90ZXh0PgogIDxwYXRoIGQ9Ik0gMTQ0IDYxMSBIIDE3OCIgY2xhc3M9ImRlcGVuZGVuY3kiLz4KICA8cGF0aCBkPSJNIDI3MCA2MTEgSCAzMDQiIGNsYXNzPSJkZXBlbmRlbmN5Ii8+CiAgPHBhdGggZD0iTSA0MTYgNjExIEggNDUwIiBjbGFzcz0iZGVwZW5kZW5jeSIvPgogIDxwYXRoIGQ9Ik0gNTQyIDYxMSBIIDU3NiIgY2xhc3M9ImRlcGVuZGVuY3kiLz4KICA8cGF0aCBkPSJNIDY4OCA2MTEgSCA3MjIiIGNsYXNzPSJkZXBlbmRlbmN5Ii8+CiAgPHBhdGggZD0iTSA4NDggNjExIEggODgyIiBjbGFzcz0iZGVwZW5kZW5jeSIvPgoKICA8cmVjdCB4PSIzMjMiIHk9IjY2MiIgd2lkdGg9IjExMiIgaGVpZ2h0PSI0MiIgY2xhc3M9ImRlcC1ib3giLz48dGV4dCB4PSIzNzkiIHk9IjY4OCIgY2xhc3M9ImRlcC10ZXh0Ij5BaWsgwrcgbSDDlyBiPC90ZXh0PgogIDxwYXRoIGQ9Ik0gNDM1IDY4MyBDIDQ3MiA2ODMgNDk2IDY3MCA0OTYgNjMyIiBjbGFzcz0iZGVwZW5kZW5jeSIvPgogIDxyZWN0IHg9IjcwMyIgeT0iNjYyIiB3aWR0aD0iMTEyIiBoZWlnaHQ9IjQyIiBjbGFzcz0iZGVwLWJveCIvPjx0ZXh0IHg9Ijc1OSIgeT0iNjg4IiBjbGFzcz0iZGVwLXRleHQiPkFpaSDCtyBtIMOXIG08L3RleHQ+CiAgPHBhdGggZD0iTSA4MTUgNjgzIEMgODQyIDY4MyA3ODUgNjY4IDc4NSA2MzIiIGNsYXNzPSJkZXBlbmRlbmN5Ii8+CgogIDxwYXRoIGQ9Ik0gMTAwNiA2MTEgSCAxMTIwIEMgMTE1MCA2MTEgMTE1MCA3MDQgMTA5MCA3MDQgSCAxMDQgQyA2NCA3MDQgNjQgNjYyIDg4IDYzMiIgY2xhc3M9Imxvb3AiLz4KICA8cmVjdCB4PSI4NjgiIHk9IjY3OCIgd2lkdGg9IjI0MCIgaGVpZ2h0PSIyOCIgcng9IjgiIGZpbGw9IiNmZmZmZmYiLz4KICA8dGV4dCB4PSI5ODgiIHk9IjY5NyIgY2xhc3M9ImFycm93LWxhYmVsIj5uZXh0IHBhbmVsOiBBKGsrMSkg4oaQIEHigLJpaSwgbSDihpAgbSDiiJIgYjwvdGV4dD4KPC9zdmc+Cg==" alt /><figcaption>Blocked Cholesky matrix partitions, phase shapes, and data dependencies</figcaption>
+</figure>
+<table>
+<colgroup>
+<col style="width: 33%"></col>
+<col style="width: 33%"></col>
+<col style="width: 33%"></col>
+</colgroup>
+<thead>
+<tr class="header">
+<th>Phase</th>
+<th>High-level operation</th>
+<th>Cost and parallel structure</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>1. Dispatch and storage preparation</td>
+<td>Select the shape-specific path; acquire cached output, solver workspace, info buffers, and pointer tables; copy the required input triangle into the factor buffer.</td>
+<td><code>O(batch × n²)</code> data movement plus fixed allocation/dispatch/launch latency.</td>
+</tr>
+<tr class="even">
+<td>2. Diagonal-panel factorization (POTRF)</td>
+<td>Factor the current <code>b × b</code> diagonal block in FP32 so subsequent work has a numerically stable panel.</td>
+<td>About <code>O(batch × b³)</code> per panel. Panels are sequential because panel <code>k+1</code> depends on the preceding update; parallelism exists within a panel and across matrices.</td>
+</tr>
+<tr class="odd">
+<td>3. Panel triangular solve (TRSM)</td>
+<td>Solve for the block column below the diagonal factor, producing <code>L₂₁</code>.</td>
+<td>About <code>O(batch × m × b²)</code> per panel. Rows and batch members are parallel, but the solve remains on the panel critical path.</td>
+</tr>
+<tr class="even">
+<td>4. Trailing rank-k update</td>
+<td>Apply the Schur-complement update <code>A₂₂ ← A₂₂ − L₂₁ L₂₁ᵀ</code>, using GEMM/RankK or a fused device update.</td>
+<td>About <code>O(batch × m² × b)</code> per panel and most of the aggregate <code>batch × n³/3</code> work. Trailing tiles and batch members provide the widest parallelism.</td>
+</tr>
+<tr class="odd">
+<td>5. Output finalization</td>
+<td>Copy or transpose the physical factor representation and zero any logical upper-triangular values touched by full GEMMs.</td>
+<td><code>O(batch × n²)</code> bandwidth work; avoidable whole-matrix passes can be visible once factorization is fast.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="performance-model-and-bottlenecks">Performance Model and Bottlenecks</h3>
+<p>An ideal factorization’s arithmetic intensity rises with n: approximately <code>n/12</code> FLOP/byte if only the required input and output triangles cross HBM, or <code>n/24</code> FLOP/byte if full input and output buffers do, before accounting for extra panel rereads. That linear growth explains why one performance model does not fit the grid. Small n has too little work per launch to approach a compute roof; large n has enough reuse in GEMM-like trailing updates to become compute-dominated; and the sequential POTRF/TRSM panel chain imposes a latency floor even when the update is highly parallel. Copies, conversions, pointer construction, and triangular cleanup remain <code>O(n²)</code> bandwidth-bound phases across every regime.</p>
+<table>
+<colgroup>
+<col style="width: 33%"></col>
+<col style="width: 33%"></col>
+<col style="width: 33%"></col>
+</colgroup>
+<thead>
+<tr class="header">
+<th>Shape regime</th>
+<th>Primary bottleneck</th>
+<th>Performance model and evidence</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>n=32/64/128; batch=4096/1024/256</td>
+<td>Launch, synchronization, and instruction latency; not peak math throughput</td>
+<td>The entire footprint is only 16 MiB and each matrix has little arithmetic. Grouping matrices per CTA, keeping rows in registers/shared memory, and using warp shuffles produced the run’s largest marginal gain, showing that library dispatch and fine-grained synchronization dominated.</td>
+</tr>
+<tr class="even">
+<td>n=256/512; batch=64/640</td>
+<td>Launch/intermediate-traffic overhead plus occupancy</td>
+<td>One persistent CTA per matrix exposes enough independent matrices to fill the GPU while keeping POTRF/TRSM/update sequencing on device. The large MathDx wins indicate that eliminating repeated host/library launches and intermediate traffic mattered as much as raw FLOPs.</td>
+</tr>
+<tr class="odd">
+<td>n=512–4096; batch=1–16</td>
+<td>Mixed solver-compute and latency regime</td>
+<td>Direct BF16x9 cuSOLVER usually won because its optimized POTRF outweighed the conversion and multi-launch costs of a custom blocked path. Persistent outputs/workspaces and the choice between batched and looped POTRF remained material, so this region is not purely compute-bound.</td>
+</tr>
+<tr class="even">
+<td>n=1024/2048; batch=60/8</td>
+<td>Batched panel critical path with compute-heavy trailing updates</td>
+<td>Grouped POTRF/TRSM and tensor-core GEMM improve throughput across matrices, but each panel still waits for the previous Schur update. Pointer-table reuse, compact panels, and cleanup kernels reduce the non-compute floor.</td>
+</tr>
+<tr class="odd">
+<td>n=8192/16384/32768; batch=1</td>
+<td>Primarily tensor-core compute-bound, with a serial panel floor</td>
+<td>The <code>O(n³)</code> lower-triangular RankK dominates and amortizes FP16 conversion, making a persistent CuTe tensor-core update profitable. FP32 POTRF/TRSM, panel conversion, and final copies are lower-order but form the remaining Amdahl-limited critical path.</td>
+</tr>
+</tbody>
+</table>
+<p>These classifications are an analytical model supported by the trial outcomes and per-shape timings, not a counter-derived roofline measurement: hosted profiling was unavailable at the snapshot, so achieved bandwidth, tensor-core utilization, occupancy, and launch gaps were not measured directly.</p>
+<h3 id="algorithm-dispatch">Algorithm Dispatch</h3>
+<p>This table follows the dispatch in the exact 972.969 µs snapshot commit, <code>f6e9b180</code>. Every benchmark has <code>cond=2</code>; the implementation dispatches only on batch size and matrix order.</p>
+<table>
+<colgroup>
+<col style="width: 33%"></col>
+<col style="width: 33%"></col>
+<col style="width: 33%"></col>
+</colgroup>
+<thead>
+<tr class="header">
+<th>Input shape (batch × n × n)</th>
+<th>Selected algorithm</th>
+<th>Details</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>4096 × 32 × 32</td>
+<td>Custom warp-resident Cholesky</td>
+<td>Four matrices per 128-thread CTA; each warp keeps one matrix row-state in registers and uses shuffle-based recursive factorization.</td>
+</tr>
+<tr class="even">
+<td>1024 × 64 × 64</td>
+<td>Custom register/shared-memory Cholesky</td>
+<td>Two matrices per 128-thread CTA with padded 65-column shared tiles and one 64-thread row group per matrix.</td>
+</tr>
+<tr class="odd">
+<td>256 × 128 × 128</td>
+<td>Custom four-thread-row Cholesky</td>
+<td>One 512-thread CTA per matrix; four lanes cooperate on each row over a padded 129-column shared tile.</td>
+</tr>
+<tr class="even">
+<td>64 × 256 × 256</td>
+<td>Persistent MathDx Cholesky</td>
+<td>One CTA per matrix; 64×64 device panels halve the left-looking panel depth to four.</td>
+</tr>
+<tr class="odd">
+<td>16 × 512 × 512</td>
+<td>Direct cuSOLVER <code>SpotrfBatched</code></td>
+<td>BF16x9-emulated FP32 math with cached output, pointer table, and info buffers.</td>
+</tr>
+<tr class="even">
+<td>640 × 512 × 512</td>
+<td>Persistent MathDx Cholesky</td>
+<td>One CTA owns each matrix for the full factorization, including device POTRF, TRSM, and tensor-core updates.</td>
+</tr>
+<tr class="odd">
+<td>4 × 1024 × 1024</td>
+<td>Direct looped cuSOLVER <code>Spotrf</code></td>
+<td>Four serial caller-stream factorizations share one persistent BF16x9 workspace.</td>
+</tr>
+<tr class="even">
+<td>60 × 1024 × 1024</td>
+<td>High-batch 256-column blocked Cholesky</td>
+<td>Reusable FP32 diagonal buffers, batched panel solves, compact FP16 panels, and tensor-core trailing updates.</td>
+</tr>
+<tr class="odd">
+<td>2 × 2048 × 2048</td>
+<td>Direct looped cuSOLVER <code>Spotrf</code></td>
+<td>Two serial caller-stream BF16x9 factorizations reuse output and solver workspace.</td>
+</tr>
+<tr class="even">
+<td>8 × 2048 × 2048</td>
+<td>Grouped 256-column blocked Cholesky</td>
+<td>Batched diagonal POTRF and TRSM use persistent pointer tables; TF32 strided GEMM updates the trailing matrices.</td>
+</tr>
+<tr class="odd">
+<td>1 × 4096 × 4096</td>
+<td>Direct cuSOLVER <code>Spotrf</code></td>
+<td>Single BF16x9 factorization with a persistent output and workspace; blocked conversion overhead was not profitable here.</td>
+</tr>
+<tr class="even">
+<td>2 × 4096 × 4096</td>
+<td>Direct looped cuSOLVER <code>Spotrf</code></td>
+<td>Two serial BF16x9 factorizations beat the mixed blocked path at this batch size.</td>
+</tr>
+<tr class="odd">
+<td>1 × 8192 × 8192</td>
+<td>Mixed-precision 4096-column blocked Cholesky</td>
+<td>FP32 panel POTRF/TRSM, compact FP16 conversion, and lower-triangle-only CuTe tensor-core RankK.</td>
+</tr>
+<tr class="even">
+<td>1 × 16384 × 16384</td>
+<td>Mixed-precision 4096-column blocked Cholesky</td>
+<td>The same CuTe path executes four large panels while retaining only the required lower-triangular update tiles.</td>
+</tr>
+<tr class="odd">
+<td>1 × 32768 × 32768</td>
+<td>Mixed-precision 4096-column blocked Cholesky</td>
+<td>Eight panels amortize conversion and launch costs; the O(n³) trailing work runs on tensor cores.</td>
+</tr>
+</tbody>
+</table>
+<h2 id="most-impactful-optimization-techniques">Most Impactful Optimization Techniques</h2>
+<table>
+<colgroup>
+<col style="width: 25%"></col>
+<col style="width: 25%"></col>
+<col style="width: 25%"></col>
+<col style="width: 25%"></col>
+</colgroup>
+<thead>
+<tr class="header">
+<th>Technique</th>
+<th>Peak contribution</th>
+<th>Prevalence</th>
+<th>Representative commits</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Register/shared-memory kernels for n=32/64/128</td>
+<td>1.8716× marginal step</td>
+<td>8 of 27 branches; at least 8 observations</td>
+<td><code>8b39c4e1</code>, <code>1428d299</code>, <code>63508924</code></td>
+</tr>
+<tr class="even">
+<td>Persistent buffers plus direct cuSOLVER/BF16x9</td>
+<td>1.6521× marginal step</td>
+<td>10 of 27 branches; at least 10 observations</td>
+<td><code>9ce7e5f1</code>, <code>20835bf5</code>, <code>55d801d0</code></td>
+</tr>
+<tr class="odd">
+<td>Shape-specific composition and dispatch</td>
+<td>1.6455× marginal combine step (2.1559× cumulative)</td>
+<td>12 of 27 combine briefs; 139 grouped observations</td>
+<td><code>9283c406</code>, <code>9d7af0d6</code>, <code>e0349c9b</code></td>
+</tr>
+<tr class="even">
+<td>Persistent MathDx for high-batch n=512/n=256</td>
+<td>1.6167× recorded marginal step (bundled)</td>
+<td>2 of 27 branches; at least 2 observations</td>
+<td><code>8879bfc4</code>, <code>4733dddb</code>, <code>f6e9b180</code></td>
+</tr>
+<tr class="odd">
+<td>Mixed-precision blocked Cholesky with triangular CuTe RankK</td>
+<td>1.2915× recorded peak (bundled); 1.1713× clean foundational step</td>
+<td>13 of 27 branches; at least 13 observations</td>
+<td><code>436001ec</code>, <code>f041bc22</code>, <code>be3e6750</code></td>
+</tr>
+<tr class="even">
+<td>Prewarming, workspace reuse, and triangular cleanup</td>
+<td>1.0527× marginal step</td>
+<td>10 of 27 branches; at least 10 observations</td>
+<td><code>292b3f6f</code>, <code>2d5d0889</code>, <code>4057017e</code></td>
+</tr>
+</tbody>
+</table>
+<p><strong>Register/shared-memory kernels for n=32/64/128.</strong> The final n=32 path groups four matrices into one 128-thread CTA, gives each matrix a warp, retains row values in registers, and recursively unrolls the 32 Cholesky steps with warp shuffles. The n=64 path groups two matrices per CTA in padded shared tiles, while n=128 uses one 512-thread CTA with four lanes per row so each thread owns 32 values rather than an entire row. This replaces generic solver setup and global-memory coordination with one resident block and cheap warp/block synchronization, which is the right bottleneck trade for thousands of tiny matrices. <code>1428d299</code> widened n=128 row teams from two to four threads and moved that cell from 69.938 to 61.549 µs; <code>63508924</code> then made staging coalesced and removed repeated row/column decoding. Eight branches independently revisited this surface, so the family is strongly supported rather than a one-off graft. It stands alone for n≤128 and stacks with the broader dispatcher through disjoint shape coverage.</p>
+<p><strong>Persistent buffers plus direct cuSOLVER/BF16x9.</strong> The middle-shape path keeps PyTorch’s current cuSOLVER handle on the caller stream but removes repeated framework work around it. <code>9ce7e5f1</code> changed the wrapper from allocating or cloning an output on every call to copying into a shape- and input-scoped persistent buffer; the same cache retains the device pointer array, <code>info</code>, and solver workspace. The wrapper chooses <code>SpotrfBatched</code> for larger batches and serial <code>Spotrf</code> calls with one shared workspace for batch≤4. <code>20835bf5</code> additionally sets <code>CUSOLVER_FP32_EMULATED_BF16X9_MATH</code> before both workspace sizing and execution, cutting n=32768 in that branch from 215173.793 to 132299.355 µs. The important follow-up was dispatch, not a universal library claim: <code>55d801d0</code> kept direct BF16x9 at n=2048/n=4096, where it beat the mixed path by as much as roughly 2×, and reserved blocked CuTe for larger or more highly batched work. Ten branches explored this family. Its 1.6521× peak is a parent-relative ranking signal and includes setup/crossover context, not a pure solver-math attribution.</p>
+<p><strong>Shape-specific composition and dispatch.</strong> The aggregate winner is a portfolio assembled from non-overlapping local winners. By the snapshot, <code>custom_kernel</code> routes n=32/64/128 to dedicated extension kernels, batch-64 n=256 and batch-640 n=512 to persistent MathDx, batch-60 n=1024 to a 256-column high-batch panel algorithm, batch-8 n=2048 to grouped blocked cuSOLVER/cuBLAS, single-batch n≥8192 to mixed-precision CuTe, and the remaining middle cells to direct cuSOLVER. <code>9d7af0d6</code> demonstrated the value of composition by merging the n=512 MathDx path with the grouped n=2048 path without taxing unrelated cells; <code>e0349c9b</code> added the n=1024 high-batch panel route. Mechanically, the dispatcher also selects zeroed versus uninitialized cached outputs and prepares only the workspace or pointer tables needed by the chosen path. This technique’s 1.6455× peak comes from a bundled combine step, while 2.1559× is the stack’s cumulative speedup, so neither should be read as the gain from a single <code>if</code>. Twelve combine briefs and 139 grouped observations show that integration was a major search activity.</p>
+<p><strong>Persistent MathDx for high-batch n=512/n=256.</strong> These kernels keep an entire matrix’s left-looking Cholesky inside one CTA: MathDx performs device POTRF and triangular solves on each panel, and FP16-input/FP32-accumulate tensor-core GEMMs apply prior-panel updates. That removes the repeated Python, cuSOLVER, and cuBLAS launch sequence that dominates when hundreds of medium matrices are available to occupy the B200 concurrently. <code>644d05ec</code> made the n=512 launch use PyTorch’s actual caller stream and improved the batch-640 cell from 1960.950 to 1935.286 µs. The later n=256 specialization in <code>4733dddb</code> took its batch-64 cell from 300.985 to 178.401 µs and the full geomean from 999.771 to 974.583 µs; <code>f6e9b180</code> widened tiles from 32 to 64 and reached 168.125 µs. The recorded 1.6167× family peak at <code>8879bfc4</code> bundles restoration of an n=32 schedule with the n=512 path, so the isolated n=256 measurements are cleaner evidence. Only two branches pursued MathDx deeply, making its measured wins strong but its prevalence less independently established.</p>
+<p><strong>Mixed-precision blocked Cholesky with triangular CuTe RankK.</strong> <code>436001ec</code> introduced a right-looking blocked algorithm that keeps numerically sensitive diagonal POTRF and panel TRSM in FP32 while moving the O(n³) trailing update to tensor cores; its clean foundational step was 1.1713×. The final single-matrix large-n path uses 4096-column panels, converts the solved panel into a compact FP16 buffer, and feeds a Blackwell persistent CuTe scheduler that enumerates only lower-triangular output tiles instead of computing the unused upper half. <code>f041bc22</code> added a tiled factor copy/transpose that reads the lower factor coalescently, writes the required output triangle, and zeros the logical upper triangle, moving the three large CuTe cells from 4772.662/14791.802/53321.911 to 4660.722/14559.581/52708.096 µs. This family stacks on the output/workspace caches and serves n≥8192, where conversion is amortized by much larger trailing updates. Thirteen branches explored it, the widest independent coverage in the run. The CSV’s 1.2915× peak belongs to bundled transplant <code>be3e6750</code>, which remeasured at 1077.830 µs versus its 1058.933 µs parent; treat that peak as noisy attribution rather than evidence that the packed converter itself won.</p>
+<p><strong>Prewarming, workspace reuse, and triangular cleanup.</strong> Once the algorithmic paths were in place, narrow setup and data-movement changes produced smaller but still stackable gains. <code>292b3f6f</code> preallocated four grouped n=2048 outputs and their pointer tables during the untimed shape transition, avoiding allocator and table-construction work in measured calls; its aggregate movement was only 1039.324 to 1035.688 µs, consistent with a micro-optimization near the 1.765% run-noise scale. <code>2d5d0889</code> replaced a generic <code>tril_</code> only for batch-60 n=1024 with a caller-stream float4 kernel that zeros the upper triangle in place, reducing that cell from 2264.428 to 2158.279 µs. The largest clear member, <code>4057017e</code>, replaced batched PyTorch panel factorization at batch-2 n=4096 with compact column-major factor buffers, persistent cuSOLVER workspace, and two serial BF16x9 POTRF calls per panel; the cell fell from 7709.368 to 3852.275 µs and aggregate from 1069.313 to 1015.759 µs. Ten branches worked this family, but its mechanisms are shape-local refinements that depend on the larger dispatcher rather than a standalone algorithm.</p>
+<h2 id="failed-optimization-techniques">Failed Optimization Techniques</h2>
+<p>The 41 failed structured trials comprised 14 validation errors, 9 build errors, and 18 runtime errors; the report data clusters them into 33 failed technique rows.</p>
+<p><strong>Illegal secondary-stream schedules.</strong> Batch sharding across explicit CUDA streams was repeatedly incompatible with the benchmark’s mandatory caller-stream policy. Four-way scheduling (<code>f2d11c5d</code>), per-matrix handles/streams/events (<code>aa18342d</code>), and eight-way scheduling (<code>6247fd2f</code>) were rejected before a trustworthy benchmark could be recorded. This is a portability failure, not evidence that concurrency lacks value: any future version must express overlap through legal caller-stream kernels, persistent CTAs, or library grouping rather than creating private streams.</p>
+<p><strong>Layout-sensitive CUTLASS/CuTe rewrites.</strong> Several attempts changed tile geometry, epilogues, or operand layout without preserving every alignment and triangular-coverage invariant. <code>7057d474</code> hit a vector-epilogue/scalar-iterator compile mismatch, <code>cb456e9d</code> produced a misaligned address at n=8192, <code>8d52c7e9</code> mixed row- and column-major strides, and <code>c9bdb065</code> omitted tiles in an asymmetric rectangular schedule, producing reconstruction residuals of 0.255–0.339. <code>3ce85c8b</code>’s direct FP32-to-FP16 TMA conversion reached an illegal instruction (XID 13). These failures indicate that future CuTe work needs explicit layout proofs and small coverage tests before a full remote run, especially around the diagonal and tail tiles.</p>
+<p><strong>Numerically unsafe or structurally incomplete factorization.</strong> Lower-triangle-only storage and aggressive reduced precision failed when later operations still read or wrote the opposite half. <code>c87292ef</code> allowed a batch-60 GEMM to pollute the upper triangle, <code>f70090d5</code> left a 0.981 lower-factor residual at batch-2 n=4096, and <code>d142afb0</code> still failed because diagonal CuTe tiles wrote upper elements despite zero initialization. A TF32 WMMA n=256 rewrite (<code>daa5ee3b</code>) produced NaN/Inf after its approximate Schur complements lost positive definiteness. <code>bd9fb59f</code> invoked Xpotrf for only the first batch member, yielding residuals of 0.881 and 8.43. Keeping panel POTRF/TRSM in FP32 and validating every batch member were therefore necessary, not conservative overhead that could simply be deleted.</p>
+<p><strong>Over-fused kernels and compile/resource pressure.</strong> Attempts to hold progressively larger matrices in one CTA crossed hard device or compilation limits. <code>20bc0a8d</code> requested 66048 bytes of static shared memory against a 48 KiB limit, <code>2050b6ec</code> needed an unavailable default dynamic-shared allocation, and <code>66dd27dd</code>/<code>745c67ad</code> exhausted launch resources at 1024/384 threads. Other literal-unrolled or large generated kernels spent more than ten minutes in JIT compilation, while one high-batch variant (<code>60e65542</code>) ran for 1846 seconds. The viable persistent kernels succeeded by limiting residency to n=256/n=512 and using tiled MathDx operations, not by materializing a full larger factorization in registers or shared memory.</p>
+<p><strong>Conversion-free and SYRK substitutions.</strong> Removing compact FP16 panel staging looked attractive but generally cost more in memory traffic or could not satisfy the tensor-core layout. The direct TMA converter crashed, while other direct-FP32 variants preserved correctness but regressed against explicit compact staging. A scalar triangular SYRK route first hit missing cuBLAS linkage (<code>0e76423c</code>); after linkage was repaired, <code>3ed44543</code> was materially slower than the full tensor-core GEMM path despite updating fewer mathematical elements. Replacing it with <code>cublasGemmStridedBatchedEx</code> recovered performance, showing that tensor-core throughput outweighed the nominal arithmetic saved by scalar triangular SYRK.</p>
+<h2 id="unexplored-areas">Unexplored Areas</h2>
+<p><strong>Kernel-level profiling.</strong> No hosted profile was available because the BREV profiler URL was not configured, and the local machine had neither a usable B200 nor local Nsight traces. The run therefore inferred bottlenecks from end-to-end and per-shape timing rather than measuring occupancy, tensor-core utilization, HBM traffic, or launch gaps. The most useful next diagnostic is a caller-stream timeline plus per-kernel occupancy/memory counters for batch-64 n=256, batch-60 n=1024, batch-8 n=2048, and single-batch n=8192; those four cells represent every custom regime and would show whether the next work belongs in scheduling, movement, or math.</p>
+<p><strong>An unrepresented algorithm family behind the public leader.</strong> At the cutoff, the latest public leader was 178.772 µs versus this run’s last submitted 1006.765 µs, a 5.63× gap. Setup reuse and copy kernels cannot plausibly close a gap of that size by themselves. The next search should treat the leader as evidence that at least one substantially different factorization, fusion strategy, or benchmark-wide dispatch family remains absent, rather than continuing only sub-percent tuning of the current portfolio.</p>
+<p><strong>Shallow shape-specific fronts.</strong> Tensor-core decomposition for n=128, multi-CTA factorization for n=4096, and batch-aware triangular scheduling at n=1024 received only a few trials before the cutoff. These should be explored as dedicated shape objectives with explicit baselines and bounded tile/cluster/panel sweeps. In particular, n=128 sits between a synchronization-heavy shared-memory kernel and tensor-core-friendly dimensions, while batch-60 n=1024 has enough parallelism to justify alternatives to its serial four-panel dependency chain.</p>
+<p><strong>Low-batch multi-CTA large-matrix Cholesky.</strong> The run never produced a robust persistent multi-CTA implementation for batch-1/2 n=4096 and above. Direct cuSOLVER remained best at n=4096, and the custom CuTe route begins only at n=8192. A legal cooperative panel/update pipeline that overlaps independent trailing tiles on the caller stream could address the remaining sequential panel latency, but it needs cross-CTA synchronization and numerical safeguards that the one-CTA MathDx experiments did not exercise.</p>
+<p><strong>Cross-run and cross-GPU reproducibility.</strong> All prevalence and speedup evidence comes from one five-worker tree on one B200 benchmark, with a measured 1.765% coefficient of variation. Repeating the top family-level changes from the same baseline under new seeds, and then on another compatible GPU, would distinguish robust mechanisms from branch-parent effects, B200-specific scheduling choices, and noise-sized wins such as prewarming.</p>
+<h2 id="scope-methodology">Scope &amp; Methodology</h2>
+<p>This report uses <code>2026-07-19-01-44-06-cholesky-resumed-local-unmerged-report-optimization.csv</code>, the reference, manager, and brief logs, Git history, and the leaderboard submission record. It covers one five-worker B200 experiment, 27 brief branches, 463 structured trials, and the 15 benchmark shapes in <code>problems/linalg/cholesky_py/task.yml</code>. Technique families were manually clustered from commit/trial-granular rows because equivalent mechanisms were described differently across workers. The per-input algorithm table was derived directly from <code>custom_kernel</code> at snapshot commit <code>f6e9b180</code>; all ranked inputs have <code>cond=2</code>, and dispatch depends only on batch and n.</p>
+<p>“Peak contribution” is the largest parent-relative <code>best_step_speedup</code> among rows assigned to a family, while the executive-summary speedup is end-to-end versus the 2153.690 µs baseline. Marginal figures are ranking signals rather than additive attribution: a commit can bundle multiple changes, inherit an unusual parent, or move by less than the run’s 1.765% timing variation. Prevalence counts observations in brief branches, not inherited reachability, and does not establish reproducibility across runs. The snapshot is intentionally frozen at 2026-07-19 09:06:31 UTC while briefs 22–26 were still active; later run status is outside this report’s measurement window.</p>
+</body>
+</html>

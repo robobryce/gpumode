@@ -1,0 +1,145 @@
+
+[2026-07-30T07:45:01Z] cadence submission attempt
+[autocuda run] acquired lock=build mode=shared at=2026-07-30T07:45:01.983962 wait=0.000s
+leaderboard-submit: problem=linalg/cholesky_py leaderboard=cholesky gpu=B200 mode=leaderboard commit=fd956a9d484692c4dc7a4ec20d94bc371d50e7ed
+Submitting to leaderboard: cholesky
+GPU: B200
+Mode: leaderboard
+File: /home/shadeform/.local/share/autocuda/gpumode/2026-07-19-01-44-06-cholesky-resumed-local/worktrees/submission-fd956a9-20260729T151120Z/problems/linalg/cholesky_py/submission.py
+
+Waiting for results...
+Application error: Server returned status 400 Bad Request: The deadline to submit to cholesky has passed.
+It was 2026-07-30 00:00:00+00:00 and today is 2026-07-30 07:45:03.391767+00:00.
+===GPUMODE_SUBMIT_BEGIN===
+commit=fd956a9d484692c4dc7a4ec20d94bc371d50e7ed
+leaderboard=cholesky gpu=B200 mode=leaderboard
+cli_exit=1
+verdict=UNKNOWN
+Application error: Server returned status 400 Bad Request: The deadline to submit to cholesky has passed.
+submit_log=/tmp/popcorn-submit-O7mzjf.log
+===GPUMODE_SUBMIT_END===
+leaderboard-submit: recent submissions for cholesky (context only, NOT the verdict) :
+ID       Leaderboard          File                 Time                 GPU(s)       Status          Score
+---------------------------------------------------------------------------------------------------------
+927160   cholesky             submission.py        2026-07-29T16:31...  B200,B20...  done       0.001976955969039701
+927140   cholesky             submission.py        2026-07-29T16:27...  B200,B20...  done       0.0020952198361791803
+927138   cholesky             submission.py        2026-07-29T16:26...  B200,B20...  done       0.0007090525372955865
+927119   cholesky             submission.py        2026-07-29T16:22...  B200,B20...  done       0.0021217830338798043
+leaderboard-submit: NO VERDICT (cli_rc=1) commit=fd956a9d484692c4dc7a4ec20d94bc371d50e7ed (see /tmp/popcorn-submit-O7mzjf.log)
+[autocuda run] released lock=build mode=shared at=2026-07-30T07:45:04.120866 ran=2.137s
+
+[2026-07-30T08:00:01Z] cadence submission attempt
+[autocuda run] acquired lock=build mode=shared at=2026-07-30T08:00:01.234738 wait=0.000s
+leaderboard-submit: problem=linalg/cholesky_py leaderboard=cholesky gpu=B200 mode=leaderboard commit=fd956a9d484692c4dc7a4ec20d94bc371d50e7ed
+Submitting to leaderboard: cholesky
+GPU: B200
+Mode: leaderboard
+File: /home/shadeform/.local/share/autocuda/gpumode/2026-07-19-01-44-06-cholesky-resumed-local/worktrees/submission-fd956a9-20260729T151120Z/problems/linalg/cholesky_py/submission.py
+
+Waiting for results...
+Application error: Server returned status 400 Bad Request: The deadline to submit to cholesky has passed.
+It was 2026-07-30 00:00:00+00:00 and today is 2026-07-30 08:00:02.490800+00:00.
+===GPUMODE_SUBMIT_BEGIN===
+commit=fd956a9d484692c4dc7a4ec20d94bc371d50e7ed
+leaderboard=cholesky gpu=B200 mode=leaderboard
+cli_exit=1
+verdict=UNKNOWN
+Application error: Server returned status 400 Bad Request: The deadline to submit to cholesky has passed.
+submit_log=/tmp/popcorn-submit-xPQx3L.log
+===GPUMODE_SUBMIT_END===
+leaderboard-submit: recent submissions for cholesky (context only, NOT the verdict) :
+ID       Leaderboard          File                 Time                 GPU(s)       Status          Score
+---------------------------------------------------------------------------------------------------------
+927160   cholesky             submission.py        2026-07-29T16:31...  B200,B20...  done       0.001976955969039701
+927140   cholesky             submission.py        2026-07-29T16:27...  B200,B20...  done       0.0020952198361791803
+927138   cholesky             submission.py        2026-07-29T16:26...  B200,B20...  done       0.0007090525372955865
+927119   cholesky             submission.py        2026-07-29T16:22...  B200,B20...  done       0.0021217830338798043
+leaderboard-submit: NO VERDICT (cli_rc=1) commit=fd956a9d484692c4dc7a4ec20d94bc371d50e7ed (see /tmp/popcorn-submit-xPQx3L.log)
+[autocuda run] released lock=build mode=shared at=2026-07-30T08:00:03.187571 ran=1.953s
+
+[2026-07-30T08:15:01Z] cadence submission attempt
+[autocuda run] acquired lock=build mode=shared at=2026-07-30T08:15:01.301178 wait=0.000s
+leaderboard-submit: problem=linalg/cholesky_py leaderboard=cholesky gpu=B200 mode=leaderboard commit=fd956a9d484692c4dc7a4ec20d94bc371d50e7ed
+Submitting to leaderboard: cholesky
+GPU: B200
+Mode: leaderboard
+File: /home/shadeform/.local/share/autocuda/gpumode/2026-07-19-01-44-06-cholesky-resumed-local/worktrees/submission-fd956a9-20260729T151120Z/problems/linalg/cholesky_py/submission.py
+
+Waiting for results...
+Application error: Server returned status 400 Bad Request: The deadline to submit to cholesky has passed.
+It was 2026-07-30 00:00:00+00:00 and today is 2026-07-30 08:15:02.722053+00:00.
+===GPUMODE_SUBMIT_BEGIN===
+commit=fd956a9d484692c4dc7a4ec20d94bc371d50e7ed
+leaderboard=cholesky gpu=B200 mode=leaderboard
+cli_exit=1
+verdict=UNKNOWN
+Application error: Server returned status 400 Bad Request: The deadline to submit to cholesky has passed.
+submit_log=/tmp/popcorn-submit-1IZIgf.log
+===GPUMODE_SUBMIT_END===
+leaderboard-submit: recent submissions for cholesky (context only, NOT the verdict) :
+ID       Leaderboard          File                 Time                 GPU(s)       Status          Score
+---------------------------------------------------------------------------------------------------------
+927160   cholesky             submission.py        2026-07-29T16:31...  B200,B20...  done       0.001976955969039701
+927140   cholesky             submission.py        2026-07-29T16:27...  B200,B20...  done       0.0020952198361791803
+927138   cholesky             submission.py        2026-07-29T16:26...  B200,B20...  done       0.0007090525372955865
+927119   cholesky             submission.py        2026-07-29T16:22...  B200,B20...  done       0.0021217830338798043
+leaderboard-submit: NO VERDICT (cli_rc=1) commit=fd956a9d484692c4dc7a4ec20d94bc371d50e7ed (see /tmp/popcorn-submit-1IZIgf.log)
+[autocuda run] released lock=build mode=shared at=2026-07-30T08:15:03.378291 ran=2.077s
+
+[2026-07-30T08:30:01Z] cadence submission attempt
+[autocuda run] acquired lock=build mode=shared at=2026-07-30T08:30:01.533238 wait=0.000s
+leaderboard-submit: problem=linalg/cholesky_py leaderboard=cholesky gpu=B200 mode=leaderboard commit=fd956a9d484692c4dc7a4ec20d94bc371d50e7ed
+Submitting to leaderboard: cholesky
+GPU: B200
+Mode: leaderboard
+File: /home/shadeform/.local/share/autocuda/gpumode/2026-07-19-01-44-06-cholesky-resumed-local/worktrees/submission-fd956a9-20260729T151120Z/problems/linalg/cholesky_py/submission.py
+
+Waiting for results...
+Application error: Server returned status 400 Bad Request: The deadline to submit to cholesky has passed.
+It was 2026-07-30 00:00:00+00:00 and today is 2026-07-30 08:30:02.953592+00:00.
+===GPUMODE_SUBMIT_BEGIN===
+commit=fd956a9d484692c4dc7a4ec20d94bc371d50e7ed
+leaderboard=cholesky gpu=B200 mode=leaderboard
+cli_exit=1
+verdict=UNKNOWN
+Application error: Server returned status 400 Bad Request: The deadline to submit to cholesky has passed.
+submit_log=/tmp/popcorn-submit-pXRsuF.log
+===GPUMODE_SUBMIT_END===
+leaderboard-submit: recent submissions for cholesky (context only, NOT the verdict) :
+ID       Leaderboard          File                 Time                 GPU(s)       Status          Score
+---------------------------------------------------------------------------------------------------------
+927160   cholesky             submission.py        2026-07-29T16:31...  B200,B20...  done       0.001976955969039701
+927140   cholesky             submission.py        2026-07-29T16:27...  B200,B20...  done       0.0020952198361791803
+927138   cholesky             submission.py        2026-07-29T16:26...  B200,B20...  done       0.0007090525372955865
+927119   cholesky             submission.py        2026-07-29T16:22...  B200,B20...  done       0.0021217830338798043
+leaderboard-submit: NO VERDICT (cli_rc=1) commit=fd956a9d484692c4dc7a4ec20d94bc371d50e7ed (see /tmp/popcorn-submit-pXRsuF.log)
+[autocuda run] released lock=build mode=shared at=2026-07-30T08:30:03.674488 ran=2.141s
+
+[2026-07-30T08:45:01Z] cadence submission attempt
+[autocuda run] acquired lock=build mode=shared at=2026-07-30T08:45:01.805591 wait=0.000s
+leaderboard-submit: problem=linalg/cholesky_py leaderboard=cholesky gpu=B200 mode=leaderboard commit=fd956a9d484692c4dc7a4ec20d94bc371d50e7ed
+Submitting to leaderboard: cholesky
+GPU: B200
+Mode: leaderboard
+File: /home/shadeform/.local/share/autocuda/gpumode/2026-07-19-01-44-06-cholesky-resumed-local/worktrees/submission-fd956a9-20260729T151120Z/problems/linalg/cholesky_py/submission.py
+
+Waiting for results...
+Application error: Server returned status 400 Bad Request: The deadline to submit to cholesky has passed.
+It was 2026-07-30 00:00:00+00:00 and today is 2026-07-30 08:45:03.182865+00:00.
+===GPUMODE_SUBMIT_BEGIN===
+commit=fd956a9d484692c4dc7a4ec20d94bc371d50e7ed
+leaderboard=cholesky gpu=B200 mode=leaderboard
+cli_exit=1
+verdict=UNKNOWN
+Application error: Server returned status 400 Bad Request: The deadline to submit to cholesky has passed.
+submit_log=/tmp/popcorn-submit-eRJMPT.log
+===GPUMODE_SUBMIT_END===
+leaderboard-submit: recent submissions for cholesky (context only, NOT the verdict) :
+ID       Leaderboard          File                 Time                 GPU(s)       Status          Score
+---------------------------------------------------------------------------------------------------------
+927160   cholesky             submission.py        2026-07-29T16:31...  B200,B20...  done       0.001976955969039701
+927140   cholesky             submission.py        2026-07-29T16:27...  B200,B20...  done       0.0020952198361791803
+927138   cholesky             submission.py        2026-07-29T16:26...  B200,B20...  done       0.0007090525372955865
+927119   cholesky             submission.py        2026-07-29T16:22...  B200,B20...  done       0.0021217830338798043
+leaderboard-submit: NO VERDICT (cli_rc=1) commit=fd956a9d484692c4dc7a4ec20d94bc371d50e7ed (see /tmp/popcorn-submit-eRJMPT.log)
+[autocuda run] released lock=build mode=shared at=2026-07-30T08:45:03.817116 ran=2.012s
