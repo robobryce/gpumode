@@ -25,6 +25,21 @@ The standard execution contract assumes a dedicated local NVIDIA GPU, so builds,
 
 **Never nest `autocuda run`.** Wrap the `harness/` script you invoke; the scripts and problem-specific guards do their work directly under that one wrapper. A nested `run exclusive` can wait forever for the GPU already held by its parent invocation.
 
+### Modal fallback for an unavailable or contended local GPU
+
+Prefer the local GPU when it is accessible and uncontended. Before selecting a backend, check both `nvidia-smi -L` and `torch.cuda.is_available()` / `torch.cuda.device_count()` from the configured workspace venv, then inspect whether another workload is consuming enough compute or memory to invalidate timing or block useful progress. Workers may use the retained Modal bridge when no compatible local GPU is accessible **or** every compatible local GPU is materially contended. A single slow sample, a failed command, a broken local toolchain, or missing configuration is not evidence of contention.
+
+Record the backend and the concrete fallback reason in `autocuda/environment.md` and in the trial description. Keep a candidate's validation and benchmark on the same backend; repeat marginal results on the same backend as the comparison candidate before ranking them. Use these commands for Modal work:
+
+- **Build:** remains local and slice-wrapped: `autocuda run slice --data-dir "$DATA_DIR" --tag "$TAG" -- bash harness/build.sh <set>/<problem>`.
+- **Validate:** `autocuda run slice --data-dir "$DATA_DIR" --tag "$TAG" -- bash harness/modal.sh validate <set>/<problem>`.
+- **Benchmark:** `autocuda run slice --data-dir "$DATA_DIR" --tag "$TAG" -- bash harness/modal.sh benchmark <set>/<problem>`.
+- **Profile:** the Modal bridge does not expose local `nsys` / `ncu`; record that exception and use the hosted profiling path only when the run policy permits it.
+
+The fallback uses `run slice` because remote GPU work needs the run's CPU/memory build slice rather than exclusive ownership of a local GPU. Do not silently switch after a local failure, and return to `run exclusive` only after the local GPU is again uncontended.
+
+**Runtime parity is mandatory.** The clean local venv and the Modal image must use the same execution-facing setup: Python 3.13, the CUDA 13.3 toolchain with Torch's CUDA 13.0 runtime, Torch 2.12 installed last, and the same direct dependency groups and version constraints for NumPy, PyYAML, Ninja, CUDA Python/Tile/Core, nvMath, CUTLASS DSL, MathDx, Tinygrad, and Helion. `harness/modal_runner.py` is the canonical manifest and records the production KernelBot commit it mirrors. Modal CLI and local static-analysis tools are control-plane dependencies, not part of the measured runtime. If either environment drifts from that manifest, rebuild it before mixing local and Modal results.
+
 ## Editable files
 
 - **`problems/<set>/<problem>/submission.py`** — the ONLY file you may edit. It must keep the contract: a module-level `custom_kernel(data: input_t) -> output_t`. The input tensors are already on the GPU (see the problem's `reference.py::generate_input` for exact shapes/dtypes) and any output buffer is preallocated. You may add module-level code (e.g. a `load_inline`/`load` call that compiles a CUDA kernel once at import time) and helper functions, but keep everything in this one file (leaderboard submissions are single-file). Do NOT change the `custom_kernel` name or signature.
@@ -36,7 +51,7 @@ Frozen GPU MODE harness — DO NOT modify. These define correctness and timing e
 - **`eval.py`** — the official KernelBot eval harness. Modes `test` / `benchmark` / `leaderboard` / `profile`; reads a spec file, runs `custom_kernel` in a spawned subprocess, writes `key: value` results to the fd named by `POPCORN_FD`. Times with CUDA events, clears L2 between repeats, runs an obligatory correctness check before timing. **Its location varies by problem** — shared at the set root (`problems/<set>/eval.py`, e.g. `pmpp_v2`) or problem-local (`problems/<set>/<problem>/eval.py`, e.g. `linalg/qr_py`). The harness resolves the right one from `task.yml`'s `files:` manifest (`bin/gen_specs.py --file-source eval.py`), so never hardcode the set root.
 - **`utils.py`** — checkers (`verbose_allclose` / `verbose_allequal`), seeding, `clear_l2_cache`. Same dual location as `eval.py`, and may be borrowed from another set (`linalg/qr_py` → `problems/pmpp_v2/utils.py`); resolved the same way (`--file-source utils.py`).
 - **`problems/<set>/<problem>/reference.py`** — `generate_input(...)` and the `check_implementation` ground truth. **`task.py`** — input/output type schema. **`task.yml`** — the official problem spec: the canonical `tests:` / `benchmarks:` shapes + leaderboard timeouts **and** the `files:` manifest that maps each runtime file (`eval.py`, `utils.py`, …) to its `source` path. The `harness/` scripts render its shapes into eval.py spec files and resolve those file locations on the fly via `bin/gen_specs.py`. Problem-specific `guards/*.sh` are also frozen validation infrastructure: QR v2 carries differential/invariance/off-grid guards, while Eigh and Cholesky carry bounded-time fresh-seed input-variation guards over published shapes and their ranked/official generator families.
-- **`harness/env.sh`, `build.sh`, `validate.sh`, `benchmark.sh`, `profile_nsys.sh`, `profile_ncu.sh`, `submit.sh`** and **`bin/gen_specs.py`** — the autocuda↔GPU-MODE bridge. `env.sh` resolves `eval.py` / `utils.py` per problem from the `files:` manifest (via `gen_specs.py --file-source`) and puts their dirs on `PYTHONPATH`, so the same local scripts drive both the set-root and problem-local layouts unchanged. Treat as read-only infrastructure.
+- **`harness/env.sh`, `build.sh`, `validate.sh`, `benchmark.sh`, `profile_nsys.sh`, `profile_ncu.sh`, `submit.sh`, `modal.sh`, `modal_runner.py`** and **`bin/gen_specs.py`** — the autocuda↔GPU-MODE bridge. `env.sh` resolves `eval.py` / `utils.py` per problem from the `files:` manifest (via `gen_specs.py --file-source`) and puts their dirs on `PYTHONPATH`, so the same local scripts drive both the set-root and problem-local layouts unchanged. `modal.sh` / `modal_runner.py` provide the unavailable-or-contended-GPU fallback above. Treat all of this as read-only infrastructure.
 
 ## Build
 
@@ -104,6 +119,7 @@ One problem is optimized per run (one `optimize-tree` run, scoped with `benchmar
 
 - **CUDA toolkit** with `nvcc` (the harness compiles `submission.py`'s CUDA via torch `load_inline` at import). Verified on CUDA 13.x.
 - **PyTorch** matching the host GPU/CUDA (the workspace venv; `bin/install.sh` builds one and writes its path into `~/.config/gpumode/gpumode.env`), plus `pyyaml` (for `bin/gen_specs.py`) and `ninja`.
+- **Modal CLI ≥ 1.1** is optional and used only by the unavailable-or-contended-GPU fallback. Its absence is a configuration error, not a reason to change benchmark policy.
 - **popcorn-cli** — GPU MODE leaderboard submission client (authenticated via Discord; see the `popcorn-login` skill).
 - Custom CUDA in a submission must build against **stock CUB/Thrust** to be leaderboard-portable; compiling against a local CCCL checkout via `extra_include_paths` is diagnostic-only (the remote build has only stock headers).
 
