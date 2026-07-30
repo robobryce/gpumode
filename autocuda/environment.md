@@ -1,12 +1,12 @@
 # Environment
 
 Per-machine half of the project description (the machine-agnostic half is the
-committed `autocuda/layout.md`). Written for the **`linalg/cholesky_py`** target
-(batched dense Cholesky factorization, `custom_kernel(A) -> L`); the
-GPU / toolchain / profiler facts apply to any problem on this host. This node
-uses the local `harness/` scripts while its B200 is uncontended. Modal is an
-authorized fallback when the local GPU is unavailable or materially contended,
-using the same production-matched execution environment described below.
+committed `autocuda/layout.md`). This file records the GPU, toolchain, runtime,
+resource, and profiler facts shared by GPU MODE problems on this host. This node
+uses the local `harness/` scripts while its B200 is uncontended. If Modal
+credentials are available, Modal is an authorized fallback when the local GPU
+is unavailable or materially contended, using the same production-matched
+execution environment described below.
 
 ## GPU and environment
 
@@ -70,10 +70,10 @@ using the same production-matched execution environment described below.
   `torch.cuda.get_device_name(0) == "NVIDIA B200"`. Use the local
   `run exclusive` commands above whenever that device is available without
   material competing compute or memory use.
-- **Modal fallback:** select it when no compatible local GPU is accessible or
-  when sustained competing use of every compatible local GPU would invalidate
-  timing or block useful worker progress. Keep builds local under `run slice`,
-  and run
+- **Modal fallback:** if Modal credentials are available, select it when no
+  compatible local GPU is accessible or when sustained competing use of every
+  compatible local GPU would invalidate timing or block useful worker progress.
+  Keep builds local under `run slice`, and run
   `harness/modal.sh validate|benchmark` under `run slice` as documented in
   `layout.md`. Record `backend=modal`, the observed contention or availability
   evidence, and the candidate commit in the trial description.
@@ -82,51 +82,22 @@ using the same production-matched execution environment described below.
   improvements on the comparison candidate's backend. A broken toolchain or
   missing credentials remains an infrastructure issue, not a fallback signal.
 
-## Baseline
-
-The unmodified `submission.py` is stock
-`torch.linalg.cholesky_ex(data, check_errors=False).L` (cuSOLVER). Measure and
-log the baseline on the run's selected parity-matched backend; record that
-backend with the reference and do not reuse a measurement from a mismatched
-runtime. Benchmark shapes come from
-`problems/linalg/cholesky_py/task.yml` and span thousands of 32×32 matrices
-through one 32768×32768 matrix.
-
-For where the baseline sits on the leaderboard and the gap to #1, read the
-standings with the **`leaderboard-rankings`** skill (no auth, no submission) —
-rankings move, so don't hardcode them here.
-
-- **Bottleneck (stable):** the stock path leaves shape-specific batch
-  parallelism, launch fusion, lower-only storage, and Blackwell tensor-core
-  updates available to a custom implementation. Measure individual shapes
-  on the selected backend before choosing between batched small-matrix and
-  blocked large-matrix mechanisms.
-- **Precision budget (stable — frozen `reference.py`):** output must be finite
-  FP32, lower triangular with a strictly positive diagonal, and satisfy the
-  dimension-scaled FP32 L1 reconstruction gate for `L @ L.T == A`. Reduced
-  precision may be used internally only when the final factor passes those
-  property-based checks across dense, spectral, diagonal, low-rank, row-scaled,
-  and tridiagonal inputs.
-
-## Noise
-
-Re-measure backend-specific noise for Cholesky before accepting marginal
-changes. Until a fresh multi-run estimate is logged, treat geomean deltas below
-**~1%** as noise and confirm them independently on the same backend as the
-comparison candidate.
-
 ## Timeouts
 
-Measured on this host (one B200, via `autocuda run`); budget with margin:
+Timeouts are problem-dependent. Measure build, validation, benchmark, and
+profiling durations for each run on its selected backend, then set its config
+with enough margin for cold compilation and slower test cases. The following
+host-level guidance applies across problems:
 
-- **Build (pure-PyTorch import):** ~2 s. A fresh custom-CUDA `load_inline`
-  (sm_100) compile is tens of seconds; a cached rebuild (unchanged source) ~1 s.
-- **Validate (test shapes):** budget up to 240 s (`test_timeout`).
-- **Benchmark (15-shape geomean):** budget up to 600 s
-  (`benchmark_timeout`).
-- **nsys profile (one shape):** ~15–20 s.
-- **ncu profile (one shape, focused):** tens of seconds to minutes; budget
-  ≥600 s and always pass a `--kernel-name` regex.
+- A fresh custom-CUDA build can take tens of seconds; cached or Python-only
+  builds can be much faster. Do not derive a universal build timeout from one
+  problem.
+- Validation and benchmark duration scales with the problem's test and
+  benchmark cases. Record measured values in the experiment data rather than
+  this shared file.
+- Nsight Systems captures usually finish much faster than focused Nsight
+  Compute captures. Nsight Compute may take minutes because it replays kernels;
+  always pass a narrow `--kernel-name` regex and budget accordingly.
 - **Leaderboard submit (`harness/submit.sh`):** variable and intermittently
   times out — budget ≥1200 s and **retry on timeout up to 3×** (a timeout is
   inconclusive; a parsed `verdict=REJECTED` is a real failure).
@@ -137,7 +108,7 @@ Profile through the harness scripts (see `layout.md` § Profiling). Both run
 `eval.py benchmark` on one shape under the `torch.cuda.profiler` range eval.py
 wraps its timed launches in (present on **`main`**), so the capture holds only
 the submission's kernels — not input generation, warmup, the L2 flush, or the
-per-repeat FP64 checker. Profile from a base that includes that range.
+per-repeat correctness checks. Profile from a base that includes that range.
 
 Nsight Systems **2026.1.3** and Nsight Compute **2026.2.0** are installed.
 `nsys` works without privilege escalation. `profile_ncu.sh` uses the working
@@ -151,7 +122,7 @@ passwordless `sudo -n` path and forwards `PATH`, `PYTHONPATH`, `CUDA_HOME`,
   ```
   NSYS_OUT="$DATA_DIR/profiles/<tag>/<name>-<sha>.nsys-rep" \
   autocuda run exclusive --data-dir "$DATA_DIR" -- \
-    bash harness/profile_nsys.sh linalg/cholesky_py "batch: 640; n: 512; cond: 2; seed: 510512" \
+    bash harness/profile_nsys.sh <set>/<problem> "<shape-spec>" \
       > "$DATA_DIR/profiles/<tag>/<name>-<sha>.nsys-txt" 2>&1
   ```
 - **ncu** (per-kernel; needs root — passwordless `sudo -n` works here, `ncu` at
@@ -159,8 +130,8 @@ passwordless `sudo -n` path and forwards `PATH`, `PYTHONPATH`, `CUDA_HOME`,
   `--kernel-name` regex or ncu replays every kernel ~40× each:
   ```
   autocuda run exclusive --data-dir "$DATA_DIR" -- \
-    bash harness/profile_ncu.sh linalg/cholesky_py "batch: 640; n: 512; cond: 2; seed: 510512" "regex:potrf|cholesky|trsm|syrk|gemm" \
+    bash harness/profile_ncu.sh <set>/<problem> "<shape-spec>" "regex:<kernel-pattern>" \
       > "$DATA_DIR/profiles/<tag>/<name>-<sha>.ncu-txt" 2>&1
   ```
   For a custom kernel, profile it once to learn its kernel names, then filter to
-  the dominant factor, solve, or trailing-update kernel.
+  the dominant kernel or small set of kernels relevant to the trial.
