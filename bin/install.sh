@@ -1,88 +1,192 @@
 #!/usr/bin/env bash
-# One-time machine setup for optimizing GPU MODE leaderboard problems with
-# autocuda, IN PLACE inside this reference-kernels fork.
+# Reproducible GPU MODE host setup.
 #
-# Idempotent. Provisions:
-#   1. popcorn-cli            (GPU MODE submission CLI) -> ~/.local/bin
-#   2. one Python venv with the production runtime plus local control tools
-#   4. ~/.config/gpumode/gpumode.env  (toolchain paths the harness sources)
+# Installs/selects CUDA 13.3, creates a fresh Python 3.13 venv in this checkout,
+# mirrors the production KernelBot/Modal dependency set, installs the CUTLASS
+# and MathDx header trees used by that image, and writes the machine config
+# consumed by harness/env.sh.
 #
-# Unlike a separate harness repo, this does NOT clone reference-kernels — this
-# repo IS it. After install, run /autocuda:discover once to write
-# autocuda/environment.md, then optimize a problem in place (see README).
-#
-# Tunables via environment:
-#   GPUMODE_ROOT      where the venv lives                (default ~/gpumode)
-#   GPUMODE_PY        python to build the venv from        (default python3.12 or python3)
-#   TORCH_INDEX_URL   PyTorch wheel index (match your CUDA/GPU)
-#                     default https://download.pytorch.org/whl/cu128 (H100/sm_90)
-#   CUDA_HOME         CUDA toolkit root  (default /usr/local/cuda)
+# Safe to rerun: the venv is rebuilt from scratch and versioned assets are
+# reused when already correct.
 set -euo pipefail
 
-GPUMODE_ROOT="${GPUMODE_ROOT:-$HOME/gpumode}"
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+CUDA_SERIES="${GPUMODE_CUDA_SERIES:-13.3}"
+CUDA_PACKAGE_SERIES="${CUDA_SERIES/./-}"
+CUDA_PREFIX="${GPUMODE_CUDA_PREFIX:-/usr/local/cuda-$CUDA_SERIES}"
 CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"
-TORCH_INDEX_URL="${TORCH_INDEX_URL:-https://download.pytorch.org/whl/cu128}"
-CFG_DIR="$HOME/.config/gpumode"
-CFG="$CFG_DIR/gpumode.env"
-mkdir -p "$GPUMODE_ROOT" "$CFG_DIR" "$HOME/.local/bin"
-
-log() { printf '\033[1;36m[install]\033[0m %s\n' "$*"; }
-
-# --- 0. sanity: GPU + nvcc ---------------------------------------------------
-command -v nvidia-smi >/dev/null || { echo "nvidia-smi not found — need an NVIDIA GPU host"; exit 1; }
-if [ ! -x "$CUDA_HOME/bin/nvcc" ]; then
-    echo "nvcc not found at $CUDA_HOME/bin/nvcc — set CUDA_HOME to your toolkit root"; exit 1
-fi
-log "GPU: $(nvidia-smi --query-gpu=name --format=csv,noheader | head -1); nvcc: $("$CUDA_HOME/bin/nvcc" --version | grep -oE 'release [0-9.]+' | head -1)"
-
-# --- 1. popcorn-cli ----------------------------------------------------------
-if command -v popcorn-cli >/dev/null 2>&1 || [ -x "$HOME/.local/bin/popcorn-cli" ]; then
-    log "popcorn-cli already installed ($(command -v popcorn-cli || echo "$HOME/.local/bin/popcorn-cli"))"
-else
-    log "installing popcorn-cli ..."
-    curl -fsSL https://raw.githubusercontent.com/gpu-mode/popcorn-cli/main/install.sh | bash
-fi
-
-# --- 2. venv + torch ---------------------------------------------------------
-VENV="${GPUMODE_RUNTIME_VENV:-$GPUMODE_ROOT/.venv}"
+VENV="${GPUMODE_RUNTIME_VENV:-$REPO_DIR/.venv}"
 PYBIN="$VENV/bin/python"
-GPUMODE_PY="${GPUMODE_PY:-$(command -v python3.13 || command -v python3)}"
-command -v uv >/dev/null 2>&1 || { echo "uv is required to reproduce the production dependency resolver"; exit 1; }
+CFG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/gpumode"
+CFG="$CFG_DIR/gpumode.env"
+CUTLASS_VERSION="4.5.2"
+CUTLASS_PATH="${CUTLASS_PATH:-/opt/cutlass}"
+MATHDX_VERSION="26.06.0"
+MATHDX_HOME="${MATHDX_HOME:-/opt/mathdx}"
+MATHDX_ARCHIVE="nvidia-mathdx-${MATHDX_VERSION}-cuda13.tar.gz"
+MATHDX_URL="https://developer.download.nvidia.com/compute/cublasdx/redist/cublasdx/cuda13/$MATHDX_ARCHIVE"
+MATHDX_SHA256="042b7c57a636c271cca32dffcc0a822ed6b2abc0b8ef5703ab2445d58563a1e6"
+MATHDX_MARKER="$MATHDX_HOME/.gpumode-mathdx-$MATHDX_VERSION-$MATHDX_SHA256"
 
-log "recreating production-mirrored runtime at $VENV ..."
-uv venv --clear --python "$GPUMODE_PY" "$VENV"
-VIRTUAL_ENV="$VENV" uv pip install --python "$PYBIN" \
-    'ninja~=1.11' 'wheel~=0.45' 'requests~=2.32.4' 'packaging~=25.0' \
-    'numpy~=2.3' pytest PyYAML 'tinygrad~=0.10' helion \
-    'nvidia-cutlass-dsl==4.5.2' 'cuda-core[cu13]' \
-    'cuda-python[all]==13.0' 'cuda-tile==1.4.0' \
-    'nvmath-python[cu13-dx]==0.9.0' 'nvidia-libmathdx-cu13==0.3.2.6' \
-    'cuda-toolkit[cccl,nvrtc]==13.0.2'
-VIRTUAL_ENV="$VENV" uv pip install --python "$PYBIN" 'torch==2.12.0'
-VIRTUAL_ENV="$VENV" uv pip install --python "$PYBIN" kernelguard 'modal>=1.1'
-uv pip check --python "$PYBIN"
-"$PYBIN" -c 'import cuda.tile, nvmath, torch, kernelguard, modal'
-log "torch CUDA check: $("$PYBIN" -c 'import torch;print("avail",torch.cuda.is_available(),"dev",torch.cuda.get_device_name(0) if torch.cuda.is_available() else "-")')"
-"$PYBIN" "$PWD/bin/kernelguard_gate.py" --self-test
+log() { printf '\033[1;36m[gpumode-setup]\033[0m %s\n' "$*"; }
+die() { echo "gpumode setup: $*" >&2; exit 1; }
 
-# --- 4. write machine config -------------------------------------------------
-cat > "$CFG" <<EOF
-# GPU MODE machine config — written by bin/install.sh. Sourced by harness/env.sh.
-GPUMODE_VENV_PYTHON="$PYBIN"
-CUDA_HOME="$CUDA_HOME"
-EOF
-log "wrote $CFG:"; sed 's/^/    /' "$CFG"
+if [ "$(id -u)" -eq 0 ]; then
+    SUDO=()
+elif command -v sudo >/dev/null 2>&1; then
+    SUDO=(sudo -n)
+else
+    die "root or passwordless sudo is required to install CUDA and /opt assets"
+fi
 
-cat <<EOF
+nvcc_release() {
+    "$1/bin/nvcc" --version 2>/dev/null | sed -n 's/.*release \([0-9][0-9.]*\).*/\1/p' | head -n1
+}
 
-$(printf '\033[1;32m✓ install complete\033[0m')
+install_host_tools() {
+    command -v apt-get >/dev/null 2>&1 || {
+        command -v curl >/dev/null 2>&1 || die "curl is required"
+        command -v git >/dev/null 2>&1 || die "git is required"
+        return 0
+    }
+    log "installing host build tools"
+    "${SUDO[@]}" apt-get update
+    DEBIAN_FRONTEND=noninteractive "${SUDO[@]}" apt-get install -y --no-install-recommends \
+        ca-certificates curl git build-essential gcc-13 g++-13 clang-18 pkg-config
+}
 
-Next steps:
-  1. Authenticate popcorn-cli (one-time) with the popcorn-login skill:
-       bash .claude/skills/popcorn-login/scripts/login.sh
-  2. Authenticate Modal for remote tests/benchmarks:  "$VENV/bin/modal" setup
-  3. Set up this machine:   /autocuda:discover   (writes autocuda/environment.md)
-  4. Pick a problem and optimize it in place — its <set>/<problem> path is the
-     one token (passed as benchmark=), e.g.:
-       /autocuda:optimize-tree workers=4 benchmark=pmpp_v2/histogram_py tag-suffix=histogram_py
-EOF
+install_cuda() {
+    if [ -x "$CUDA_PREFIX/bin/nvcc" ] && [ "$(nvcc_release "$CUDA_PREFIX")" = "$CUDA_SERIES" ]; then
+        log "CUDA $CUDA_SERIES already present at $CUDA_PREFIX"
+    else
+        command -v apt-get >/dev/null 2>&1 \
+            || die "CUDA $CUDA_SERIES is missing and automatic installation requires apt-get"
+        . /etc/os-release
+        [ "${ID:-}" = ubuntu ] || die "automatic CUDA installation currently supports Ubuntu only"
+        case "${VERSION_ID:-}" in
+            24.04) cuda_repo=ubuntu2404 ;;
+            22.04) cuda_repo=ubuntu2204 ;;
+            *) die "unsupported Ubuntu release ${VERSION_ID:-unknown} for automatic CUDA installation" ;;
+        esac
+        arch="$(dpkg --print-architecture)"
+        [ "$arch" = amd64 ] || die "automatic CUDA installation currently supports amd64 only"
+        keyring="$(mktemp --suffix=.deb)"
+        trap 'rm -f "${keyring:-}" "${mathdx_tmp:-}"' EXIT
+        log "installing CUDA toolkit $CUDA_SERIES (driver packages are not installed)"
+        curl -fsSL "https://developer.download.nvidia.com/compute/cuda/repos/$cuda_repo/x86_64/cuda-keyring_1.1-1_all.deb" -o "$keyring"
+        "${SUDO[@]}" dpkg -i "$keyring"
+        "${SUDO[@]}" apt-get update
+        DEBIAN_FRONTEND=noninteractive "${SUDO[@]}" apt-get install -y --no-install-recommends \
+            "cuda-toolkit-$CUDA_PACKAGE_SERIES=13.3.0-1" \
+            'cuda-compiler-13-3=13.3.0-1' \
+            'cuda-nvcc-13-3=13.3.33-1' 'cuda-crt-13-3=13.3.33-1' \
+            'libnvvm-13-3=13.3.33-1' 'libnvptxcompiler-13-3=13.3.33-1'
+        "${SUDO[@]}" apt-mark hold \
+            "cuda-toolkit-$CUDA_PACKAGE_SERIES" cuda-compiler-13-3 \
+            cuda-nvcc-13-3 cuda-crt-13-3 libnvvm-13-3 libnvptxcompiler-13-3
+    fi
+
+    if command -v update-alternatives >/dev/null 2>&1; then
+        "${SUDO[@]}" update-alternatives --install /usr/local/cuda cuda "$CUDA_PREFIX" 133
+        "${SUDO[@]}" update-alternatives --set cuda "$CUDA_PREFIX"
+    else
+        "${SUDO[@]}" ln -sfn "$CUDA_PREFIX" /usr/local/cuda
+    fi
+    CUDA_HOME=/usr/local/cuda
+    [ "$(nvcc_release "$CUDA_HOME")" = "$CUDA_SERIES" ] \
+        || die "$CUDA_HOME does not resolve to CUDA $CUDA_SERIES"
+    nvcc_build="$($CUDA_HOME/bin/nvcc --version | sed -n 's/.*V\([0-9][0-9.]*\).*/\1/p' | head -n1)"
+    [ "$nvcc_build" = 13.3.33 ] \
+        || die "CUDA nvcc 13.3.33 required for leaderboard parity, found ${nvcc_build:-unknown}"
+}
+
+install_uv() {
+    if command -v uv >/dev/null 2>&1; then return; fi
+    log "installing uv"
+    curl -LsSf https://astral.sh/uv/install.sh | sh
+    export PATH="$HOME/.local/bin:$PATH"
+    command -v uv >/dev/null 2>&1 || die "uv installation failed"
+}
+
+install_sdk_headers() {
+    if [ ! -f "$CUTLASS_PATH/include/cutlass/cutlass.h" ]; then
+        log "installing CUTLASS v$CUTLASS_VERSION headers at $CUTLASS_PATH"
+        "${SUDO[@]}" rm -rf "$CUTLASS_PATH"
+        "${SUDO[@]}" git clone --depth 1 --branch "v$CUTLASS_VERSION" \
+            https://github.com/NVIDIA/cutlass.git "$CUTLASS_PATH"
+    fi
+    cutlass_commit="$("${SUDO[@]}" git -c safe.directory="$CUTLASS_PATH" -C "$CUTLASS_PATH" rev-parse HEAD 2>/dev/null || true)"
+    [ "$cutlass_commit" = db1c288993354c88e551c40c19a8fb93a774a241 ] \
+        || die "$CUTLASS_PATH is not CUTLASS v$CUTLASS_VERSION; remove it and rerun bin/install.sh"
+
+    if [ ! -f "$MATHDX_MARKER" ]; then
+        log "installing MathDx $MATHDX_VERSION headers at $MATHDX_HOME"
+        mathdx_tmp="$(mktemp --suffix=.tar.gz)"
+        curl -fsSL "$MATHDX_URL" -o "$mathdx_tmp"
+        echo "$MATHDX_SHA256  $mathdx_tmp" | sha256sum -c -
+        "${SUDO[@]}" rm -rf "$MATHDX_HOME"
+        "${SUDO[@]}" mkdir -p "$MATHDX_HOME"
+        "${SUDO[@]}" tar -xzf "$mathdx_tmp" --strip-components=4 -C "$MATHDX_HOME"
+        "${SUDO[@]}" touch "$MATHDX_MARKER"
+    fi
+
+    CPLUS_INCLUDE_PATH="$MATHDX_HOME/include:$MATHDX_HOME/external/cutlass/include:$CUTLASS_PATH/include:$CUTLASS_PATH/tools/util/include"
+    export CPLUS_INCLUDE_PATH
+    printf '#include <cublasdx.hpp>\n' | "$CUDA_HOME/bin/nvcc" \
+        -std=c++17 -x cu -c - -o /tmp/gpumode-cublasdx-smoke.o
+    "${SUDO[@]}" rm -f /tmp/gpumode-cublasdx-smoke.o
+}
+
+install_runtime() {
+    log "recreating production-matched Python 3.13 runtime at $VENV"
+    uv venv --clear --python 3.13 "$VENV"
+    VIRTUAL_ENV="$VENV" uv pip install --python "$PYBIN" \
+        'ninja~=1.11' 'wheel~=0.45' 'requests~=2.32.4' 'packaging~=25.0' \
+        'numpy~=2.3' pytest PyYAML 'tinygrad~=0.10' helion \
+        'nvidia-cutlass-dsl==4.5.2' 'cuda-core[cu13]' \
+        'cuda-python[all]==13.0' 'cuda-tile==1.4.0' \
+        'nvmath-python[cu13-dx]==0.9.0' 'nvidia-libmathdx-cu13==0.3.2.6' \
+        'cuda-toolkit[cccl,nvrtc]==13.0.2'
+    # Match production ordering: Torch's CUDA/NCCL dependency set wins.
+    VIRTUAL_ENV="$VENV" uv pip install --python "$PYBIN" 'torch==2.12.0'
+    # Local control-plane tools are intentionally absent from the remote image.
+    VIRTUAL_ENV="$VENV" uv pip install --python "$PYBIN" kernelguard 'modal>=1.1'
+    uv pip check --python "$PYBIN"
+}
+
+write_config() {
+    mkdir -p "$CFG_DIR"
+    umask 022
+    {
+        echo '# GPU MODE machine config — written by bin/install.sh. Sourced by harness/env.sh.'
+        printf 'GPUMODE_VENV_PYTHON=%q\n' "$PYBIN"
+        printf 'CUDA_HOME=%q\n' "$CUDA_HOME"
+        printf 'CUTLASS_PATH=%q\n' "$CUTLASS_PATH"
+        printf 'MATHDX_HOME=%q\n' "$MATHDX_HOME"
+    } > "$CFG"
+    log "wrote $CFG"
+}
+
+install_host_tools
+install_cuda
+install_uv
+install_sdk_headers
+install_runtime
+write_config
+
+export GPUMODE_VENV_PYTHON="$PYBIN" CUDA_HOME CUTLASS_PATH MATHDX_HOME
+export CPLUS_INCLUDE_PATH="$MATHDX_HOME/include:$MATHDX_HOME/external/cutlass/include:$CUTLASS_PATH/include:$CUTLASS_PATH/tools/util/include"
+"$PYBIN" "$REPO_DIR/bin/verify_environment.py"
+"$PYBIN" "$REPO_DIR/bin/kernelguard_gate.py" --self-test
+
+if [ "${GPUMODE_INSTALL_POPCORN:-1}" = 1 ]; then
+    if command -v popcorn-cli >/dev/null 2>&1 || [ -x "$HOME/.local/bin/popcorn-cli" ]; then
+        log "popcorn-cli already installed"
+    else
+        log "installing popcorn-cli"
+        curl -fsSL https://raw.githubusercontent.com/gpu-mode/popcorn-cli/main/install.sh | bash
+    fi
+fi
+
+log "setup complete: CUDA $CUDA_SERIES, $PYBIN"
+echo "Authenticate optional services separately: popcorn-cli via the popcorn-login skill; Modal via $VENV/bin/modal setup."

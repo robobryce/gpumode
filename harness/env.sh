@@ -1,3 +1,4 @@
+#!/usr/bin/env bash
 # Shared environment for the autocuda <-> GPU MODE bridge.
 # Sourced by build.sh / validate.sh / benchmark.sh / profile_ncu.sh.
 #
@@ -21,8 +22,7 @@ REPO_DIR="$(cd "$HARNESS_DIR/.." && pwd)"
 
 # --- 1. machine-level config -------------------------------------------------
 # Written by bin/install.sh to ~/.config/gpumode/gpumode.env. Defines
-# GPUMODE_VENV_PYTHON and CUDA_HOME. (GPUMODE_REFERENCE_KERNELS is unused here —
-# this repo IS the reference-kernels checkout.)
+# GPUMODE_VENV_PYTHON, CUDA_HOME, CUTLASS_PATH, and MATHDX_HOME.
 for cfg in "${GPUMODE_ENV:-}" "$HOME/.config/gpumode/gpumode.env"; do
     if [ -n "$cfg" ] && [ -f "$cfg" ]; then source "$cfg"; break; fi
 done
@@ -42,10 +42,23 @@ SET_DIR="$(dirname "$PROBLEM_DIR")"   # the set root (problems/<set>); the
 # PYTHON is consumed by the scripts that source this file (not exported on
 # purpose — it stays a shell var the same-process callers use as "$PYTHON").
 # shellcheck disable=SC2034
-PYTHON="${GPUMODE_VENV_PYTHON:-$HOME/gpumode/.venv/bin/python}"
+PYTHON="${GPUMODE_VENV_PYTHON:-$REPO_DIR/.venv/bin/python}"
 export CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"
-export PATH="$CUDA_HOME/bin:$PATH"
+export CUTLASS_PATH="${CUTLASS_PATH:-/opt/cutlass}"
+export MATHDX_HOME="${MATHDX_HOME:-/opt/mathdx}"
+[ -x "$PYTHON" ] || {
+    echo "GPU MODE venv not found at $PYTHON; run $REPO_DIR/bin/install.sh" >&2; exit 1; }
+PYTHON_BIN_DIR="$(dirname "$PYTHON")"
+export PATH="$PYTHON_BIN_DIR:$CUDA_HOME/bin:$PATH"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+export CPLUS_INCLUDE_PATH="$MATHDX_HOME/include:$MATHDX_HOME/external/cutlass/include:$CUTLASS_PATH/include:$CUTLASS_PATH/tools/util/include${CPLUS_INCLUDE_PATH:+:$CPLUS_INCLUDE_PATH}"
+
+# Every harness entry point verifies the runtime before loading problem code.
+# This turns stale venvs, wrong CUDA defaults, and missing production headers
+# into an immediate actionable error instead of a late compile/benchmark fault.
+if [ "${GPUMODE_SKIP_ENV_CHECK:-0}" != 1 ]; then
+    "$PYTHON" "$REPO_DIR/bin/verify_environment.py" >/dev/null || exit 1
+fi
 
 # Locate eval.py / utils.py from the problem's task.yml `files:` manifest —
 # the same flattening KernelBot does — instead of assuming the set root. Most

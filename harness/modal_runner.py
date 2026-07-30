@@ -62,7 +62,8 @@ image = (
             f"echo '{MATHDX_SHA256}  /tmp/{MATHDX_ARCHIVE}' | sha256sum -c - && "
             "mkdir -p /opt/mathdx && "
             f"tar -xzf /tmp/{MATHDX_ARCHIVE} --strip-components=4 -C /opt/mathdx && "
-            f"rm /tmp/{MATHDX_ARCHIVE}"
+            f"rm /tmp/{MATHDX_ARCHIVE} && "
+            f"touch /opt/mathdx/.gpumode-mathdx-{MATHDX_VERSION}-{MATHDX_SHA256}"
         ),
     )
     .env(

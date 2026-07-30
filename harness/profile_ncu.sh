@@ -74,6 +74,9 @@ else
         TORCH_EXTENSIONS_DIR="$TORCH_EXTENSIONS_DIR"
         PYTHONNOUSERSITE="${PYTHONNOUSERSITE:-1}"
         MAX_JOBS="$MAX_JOBS"
+        CUTLASS_PATH="$CUTLASS_PATH"
+        MATHDX_HOME="$MATHDX_HOME"
+        CPLUS_INCLUDE_PATH="$CPLUS_INCLUDE_PATH"
     )
     [ -n "${LD_LIBRARY_PATH:-}" ] && KEEP+=(LD_LIBRARY_PATH="$LD_LIBRARY_PATH")
     # `sudo -n`: fail fast rather than hang on a password prompt under the

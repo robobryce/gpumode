@@ -6,6 +6,12 @@ This is a fork of [gpu-mode/reference-kernels](https://github.com/gpu-mode/refer
 
 Pick the target problem by passing its `<set>/<problem>` path — this is the single token that selects the target. It is both the `benchmark=` argument you scope the run with **and** the first positional argument to every `harness/` script (which use it to locate the editable file and put the right dirs on `PYTHONPATH`). There is no environment variable to export: the `harness/` scripts take the path as an argument, so it travels with each command instead of relying on shell state that an agent harness does not preserve between separate command invocations. There is **one** autocuda data dir for the whole repo (`autocuda/` at the root) holding the run's logs, schema, worktrees, and dashboard. The machine-agnostic project description is this `layout.md` (committed); the per-machine half — GPU, toolchain paths, measured timings/noise, profiler invocations — is `autocuda/environment.md`, which `/autocuda:discover` writes per host (run it once on a fresh machine; with this `layout.md` present it only sets up and records the environment).
 
+## Required host setup
+
+Run `bash bin/install.sh` from the repository root before discovery or optimization. It is the single supported setup path: it installs/selects the leaderboard-matched CUDA 13.3.0 toolkit with `nvcc` 13.3.33 without replacing the host driver, recreates the repository-local `.venv` with Python 3.13 and the production KernelBot dependency order, installs the matching CUTLASS and MathDx headers, and writes `~/.config/gpumode/gpumode.env`. Rerun it after changing the dependency manifest, moving the checkout, or detecting environment drift.
+
+Every local harness entry point sources `harness/env.sh`. That loader reads the generated machine config, exports the production include/toolchain paths, and runs `bin/verify_environment.py` before touching problem code. Do not bypass it with a manually activated venv or a naked `python`/`nvcc` invocation. Optional `popcorn-cli` and Modal authentication happen after setup and remain conditional as described below.
+
 Optimize a problem — pass its `<set>/<problem>` path as `benchmark=` (the one token that selects the target; nothing to export, nothing to `cd` into):
 
 ```bash

@@ -10,13 +10,21 @@ execution environment described below.
 
 ## GPU and environment
 
+- **Provisioning:** run `bash bin/install.sh` from the repository root. It
+  installs/selects CUDA 13.3.0 with leaderboard-matched `nvcc` 13.3.33,
+  recreates `.venv`, installs the production-matched Python packages plus
+  `/opt/cutlass` and `/opt/mathdx`, writes
+  `~/.config/gpumode/gpumode.env`, and executes `bin/verify_environment.py`.
+  `harness/env.sh` repeats that verification for every local harness command;
+  do not bypass the generated config or substitute a manually assembled venv.
+
 - **Host GPU:** 1× NVIDIA B200 (Blackwell, 183359 MiB HBM3e), compute capability
   **10.0 (sm_100)**. Single device — `torch.cuda.device_count() == 1`, no
   round-robin; `autocuda run exclusive` claims `gpu-0`, pins
   `CUDA_VISIBLE_DEVICES=0`, and serializes every validation, benchmark, and
   profile on that GPU (`harness/env.sh` also defaults direct calls to device 0).
 - **Driver / CUDA:** driver **580.126.09**; the system default is the leaderboard-matched CUDA toolkit **13.3.0** at `/usr/local/cuda` (`nvcc V13.3.33`). The `cuda` alternative is in automatic mode and resolves to `/usr/local/cuda-13.3`; the CUDA 13.3 packages are held to prevent an unattended upgrade to the 13.3.1 maintenance stack. Torch's bundled CUDA runtime is 13.0 (`torch.version.cuda`).
-- **Leaderboard runtime:** Python **3.13.14** and PyTorch **2.12.0+cu130** live in the freshly rebuilt venv `/home/shadeform/gpumode/.venv`. Its direct dependency groups and install order mirror the production KernelBot image, with Torch installed last. `/home/shadeform/.config/gpumode/gpumode.env` selects this venv and `/usr/local/cuda` for every harness invocation.
+- **Leaderboard runtime:** Python **3.13.14** and PyTorch **2.12.0+cu130** live in the freshly rebuilt venv `/home/shadeform/gpumode/.venv`. Its direct dependency groups and install order mirror the production KernelBot image, with Torch installed last. `/home/shadeform/.config/gpumode/gpumode.env` selects this venv, `/usr/local/cuda`, `/opt/cutlass`, and `/opt/mathdx` for every harness invocation.
 - **nvJitLink:** PyTorch resolves its bundled `nvidia/cu13/lib/libnvJitLink.so.13` (13.0.88), while native CUDA 13.3 compilation resolves `/usr/local/cuda-13.3/targets/x86_64-linux/lib/libnvJitLink.so.13` (13.3.33). A cold extension rebuild, full validation, and full benchmark all pass without `LD_PRELOAD`; do not reintroduce the old preload workaround.
 - **ninja:** already usable (`torch.utils.cpp_extension.is_ninja_available()` →
   True); no symlink fix needed on this host.
@@ -54,12 +62,13 @@ execution environment described below.
   `import cuda.tile, nvmath, cutlass.cute, torch` passes and Torch reports
   `2.12.0+cu130`.
 - **Common runtime only:** submissions must use dependencies and headers
-  available in both environments. Modal CLI 1.5.2 and local `kernelguard` are
+  available in both environments. Modal CLI and local `kernelguard` are
   controller/static-check tools and intentionally stay outside the clean
   execution runtime. Do not add a convenience package to only one backend.
-- **Drift rule:** after changing either manifest or venv, verify the imports,
-  Python/Torch/CUDA versions, and direct dependency constraints before using
-  Modal fallback. If they differ, rebuild the stale environment and do not
+- **Drift rule:** after changing either manifest or venv, rerun
+  `bash bin/install.sh`; `bin/verify_environment.py` checks the imports,
+  Python/Torch/CUDA versions, direct dependency constraints, and native header
+  trees. If the environments differ, rebuild the stale environment and do not
   compare its timings with the other backend.
 
 ## Execution backend selection
