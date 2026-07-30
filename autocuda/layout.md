@@ -140,6 +140,12 @@ Leaderboard submissions are **mandatory evidence**, not optional reporting. A ru
 
 Automatic submission is authorized for this workspace. Do not ask the operator before submitting, and do not continue optimizing until the required submission for the current phase has either succeeded or failed with an explicit, logged infrastructure/authentication error.
 
+### Hourly submission cadence
+
+If valid `popcorn-cli` credentials are present, submit the current best safe committed kernel to the leaderboard at least once every hour while optimization is active. This hourly requirement applies even when no new best has been found since the previous submission: resubmit the current best and record the attempt, commit SHA, local metric, and returned result. Improvement-triggered submissions remain immediate and reset the one-hour clock. Do not interpret the hourly cadence as a cooldown or pause in optimization; workers continue useful work between submissions.
+
+If credentials are absent or authentication fails, record the infrastructure error and continue work that does not require leaderboard access. Resume the hourly cadence as soon as working credentials become available.
+
 Submission can be flaky. A run that comes back **failed** is a real failure — treat it as one. A run that **times out** is not conclusive: retry it, up to 3 times. If all 3 time out, treat that as a real failure.
 
 - **At baseline setup:** after the baseline passes local validation, is benchmarked, profiled, and logged with `autocuda log optimize-tree baseline`, immediately submit that exact baseline `submission.py` with `popcorn-cli submit --no-tui --leaderboard <name> --gpu <gpu> --mode leaderboard submission.py`. If this submission is missing, the entire optimize run is invalid and workers must not be launched.
