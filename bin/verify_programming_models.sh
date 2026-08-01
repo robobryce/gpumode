@@ -17,8 +17,20 @@ log() { printf '\033[1;35m[programming-models]\033[0m %s\n' "$*"; }
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
-log "CUDA C++"
-"$CUDA_HOME/bin/nvcc" -std=c++17 -arch=sm_100 "$REPO_DIR/bin/smoke/cuda_cpp.cu" -o "$tmp/cuda-cpp"
+CUDA_ARCH="${GPUMODE_CUDA_ARCH:-$("$PYTHON" - <<'PY'
+import torch
+
+major, minor = torch.cuda.get_device_capability()
+print(f"sm_{major}{minor}")
+PY
+)}"
+[[ "$CUDA_ARCH" =~ ^sm_[0-9]+$ ]] || {
+    echo "invalid CUDA architecture: $CUDA_ARCH" >&2
+    exit 1
+}
+
+log "CUDA C++ ($CUDA_ARCH)"
+"$CUDA_HOME/bin/nvcc" -std=c++17 "-arch=$CUDA_ARCH" "$REPO_DIR/bin/smoke/cuda_cpp.cu" -o "$tmp/cuda-cpp"
 "$tmp/cuda-cpp"
 
 log "CuTe DSL"
