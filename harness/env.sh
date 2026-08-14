@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Shared environment for the autocuda <-> GPU MODE bridge.
-# Sourced by build.sh / validate.sh / benchmark.sh / profile_ncu.sh.
+# Sourced by validate.sh / benchmark.sh / profile_ncu.sh.
 #
 # Optimization happens IN PLACE: the editable file is the problem's own
 # `submission.py` under `problems/<set>/<problem>/`, and the frozen
@@ -9,7 +9,7 @@
 #
 # Select the target problem by passing <set>/<problem> (e.g.
 # `pmpp_v2/histogram_py`) as the FIRST positional argument to the calling
-# script — build.sh / validate.sh / benchmark.sh / profile_ncu.sh each forward
+# script — validate.sh / benchmark.sh / profile_ncu.sh each forward
 # their args here via `source env.sh "$@"`. This is the same <set>/<problem>
 # string you scope an optimize-tree run with (`benchmark=<set>/<problem>`), so
 # the one token flows from the skill argument straight to the harness with no

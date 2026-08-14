@@ -51,9 +51,8 @@
 # triggers torch load_inline behind a per-build-dir baton lock. If the outer
 # timeout kills the worker mid-import (case (c)), a stale lock can be left behind
 # and would hang the NEXT validate's import for the full baton wait. So this guard
-# clears any stale (unheld) torch build lock both BEFORE and AFTER the run, the
-# same way harness/build.sh does -- converting a would-be silent hang into a
-# self-healing fast failure here.
+# clears any stale (unheld) torch build lock both BEFORE and AFTER the run,
+# converting a would-be silent hang into a self-healing fast failure here.
 #
 # BOUNDARY — it asserts the kernel SURVIVES off-grid n without taking the run
 # down; it does not exhaustively prove correctness at every possible n. It checks
@@ -72,7 +71,7 @@ set -uo pipefail
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
 source "$REPO_DIR/harness/env.sh" "$@"
 
-# --- stale torch build-lock hygiene (mirror of harness/build.sh) -------------
+# --- stale torch build-lock hygiene ------------------------------------------
 # Remove a torch load_inline baton lock only when NO process is holding it (a
 # crash/timeout left it behind). Never touch a lock another live build holds.
 clear_unheld_torch_locks() {

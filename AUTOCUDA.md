@@ -5,7 +5,7 @@ This fork of [gpu-mode/reference-kernels](https://github.com/gpu-mode/reference-
 ```
 bin/install.sh              one-time machine setup (popcorn-cli, torch venv, gpumode.env)
 bin/gen_specs.py            task.yml -> eval.py spec files + leaderboard/gpu/meta lookup
-harness/                    build/validate/benchmark/profile/submit bridge, plus Modal launcher
+harness/                    validate/benchmark/profile/submit bridge, plus Modal launcher
 autocuda/layout.md          committed, machine-agnostic project description (the ground truth)
                             (autocuda/environment.md, the per-machine half, is written by /autocuda:discover)
 .claude/skills/             repo-level agent skills (also exposed as .agents/skills):

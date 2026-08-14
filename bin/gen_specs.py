@@ -21,7 +21,7 @@ for `eval.py` / `utils.py` — which is NOT always the set root: most problems
 share `../eval.py`, but several (qr_py, mla-decode, trimul, …) ship a
 problem-local `eval.py`, and qr_py borrows `utils.py` from another set
 (`../../pmpp_v2/utils.py`). harness/env.sh calls this so the same unwrapped
-build/validate/benchmark/profile scripts work for every layout. Falls back to
+validate/benchmark/profile scripts work for every layout. Falls back to
 the set-root sibling, then the problem-local file, when the manifest is silent.
 
 The leaderboard name and supported GPUs come from the set-level yaml
