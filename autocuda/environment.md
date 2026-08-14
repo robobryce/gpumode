@@ -40,8 +40,8 @@ SM120 workers used for autocuda experiments.
   `CUDA_VISIBLE_DEVICES` to device 0. `autocuda run exclusive` claims `gpu-0`
   and serializes validation, benchmark, and profiling work on it.
 - **Host resources:** the measured worker configuration has 16 AMD EPYC 9335
-  CPUs, 141 GiB RAM, and 4 GiB swap. `harness/env.sh` defaults `MAX_JOBS=3` per
-  worker so four simultaneous agent builds use at most 12 compiler jobs.
+  CPUs, 141 GiB RAM, and 4 GiB swap. `harness/env.sh` defaults `MAX_JOBS=3` so
+  import-time extension compilation during validation does not saturate the host.
 
 ## Runtime and programming models
 
@@ -93,18 +93,13 @@ SM120 workers used for autocuda experiments.
 
 ## Harness execution
 
-- Build under the experiment's CPU and memory slice:
-
-  ```bash
-  autocuda run slice --data-dir "$DATA_DIR" --tag "$TAG" -- \
-    bash harness/build.sh <set>/<problem>
-  ```
-
-- Serialize GPU work for validation, benchmarks, and profiles:
+- There is no separate build step. Validation imports and invokes the submission,
+  which triggers import-time extension compilation and first-use JIT compilation.
+- Serialize local GPU work for validation, benchmarks, and profiles:
 
   ```bash
   autocuda run exclusive --data-dir "$DATA_DIR" -- \
-    bash harness/benchmark.sh <set>/<problem>
+    bash harness/validate.sh <set>/<problem>
   ```
 
 - Use an absolute shared `DATA_DIR` from worker worktrees and wrap each harness
@@ -113,12 +108,12 @@ SM120 workers used for autocuda experiments.
 
 ## Timeouts
 
-Timeouts are problem-dependent. Measure build, validation, benchmark, and
-profiling durations for the selected problem, then allow enough margin for cold
-compilation and slower cases.
+Timeouts are problem-dependent. Measure validation, benchmark, and profiling
+durations for the selected problem, then allow enough margin for cold compilation
+and slower cases.
 
-- Fresh custom-kernel builds can take tens of seconds; cached or Python-only
-  builds can be much faster.
+- A cold validation may include import-time or first-use kernel compilation and
+  can take much longer than a cached validation.
 - Validation and benchmark duration scales with the problem's cases. Record
   measured values in experiment data rather than treating them as host facts.
 - Nsight Systems captures are normally much faster than focused Nsight Compute
